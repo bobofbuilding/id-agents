@@ -7,6 +7,65 @@ interface HelpViewProps {
   scrollOffset: number;
 }
 
+// ── Keybinding groups (hand-maintained; restored from the pre-Phase-5
+//    HelpModal at commit 1bdba04). The command catalog below is still
+//    auto-sourced from the registry; only these three groups document
+//    the in-app keybindings that App.tsx's useInput actually wires.
+interface Keybind {
+  title: string;
+  rows: Array<[string, string]>;
+}
+
+const VIEWS: Keybind = {
+  title: 'Views',
+  rows: [
+    ['a', 'Agents'],
+    ['t', 'Tasks'],
+    ['n', 'News'],
+    ['c', 'Calendar'],
+    ['h', 'Heartbeats'],
+    ['l', 'Library'],
+    ['s', 'Skills'],
+  ],
+};
+
+const NAVIGATE: Keybind = {
+  title: 'Navigate',
+  rows: [
+    ['↑ ↓', 'Move row'],
+    ['PgUp/Dn', 'Move page'],
+    ['→', 'Open detail'],
+    ['← Esc', 'Back'],
+    ['Tab', 'Cycle team'],
+  ],
+};
+
+const GLOBAL: Keybind = {
+  title: 'Global',
+  rows: [
+    ['?', 'Toggle help'],
+    ['q', 'Quit'],
+    ['^C', 'Force quit'],
+  ],
+};
+
+function KeybindColumn({ group, keyWidth }: { group: Keybind; keyWidth: number }): React.ReactElement {
+  return (
+    <Box flexDirection="column" marginRight={2}>
+      <Text bold>{group.title}</Text>
+      {group.rows.map(([keybind, desc]) => (
+        <Box key={keybind}>
+          <Box width={keyWidth}>
+            <Text color="yellow">{keybind}</Text>
+          </Box>
+          <Text>{desc}</Text>
+        </Box>
+      ))}
+    </Box>
+  );
+}
+
+// ── Command catalog (auto-sourced; tier-grouped, scrollable) ─────────
 type Row =
   | { kind: 'header'; tier: RiskTier; count: number }
   | { kind: 'cmd'; name: string; description: string; tier: RiskTier }
@@ -72,20 +131,29 @@ export function HelpView(props: HelpViewProps): React.ReactElement {
   const padCount = Math.max(0, props.windowSize - visible.length);
   const endLineNo = start + visible.length;
 
-  // Count just the command rows (exclude headers + spacers) for the
-  // header line. The spacers/headers are chrome, not content.
   const cmdCount = rows.filter((r) => r.kind === 'cmd').length;
 
   return (
     <Box flexDirection="column" borderStyle="round" borderColor="cyan" paddingX={1}>
       <Box justifyContent="space-between">
         <Text bold color="cyan">
-          Help · {cmdCount} commands
+          Help · keybindings + {cmdCount} commands
         </Text>
         <Text dimColor>
           {total} lines · {total === 0 ? 0 : start + 1}–{endLineNo} · ↑↓/jk scroll · Esc / ? close
         </Text>
       </Box>
+
+      {/* Fixed (non-scrollable) keybinding block. Three columns mirror
+          the pre-Phase-5 HelpModal layout exactly. */}
+      <Box flexDirection="row" marginTop={1}>
+        <KeybindColumn group={VIEWS} keyWidth={3} />
+        <KeybindColumn group={NAVIGATE} keyWidth={9} />
+        <KeybindColumn group={GLOBAL} keyWidth={4} />
+      </Box>
+
+      {/* Scrollable command catalog. Only this block responds to the
+          ↑↓/jk scroll keys; the keybinding block above stays fixed. */}
       <Text dimColor> </Text>
       {visible.map((row, i) => renderRow(row, `help-row-${start + i}`))}
       {Array.from({ length: padCount }, (_, i) => (
