@@ -1276,6 +1276,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         if (input === 'h') return openHeartbeats();
         if (input === 'l') return openLibraryAgents();
         if (input === 's') return openLibrarySkills();
+        if (key.leftArrow || key.escape) return setView('agents');
         if (key.upArrow) return moveSchedSel(-1);
         if (key.downArrow) return moveSchedSel(1);
         if (key.pageUp) return moveSchedSel(-calendarWindowSize);
@@ -1302,6 +1303,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         if (input === 'c') return openCalendar();
         if (input === 'l') return openLibraryAgents();
         if (input === 's') return openLibrarySkills();
+        if (key.leftArrow || key.escape) return setView('agents');
         if (key.rightArrow) return openHeartbeatDetail();
         if (key.upArrow) return moveHbSel(-1);
         if (key.downArrow) return moveHbSel(1);
