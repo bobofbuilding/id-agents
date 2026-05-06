@@ -987,6 +987,36 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           setHelpScroll(Number.MAX_SAFE_INTEGER);
           return;
         }
+        // Single-letter view shortcuts close help and switch in one
+        // keystroke — matches what the help text itself documents
+        // under "Views". Reuses the same dispatch/openers the per-view
+        // input blocks already call so behavior is identical.
+        if (
+          input === 'a' || input === 't' || input === 'n' ||
+          input === 'c' || input === 'h' || input === 'l' || input === 's'
+        ) {
+          setShowHelp(false);
+          setHelpScroll(0);
+          if (input === 'a') return setView('agents');
+          if (input === 't') return setView('tasks');
+          if (input === 'n') return setView('news');
+          if (input === 'c') return openCalendar();
+          if (input === 'h') return openHeartbeats();
+          if (input === 'l') return openLibraryAgents();
+          if (input === 's') return openLibrarySkills();
+          return;
+        }
+        // ':' / '/' close help and open the command bar with that
+        // sigil already in the buffer — same shape as the global
+        // command-mode entry path.
+        if (input === ':' || input === '/') {
+          setShowHelp(false);
+          setHelpScroll(0);
+          setCommandMode(true);
+          setCommandBuffer(input);
+          setCommandHistoryIndex(null);
+          return;
+        }
         return; // swallow everything else
       }
       // Retype prompt (Phase 4) — owns every keystroke. Enter checks
