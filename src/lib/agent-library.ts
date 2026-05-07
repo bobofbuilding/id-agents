@@ -68,11 +68,22 @@ export interface LibraryPaths {
  *
  *   <libRoot>/agents
  *   <libRoot>/skills
+ *
+ * Skills fallback: when `<libRoot>/skills` is absent but a sibling
+ * `<libRoot>/../skills` exists, the sibling is used. This matches the
+ * in-repo layout where `configs/agents/` and a top-level `skills/`
+ * live side-by-side rather than nested under one root.
  */
 export function getLibraryPaths(libRoot: string): LibraryPaths {
+  const nestedSkills = path.join(libRoot, 'skills');
+  const siblingSkills = path.resolve(libRoot, '..', 'skills');
+  const skills =
+    !isDirectory(nestedSkills) && isDirectory(siblingSkills)
+      ? siblingSkills
+      : nestedSkills;
   return {
     agents: path.join(libRoot, 'agents'),
-    skills: path.join(libRoot, 'skills'),
+    skills,
   };
 }
 

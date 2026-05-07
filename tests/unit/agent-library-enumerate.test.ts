@@ -38,6 +38,33 @@ describe('getLibraryPaths', () => {
     expect(paths.agents).toBe(path.join('/repo/configs', 'agents'));
     expect(paths.skills).toBe(path.join('/repo/configs', 'skills'));
   });
+
+  it('falls back to a sibling skills/ when nested skills/ is absent', () => {
+    const tmp = mkTmp();
+    try {
+      const libRoot = path.join(tmp, 'configs');
+      mkdir(libRoot);
+      mkdir(path.join(tmp, 'skills'));
+      const paths = getLibraryPaths(libRoot);
+      expect(paths.agents).toBe(path.join(libRoot, 'agents'));
+      expect(paths.skills).toBe(path.resolve(libRoot, '..', 'skills'));
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('prefers nested skills/ over sibling when both exist', () => {
+    const tmp = mkTmp();
+    try {
+      const libRoot = path.join(tmp, 'configs');
+      mkdir(path.join(libRoot, 'skills'));
+      mkdir(path.join(tmp, 'skills'));
+      const paths = getLibraryPaths(libRoot);
+      expect(paths.skills).toBe(path.join(libRoot, 'skills'));
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 });
 
 /* ------------------------------------------------------------------ */
