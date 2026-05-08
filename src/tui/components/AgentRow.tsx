@@ -5,6 +5,7 @@ import { padRight, truncate, humanizeLastSeen } from '../util/format.js';
 import { statusColor, healthColor, healthDot } from '../util/colors.js';
 import { formatMemory, memoryColor } from '../util/memory.js';
 import { abbrevModel } from '../util/models.js';
+import type { TextWrapMode } from '../util/wrap.js';
 
 interface AgentRowProps {
   agent: Agent;
@@ -13,6 +14,7 @@ interface AgentRowProps {
   newsColor: string;
   memBytes: number | null;
   nowMs: number;
+  wrapMode: TextWrapMode;
 }
 
 // Column widths for local agents
@@ -68,7 +70,7 @@ function isRemoteAgent(agent: Agent): boolean {
     agent.metadata?.runtime === 'public-agent-remote';
 }
 
-function AgentRowInner({ agent, selected, uptime, newsColor, memBytes, nowMs }: AgentRowProps): React.ReactElement {
+function AgentRowInner({ agent, selected, uptime, newsColor, memBytes, nowMs, wrapMode }: AgentRowProps): React.ReactElement {
   const marker = selected ? '▶ ' : '  ';
   const name = padRight(agent.alias ?? agent.name, COLS.name);
   const runtime = padRight(abbrevRuntime(agent.metadata?.runtime), COLS.runtime);
@@ -93,7 +95,7 @@ function AgentRowInner({ agent, selected, uptime, newsColor, memBytes, nowMs }: 
     const remoteStatus = padRight(remoteStatusLabel, COLS.status);
 
     return (
-      <Text inverse={selected} wrap="truncate-end">
+      <Text inverse={selected} wrap={wrapMode}>
         {marker}
         <Text bold={selected}>{name}</Text>
         <Text dimColor>{portCell}</Text>
@@ -119,7 +121,7 @@ function AgentRowInner({ agent, selected, uptime, newsColor, memBytes, nowMs }: 
   const uptimeCell = padRight(uptime, COLS.uptime);
 
   return (
-    <Text inverse={selected} wrap="truncate-end">
+    <Text inverse={selected} wrap={wrapMode}>
       {marker}
       <Text bold={selected}>{name}</Text>
       {port}
@@ -142,6 +144,7 @@ export const AgentRow = React.memo(AgentRowInner, (prev, next) => {
   if (prev.newsColor !== next.newsColor) return false;
   if (prev.memBytes !== next.memBytes) return false;
   if (prev.nowMs !== next.nowMs) return false;
+  if (prev.wrapMode !== next.wrapMode) return false;
   const a = prev.agent;
   const b = next.agent;
   return (
@@ -160,10 +163,10 @@ export const AgentRow = React.memo(AgentRowInner, (prev, next) => {
   );
 });
 
-export function AgentRowHeader(props: { hasRemote?: boolean }): React.ReactElement {
+export function AgentRowHeader(props: { hasRemote?: boolean; wrapMode: TextWrapMode }): React.ReactElement {
   if (props.hasRemote) {
     return (
-      <Text bold dimColor wrap="truncate-end">
+      <Text bold dimColor wrap={props.wrapMode}>
         {padRight('', REMOTE_COLS.marker)}
         {padRight('NAME', REMOTE_COLS.name)}
         {padRight('PORT', REMOTE_COLS.port)}
@@ -181,7 +184,7 @@ export function AgentRowHeader(props: { hasRemote?: boolean }): React.ReactEleme
     );
   }
   return (
-    <Text bold dimColor wrap="truncate-end">
+    <Text bold dimColor wrap={props.wrapMode}>
       {padRight('', COLS.marker)}
       {padRight('NAME', COLS.name)}
       {padRight('PORT', COLS.port)}

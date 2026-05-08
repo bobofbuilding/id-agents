@@ -3,6 +3,7 @@ import { Box, Text } from 'ink';
 import type { Schedule } from '../api/types.js';
 import { padRight, truncate } from '../util/format.js';
 import { cadenceLabel, formatNextFire, nextFireSec } from '../util/schedule.js';
+import type { TextWrapMode } from '../util/wrap.js';
 
 interface CalendarRow {
   schedule: Schedule;
@@ -17,6 +18,7 @@ interface CalendarViewProps {
   windowSize: number;
   loading: boolean;
   error: Error | null;
+  wrapMode: TextWrapMode;
 }
 
 const COLS = {
@@ -28,7 +30,7 @@ const COLS = {
 } as const;
 
 export function CalendarView(props: CalendarViewProps): React.ReactElement {
-  const { schedules, nowSec, selectedIndex, windowStart, windowSize, loading, error } = props;
+  const { schedules, nowSec, selectedIndex, windowStart, windowSize, loading, error, wrapMode } = props;
 
   const rows: CalendarRow[] = React.useMemo(() => {
     const out: CalendarRow[] = schedules.map((s) => ({
@@ -59,7 +61,7 @@ export function CalendarView(props: CalendarViewProps): React.ReactElement {
           {error ? `error: ${error.message}` : null}
         </Text>
       </Box>
-      <Header />
+      <Header wrapMode={wrapMode} />
       <Text dimColor>{hiddenAbove > 0 ? `↑ ${hiddenAbove} more above` : ' '}</Text>
       {visible.length === 0 && !loading ? (
         <Text dimColor>no scheduled items in this view</Text>
@@ -70,6 +72,7 @@ export function CalendarView(props: CalendarViewProps): React.ReactElement {
             row={row}
             nowSec={nowSec}
             selected={windowStart + i === selectedIndex}
+            wrapMode={wrapMode}
           />
         ))
       )}
@@ -90,9 +93,9 @@ export function CalendarView(props: CalendarViewProps): React.ReactElement {
   );
 }
 
-function Header(): React.ReactElement {
+function Header(props: { wrapMode: TextWrapMode }): React.ReactElement {
   return (
-    <Text bold dimColor>
+    <Text bold dimColor wrap={props.wrapMode}>
       {padRight('', COLS.marker)}
       {padRight('TIME', COLS.time)}
       {padRight('AGENT', COLS.agent)}
@@ -106,9 +109,10 @@ interface RowInnerProps {
   row: CalendarRow;
   nowSec: number;
   selected: boolean;
+  wrapMode: TextWrapMode;
 }
 
-function RowInner({ row, nowSec, selected }: RowInnerProps): React.ReactElement {
+function RowInner({ row, nowSec, selected, wrapMode }: RowInnerProps): React.ReactElement {
   const { schedule, nextFire } = row;
   const marker = selected ? '▶ ' : '  ';
   const timeCell =
@@ -118,7 +122,7 @@ function RowInner({ row, nowSec, selected }: RowInnerProps): React.ReactElement 
   const cadence = padRight(cadenceLabel(schedule), COLS.cadence);
   const kindColor = schedule.kind === 'heartbeat' ? 'cyan' : 'magenta';
   return (
-    <Text inverse={selected}>
+    <Text inverse={selected} wrap={wrapMode}>
       {marker}
       <Text color={schedule.active ? 'white' : 'gray'}>{timeCell}</Text>
       {agent}
@@ -131,6 +135,7 @@ function RowInner({ row, nowSec, selected }: RowInnerProps): React.ReactElement 
 const Row = React.memo(RowInner, (prev, next) => {
   if (prev.selected !== next.selected) return false;
   if (prev.nowSec !== next.nowSec) return false;
+  if (prev.wrapMode !== next.wrapMode) return false;
   const a = prev.row;
   const b = next.row;
   return (

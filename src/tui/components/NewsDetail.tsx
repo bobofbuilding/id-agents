@@ -1,6 +1,7 @@
 import React from 'react';
 import { Box, Text } from 'ink';
 import type { NewsItem } from '../api/types.js';
+import type { TextWrapMode } from '../util/wrap.js';
 
 interface NewsDetailProps {
   agentName: string | null;
@@ -9,10 +10,11 @@ interface NewsDetailProps {
   windowSize: number;
   scrollOffset: number;
   contentWidth: number;
+  wrapMode: TextWrapMode;
 }
 
 export function NewsDetail(props: NewsDetailProps): React.ReactElement {
-  const { agentName, item, positionLabel, windowSize, scrollOffset, contentWidth } = props;
+  const { agentName, item, positionLabel, windowSize, scrollOffset, contentWidth, wrapMode } = props;
 
   const lines = item
     ? buildBodyLines(item, contentWidth)
@@ -31,19 +33,19 @@ export function NewsDetail(props: NewsDetailProps): React.ReactElement {
         <Text dimColor>{positionLabel}</Text>
       </Box>
       <Text dimColor>{hiddenAbove > 0 ? `↑ ${hiddenAbove} more above` : ' '}</Text>
-      <Body visible={visible} windowSize={windowSize} />
+      <Body visible={visible} windowSize={windowSize} wrapMode={wrapMode} />
       <Text dimColor>{hiddenBelow > 0 ? `↓ ${hiddenBelow} more below` : ' '}</Text>
     </Box>
   );
 }
 
-function Body(props: { visible: string[]; windowSize: number }): React.ReactElement {
-  const { visible, windowSize } = props;
+function Body(props: { visible: string[]; windowSize: number; wrapMode: TextWrapMode }): React.ReactElement {
+  const { visible, windowSize, wrapMode } = props;
   const padCount = Math.max(0, windowSize - visible.length);
   return (
     <>
       {visible.map((line, i) => (
-        <Text key={`line-${i}`}>{line || ' '}</Text>
+        <Text key={`line-${i}`} wrap={wrapMode}>{line || ' '}</Text>
       ))}
       {Array.from({ length: padCount }, (_, i) => (
         <Text key={`pad-${i}`}> </Text>

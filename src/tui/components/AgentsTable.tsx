@@ -2,6 +2,7 @@ import React from 'react';
 import { Box, Text } from 'ink';
 import type { Agent } from '../api/types.js';
 import { AgentRow, AgentRowHeader } from './AgentRow.js';
+import type { TextWrapMode } from '../util/wrap.js';
 
 interface AgentsTableProps {
   agents: Agent[];
@@ -16,6 +17,7 @@ interface AgentsTableProps {
   loading: boolean;
   error: Error | null;
   nowMs: number;
+  wrapMode: TextWrapMode;
 }
 
 function isRemoteAgent(a: Agent): boolean {
@@ -37,6 +39,7 @@ export function AgentsTable(props: AgentsTableProps): React.ReactElement {
     loading,
     error,
     nowMs,
+    wrapMode,
   } = props;
   const total = agents.length;
   const windowEnd = Math.min(total, windowStart + windowSize);
@@ -60,7 +63,7 @@ export function AgentsTable(props: AgentsTableProps): React.ReactElement {
           {error ? `error: ${error.message}` : null}
         </Text>
       </Box>
-      <AgentRowHeader hasRemote={hasRemote} />
+      <AgentRowHeader hasRemote={hasRemote} wrapMode={wrapMode} />
       <Text dimColor>{hiddenAbove > 0 ? `↑ ${hiddenAbove} more above` : ' '}</Text>
       {visible.length === 0 && !loading ? (
         <Text dimColor>no agents in this view</Text>
@@ -74,6 +77,7 @@ export function AgentsTable(props: AgentsTableProps): React.ReactElement {
             memBytes={memBytesById.get(agent.id) ?? null}
             selected={windowStart + i === selectedIndex}
             nowMs={nowMs}
+            wrapMode={wrapMode}
           />
         ))
       )}

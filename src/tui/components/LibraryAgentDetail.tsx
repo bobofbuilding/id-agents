@@ -1,6 +1,7 @@
 import React from 'react';
 import { Box, Text } from 'ink';
 import type { LibraryAgentDetailResponse } from '../api/manager.js';
+import type { TextWrapMode } from '../util/wrap.js';
 
 interface LibraryAgentDetailProps {
   agent: LibraryAgentDetailResponse | null;
@@ -11,12 +12,13 @@ interface LibraryAgentDetailProps {
   windowSize: number;
   scrollOffset: number;
   contentWidth: number;
+  wrapMode: TextWrapMode;
 }
 
 const README_PREVIEW_LINES = 18;
 
 export function LibraryAgentDetail(props: LibraryAgentDetailProps): React.ReactElement {
-  const { agent, agentName, loading, error, positionLabel, windowSize, scrollOffset, contentWidth } = props;
+  const { agent, agentName, loading, error, positionLabel, windowSize, scrollOffset, contentWidth, wrapMode } = props;
 
   const lines = buildBodyLines(agent, contentWidth, loading, error);
   const total = lines.length;
@@ -36,19 +38,19 @@ export function LibraryAgentDetail(props: LibraryAgentDetailProps): React.ReactE
         <Text dimColor>{positionLabel}</Text>
       </Box>
       <Text dimColor>{hiddenAbove > 0 ? `↑ ${hiddenAbove} more above` : ' '}</Text>
-      <Body visible={visible} windowSize={windowSize} />
+      <Body visible={visible} windowSize={windowSize} wrapMode={wrapMode} />
       <Text dimColor>{hiddenBelow > 0 ? `↓ ${hiddenBelow} more below` : ' '}</Text>
     </Box>
   );
 }
 
-function Body(props: { visible: string[]; windowSize: number }): React.ReactElement {
-  const { visible, windowSize } = props;
+function Body(props: { visible: string[]; windowSize: number; wrapMode: TextWrapMode }): React.ReactElement {
+  const { visible, windowSize, wrapMode } = props;
   const padCount = Math.max(0, windowSize - visible.length);
   return (
     <>
       {visible.map((line, i) => (
-        <Text key={`line-${i}`}>{line || ' '}</Text>
+        <Text key={`line-${i}`} wrap={wrapMode}>{line || ' '}</Text>
       ))}
       {Array.from({ length: padCount }, (_, i) => (
         <Text key={`pad-${i}`}> </Text>

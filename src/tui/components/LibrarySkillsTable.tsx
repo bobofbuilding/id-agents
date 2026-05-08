@@ -2,6 +2,7 @@ import React from 'react';
 import { Box, Text } from 'ink';
 import { padRight } from '../util/format.js';
 import type { LibrarySkillRow } from '../api/manager.js';
+import type { TextWrapMode } from '../util/wrap.js';
 
 interface LibrarySkillsTableProps {
   entries: LibrarySkillRow[];
@@ -11,6 +12,7 @@ interface LibrarySkillsTableProps {
   windowSize: number;
   loading: boolean;
   error: Error | null;
+  wrapMode: TextWrapMode;
 }
 
 const COLS = {
@@ -24,7 +26,7 @@ const NAME_FLAG_GAP = '  ';
 const FLAG_SOURCE_GAP = '  ';
 
 export function LibrarySkillsTable(props: LibrarySkillsTableProps): React.ReactElement {
-  const { entries, libraryRoot, selectedIndex, windowStart, windowSize, loading, error } = props;
+  const { entries, libraryRoot, selectedIndex, windowStart, windowSize, loading, error, wrapMode } = props;
   const total = entries.length;
   const windowEnd = Math.min(total, windowStart + windowSize);
   const visible = entries.slice(windowStart, windowEnd);
@@ -41,7 +43,7 @@ export function LibrarySkillsTable(props: LibrarySkillsTableProps): React.ReactE
         </Text>
       </Box>
       <Text dimColor>{libraryRoot ?? '(no library configured)'}</Text>
-      <Header />
+      <Header wrapMode={wrapMode} />
       <Text dimColor>{hiddenAbove > 0 ? `↑ ${hiddenAbove} more above` : ' '}</Text>
       {visible.length === 0 && !loading ? (
         <Text dimColor>
@@ -51,7 +53,7 @@ export function LibrarySkillsTable(props: LibrarySkillsTableProps): React.ReactE
         </Text>
       ) : (
         visible.map((row, i) => (
-          <Row key={row.name} row={row} selected={windowStart + i === selectedIndex} />
+          <Row key={row.name} row={row} selected={windowStart + i === selectedIndex} wrapMode={wrapMode} />
         ))
       )}
       {Array.from(
@@ -70,9 +72,9 @@ export function LibrarySkillsTable(props: LibrarySkillsTableProps): React.ReactE
   );
 }
 
-function Header(): React.ReactElement {
+function Header(props: { wrapMode: TextWrapMode }): React.ReactElement {
   return (
-    <Text bold dimColor>
+    <Text bold dimColor wrap={props.wrapMode}>
       {padRight('', COLS.marker)}
       {padRight('NAME', COLS.name)}
       {NAME_FLAG_GAP}
@@ -83,11 +85,11 @@ function Header(): React.ReactElement {
   );
 }
 
-function Row(props: { row: LibrarySkillRow; selected: boolean }): React.ReactElement {
-  const { row, selected } = props;
+function Row(props: { row: LibrarySkillRow; selected: boolean; wrapMode: TextWrapMode }): React.ReactElement {
+  const { row, selected, wrapMode } = props;
   const marker = selected ? '▶ ' : '  ';
   return (
-    <Text inverse={selected}>
+    <Text inverse={selected} wrap={wrapMode}>
       {marker}
       {padRight(row.name, COLS.name)}
       {NAME_FLAG_GAP}

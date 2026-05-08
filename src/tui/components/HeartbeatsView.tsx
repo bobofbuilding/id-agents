@@ -3,6 +3,7 @@ import { Box, Text } from 'ink';
 import type { Schedule } from '../api/types.js';
 import { padRight, truncate } from '../util/format.js';
 import { formatInterval } from '../util/schedule.js';
+import type { TextWrapMode } from '../util/wrap.js';
 
 export interface HeartbeatRow {
   agent: string;
@@ -20,6 +21,7 @@ interface HeartbeatsViewProps {
   windowSize: number;
   loading: boolean;
   error: Error | null;
+  wrapMode: TextWrapMode;
 }
 
 const COLS = {
@@ -31,7 +33,7 @@ const COLS = {
 } as const;
 
 export function HeartbeatsView(props: HeartbeatsViewProps): React.ReactElement {
-  const { rows, nowSec, selectedIndex, windowStart, windowSize, loading, error } = props;
+  const { rows, nowSec, selectedIndex, windowStart, windowSize, loading, error, wrapMode } = props;
 
   const total = rows.length;
   const windowEnd = Math.min(total, windowStart + windowSize);
@@ -48,7 +50,7 @@ export function HeartbeatsView(props: HeartbeatsViewProps): React.ReactElement {
           {error ? `error: ${error.message}` : null}
         </Text>
       </Box>
-      <Header />
+      <Header wrapMode={wrapMode} />
       <Text dimColor>{hiddenAbove > 0 ? `↑ ${hiddenAbove} more above` : ' '}</Text>
       {visible.length === 0 && !loading ? (
         <Text dimColor>no active heartbeats in this view</Text>
@@ -59,6 +61,7 @@ export function HeartbeatsView(props: HeartbeatsViewProps): React.ReactElement {
             row={row}
             nowSec={nowSec}
             selected={windowStart + i === selectedIndex}
+            wrapMode={wrapMode}
           />
         ))
       )}
@@ -79,9 +82,9 @@ export function HeartbeatsView(props: HeartbeatsViewProps): React.ReactElement {
   );
 }
 
-function Header(): React.ReactElement {
+function Header(props: { wrapMode: TextWrapMode }): React.ReactElement {
   return (
-    <Text bold dimColor>
+    <Text bold dimColor wrap={props.wrapMode}>
       {padRight('', COLS.marker)}
       {padRight('AGENT', COLS.agent)}
       {padRight('INTERVAL', COLS.interval)}
@@ -95,9 +98,10 @@ interface RowInnerProps {
   row: HeartbeatRow;
   nowSec: number;
   selected: boolean;
+  wrapMode: TextWrapMode;
 }
 
-function RowInner({ row, nowSec, selected }: RowInnerProps): React.ReactElement {
+function RowInner({ row, nowSec, selected, wrapMode }: RowInnerProps): React.ReactElement {
   const marker = selected ? '▶ ' : '  ';
   const agent = padRight(truncate(row.agent, COLS.agent - 1), COLS.agent);
   const interval = padRight(formatInterval(row.intervalSec), COLS.interval);
@@ -108,7 +112,7 @@ function RowInner({ row, nowSec, selected }: RowInnerProps): React.ReactElement 
   const next = padRight(bucketedCountdown(row.nextFireSec - nowSec), COLS.next);
   const activeColor = row.schedule.active ? 'white' : 'gray';
   return (
-    <Text inverse={selected}>
+    <Text inverse={selected} wrap={wrapMode}>
       {marker}
       <Text color={activeColor}>{agent}</Text>
       {interval}
@@ -121,6 +125,7 @@ function RowInner({ row, nowSec, selected }: RowInnerProps): React.ReactElement 
 const Row = React.memo(RowInner, (prev, next) => {
   if (prev.selected !== next.selected) return false;
   if (prev.nowSec !== next.nowSec) return false;
+  if (prev.wrapMode !== next.wrapMode) return false;
   const a = prev.row;
   const b = next.row;
   return (

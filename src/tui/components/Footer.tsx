@@ -18,6 +18,7 @@ export type FooterView =
 
 interface FooterProps {
   view: FooterView;
+  wrapEnabled: boolean;
 }
 
 // Footer is a one-liner. Press `?` to open the full help modal which
@@ -40,15 +41,16 @@ const HAS_BACK: Record<FooterView, boolean> = {
   'library-skill-detail': true,
 };
 
-function hintFor(view: FooterView): string {
+function hintFor(view: FooterView, wrapEnabled: boolean): string {
   const back = HAS_BACK[view] ? ' · ← back' : '';
-  return `↑↓ nav${back} · : cmd · ? help · q quit`;
+  const wrap = wrapEnabled ? 'wrap on' : 'wrap off';
+  return `↑↓ nav${back} · w ${wrap} · : cmd · ? help · q quit`;
 }
 
-export function Footer({ view }: FooterProps): React.ReactElement {
+export function Footer({ view, wrapEnabled }: FooterProps): React.ReactElement {
   return (
     <Box paddingX={1} justifyContent="space-between">
-      <Text dimColor>{hintFor(view)}</Text>
+      <Text dimColor>{hintFor(view, wrapEnabled)}</Text>
       <Text dimColor>ID Agents Dashboard</Text>
     </Box>
   );

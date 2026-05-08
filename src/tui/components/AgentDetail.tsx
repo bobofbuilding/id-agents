@@ -9,6 +9,7 @@ import { Box, Text } from 'ink';
 import type { Agent } from '../api/types.js';
 import { humanizeLastSeen } from '../util/format.js';
 import { healthColor } from '../util/colors.js';
+import type { TextWrapMode } from '../util/wrap.js';
 
 interface AgentDetailProps {
   agent: Agent | null;
@@ -17,6 +18,7 @@ interface AgentDetailProps {
   scrollOffset: number;
   contentWidth: number;
   nowMs: number;
+  wrapMode: TextWrapMode;
 }
 
 function fieldRow(label: string, value: string | null | undefined, color?: string): string {
@@ -27,7 +29,7 @@ function fieldRow(label: string, value: string | null | undefined, color?: strin
 }
 
 export function AgentDetail(props: AgentDetailProps): React.ReactElement {
-  const { agent, positionLabel, windowSize, scrollOffset, contentWidth, nowMs } = props;
+  const { agent, positionLabel, windowSize, scrollOffset, contentWidth, nowMs, wrapMode } = props;
 
   if (!agent) {
     return (
@@ -93,10 +95,10 @@ export function AgentDetail(props: AgentDetailProps): React.ReactElement {
       {visible.map((row, i) => {
         if (!row.label && !row.value) return <Text key={i}> </Text>;
         if (row.label.startsWith('---')) {
-          return <Text key={i} bold dimColor>{row.label}</Text>;
+          return <Text key={i} bold dimColor wrap={wrapMode}>{row.label}</Text>;
         }
         return (
-          <Text key={i}>
+          <Text key={i} wrap={wrapMode}>
             <Text dimColor>{row.label.padEnd(W)}</Text>
             {row.color
               ? <Text color={row.color}>{row.value}</Text>

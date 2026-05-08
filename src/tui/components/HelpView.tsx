@@ -1,10 +1,12 @@
 import React from 'react';
 import { Box, Text } from 'ink';
 import { catalogEntriesByTier, type RiskTier } from '../commands/registry.js';
+import type { TextWrapMode } from '../util/wrap.js';
 
 interface HelpViewProps {
   windowSize: number;
   scrollOffset: number;
+  wrapMode: TextWrapMode;
 }
 
 // ── Keybinding groups (hand-maintained; restored from the pre-Phase-5
@@ -44,6 +46,7 @@ const GLOBAL: Keybind = {
   title: 'Global',
   rows: [
     ['?', 'Toggle help'],
+    ['w', 'Toggle wrap'],
     ['q', 'Quit'],
     ['^C', 'Force quit'],
   ],
@@ -102,7 +105,7 @@ function buildRows(): Row[] {
 
 const NAME_COL_WIDTH = 16;
 
-function renderRow(row: Row, key: string): React.ReactElement {
+function renderRow(row: Row, key: string, wrapMode: TextWrapMode): React.ReactElement {
   if (row.kind === 'spacer') return <Text key={key}> </Text>;
   if (row.kind === 'header') {
     return (
@@ -117,7 +120,7 @@ function renderRow(row: Row, key: string): React.ReactElement {
       <Box width={NAME_COL_WIDTH}>
         <Text color={TIER_COLOR[row.tier]}>{`  :${row.name}`}</Text>
       </Box>
-      <Text wrap="truncate-end">{row.description}</Text>
+      <Text wrap={wrapMode}>{row.description}</Text>
     </Box>
   );
 }
@@ -155,7 +158,7 @@ export function HelpView(props: HelpViewProps): React.ReactElement {
       {/* Scrollable command catalog. Only this block responds to the
           ↑↓/jk scroll keys; the keybinding block above stays fixed. */}
       <Text dimColor> </Text>
-      {visible.map((row, i) => renderRow(row, `help-row-${start + i}`))}
+      {visible.map((row, i) => renderRow(row, `help-row-${start + i}`, props.wrapMode))}
       {Array.from({ length: padCount }, (_, i) => (
         <Text key={`help-pad-${i}`}> </Text>
       ))}
