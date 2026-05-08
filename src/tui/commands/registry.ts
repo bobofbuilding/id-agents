@@ -164,18 +164,17 @@ const REGISTRY: Record<string, CommandSpec> = {
   teams: remote('teams', 'List all teams in the manager DB', 'safe'),
   team: remote(
     'team',
-    'Show/switch active team; create when missing: `:team <name>`; delete empty team: `:team delete <name>`',
+    'Show/switch active team; delete empty team: `:team delete <name>`',
     'powerful',
     {
       shouldConfirm: (args) =>
-        (args[0]?.toLowerCase() === 'delete' && Boolean(args[1])) ||
-        (args.length === 1 && args[0]?.toLowerCase() !== 'delete'),
+        args[0]?.toLowerCase() === 'delete' && Boolean(args[1]),
       shouldRetype: (args) => args[0]?.toLowerCase() === 'delete' && Boolean(args[1]),
       confirmPreview: (args) => {
         if (args[0]?.toLowerCase() === 'delete') {
           return args[1] ? `DELETE team ${args[1]}` : null;
         }
-        return args[0] ? `CREATE team ${args[0]}` : null;
+        return null;
       },
     },
   ),

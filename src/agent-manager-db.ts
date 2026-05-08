@@ -7206,7 +7206,7 @@ export class AgentManagerDb {
       case 'team': {
         // /team - show current team (from header)
         // /team delete <name> - delete an empty, inactive team.
-        // /team <name> - switch to existing team, or create it first.
+        // /team <name> - switch to an existing team.
         const targetName = args[0];
         const subcommand = targetName?.toLowerCase();
         if (subcommand === 'delete' || subcommand === 'remove') {
@@ -7238,16 +7238,12 @@ export class AgentManagerDb {
             return { ok: false, error: nameCheck.error };
           }
 
-          const existing = await this.db.teams.getTeamByName(targetName);
-          const targetTeamId = existing?.id ?? await this.db.teams.getOrCreateTeamId(targetName);
-          const targetTeam = existing ?? await this.db.teams.getTeam(targetTeamId);
+          const targetTeam = await this.db.teams.getTeamByName(targetName);
           if (!targetTeam) {
-            return { ok: false, error: 'Failed to create team' };
-          }
-
-          if (!existing) {
-            const teamDir = `${this.baseWorkDir}/teams/${targetName}`;
-            if (!existsSync(teamDir)) mkdirSync(teamDir, { recursive: true });
+            return {
+              ok: false,
+              error: `Team ${targetName} not found. Create configs/${targetName}.yaml and run :deploy ${targetName}, or :sync ${targetName} to materialize an existing YAML.`
+            };
           }
 
           const targetAgentCount = await this.db.agents.count(targetTeam.id);
@@ -7257,7 +7253,6 @@ export class AgentManagerDb {
               id: targetTeam.id,
               name: targetTeam.name,
               agentCount: parseInt(targetAgentCount || '0'),
-              created: !existing,
               switched: true
             }
           };

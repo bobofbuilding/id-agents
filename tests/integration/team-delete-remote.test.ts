@@ -100,7 +100,49 @@ afterAll(async () => {
   try { fs.rmSync(workDir, { recursive: true, force: true }); } catch { /* ignore */ }
 });
 
-describe('POST /remote /team delete', () => {
+describe('POST /remote /team', () => {
+  it('returns a YAML-anchored error instead of creating a missing team', async () => {
+    await db.teams.getOrCreateTeamId('idchain');
+
+    const res = await fetch(`${baseUrl}/remote`, {
+      method: 'POST',
+      headers: headers('idchain'),
+      body: JSON.stringify({ agent: 'tui', command: '/team skunkworks' }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as { ok: boolean; error?: string };
+    expect(body.ok).toBe(false);
+    expect(body.error).toBe(
+      'Team skunkworks not found. Create configs/skunkworks.yaml and run :deploy skunkworks, or :sync skunkworks to materialize an existing YAML.',
+    );
+    expect(await db.teams.getTeamByName('skunkworks')).toBeNull();
+    expect(fs.existsSync(path.join(workDir, 'teams', 'skunkworks'))).toBe(false);
+  });
+
+  it('switches to an existing team', async () => {
+    await db.teams.getOrCreateTeamId('idchain');
+    const targetTeamId = await db.teams.getOrCreateTeamId('switchable-team');
+
+    const res = await fetch(`${baseUrl}/remote`, {
+      method: 'POST',
+      headers: headers('idchain'),
+      body: JSON.stringify({ agent: 'tui', command: '/team switchable-team' }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as {
+      ok: boolean;
+      result?: { id?: string; name?: string; agentCount?: number; switched?: boolean; created?: boolean };
+    };
+    expect(body.ok).toBe(true);
+    expect(body.result).toMatchObject({
+      id: targetTeamId,
+      name: 'switchable-team',
+      agentCount: 0,
+      switched: true,
+    });
+    expect(body.result).not.toHaveProperty('created');
+  });
+
   it('refuses to delete a team that still has agents', async () => {
     await db.teams.getOrCreateTeamId('idchain');
     const teamId = await db.teams.getOrCreateTeamId('occupied-team');

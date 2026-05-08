@@ -56,7 +56,7 @@ describe('TUI command registry tiers', () => {
     expect(confirmationLevel(command('heartbeat'), ['worker'])).toBe('none');
   });
 
-  it('routes :team <name> through /remote with create confirmation preview', async () => {
+  it('routes :team <name> through /remote as a safe switch', async () => {
     const calls: Array<{ url: string; init: RequestInit }> = [];
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
@@ -71,8 +71,8 @@ describe('TUI command registry tiers', () => {
       const spec = command('team');
       expect(spec.tier).toBe('powerful');
       expect(confirmationLevel(spec, [])).toBe('none');
-      expect(confirmationLevel(spec, ['skunkworks'])).toBe('yn');
-      expect(commandConfirmPreview(spec, ['skunkworks'])).toBe('CREATE team skunkworks');
+      expect(confirmationLevel(spec, ['skunkworks'])).toBe('none');
+      expect(commandConfirmPreview(spec, ['skunkworks'])).toBeNull();
 
       await spec.run({
         manager: 'http://127.0.0.1:0',
