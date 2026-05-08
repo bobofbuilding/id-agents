@@ -56,6 +56,17 @@ describe('TUI command registry tiers', () => {
     expect(confirmationLevel(command('heartbeat'), ['worker'])).toBe('none');
   });
 
+  it('opts only obvious tabular command results into table rendering', () => {
+    expect(command('status').resultRenderer).toBe('table');
+    expect(command('teams').resultRenderer).toBe('table');
+    expect(command('output').resultRenderer).toBe('table');
+    expect(command('list').resultRenderer).toBe('table');
+
+    expect(command('meta').resultRenderer).toBeUndefined();
+    expect(command('configs').resultRenderer).toBeUndefined();
+    expect(command('news').resultRenderer).toBeUndefined();
+  });
+
   it('routes :team <name> through /remote as a safe switch', async () => {
     const calls: Array<{ url: string; init: RequestInit }> = [];
     const originalFetch = globalThis.fetch;

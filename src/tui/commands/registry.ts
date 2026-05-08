@@ -25,6 +25,7 @@ export interface CommandContext {
 }
 
 export type RiskTier = 'safe' | 'powerful' | 'destructive';
+export type CommandResultRenderer = 'auto' | 'json' | 'table';
 
 // Phase 6: context for arg-level Tab completion. The TUI assembles
 // this once per Tab keypress from data already in scope (allAgents),
@@ -43,6 +44,7 @@ export interface CommandSpec {
   // subcommands), the tier is the highest reachable level. The runtime
   // gate is still driven by `shouldConfirm`/`shouldRetype` predicates.
   tier: RiskTier;
+  resultRenderer?: CommandResultRenderer;
   run: (ctx: CommandContext) => Promise<unknown>;
   // Returns true when the args trigger a destructive/mutating handler
   // and the user should see a Y/N prompt before dispatch. Absent or
@@ -73,7 +75,7 @@ function remote(
   name: string,
   description: string,
   tier: RiskTier,
-  extras: Pick<CommandSpec, 'shouldConfirm' | 'shouldRetype' | 'confirmPreview' | 'argCompleter'> = {},
+  extras: Pick<CommandSpec, 'shouldConfirm' | 'shouldRetype' | 'confirmPreview' | 'argCompleter' | 'resultRenderer'> = {},
 ): CommandSpec {
   return {
     name,
@@ -165,8 +167,8 @@ const REGISTRY: Record<string, CommandSpec> = {
   help: helpCommand,
 
   // ── Phase 2: read-only safe defaults ─────────────────────────────
-  status: remote('status', 'Team health summary (running/offline + per-agent health)', 'safe'),
-  teams: remote('teams', 'List all teams in the manager DB', 'safe'),
+  status: remote('status', 'Team health summary (running/offline + per-agent health)', 'safe', { resultRenderer: 'table' }),
+  teams: remote('teams', 'List all teams in the manager DB', 'safe', { resultRenderer: 'table' }),
   team: remote(
     'team',
     'Show/switch active team; delete empty team: `:team delete <name>`',
@@ -185,9 +187,9 @@ const REGISTRY: Record<string, CommandSpec> = {
   ),
   configs: remote('configs', 'List configs/*.yaml deployment files', 'safe'),
   news: remote('news', 'List news items for an agent (`:news <agent>`)', 'safe', { argCompleter: agentNameSlot0 }),
-  output: remote('output', "List files in an agent's ./output dir (`:output <agent>`)", 'safe', { argCompleter: agentNameSlot0 }),
+  output: remote('output', "List files in an agent's ./output dir (`:output <agent>`)", 'safe', { argCompleter: agentNameSlot0, resultRenderer: 'table' }),
   meta: remote('meta', 'Show agent metadata (`:meta <agent>`)', 'safe', { argCompleter: agentNameSlot0 }),
-  list: remote('list', 'Show all pending queries in the active team', 'safe'),
+  list: remote('list', 'Show all pending queries in the active team', 'safe', { resultRenderer: 'table' }),
 
   // ── Phase 2/3/4 hybrids — tier reflects worst-case subcommand ────
   schedule: remote(

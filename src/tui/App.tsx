@@ -19,6 +19,7 @@ import { LibrarySkillsTable } from './components/LibrarySkillsTable.js';
 import { LibrarySkillDetail } from './components/LibrarySkillDetail.js';
 import { CommandBar } from './components/CommandBar.js';
 import { CommandResultView } from './components/CommandResultView.js';
+import { CommandResultTable } from './components/CommandResultTable.js';
 import {
   commandConfirmPreview,
   completeBuffer,
@@ -55,6 +56,8 @@ import {
   totalMemoryColor as totalMemColor,
 } from './util/memory.js';
 import { isWrapToggleInput, textWrapMode, toggleWrapEnabled } from './util/wrap.js';
+import { detectTabularResult, type TabularDetection } from './util/tabular.js';
+import type { CommandResultRenderer } from './commands/registry.js';
 
 type View =
   | 'agents'
@@ -110,6 +113,19 @@ const NEWS_MESSAGE_WIDTH = TERMINAL_CONTENT_WIDTH - 8 - 1 - 17 - 4;
 
 interface AppProps {
   staticMode?: boolean;
+}
+
+interface CommandResultState {
+  command: string;
+  text: string;
+  renderer: CommandResultRenderer;
+  table: TabularDetection | null;
+  tableError: string | null;
+  showJson: boolean;
+}
+
+function previewJson(value: unknown): string {
+  return JSON.stringify(value, null, 2).slice(0, 200);
 }
 
 export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
@@ -172,7 +188,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
   const [commandBuffer, setCommandBuffer] = useState('');
   const [commandHistory, setCommandHistory] = useState<string[]>([]);
   const [commandHistoryIndex, setCommandHistoryIndex] = useState<number | null>(null);
-  const [commandResult, setCommandResult] = useState<{ command: string; text: string } | null>(null);
+  const [commandResult, setCommandResult] = useState<CommandResultState | null>(null);
   const [commandResultScroll, setCommandResultScroll] = useState(0);
   // Phase 6: error kind drives the visual treatment. 'network' renders
   // yellow with a connectivity glyph (transient — try again later);
@@ -948,8 +964,20 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           args: parsed.args,
           teamName: resolvedTeam,
         });
+        const renderer = spec.resultRenderer ?? 'auto';
+        const table = renderer === 'json' ? null : detectTabularResult(data);
+        const tableError = renderer === 'table' && !table
+          ? `expected tabular result, got: ${previewJson(data)}`
+          : null;
         const text = JSON.stringify(data, null, 2);
-        setCommandResult({ command: raw, text });
+        setCommandResult({
+          command: raw,
+          text,
+          renderer,
+          table,
+          tableError,
+          showJson: false,
+        });
         setCommandResultScroll(0);
         if (TEAM_MUTATING_COMMANDS.has(parsed.name)) {
           setTeamsRefreshKey((k) => k + 1);
@@ -1258,6 +1286,11 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           setWrapEnabled(toggleWrapEnabled);
           return;
         }
+        if (input === 'j' && (commandResult.table || commandResult.tableError) && !commandResult.showJson) {
+          setCommandResult({ ...commandResult, showJson: true });
+          setCommandResultScroll(0);
+          return;
+        }
         if (key.upArrow) {
           setCommandResultScroll((s) => Math.max(0, s - 1));
           return;
@@ -1497,12 +1530,42 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
       {showHelp ? (
         <HelpView windowSize={detailWindowSize} scrollOffset={helpScroll} wrapMode={wrapMode} />
       ) : commandResult ? (
-        <CommandResultView
-          command={commandResult.command}
-          text={commandResult.text}
-          windowSize={detailWindowSize}
-          scrollOffset={commandResultScroll}
-        />
+        commandResult.showJson || commandResult.renderer === 'json' || (!commandResult.table && !commandResult.tableError) ? (
+          <CommandResultView
+            command={commandResult.command}
+            text={commandResult.text}
+            windowSize={detailWindowSize}
+            scrollOffset={commandResultScroll}
+          />
+        ) : (
+          <Box flexDirection="column" borderStyle="round" borderColor={commandResult.tableError ? 'red' : 'cyan'} paddingX={1}>
+            <Box justifyContent="space-between">
+              <Text bold color={commandResult.tableError ? 'red' : 'cyan'}>cmd · {commandResult.command}</Text>
+              <Text dimColor>
+                {commandResult.table
+                  ? `${commandResult.table.rows.length} rows · ↑↓ scroll · j JSON · Esc clear`
+                  : 'j JSON fallback · Esc clear'}
+              </Text>
+            </Box>
+            <Text dimColor> </Text>
+            {commandResult.tableError ? (
+              <>
+                <Text color="red" wrap="truncate-end">{commandResult.tableError}</Text>
+                <Text dimColor>press j to view raw JSON</Text>
+                {Array.from({ length: Math.max(0, detailWindowSize - 2) }, (_, i) => (
+                  <Text key={`cmd-table-error-pad-${i}`}> </Text>
+                ))}
+              </>
+            ) : commandResult.table ? (
+              <CommandResultTable
+                rows={commandResult.table.rows}
+                scroll={commandResultScroll}
+                windowSize={detailWindowSize}
+                wrapMode={wrapMode}
+              />
+            ) : null}
+          </Box>
+        )
       ) : view === 'agents' ? (
         <>
           <TeamsPanel
