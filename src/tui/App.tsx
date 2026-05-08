@@ -916,6 +916,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           executor: SELF_AGENT,
           signal: ac.signal,
           args: parsed.args,
+          teamName: selectedTeam ?? teams.find((t) => t.name !== 'public')?.name,
         });
         const text = JSON.stringify(data, null, 2);
         setCommandResult({ command: raw, text });
@@ -939,7 +940,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         setCommandRunning(false);
       }
     },
-    [manager],
+    [manager, selectedTeam, teams],
   );
 
   useInput(

@@ -17,6 +17,11 @@ export interface CommandContext {
   executor: string;
   signal: AbortSignal;
   args: string[];
+  // Active team name for the X-Id-Team header. When the TUI is on the
+  // "All" view, callers may pass a sensible fallback (e.g. the first
+  // real team) so dispatched commands don't fall through to whatever
+  // the daemon's default team happens to be.
+  teamName?: string;
 }
 
 export type RiskTier = 'safe' | 'powerful' | 'destructive';
@@ -74,9 +79,9 @@ function remote(
     name,
     description,
     tier,
-    run: async ({ manager, executor, signal, args }) => {
+    run: async ({ manager, executor, signal, args, teamName }) => {
       const command = ['/' + name, ...args].join(' ');
-      return runRemoteCommand(manager, executor, command, signal);
+      return runRemoteCommand(manager, executor, command, signal, teamName);
     },
     ...extras,
   };
