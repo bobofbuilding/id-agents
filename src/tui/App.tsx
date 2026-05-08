@@ -135,6 +135,38 @@ interface CommandResultState {
   showJson: boolean;
 }
 
+export interface CommandResultInputKey {
+  escape?: boolean;
+  ctrl?: boolean;
+  upArrow?: boolean;
+  downArrow?: boolean;
+  leftArrow?: boolean;
+  rightArrow?: boolean;
+  pageUp?: boolean;
+  pageDown?: boolean;
+}
+
+export function commandResultConsumesInput(
+  input: string,
+  key: CommandResultInputKey,
+  { canShowJson }: { canShowJson: boolean },
+): boolean {
+  return Boolean(
+    key.escape ||
+      input === ':' ||
+      input === '/' ||
+      (key.ctrl && input === 'c') ||
+      input === 'q' ||
+      input === '?' ||
+      isWrapToggleInput(input) ||
+      (input === 'j' && canShowJson) ||
+      key.upArrow ||
+      key.downArrow ||
+      key.pageUp ||
+      key.pageDown,
+  );
+}
+
 function previewJson(value: unknown): string {
   return JSON.stringify(value, null, 2).slice(0, 200);
 }
@@ -1405,10 +1437,11 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         if (key.tab) {
           // Phase 6: command-name completion (first token) or
           // arg-level completion (subsequent slots) via the spec's
-          // argCompleter. Agent-name slot is the only data-driven
-          // context for now; future slots can extend ArgCompleterContext.
+          // argCompleter. Completion context is assembled from data the
+          // dashboard already has in scope.
           const completed = completeBuffer(commandBuffer, {
             agentNames: allAgents.map((a) => a.name),
+            teamNames: teams.map((t) => t.name),
           });
           if (completed !== null) {
             setCommandBuffer(completed);
@@ -1430,7 +1463,9 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
       // re-open the bar without dismissing the result so the user can
       // chain queries while keeping the previous output visible. Global
       // keys (q, ?, Ctrl+C) still pass through.
-      if (commandResult) {
+      if (commandResult && commandResultConsumesInput(input, key, {
+        canShowJson: Boolean(commandResult.table || commandResult.tableError) && !commandResult.showJson,
+      })) {
         if (key.escape) {
           setCommandResult(null);
           setCommandError(null);

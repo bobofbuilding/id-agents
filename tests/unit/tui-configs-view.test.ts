@@ -6,6 +6,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { commandResultConsumesInput } from '../../src/tui/App.js';
 import { ConfigDetail } from '../../src/tui/components/ConfigDetail.js';
 import { ConfigsList } from '../../src/tui/components/ConfigsList.js';
 import { listConfigFiles, type ConfigFileRow } from '../../src/tui/util/configs.js';
@@ -83,6 +84,15 @@ describe('TUI configs components', () => {
     expect(text).toContain('↑ 1 more above');
     expect(text).toContain('agents:');
     expect(text).toContain('  - name: tui');
+  });
+});
+
+describe('TUI config-detail navigation policy', () => {
+  it('does not let an open command result swallow left-arrow view navigation', () => {
+    expect(commandResultConsumesInput('', { leftArrow: true }, { canShowJson: false })).toBe(false);
+    expect(commandResultConsumesInput('', { upArrow: true }, { canShowJson: false })).toBe(true);
+    expect(commandResultConsumesInput('j', {}, { canShowJson: true })).toBe(true);
+    expect(commandResultConsumesInput('j', {}, { canShowJson: false })).toBe(false);
   });
 });
 

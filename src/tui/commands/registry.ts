@@ -10,7 +10,7 @@
 // is intentionally NOT included — Track B owns that command and is
 // paused pending the operator's A/B/A-admin-gated pick.
 
-import { fetchAgentsAllTeams, fetchTeams, runRemoteCommand } from '../api/manager.js';
+import { fetchAgentsAllTeams, fetchAgentsByTeam, fetchTeams, runRemoteCommand } from '../api/manager.js';
 
 export interface CommandContext {
   manager: string;
@@ -32,6 +32,7 @@ export type CommandResultRenderer = 'auto' | 'json' | 'table';
 // so completers stay synchronous and side-effect-free.
 export interface ArgCompleterContext {
   agentNames: string[];
+  teamNames: string[];
 }
 
 export interface CommandSpec {
@@ -120,18 +121,25 @@ const heartbeatSlots: NonNullable<CommandSpec['argCompleter']> = (slot, ctx) => 
   return [];
 };
 
-// `agents` keeps the Phase 1 cross-team semantics — the manager's
-// `/remote` `agents` handler is single-team. Phase 1 acceptance still
-// holds: `:agents` from any view returns the merged agent list.
+// `agents` keeps the Phase 1 cross-team semantics when invoked without
+// args. With one team arg, it scopes the list through /agents?team=<name>.
 const agentsCommand: CommandSpec = {
   name: 'agents',
-  description: 'List all agents across all teams',
+  description: 'List agents across all teams, or one team: `:agents <team>`',
   tier: 'safe',
   // The dashboard already has a dedicated agents view with rich rendering;
   // surfacing :agents as a command is for raw inspection, so force JSON
   // instead of letting auto-detection fold it into a stripped-down table.
   resultRenderer: 'json',
-  run: async ({ manager, signal }) => {
+  argCompleter: (slot, ctx) => (slot === 0 ? ctx.teamNames : []),
+  run: async ({ manager, signal, args }) => {
+    if (args.length > 1) {
+      return { ok: false, error: 'Usage: :agents [team]' };
+    }
+    if (args.length === 1) {
+      const agents = await fetchAgentsByTeam(manager, args[0]!, signal);
+      return { count: agents.length, agents };
+    }
     const teams = await fetchTeams(manager, signal);
     const agents = await fetchAgentsAllTeams(manager, teams, signal);
     return { count: agents.length, agents };

@@ -6,6 +6,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   catalogEntriesByTier,
+  completeBuffer,
   commandConfirmPreview,
   confirmationLevel,
   lookupCommand,
@@ -87,6 +88,109 @@ describe('TUI command registry tiers', () => {
 
       expect(result).toEqual({ tuiAction: 'configs' });
       expect(calls).toEqual([]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('keeps :agents without args on the cross-team dispatch path', async () => {
+    const calls: string[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const href = String(url);
+      calls.push(href);
+      if (href.endsWith('/teams')) {
+        return new Response(JSON.stringify({ teams: [{ name: 'idchain' }, { name: 'public' }] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ agents: [{ id: href, name: 'agent' }] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    try {
+      const result = await command('agents').run({
+        manager: 'http://127.0.0.1:0',
+        executor: 'tui',
+        signal: new AbortController().signal,
+        args: [],
+      });
+
+      expect(result).toEqual({
+        count: 2,
+        agents: [
+          { id: 'http://127.0.0.1:0/agents?team=idchain', name: 'agent', teamName: 'idchain' },
+          { id: 'http://127.0.0.1:0/agents?team=public', name: 'agent', teamName: 'public' },
+        ],
+      });
+      expect(calls).toEqual([
+        'http://127.0.0.1:0/teams',
+        'http://127.0.0.1:0/agents?team=idchain',
+        'http://127.0.0.1:0/agents?team=public',
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('routes :agents <team> through the single-team agents endpoint', async () => {
+    const calls: string[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const href = String(url);
+      calls.push(href);
+      return new Response(JSON.stringify({ agents: [{ id: '1', name: 'cto' }] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    try {
+      const result = await command('agents').run({
+        manager: 'http://127.0.0.1:0',
+        executor: 'tui',
+        signal: new AbortController().signal,
+        args: ['idchain'],
+      });
+
+      expect(result).toEqual({
+        count: 1,
+        agents: [{ id: '1', name: 'cto', teamName: 'idchain' }],
+      });
+      expect(calls).toEqual(['http://127.0.0.1:0/agents?team=idchain']);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('rejects :agents with too many args and completes team names', async () => {
+    const originalFetch = globalThis.fetch;
+    const calls: string[] = [];
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      calls.push(String(url));
+      return new Response(JSON.stringify({ agents: [] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    try {
+      const result = await command('agents').run({
+        manager: 'http://127.0.0.1:0',
+        executor: 'tui',
+        signal: new AbortController().signal,
+        args: ['foo', 'bar'],
+      });
+
+      expect(result).toEqual({ ok: false, error: 'Usage: :agents [team]' });
+      expect(calls).toEqual([]);
+      expect(completeBuffer(':agents id', {
+        agentNames: [],
+        teamNames: ['idchain', 'public'],
+      })).toBe(':agents idchain ');
     } finally {
       globalThis.fetch = originalFetch;
     }
