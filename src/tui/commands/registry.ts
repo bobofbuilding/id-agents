@@ -162,7 +162,10 @@ const REGISTRY: Record<string, CommandSpec> = {
   // ── Phase 2: read-only safe defaults ─────────────────────────────
   status: remote('status', 'Team health summary (running/offline + per-agent health)', 'safe'),
   teams: remote('teams', 'List all teams in the manager DB', 'safe'),
-  team: remote('team', 'Show the active team (id, name, agent count)', 'safe'),
+  team: remote('team', 'Show/switch active team; create when missing: `:team <name>`', 'powerful', {
+    shouldConfirm: (args) => args.length === 1,
+    confirmPreview: (args) => (args[0] ? `CREATE team ${args[0]}` : null),
+  }),
   configs: remote('configs', 'List configs/*.yaml deployment files', 'safe'),
   news: remote('news', 'List news items for an agent (`:news <agent>`)', 'safe', { argCompleter: agentNameSlot0 }),
   heartbeats: remote('heartbeats', 'List agents with heartbeat enabled', 'safe'),

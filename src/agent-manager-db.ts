@@ -7196,6 +7196,42 @@ export class AgentManagerDb {
 
       case 'team': {
         // /team - show current team (from header)
+        // /team <name> - switch to existing team, or create it first.
+        const targetName = args[0];
+        if (targetName) {
+          if (args.length !== 1) {
+            return { ok: false, error: 'Usage: /team [name]' };
+          }
+          const nameCheck = validateName(targetName, 'team');
+          if (!nameCheck.valid) {
+            return { ok: false, error: nameCheck.error };
+          }
+
+          const existing = await this.db.teams.getTeamByName(targetName);
+          const targetTeamId = existing?.id ?? await this.db.teams.getOrCreateTeamId(targetName);
+          const targetTeam = existing ?? await this.db.teams.getTeam(targetTeamId);
+          if (!targetTeam) {
+            return { ok: false, error: 'Failed to create team' };
+          }
+
+          if (!existing) {
+            const teamDir = `${this.baseWorkDir}/teams/${targetName}`;
+            if (!existsSync(teamDir)) mkdirSync(teamDir, { recursive: true });
+          }
+
+          const targetAgentCount = await this.db.agents.count(targetTeam.id);
+          return {
+            ok: true,
+            result: {
+              id: targetTeam.id,
+              name: targetTeam.name,
+              agentCount: parseInt(targetAgentCount || '0'),
+              created: !existing,
+              switched: true
+            }
+          };
+        }
+
         const team = await this.db.teams.getTeam(teamId);
         if (!team) {
           return { ok: false, error: 'Team not found' };
