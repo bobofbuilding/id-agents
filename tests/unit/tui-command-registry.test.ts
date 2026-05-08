@@ -67,6 +67,32 @@ describe('TUI command registry tiers', () => {
     expect(command('news').resultRenderer).toBeUndefined();
   });
 
+  it('routes :configs to a TUI action instead of /remote dispatch', async () => {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), init: init ?? {} });
+      return new Response(JSON.stringify({ ok: true, result: [] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    try {
+      const result = await command('configs').run({
+        manager: 'http://127.0.0.1:0',
+        executor: 'tui',
+        signal: new AbortController().signal,
+        args: [],
+      });
+
+      expect(result).toEqual({ tuiAction: 'configs' });
+      expect(calls).toEqual([]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it('routes :team <name> through /remote as a safe switch', async () => {
     const calls: Array<{ url: string; init: RequestInit }> = [];
     const originalFetch = globalThis.fetch;

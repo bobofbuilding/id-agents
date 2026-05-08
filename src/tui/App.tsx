@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Box, Text, useApp, useInput, useStdout } from 'ink';
 import { Footer } from './components/Footer.js';
@@ -17,6 +18,8 @@ import { LibraryAgentsTable } from './components/LibraryAgentsTable.js';
 import { LibraryAgentDetail } from './components/LibraryAgentDetail.js';
 import { LibrarySkillsTable } from './components/LibrarySkillsTable.js';
 import { LibrarySkillDetail } from './components/LibrarySkillDetail.js';
+import { ConfigsList } from './components/ConfigsList.js';
+import { ConfigDetail } from './components/ConfigDetail.js';
 import { CommandBar } from './components/CommandBar.js';
 import { CommandResultView } from './components/CommandResultView.js';
 import { CommandResultTable } from './components/CommandResultTable.js';
@@ -57,6 +60,7 @@ import {
 } from './util/memory.js';
 import { isWrapToggleInput, textWrapMode, toggleWrapEnabled } from './util/wrap.js';
 import { detectTabularResult, type TabularDetection } from './util/tabular.js';
+import { listConfigFiles } from './util/configs.js';
 import type { CommandResultRenderer } from './commands/registry.js';
 
 type View =
@@ -72,7 +76,9 @@ type View =
   | 'library-agents'
   | 'library-agent-detail'
   | 'library-skills'
-  | 'library-skill-detail';
+  | 'library-skill-detail'
+  | 'configs-list'
+  | 'config-detail';
 
 const AGENTS_POLL_MS = 2000;
 const TEAMS_POLL_MS = 15000;
@@ -173,6 +179,10 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
   const [libSkillWindowStart, setLibSkillWindowStart] = useState(0);
   const [libAgentDetailScroll, setLibAgentDetailScroll] = useState(0);
   const [libSkillDetailScroll, setLibSkillDetailScroll] = useState(0);
+  const [configSelectedIndex, setConfigSelectedIndex] = useState(0);
+  const [configWindowStart, setConfigWindowStart] = useState(0);
+  const [configDetailScroll, setConfigDetailScroll] = useState(0);
+  const [configRefreshKey, setConfigRefreshKey] = useState(0);
   const [showQuitConfirm, setShowQuitConfirm] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const [helpScroll, setHelpScroll] = useState(0);
@@ -388,6 +398,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
   const calendarWindowSize = Math.max(MIN_VISIBLE, rows - CALENDAR_CHROME_ROWS);
   const heartbeatsWindowSize = Math.max(MIN_VISIBLE, rows - HEARTBEATS_CHROME_ROWS);
   const libraryWindowSize = Math.max(MIN_VISIBLE, rows - LIBRARY_CHROME_ROWS);
+  const configsWindowSize = libraryWindowSize;
   const total = visibleAgents.length;
 
   // Tasks polling
@@ -913,6 +924,68 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
     setLibSkillDetailScroll((off) => Math.max(0, off + delta));
   }, []);
 
+  // ---------------------------------------------------------------- Configs
+  // Local filesystem browser for configs/*.yaml. This is intentionally
+  // TUI-side, not a /remote daemon command, because the dashboard process
+  // already has access to the project checkout.
+  const configRows = useMemo(() => listConfigFiles(), [configRefreshKey]);
+  const configTotal = configRows.length;
+  const selectedConfig = configRows[configSelectedIndex] ?? null;
+  const configDetail = useMemo(() => {
+    if (!selectedConfig) return { contents: null, error: null as Error | null };
+    try {
+      return { contents: readFileSync(selectedConfig.absolutePath, 'utf8'), error: null as Error | null };
+    } catch (err: unknown) {
+      return {
+        contents: null,
+        error: err instanceof Error ? err : new Error(String(err)),
+      };
+    }
+  }, [selectedConfig]);
+
+  useEffect(() => {
+    if (configTotal === 0) {
+      if (configSelectedIndex !== 0) setConfigSelectedIndex(0);
+      if (configWindowStart !== 0) setConfigWindowStart(0);
+      return;
+    }
+    const clampedSel = Math.min(configSelectedIndex, configTotal - 1);
+    if (clampedSel !== configSelectedIndex) setConfigSelectedIndex(clampedSel);
+    const maxStart = Math.max(0, configTotal - configsWindowSize);
+    let nextStart = configWindowStart;
+    if (clampedSel < nextStart) nextStart = clampedSel;
+    if (clampedSel >= nextStart + configsWindowSize)
+      nextStart = clampedSel - configsWindowSize + 1;
+    if (nextStart > maxStart) nextStart = maxStart;
+    if (nextStart < 0) nextStart = 0;
+    if (nextStart !== configWindowStart) setConfigWindowStart(nextStart);
+  }, [configTotal, configSelectedIndex, configWindowStart, configsWindowSize]);
+
+  const openConfigs = useCallback(() => {
+    setConfigRefreshKey((k) => k + 1);
+    setConfigSelectedIndex(0);
+    setConfigWindowStart(0);
+    setView('configs-list');
+  }, []);
+
+  const openConfigDetail = useCallback(() => {
+    if (!selectedConfig) return;
+    setConfigDetailScroll(0);
+    setView('config-detail');
+  }, [selectedConfig]);
+
+  const moveConfigSel = useCallback(
+    (delta: number) => {
+      if (configTotal === 0) return;
+      setConfigSelectedIndex((idx) => clamp(idx + delta, 0, configTotal - 1));
+    },
+    [configTotal],
+  );
+
+  const moveConfigDetailScroll = useCallback((delta: number) => {
+    setConfigDetailScroll((off) => Math.max(0, off + delta));
+  }, []);
+
   // Execute a command-bar entry. Validation, dispatch, and result/error
   // capture are centralized here so the keystroke handler stays simple.
   const runCommand = useCallback(
@@ -964,6 +1037,21 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           args: parsed.args,
           teamName: resolvedTeam,
         });
+        if (isTuiAction(data)) {
+          setCommandResult(null);
+          setCommandResultScroll(0);
+          if (data.tuiAction === 'help') {
+            setShowHelp(true);
+            setHelpScroll(0);
+            setCommandError(null);
+            return;
+          }
+          if (data.tuiAction === 'configs') {
+            openConfigs();
+            setCommandError(null);
+            return;
+          }
+        }
         const renderer = spec.resultRenderer ?? 'auto';
         const table = renderer === 'json' ? null : detectTabularResult(data);
         const tableError = renderer === 'table' && !table
@@ -998,7 +1086,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         setCommandRunning(false);
       }
     },
-    [manager, selectedTeam, teams, allAgents],
+    [manager, selectedTeam, teams, allAgents, openConfigs],
   );
 
   useInput(
@@ -1168,17 +1256,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           setCommandHistoryIndex(null);
           setCommandMode(false);
           setCommandBuffer('');
-          // Phase 5: intercept the TUI-side `:help` action before any
-          // confirmation/dispatch path. `help` lives in the catalog
-          // (so it shows up in tab completion and the help view
-          // itself), but its `run` body is inert — the App owns it.
           const parsed = parseCommandLine(raw);
-          if (parsed && parsed.name === 'help') {
-            setShowHelp(true);
-            setHelpScroll(0);
-            setCommandError(null);
-            return;
-          }
           // Phase 3/4 gate: parse and check the spec's confirmation
           // tier. Retype short-circuits Y/N when both predicates fire,
           // so the user only sees the higher-tier prompt.
@@ -1352,6 +1430,35 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         if (key.pageDown) return moveAgentsSel(agentsWindowSize);
         if (isHomeKey(input)) return setSelectedIndex(0);
         if (isEndKey(input)) return setSelectedIndex(Math.max(0, total - 1));
+        return;
+      }
+
+      if (view === 'configs-list') {
+        if (input === 'a') return setView('agents');
+        if (input === 't') return setView('tasks');
+        if (input === 'c') return openCalendar();
+        if (input === 'h') return openHeartbeats();
+        if (input === 'l') return openLibraryAgents();
+        if (input === 's') return openLibrarySkills();
+        if (key.leftArrow || key.escape) return setView('agents');
+        if (key.rightArrow) return openConfigDetail();
+        if (input === 'k' || key.upArrow) return moveConfigSel(-1);
+        if (input === 'j' || key.downArrow) return moveConfigSel(1);
+        if (key.pageUp) return moveConfigSel(-configsWindowSize);
+        if (key.pageDown) return moveConfigSel(configsWindowSize);
+        if (isHomeKey(input)) return setConfigSelectedIndex(0);
+        if (isEndKey(input)) return setConfigSelectedIndex(Math.max(0, configTotal - 1));
+        return;
+      }
+
+      if (view === 'config-detail') {
+        if (key.leftArrow || key.escape) return setView('configs-list');
+        if (input === 'k' || key.upArrow) return moveConfigDetailScroll(-1);
+        if (input === 'j' || key.downArrow) return moveConfigDetailScroll(1);
+        if (key.pageUp) return moveConfigDetailScroll(-detailWindowSize);
+        if (key.pageDown) return moveConfigDetailScroll(detailWindowSize);
+        if (isHomeKey(input)) return setConfigDetailScroll(0);
+        if (isEndKey(input)) return setConfigDetailScroll(Number.MAX_SAFE_INTEGER);
         return;
       }
 
@@ -1608,6 +1715,28 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           nowMs={pollTs || Date.now()}
           wrapMode={wrapMode}
         />
+      ) : view === 'configs-list' ? (
+        <ConfigsList
+          entries={configRows}
+          selectedIndex={configSelectedIndex}
+          windowStart={configWindowStart}
+          windowSize={configsWindowSize}
+          wrapMode={wrapMode}
+        />
+      ) : view === 'config-detail' ? (
+        <ConfigDetail
+          config={selectedConfig}
+          contents={configDetail.contents}
+          error={configDetail.error}
+          positionLabel={
+            configTotal > 0
+              ? `config ${configSelectedIndex + 1} of ${configTotal}`
+              : ''
+          }
+          windowSize={detailWindowSize}
+          scrollOffset={configDetailScroll}
+          wrapMode={wrapMode}
+        />
       ) : view === 'tasks' ? (
         <>
           <TeamsPanel
@@ -1825,6 +1954,12 @@ function clamp(n: number, lo: number, hi: number): number {
   if (n < lo) return lo;
   if (n > hi) return hi;
   return n;
+}
+
+function isTuiAction(value: unknown): value is { tuiAction: 'help' | 'configs' } {
+  if (typeof value !== 'object' || value === null) return false;
+  const action = (value as { tuiAction?: unknown }).tuiAction;
+  return action === 'help' || action === 'configs';
 }
 
 function isHomeKey(input: string): boolean {

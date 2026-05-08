@@ -25,6 +25,7 @@ const VIEWS: Keybind = {
     ['t', 'Tasks'],
     ['n', 'News'],
     ['c', 'Calendar'],
+    [':configs', 'Configs'],
     ['h', 'Heartbeats'],
     ['l', 'Library'],
     ['s', 'Skills'],
@@ -35,6 +36,7 @@ const NAVIGATE: Keybind = {
   title: 'Navigate',
   rows: [
     ['↑ ↓', 'Move row'],
+    ['j k', 'Move row / scroll'],
     ['PgUp/Dn', 'Move page'],
     ['→', 'Open detail'],
     ['← Esc', 'Back'],

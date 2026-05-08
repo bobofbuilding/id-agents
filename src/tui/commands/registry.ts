@@ -150,6 +150,13 @@ const helpCommand: CommandSpec = {
   run: async () => ({ tuiAction: 'help' }),
 };
 
+const configsCommand: CommandSpec = {
+  name: 'configs',
+  description: 'Open the navigable configs/*.yaml browser',
+  tier: 'safe',
+  run: async () => ({ tuiAction: 'configs' }),
+};
+
 // ── Phase 3 predicates ─────────────────────────────────────────────
 // These keep a single catalog entry per top-level token (`schedule`,
 // `task`, `registry`, `agent`, `heartbeat`) and decide on the args
@@ -189,7 +196,7 @@ const REGISTRY: Record<string, CommandSpec> = {
       },
     },
   ),
-  configs: remote('configs', 'List configs/*.yaml deployment files', 'safe'),
+  configs: configsCommand,
   news: remote('news', 'List news items for an agent (`:news <agent>`)', 'safe', { argCompleter: agentNameSlot0 }),
   output: remote('output', "List files in an agent's ./output dir (`:output <agent>`)", 'safe', { argCompleter: agentNameSlot0, resultRenderer: 'table' }),
   meta: remote('meta', 'Show agent metadata (`:meta <agent>`)', 'safe', { argCompleter: agentNameSlot0 }),
