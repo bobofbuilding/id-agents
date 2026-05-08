@@ -98,6 +98,7 @@ const DETAIL_CONTENT_WIDTH = 76;
 const MIN_VISIBLE = 3;
 const SELF_AGENT = 'tui';
 const TERMINAL_CONTENT_WIDTH = 76;
+const TEAM_MUTATING_COMMANDS: ReadonlySet<string> = new Set(['team', 'deploy', 'sync']);
 const NEWS_MESSAGE_WIDTH = TERMINAL_CONTENT_WIDTH - 8 - 1 - 17 - 4;
 
 interface AppProps {
@@ -111,6 +112,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
 
   const [staticTeams, setStaticTeams] = useState<Team[] | null>(null);
   const [staticAllAgents, setStaticAllAgents] = useState<Agent[] | null>(null);
+  const [teamsRefreshKey, setTeamsRefreshKey] = useState(0);
 
   useEffect(() => {
     if (!staticMode) return;
@@ -199,7 +201,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
     (signal) => fetchTeams(manager, signal),
     TEAMS_POLL_MS,
     staticMode,
-    [manager],
+    [manager, teamsRefreshKey],
   );
   const teamsRaw = staticMode ? staticTeams ?? [] : teamsPoll.data ?? [];
   // Always render `public` immediately after the `All` chip, then the rest in
@@ -918,6 +920,9 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         const text = JSON.stringify(data, null, 2);
         setCommandResult({ command: raw, text });
         setCommandResultScroll(0);
+        if (TEAM_MUTATING_COMMANDS.has(parsed.name)) {
+          setTeamsRefreshKey((k) => k + 1);
+        }
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         // Phase 6: typed errors from runRemoteCommand → split rendering.
