@@ -93,6 +93,42 @@ describe('TUI command registry tiers', () => {
     }
   });
 
+  it('routes :team delete <name> through /remote with retype confirmation preview', async () => {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), init: init ?? {} });
+      return new Response(JSON.stringify({ ok: true, result: { success: true } }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    try {
+      const spec = command('team');
+      expect(confirmationLevel(spec, ['delete'])).toBe('none');
+      expect(confirmationLevel(spec, ['delete', 'foo'])).toBe('retype');
+      expect(commandConfirmPreview(spec, ['delete', 'foo'])).toBe('DELETE team foo');
+
+      await spec.run({
+        manager: 'http://127.0.0.1:0',
+        executor: 'tui',
+        signal: new AbortController().signal,
+        args: ['delete', 'foo'],
+      });
+
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.url).toBe('http://127.0.0.1:0/remote');
+      expect(calls[0]?.init.method).toBe('POST');
+      expect(JSON.parse(String(calls[0]?.init.body))).toEqual({
+        agent: 'tui',
+        command: '/team delete foo',
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it('escalates hybrid remove/delete subcommands from Y/N to retype', () => {
     expect(confirmationLevel(command('schedule'), ['add', 'daily'])).toBe('yn');
     expect(confirmationLevel(command('schedule'), ['remove', 'daily'])).toBe('retype');

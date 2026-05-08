@@ -2923,42 +2923,12 @@ export class AgentManagerDb {
         return res.status(400).json({ error: 'Missing team name' });
       }
 
-      if (name === 'default') {
-        return res.status(400).json({ error: 'Cannot delete the "default" team — it is the fallback for all unscoped requests' });
-      }
-
       try {
-        // Find the team
-        const team = await this.db.teams.getTeamByName(name);
-
-        if (!team) {
-          return res.status(404).json({ error: `Team "${name}" not found` });
+        const result = await this.deleteEmptyTeamByName(name);
+        if (!result.ok) {
+          return res.status(result.status).json({ error: result.error });
         }
-
-        const teamId = team.id;
-
-        // NB: no `::text` cast — that's Postgres-only and breaks on SQLite.
-        // COUNT(*) returns a number on both backends; parseInt tolerates both.
-        const countResult = await this.db.adapter.query<{ count: string | number }>(
-          'SELECT COUNT(*) as count FROM agents WHERE team_id = $1 AND deleted_at IS NULL',
-          [teamId]
-        );
-        const agentCount = parseInt(String(countResult.rows[0]?.count ?? '0'));
-
-        if (agentCount > 0) {
-          return res.status(400).json({
-            error: `Team "${name}" still has ${agentCount} agent(s). Run /delete --team ${name} first to remove agents, then /team delete ${name} to remove the team.`
-          });
-        }
-
-        // Delete the team
-        await this.db.teams.deleteTeam(teamId);
-
-        // Optionally remove the team directory (but keep files as backup)
-        // const teamDir = `${this.baseWorkDir}/teams/${name}`;
-        // We don't delete the folder to preserve any files
-
-        res.json({ success: true, message: `Team "${name}" deleted` });
+        res.json(result.result);
       } catch (error: any) {
         console.error('Error deleting team:', error);
         res.status(500).json({ error: error.message || 'Failed to delete team' });
@@ -5246,6 +5216,45 @@ export class AgentManagerDb {
     return { definition, targets };
   }
 
+  private async deleteEmptyTeamByName(
+    name: string,
+  ): Promise<{ ok: true; result: { success: true; name: string; message: string } } | { ok: false; status: number; error: string }> {
+    if (name === 'default') {
+      return {
+        ok: false,
+        status: 400,
+        error: 'Cannot delete the "default" team — it is the fallback for all unscoped requests',
+      };
+    }
+
+    const team = await this.db.teams.getTeamByName(name);
+    if (!team) {
+      return { ok: false, status: 404, error: `Team "${name}" not found` };
+    }
+
+    // NB: no `::text` cast — that's Postgres-only and breaks on SQLite.
+    // COUNT(*) returns a number on both backends; parseInt tolerates both.
+    const countResult = await this.db.adapter.query<{ count: string | number }>(
+      'SELECT COUNT(*) as count FROM agents WHERE team_id = $1 AND deleted_at IS NULL',
+      [team.id],
+    );
+    const agentCount = parseInt(String(countResult.rows[0]?.count ?? '0'));
+
+    if (agentCount > 0) {
+      return {
+        ok: false,
+        status: 400,
+        error: `Team "${name}" still has ${agentCount} agent(s). Run /delete --team ${name} first to remove agents, then /team delete ${name} to remove the team.`,
+      };
+    }
+
+    await this.db.teams.deleteTeam(team.id);
+    return {
+      ok: true,
+      result: { success: true, name, message: `Team "${name}" deleted` },
+    };
+  }
+
   /**
    * Execute a CLI-style command and return the result
    */
@@ -7196,11 +7205,33 @@ export class AgentManagerDb {
 
       case 'team': {
         // /team - show current team (from header)
+        // /team delete <name> - delete an empty, inactive team.
         // /team <name> - switch to existing team, or create it first.
         const targetName = args[0];
+        const subcommand = targetName?.toLowerCase();
+        if (subcommand === 'delete' || subcommand === 'remove') {
+          const nameArg = args[1];
+          if (!nameArg || args.length !== 2) {
+            return { ok: false, error: 'Usage: /team delete <name>' };
+          }
+          const nameCheck = validateName(nameArg, 'team');
+          if (!nameCheck.valid) {
+            return { ok: false, error: nameCheck.error };
+          }
+          if (nameArg === teamName) {
+            return { ok: false, error: `Cannot delete the active team "${nameArg}". Switch to another team first.` };
+          }
+
+          const deleted = await this.deleteEmptyTeamByName(nameArg);
+          if (!deleted.ok) {
+            return { ok: false, error: deleted.error };
+          }
+          return { ok: true, result: deleted.result };
+        }
+
         if (targetName) {
           if (args.length !== 1) {
-            return { ok: false, error: 'Usage: /team [name]' };
+            return { ok: false, error: 'Usage: /team [name] | /team delete <name>' };
           }
           const nameCheck = validateName(targetName, 'team');
           if (!nameCheck.valid) {
