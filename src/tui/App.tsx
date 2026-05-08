@@ -112,7 +112,7 @@ const TEAM_MUTATING_COMMANDS: ReadonlySet<string> = new Set(['team', 'deploy', '
 // is on the All view (selectedTeam === null), App.tsx tries to resolve
 // the agent across all teams to pick the right X-Id-Team header.
 const AGENT_TARGETED_COMMANDS: ReadonlySet<string> = new Set([
-  'meta', 'news', 'output', 'cancel', 'clear', 'delete', 'register',
+  'meta', 'output', 'cancel', 'clear', 'delete', 'register',
   'ask', 'hey', 'agent',
 ]);
 const NEWS_MESSAGE_WIDTH = TERMINAL_CONTENT_WIDTH - 8 - 1 - 17 - 4;

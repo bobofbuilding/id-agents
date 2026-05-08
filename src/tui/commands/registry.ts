@@ -90,7 +90,7 @@ function remote(
 }
 
 // Common slot-0 agent-name completer used by every command whose first
-// positional arg is an agent name (news, output, meta, cancel, clear,
+// positional arg is an agent name (output, meta, cancel, clear,
 // delete, register).
 const agentNameSlot0: NonNullable<CommandSpec['argCompleter']> = (slot, ctx) =>
   slot === 0 ? ctx.agentNames : [];
@@ -197,7 +197,6 @@ const REGISTRY: Record<string, CommandSpec> = {
     },
   ),
   configs: configsCommand,
-  news: remote('news', 'List news items for an agent (`:news <agent>`)', 'safe', { argCompleter: agentNameSlot0 }),
   output: remote('output', "List files in an agent's ./output dir (`:output <agent>`)", 'safe', { argCompleter: agentNameSlot0, resultRenderer: 'table' }),
   meta: remote('meta', 'Show agent metadata (`:meta <agent>`)', 'safe', { argCompleter: agentNameSlot0 }),
   list: remote('list', 'Show all pending queries in the active team', 'safe', { resultRenderer: 'table' }),
