@@ -180,7 +180,6 @@ const REGISTRY: Record<string, CommandSpec> = {
   ),
   configs: remote('configs', 'List configs/*.yaml deployment files', 'safe'),
   news: remote('news', 'List news items for an agent (`:news <agent>`)', 'safe', { argCompleter: agentNameSlot0 }),
-  heartbeats: remote('heartbeats', 'List agents with heartbeat enabled', 'safe'),
   output: remote('output', "List files in an agent's ./output dir (`:output <agent>`)", 'safe', { argCompleter: agentNameSlot0 }),
   meta: remote('meta', 'Show agent metadata (`:meta <agent>`)', 'safe', { argCompleter: agentNameSlot0 }),
   list: remote('list', 'Show all pending queries in the active team', 'safe'),
