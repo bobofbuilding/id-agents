@@ -99,6 +99,13 @@ const MIN_VISIBLE = 3;
 const SELF_AGENT = 'tui';
 const TERMINAL_CONTENT_WIDTH = 76;
 const TEAM_MUTATING_COMMANDS: ReadonlySet<string> = new Set(['team', 'deploy', 'sync']);
+// Commands whose first positional arg is an agent name. When the operator
+// is on the All view (selectedTeam === null), App.tsx tries to resolve
+// the agent across all teams to pick the right X-Id-Team header.
+const AGENT_TARGETED_COMMANDS: ReadonlySet<string> = new Set([
+  'meta', 'news', 'output', 'cancel', 'clear', 'delete', 'register',
+  'ask', 'hey', 'agent',
+]);
 const NEWS_MESSAGE_WIDTH = TERMINAL_CONTENT_WIDTH - 8 - 1 - 17 - 4;
 
 interface AppProps {
@@ -907,6 +914,29 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         });
         return;
       }
+      // Resolve the X-Id-Team header. When the operator has a specific team
+      // selected, use it. When on the All view, agent-targeted commands
+      // (meta, news, output, ...) try to find the agent across all teams
+      // so the dispatch lands in the right place. Same-name agents in
+      // different teams are ambiguous: report and bail.
+      let resolvedTeam: string | undefined = selectedTeam ?? undefined;
+      if (!resolvedTeam && AGENT_TARGETED_COMMANDS.has(parsed.name) && parsed.args.length > 0) {
+        const targetName = parsed.args[0];
+        const matches = allAgents.filter((a) => a.name === targetName);
+        const distinctTeams = Array.from(new Set(matches.map((m) => m.teamName)));
+        if (distinctTeams.length === 1) {
+          resolvedTeam = distinctTeams[0];
+        } else if (distinctTeams.length > 1) {
+          setCommandError({
+            kind: 'manager',
+            message: `${parsed.name}: agent "${targetName}" exists in multiple teams (${distinctTeams.join(', ')}). Switch to the team you want first.`,
+          });
+          return;
+        }
+      }
+      if (!resolvedTeam) {
+        resolvedTeam = teams.find((t) => t.name !== 'public')?.name;
+      }
       const ac = new AbortController();
       setCommandRunning(true);
       setCommandError(null);
@@ -916,7 +946,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           executor: SELF_AGENT,
           signal: ac.signal,
           args: parsed.args,
-          teamName: selectedTeam ?? teams.find((t) => t.name !== 'public')?.name,
+          teamName: resolvedTeam,
         });
         const text = JSON.stringify(data, null, 2);
         setCommandResult({ command: raw, text });
@@ -940,7 +970,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         setCommandRunning(false);
       }
     },
-    [manager, selectedTeam, teams],
+    [manager, selectedTeam, teams, allAgents],
   );
 
   useInput(
