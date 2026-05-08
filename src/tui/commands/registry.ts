@@ -127,6 +127,10 @@ const agentsCommand: CommandSpec = {
   name: 'agents',
   description: 'List all agents across all teams',
   tier: 'safe',
+  // The dashboard already has a dedicated agents view with rich rendering;
+  // surfacing :agents as a command is for raw inspection, so force JSON
+  // instead of letting auto-detection fold it into a stripped-down table.
+  resultRenderer: 'json',
   run: async ({ manager, signal }) => {
     const teams = await fetchTeams(manager, signal);
     const agents = await fetchAgentsAllTeams(manager, teams, signal);
