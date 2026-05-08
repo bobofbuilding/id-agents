@@ -20,6 +20,8 @@ import { LibrarySkillsTable } from './components/LibrarySkillsTable.js';
 import { LibrarySkillDetail } from './components/LibrarySkillDetail.js';
 import { ConfigsList } from './components/ConfigsList.js';
 import { ConfigDetail } from './components/ConfigDetail.js';
+import { OutputList } from './components/OutputList.js';
+import { OutputDetail } from './components/OutputDetail.js';
 import { CommandBar } from './components/CommandBar.js';
 import { CommandResultView } from './components/CommandResultView.js';
 import { CommandResultTable } from './components/CommandResultTable.js';
@@ -61,6 +63,7 @@ import {
 import { isWrapToggleInput, textWrapMode, toggleWrapEnabled } from './util/wrap.js';
 import { detectTabularResult, type TabularDetection } from './util/tabular.js';
 import { listConfigFiles } from './util/configs.js';
+import { listOutputFiles, readOutputFileDetail } from './util/output-files.js';
 import type { CommandResultRenderer } from './commands/registry.js';
 
 type View =
@@ -78,7 +81,9 @@ type View =
   | 'library-skills'
   | 'library-skill-detail'
   | 'configs-list'
-  | 'config-detail';
+  | 'config-detail'
+  | 'output-list'
+  | 'output-detail';
 
 const AGENTS_POLL_MS = 2000;
 const TEAMS_POLL_MS = 15000;
@@ -183,6 +188,12 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
   const [configWindowStart, setConfigWindowStart] = useState(0);
   const [configDetailScroll, setConfigDetailScroll] = useState(0);
   const [configRefreshKey, setConfigRefreshKey] = useState(0);
+  const [outputAgentName, setOutputAgentName] = useState<string | null>(null);
+  const [outputTeamName, setOutputTeamName] = useState<string | null>(null);
+  const [outputSelectedIndex, setOutputSelectedIndex] = useState(0);
+  const [outputWindowStart, setOutputWindowStart] = useState(0);
+  const [outputDetailScroll, setOutputDetailScroll] = useState(0);
+  const [outputRefreshKey, setOutputRefreshKey] = useState(0);
   const [showQuitConfirm, setShowQuitConfirm] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const [helpScroll, setHelpScroll] = useState(0);
@@ -399,6 +410,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
   const heartbeatsWindowSize = Math.max(MIN_VISIBLE, rows - HEARTBEATS_CHROME_ROWS);
   const libraryWindowSize = Math.max(MIN_VISIBLE, rows - LIBRARY_CHROME_ROWS);
   const configsWindowSize = libraryWindowSize;
+  const outputWindowSize = libraryWindowSize;
   const total = visibleAgents.length;
 
   // Tasks polling
@@ -986,6 +998,84 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
     setConfigDetailScroll((off) => Math.max(0, off + delta));
   }, []);
 
+  // ---------------------------------------------------------------- Output
+  // TUI-side browser for an agent's ./output directory. The agent is scoped
+  // from the command argument and resolved from the existing /agents data.
+  const outputAgent = useMemo(() => {
+    if (!outputAgentName) return null;
+    return allAgents.find((a) =>
+      a.name === outputAgentName && (!outputTeamName || a.teamName === outputTeamName)
+    ) ?? allAgents.find((a) => a.name === outputAgentName) ?? null;
+  }, [allAgents, outputAgentName, outputTeamName]);
+  const outputRows = useMemo(
+    () => listOutputFiles(outputAgent?.workingDirectory),
+    [outputAgent?.workingDirectory, outputRefreshKey],
+  );
+  const outputTotal = outputRows.length;
+  const selectedOutputFile = outputRows[outputSelectedIndex] ?? null;
+  const outputListError = outputAgentName && !outputAgent
+    ? `agent not found in /agents response: ${outputAgentName}`
+    : outputAgent && !outputAgent.workingDirectory
+      ? `agent has no workingDirectory: ${outputAgent.name}`
+      : null;
+  const outputDetail = useMemo(() => {
+    if (!selectedOutputFile) return { contents: null, error: null as Error | null };
+    try {
+      return { contents: readOutputFileDetail(selectedOutputFile), error: null as Error | null };
+    } catch (err: unknown) {
+      return {
+        contents: null,
+        error: err instanceof Error ? err : new Error(String(err)),
+      };
+    }
+  }, [selectedOutputFile]);
+
+  useEffect(() => {
+    if (outputTotal === 0) {
+      if (outputSelectedIndex !== 0) setOutputSelectedIndex(0);
+      if (outputWindowStart !== 0) setOutputWindowStart(0);
+      return;
+    }
+    const clampedSel = Math.min(outputSelectedIndex, outputTotal - 1);
+    if (clampedSel !== outputSelectedIndex) setOutputSelectedIndex(clampedSel);
+    const maxStart = Math.max(0, outputTotal - outputWindowSize);
+    let nextStart = outputWindowStart;
+    if (clampedSel < nextStart) nextStart = clampedSel;
+    if (clampedSel >= nextStart + outputWindowSize)
+      nextStart = clampedSel - outputWindowSize + 1;
+    if (nextStart > maxStart) nextStart = maxStart;
+    if (nextStart < 0) nextStart = 0;
+    if (nextStart !== outputWindowStart) setOutputWindowStart(nextStart);
+  }, [outputTotal, outputSelectedIndex, outputWindowStart, outputWindowSize]);
+
+  const openOutput = useCallback((agentName: string, teamName?: string) => {
+    setOutputAgentName(agentName);
+    setOutputTeamName(teamName ?? null);
+    setOutputRefreshKey((k) => k + 1);
+    setOutputSelectedIndex(0);
+    setOutputWindowStart(0);
+    setOutputDetailScroll(0);
+    setView('output-list');
+  }, []);
+
+  const openOutputDetail = useCallback(() => {
+    if (!selectedOutputFile) return;
+    setOutputDetailScroll(0);
+    setView('output-detail');
+  }, [selectedOutputFile]);
+
+  const moveOutputSel = useCallback(
+    (delta: number) => {
+      if (outputTotal === 0) return;
+      setOutputSelectedIndex((idx) => clamp(idx + delta, 0, outputTotal - 1));
+    },
+    [outputTotal],
+  );
+
+  const moveOutputDetailScroll = useCallback((delta: number) => {
+    setOutputDetailScroll((off) => Math.max(0, off + delta));
+  }, []);
+
   // Execute a command-bar entry. Validation, dispatch, and result/error
   // capture are centralized here so the keystroke handler stays simple.
   const runCommand = useCallback(
@@ -1051,6 +1141,11 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
             setCommandError(null);
             return;
           }
+          if (data.tuiAction === 'output') {
+            openOutput(data.agent, resolvedTeam);
+            setCommandError(null);
+            return;
+          }
         }
         const renderer = spec.resultRenderer ?? 'auto';
         const table = renderer === 'json' ? null : detectTabularResult(data);
@@ -1086,7 +1181,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         setCommandRunning(false);
       }
     },
-    [manager, selectedTeam, teams, allAgents, openConfigs],
+    [manager, selectedTeam, teams, allAgents, openConfigs, openOutput],
   );
 
   useInput(
@@ -1462,6 +1557,35 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         return;
       }
 
+      if (view === 'output-list') {
+        if (input === 'a') return setView('agents');
+        if (input === 't') return setView('tasks');
+        if (input === 'c') return openCalendar();
+        if (input === 'h') return openHeartbeats();
+        if (input === 'l') return openLibraryAgents();
+        if (input === 's') return openLibrarySkills();
+        if (key.leftArrow || key.escape) return setView('agents');
+        if (key.rightArrow) return openOutputDetail();
+        if (input === 'k' || key.upArrow) return moveOutputSel(-1);
+        if (input === 'j' || key.downArrow) return moveOutputSel(1);
+        if (key.pageUp) return moveOutputSel(-outputWindowSize);
+        if (key.pageDown) return moveOutputSel(outputWindowSize);
+        if (isHomeKey(input)) return setOutputSelectedIndex(0);
+        if (isEndKey(input)) return setOutputSelectedIndex(Math.max(0, outputTotal - 1));
+        return;
+      }
+
+      if (view === 'output-detail') {
+        if (key.leftArrow || key.escape) return setView('output-list');
+        if (input === 'k' || key.upArrow) return moveOutputDetailScroll(-1);
+        if (input === 'j' || key.downArrow) return moveOutputDetailScroll(1);
+        if (key.pageUp) return moveOutputDetailScroll(-detailWindowSize);
+        if (key.pageDown) return moveOutputDetailScroll(detailWindowSize);
+        if (isHomeKey(input)) return setOutputDetailScroll(0);
+        if (isEndKey(input)) return setOutputDetailScroll(Number.MAX_SAFE_INTEGER);
+        return;
+      }
+
       if (view === 'tasks') {
         if (input === 't') return toggleTasksView();
         if (input === 'c') return openCalendar();
@@ -1737,6 +1861,31 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           scrollOffset={configDetailScroll}
           wrapMode={wrapMode}
         />
+      ) : view === 'output-list' ? (
+        <OutputList
+          agentName={outputAgentName}
+          entries={outputRows}
+          selectedIndex={outputSelectedIndex}
+          windowStart={outputWindowStart}
+          windowSize={outputWindowSize}
+          wrapMode={wrapMode}
+          error={outputListError}
+        />
+      ) : view === 'output-detail' ? (
+        <OutputDetail
+          agentName={outputAgentName}
+          file={selectedOutputFile}
+          contents={outputDetail.contents}
+          error={outputDetail.error}
+          positionLabel={
+            outputTotal > 0
+              ? `file ${outputSelectedIndex + 1} of ${outputTotal}`
+              : ''
+          }
+          windowSize={detailWindowSize}
+          scrollOffset={outputDetailScroll}
+          wrapMode={wrapMode}
+        />
       ) : view === 'tasks' ? (
         <>
           <TeamsPanel
@@ -1956,10 +2105,13 @@ function clamp(n: number, lo: number, hi: number): number {
   return n;
 }
 
-function isTuiAction(value: unknown): value is { tuiAction: 'help' | 'configs' } {
+function isTuiAction(value: unknown): value is
+  | { tuiAction: 'help' | 'configs' }
+  | { tuiAction: 'output'; agent: string } {
   if (typeof value !== 'object' || value === null) return false;
   const action = (value as { tuiAction?: unknown }).tuiAction;
-  return action === 'help' || action === 'configs';
+  if (action === 'help' || action === 'configs') return true;
+  return action === 'output' && typeof (value as { agent?: unknown }).agent === 'string';
 }
 
 function isHomeKey(input: string): boolean {

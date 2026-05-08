@@ -26,6 +26,7 @@ const VIEWS: Keybind = {
     ['n', 'News'],
     ['c', 'Calendar'],
     [':configs', 'Configs'],
+    [':output <agent>', 'Output files'],
     ['h', 'Heartbeats'],
     ['l', 'Library'],
     ['s', 'Skills'],
@@ -40,6 +41,7 @@ const NAVIGATE: Keybind = {
     ['PgUp/Dn', 'Move page'],
     ['→', 'Open detail'],
     ['← Esc', 'Back'],
+    ['w', 'Wrap detail'],
     ['Tab', 'Cycle team'],
   ],
 };
@@ -51,6 +53,16 @@ const GLOBAL: Keybind = {
     ['w', 'Toggle wrap'],
     ['q', 'Quit'],
     ['^C', 'Force quit'],
+  ],
+};
+
+const OUTPUT_FILES: Keybind = {
+  title: 'Output',
+  rows: [
+    ['text', '.md .txt .json .yaml .yml .log .csv .ts .tsx .js .jsx .py .sh'],
+    ['text', '.sql .toml .ini .html .htm .xml .svg .conf .diff .patch .env'],
+    ['text', 'extensionless files'],
+    ['binary', 'other extensions show a placeholder only'],
   ],
 };
 
@@ -155,6 +167,9 @@ export function HelpView(props: HelpViewProps): React.ReactElement {
         <KeybindColumn group={VIEWS} keyWidth={3} />
         <KeybindColumn group={NAVIGATE} keyWidth={9} />
         <KeybindColumn group={GLOBAL} keyWidth={4} />
+      </Box>
+      <Box flexDirection="row">
+        <KeybindColumn group={OUTPUT_FILES} keyWidth={6} />
       </Box>
 
       {/* Scrollable command catalog. Only this block responds to the

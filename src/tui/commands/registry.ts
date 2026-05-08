@@ -157,6 +157,18 @@ const configsCommand: CommandSpec = {
   run: async () => ({ tuiAction: 'configs' }),
 };
 
+const outputCommand: CommandSpec = {
+  name: 'output',
+  description: "Open an agent's navigable ./output browser (`:output <agent>`)",
+  tier: 'safe',
+  argCompleter: agentNameSlot0,
+  resultRenderer: 'table',
+  run: async ({ args }) =>
+    args[0]
+      ? { tuiAction: 'output', agent: args[0] }
+      : { ok: false, error: 'Usage: :output <agent>' },
+};
+
 // ── Phase 3 predicates ─────────────────────────────────────────────
 // These keep a single catalog entry per top-level token (`schedule`,
 // `task`, `registry`, `agent`, `heartbeat`) and decide on the args
@@ -197,7 +209,7 @@ const REGISTRY: Record<string, CommandSpec> = {
     },
   ),
   configs: configsCommand,
-  output: remote('output', "List files in an agent's ./output dir (`:output <agent>`)", 'safe', { argCompleter: agentNameSlot0, resultRenderer: 'table' }),
+  output: outputCommand,
   meta: remote('meta', 'Show agent metadata (`:meta <agent>`)', 'safe', { argCompleter: agentNameSlot0 }),
   list: remote('list', 'Show all pending queries in the active team', 'safe', { resultRenderer: 'table' }),
 

@@ -59,12 +59,11 @@ describe('TUI command registry tiers', () => {
   it('opts only obvious tabular command results into table rendering', () => {
     expect(command('status').resultRenderer).toBe('table');
     expect(command('teams').resultRenderer).toBe('table');
-    expect(command('output').resultRenderer).toBe('table');
     expect(command('list').resultRenderer).toBe('table');
 
     expect(command('meta').resultRenderer).toBeUndefined();
     expect(command('configs').resultRenderer).toBeUndefined();
-    expect(command('news').resultRenderer).toBeUndefined();
+    expect(command('output').resultRenderer).toBe('table');
   });
 
   it('routes :configs to a TUI action instead of /remote dispatch', async () => {
@@ -87,6 +86,40 @@ describe('TUI command registry tiers', () => {
       });
 
       expect(result).toEqual({ tuiAction: 'configs' });
+      expect(calls).toEqual([]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('routes :output <agent> to a scoped TUI action and requires an agent argument', async () => {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), init: init ?? {} });
+      return new Response(JSON.stringify({ ok: true, result: [] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    try {
+      const spec = command('output');
+      const ok = await spec.run({
+        manager: 'http://127.0.0.1:0',
+        executor: 'tui',
+        signal: new AbortController().signal,
+        args: ['cto'],
+      });
+      const missing = await spec.run({
+        manager: 'http://127.0.0.1:0',
+        executor: 'tui',
+        signal: new AbortController().signal,
+        args: [],
+      });
+
+      expect(ok).toEqual({ tuiAction: 'output', agent: 'cto' });
+      expect(missing).toEqual({ ok: false, error: 'Usage: :output <agent>' });
       expect(calls).toEqual([]);
     } finally {
       globalThis.fetch = originalFetch;

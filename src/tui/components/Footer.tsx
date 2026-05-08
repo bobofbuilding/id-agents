@@ -16,7 +16,9 @@ export type FooterView =
   | 'library-skills'
   | 'library-skill-detail'
   | 'configs-list'
-  | 'config-detail';
+  | 'config-detail'
+  | 'output-list'
+  | 'output-detail';
 
 interface FooterProps {
   view: FooterView;
@@ -43,6 +45,8 @@ const HAS_BACK: Record<FooterView, boolean> = {
   'library-skill-detail': true,
   'configs-list': true,
   'config-detail': true,
+  'output-list': true,
+  'output-detail': true,
 };
 
 function hintFor(view: FooterView, wrapEnabled: boolean): string {
