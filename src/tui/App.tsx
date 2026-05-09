@@ -1395,7 +1395,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           const level = parsed && spec ? confirmationLevel(spec, parsed.args) : 'none';
           if (level === 'retype' && parsed && spec) {
             setCommandRetype({
-              expected: raw,
+              expected: raw.replace(/^[:/]+/, ''),
               preview: commandConfirmPreview(spec, parsed.args, { teamCounts }) ?? raw,
               typed: '',
               mismatchSeen: false,
