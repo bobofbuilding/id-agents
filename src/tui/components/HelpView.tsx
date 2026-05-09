@@ -9,77 +9,42 @@ interface HelpViewProps {
   wrapMode: TextWrapMode;
 }
 
-// Outer border/header + keybinding block + spacer + App footer. App.tsx
-// subtracts this from terminal rows so only the command catalog gets the
-// remaining rows.
-export const HELP_VIEW_CHROME_ROWS = 15;
+// Outer border (2) + header (1) + spacer (1) = 4 rows that don't belong to the
+// scrollable list. App.tsx subtracts this from terminal rows so the list gets
+// the rest.
+export const HELP_VIEW_CHROME_ROWS = 4;
 
-// ── Keybinding groups (hand-maintained; restored from the pre-Phase-5
-//    HelpModal at commit 1bdba04). The command catalog below is still
-//    auto-sourced from the registry; only these three groups document
-//    the in-app keybindings that App.tsx's useInput actually wires.
-interface Keybind {
-  title: string;
-  rows: Array<[string, string]>;
-}
+// ── Keybinding groups (in-app keybindings App.tsx's useInput wires) ──
+const VIEW_BINDINGS: Array<[string, string]> = [
+  ['a', 'Agents'],
+  ['t', 'Tasks'],
+  ['n', 'News'],
+  ['c', 'Calendar'],
+  ['h', 'Heartbeats'],
+  ['l', 'Library'],
+  ['s', 'Skills'],
+];
 
-const VIEWS: Keybind = {
-  title: 'Views',
-  rows: [
-    ['a', 'Agents'],
-    ['t', 'Tasks'],
-    ['n', 'News'],
-    ['c', 'Calendar'],
-    ['/configs', 'Configs'],
-    ['/output <agent>', 'Output files'],
-    ['h', 'Heartbeats'],
-    ['l', 'Library'],
-    ['s', 'Skills'],
-  ],
-};
+const NAVIGATE_BINDINGS: Array<[string, string]> = [
+  ['↑ ↓', 'Move row'],
+  ['j k', 'Move row / scroll'],
+  ['PgUp/Dn', 'Move page'],
+  ['→', 'Open detail'],
+  ['← Esc', 'Back'],
+  ['w', 'Wrap detail'],
+  ['Tab', 'Cycle team'],
+];
 
-const NAVIGATE: Keybind = {
-  title: 'Navigate',
-  rows: [
-    ['↑ ↓', 'Move row'],
-    ['j k', 'Move row / scroll'],
-    ['PgUp/Dn', 'Move page'],
-    ['→', 'Open detail'],
-    ['← Esc', 'Back'],
-    ['w', 'Wrap detail'],
-    ['Tab', 'Cycle team'],
-  ],
-};
+const GLOBAL_BINDINGS: Array<[string, string]> = [
+  ['?', 'Toggle help'],
+  ['w', 'Toggle wrap'],
+  ['q', 'Quit'],
+  ['^C', 'Force quit'],
+];
 
-const GLOBAL: Keybind = {
-  title: 'Global',
-  rows: [
-    ['?', 'Toggle help'],
-    ['w', 'Toggle wrap'],
-    ['q', 'Quit'],
-    ['^C', 'Force quit'],
-  ],
-};
-
-function KeybindColumn({ group, keyWidth }: { group: Keybind; keyWidth: number }): React.ReactElement {
-  return (
-    <Box flexDirection="column" marginRight={2}>
-      <Text bold>{group.title}</Text>
-      {group.rows.map(([keybind, desc]) => (
-        <Box key={keybind}>
-          <Box width={keyWidth}>
-            <Text color="yellow">{keybind}</Text>
-          </Box>
-          <Text>{desc}</Text>
-        </Box>
-      ))}
-    </Box>
-  );
-}
-
-// ── Command catalog (auto-sourced; tier-grouped, scrollable) ─────────
 type Row =
-  | { kind: 'header'; tier: RiskTier; count: number }
+  | { kind: 'section'; title: string; color: string; count?: number }
+  | { kind: 'kbd'; key: string; description: string }
   | { kind: 'cmd'; name: string; description: string; tier: RiskTier }
   | { kind: 'spacer' };
 
@@ -98,17 +63,28 @@ const TIER_COLOR: Record<RiskTier, string> = {
 const TIER_ORDER: RiskTier[] = ['safe', 'powerful', 'destructive'];
 
 function buildRows(): Row[] {
-  const grouped = catalogEntriesByTier();
   const rows: Row[] = [];
-  for (let i = 0; i < TIER_ORDER.length; i++) {
-    const tier = TIER_ORDER[i]!;
+  rows.push({ kind: 'section', title: 'Views', color: 'cyan' });
+  for (const [key, desc] of VIEW_BINDINGS) rows.push({ kind: 'kbd', key, description: desc });
+  rows.push({ kind: 'spacer' });
+
+  const grouped = catalogEntriesByTier();
+  for (const tier of TIER_ORDER) {
     const entries = grouped[tier];
-    rows.push({ kind: 'header', tier, count: entries.length });
+    rows.push({ kind: 'section', title: TIER_LABEL[tier], color: TIER_COLOR[tier], count: entries.length });
     for (const spec of entries) {
       rows.push({ kind: 'cmd', name: spec.name, description: spec.description, tier });
     }
-    if (i < TIER_ORDER.length - 1) rows.push({ kind: 'spacer' });
+    rows.push({ kind: 'spacer' });
   }
+
+  rows.push({ kind: 'section', title: 'Navigate', color: 'cyan' });
+  for (const [key, desc] of NAVIGATE_BINDINGS) rows.push({ kind: 'kbd', key, description: desc });
+  rows.push({ kind: 'spacer' });
+
+  rows.push({ kind: 'section', title: 'Global', color: 'cyan' });
+  for (const [key, desc] of GLOBAL_BINDINGS) rows.push({ kind: 'kbd', key, description: desc });
+
   return rows;
 }
 
@@ -116,12 +92,22 @@ const NAME_COL_WIDTH = 16;
 
 function renderRow(row: Row, key: string, wrapMode: TextWrapMode): React.ReactElement {
   if (row.kind === 'spacer') return <Text key={key}> </Text>;
-  if (row.kind === 'header') {
+  if (row.kind === 'section') {
     return (
-      <Text key={key} bold color={TIER_COLOR[row.tier]}>
-        {TIER_LABEL[row.tier]}
-        <Text dimColor>{`  (${row.count})`}</Text>
+      <Text key={key} bold color={row.color}>
+        {row.title}
+        {row.count !== undefined ? <Text dimColor>{`  (${row.count})`}</Text> : null}
       </Text>
+    );
+  }
+  if (row.kind === 'kbd') {
+    return (
+      <Box key={key}>
+        <Box width={NAME_COL_WIDTH}>
+          <Text color="yellow">{`  ${row.key}`}</Text>
+        </Box>
+        <Text wrap={wrapMode}>{row.description}</Text>
+      </Box>
     );
   }
   return (
@@ -149,23 +135,12 @@ export function HelpViewImpl(props: HelpViewProps): React.ReactElement {
     <Box flexDirection="column" borderStyle="round" borderColor="cyan" paddingX={1}>
       <Box justifyContent="space-between">
         <Text bold color="cyan">
-          Help · keybindings + {cmdCount} commands
+          Help · {cmdCount} commands
         </Text>
         <Text dimColor>
           {total} lines · {total === 0 ? 0 : start + 1}–{endLineNo} · ↑↓/jk scroll · Esc / ? close
         </Text>
       </Box>
-
-      {/* Fixed (non-scrollable) keybinding block. Three columns mirror
-          the pre-Phase-5 HelpModal layout exactly. */}
-      <Box flexDirection="row" marginTop={1}>
-        <KeybindColumn group={VIEWS} keyWidth={16} />
-        <KeybindColumn group={NAVIGATE} keyWidth={9} />
-        <KeybindColumn group={GLOBAL} keyWidth={4} />
-      </Box>
-
-      {/* Scrollable command catalog. Only this block responds to the
-          ↑↓/jk scroll keys; the keybinding block above stays fixed. */}
       <Text dimColor> </Text>
       {visible.map((row, i) => renderRow(row, `help-row-${start + i}`, props.wrapMode))}
       {Array.from({ length: padCount }, (_, i) => (
