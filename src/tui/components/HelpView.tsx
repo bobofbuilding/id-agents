@@ -56,16 +56,6 @@ const GLOBAL: Keybind = {
   ],
 };
 
-const OUTPUT_FILES: Keybind = {
-  title: 'Output',
-  rows: [
-    ['text', '.md .txt .json .yaml .yml .log .csv .ts .tsx .js .jsx .py .sh'],
-    ['text', '.sql .toml .ini .html .htm .xml .svg .conf .diff .patch .env'],
-    ['text', 'extensionless files'],
-    ['binary', 'other extensions show a placeholder only'],
-  ],
-};
-
 function KeybindColumn({ group, keyWidth }: { group: Keybind; keyWidth: number }): React.ReactElement {
   return (
     <Box flexDirection="column" marginRight={2}>
@@ -132,14 +122,14 @@ function renderRow(row: Row, key: string, wrapMode: TextWrapMode): React.ReactEl
   return (
     <Box key={key}>
       <Box width={NAME_COL_WIDTH}>
-        <Text color={TIER_COLOR[row.tier]}>{`  :${row.name}`}</Text>
+        <Text color={TIER_COLOR[row.tier]}>{`  /${row.name}`}</Text>
       </Box>
       <Text wrap={wrapMode}>{row.description}</Text>
     </Box>
   );
 }
 
-export function HelpView(props: HelpViewProps): React.ReactElement {
+function HelpViewImpl(props: HelpViewProps): React.ReactElement {
   const rows = buildRows();
   const total = rows.length;
   const maxStart = Math.max(0, total - props.windowSize);
@@ -164,12 +154,9 @@ export function HelpView(props: HelpViewProps): React.ReactElement {
       {/* Fixed (non-scrollable) keybinding block. Three columns mirror
           the pre-Phase-5 HelpModal layout exactly. */}
       <Box flexDirection="row" marginTop={1}>
-        <KeybindColumn group={VIEWS} keyWidth={3} />
+        <KeybindColumn group={VIEWS} keyWidth={16} />
         <KeybindColumn group={NAVIGATE} keyWidth={9} />
         <KeybindColumn group={GLOBAL} keyWidth={4} />
-      </Box>
-      <Box flexDirection="row">
-        <KeybindColumn group={OUTPUT_FILES} keyWidth={6} />
       </Box>
 
       {/* Scrollable command catalog. Only this block responds to the
@@ -182,3 +169,5 @@ export function HelpView(props: HelpViewProps): React.ReactElement {
     </Box>
   );
 }
+
+export const HelpView = React.memo(HelpViewImpl);
