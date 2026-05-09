@@ -5648,8 +5648,7 @@ export class AgentManagerDb {
             return { ok: true, result: { message: `Heartbeat enabled for ${agent.name} (interval: ${config.interval}s)` } };
           } else {
             // Disable heartbeat
-            const newMetadata = { ...agent.metadata };
-            delete newMetadata.heartbeat;
+            const newMetadata = { ...agent.metadata, heartbeat: false };
             await this.db.agents.updateMetadata(agent.id, newMetadata);
             if (this.schedulerService) {
               await this.schedulerService.removeAgentSchedules(agent.id);
