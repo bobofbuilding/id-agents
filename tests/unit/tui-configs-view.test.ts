@@ -86,9 +86,11 @@ describe('TUI configs components', () => {
 });
 
 describe('TUI command-result panel input policy', () => {
-  it('consumes nav arrows: left dismisses like Esc, right is a no-op', () => {
-    // leftArrow dismisses the panel like Esc — operator preference.
+  it('consumes nav and confirm keys: Esc / Left / Enter dismiss; right is a no-op', () => {
+    // Esc, leftArrow, and Enter all dismiss the panel — operator preference.
+    expect(commandResultConsumesInput('', { escape: true }, { canShowJson: false })).toBe(true);
     expect(commandResultConsumesInput('', { leftArrow: true }, { canShowJson: false })).toBe(true);
+    expect(commandResultConsumesInput('', { return: true }, { canShowJson: false })).toBe(true);
     // rightArrow is consumed so the JSON panel doesn't accidentally drill into
     // a sub-view (`:agents <team>` + Right would otherwise open news/detail).
     expect(commandResultConsumesInput('', { rightArrow: true }, { canShowJson: false })).toBe(true);
