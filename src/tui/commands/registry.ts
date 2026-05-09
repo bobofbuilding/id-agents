@@ -26,6 +26,7 @@ export interface CommandContext {
 
 export type RiskTier = 'safe' | 'powerful' | 'destructive';
 export type CommandResultRenderer = 'auto' | 'json' | 'table';
+export type CommandResultRendererSelector = CommandResultRenderer | ((args: string[]) => CommandResultRenderer);
 
 // Phase 6: context for arg-level Tab completion. The TUI assembles
 // this once per Tab keypress from data already in scope (allAgents),
@@ -33,6 +34,10 @@ export type CommandResultRenderer = 'auto' | 'json' | 'table';
 export interface ArgCompleterContext {
   agentNames: string[];
   teamNames: string[];
+}
+
+export interface ConfirmPreviewContext {
+  teamCounts?: ReadonlyMap<string, number>;
 }
 
 export interface CommandSpec {
@@ -45,7 +50,7 @@ export interface CommandSpec {
   // subcommands), the tier is the highest reachable level. The runtime
   // gate is still driven by `shouldConfirm`/`shouldRetype` predicates.
   tier: RiskTier;
-  resultRenderer?: CommandResultRenderer;
+  resultRenderer?: CommandResultRendererSelector;
   run: (ctx: CommandContext) => Promise<unknown>;
   // Returns true when the args trigger a destructive/mutating handler
   // and the user should see a Y/N prompt before dispatch. Absent or
@@ -60,7 +65,7 @@ export interface CommandSpec {
   // self-documenting (e.g., `delete agent foo`, `cancel running query
   // on agent foo`). Absent or returning null → renderer falls back to
   // the raw command line.
-  confirmPreview?: (args: string[]) => string | null;
+  confirmPreview?: (args: string[], ctx?: ConfirmPreviewContext) => string | null;
   // Phase 6: candidate strings for the arg slot at `slotIndex` (0 =
   // first arg after the command name). Returns ALL candidates for the
   // slot — the caller filters by partial-prefix match. Absent → no
@@ -96,6 +101,8 @@ function remote(
 const agentNameSlot0: NonNullable<CommandSpec['argCompleter']> = (slot, ctx) =>
   slot === 0 ? ctx.agentNames : [];
 
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 // `agent <name> <subAction>` — slot 0 is name, slot 1 is the
 // subcommand from a small fixed set.
 const AGENT_SUBACTIONS = ['rebuild', 'start', 'stop', 'probe', 'logs', 'wallet', 'heartbeat'];
@@ -123,22 +130,72 @@ const heartbeatSlots: NonNullable<CommandSpec['argCompleter']> = (slot, ctx) => 
 
 // `agents` keeps the Phase 1 cross-team semantics when invoked without
 // args. With one team arg, it scopes the list through /agents?team=<name>.
+const AGENTS_BULK_ACTIONS = new Set(['rebuild', 'start', 'stop']);
+const agentsUsage = 'Usage: :agents [team] | :agents <team> <rebuild|start|stop>';
+
 const agentsCommand: CommandSpec = {
   name: 'agents',
-  description: 'List agents across all teams, or one team: `:agents <team>`',
-  tier: 'safe',
+  description: 'List agents, or run team lifecycle: `:agents <team> <rebuild|start|stop>`',
+  tier: 'destructive',
   // The dashboard already has a dedicated agents view with rich rendering;
   // surfacing :agents as a command is for raw inspection, so force JSON
   // instead of letting auto-detection fold it into a stripped-down table.
-  resultRenderer: 'json',
-  argCompleter: (slot, ctx) => (slot === 0 ? ctx.teamNames : []),
-  run: async ({ manager, signal, args }) => {
-    if (args.length > 1) {
-      return { ok: false, error: 'Usage: :agents [team]' };
+  resultRenderer: (args) => (args.length === 2 ? 'table' : 'json'),
+  argCompleter: (slot, ctx) => {
+    if (slot === 0) return ctx.teamNames;
+    if (slot === 1) return Array.from(AGENTS_BULK_ACTIONS);
+    return [];
+  },
+  shouldConfirm: (args) => {
+    const action = args[1]?.toLowerCase() ?? '';
+    return args.length === 2 && (action === 'rebuild' || action === 'start');
+  },
+  shouldRetype: (args) => args.length === 2 && args[1]?.toLowerCase() === 'stop',
+  confirmPreview: (args, ctx) => {
+    if (args.length !== 2) return null;
+    const team = args[0] ?? '<team>';
+    const action = args[1]?.toLowerCase() ?? '';
+    if (!AGENTS_BULK_ACTIONS.has(action)) return null;
+    const count = ctx?.teamCounts?.get(team);
+    const countText = typeof count === 'number' ? `${count} ` : '';
+    return `${action} ${countText}agents in team ${team}`;
+  },
+  run: async ({ manager, executor, signal, args }) => {
+    if (args.length > 2) {
+      return { ok: false, error: agentsUsage };
     }
     if (args.length === 1) {
       const agents = await fetchAgentsByTeam(manager, args[0]!, signal);
       return { count: agents.length, agents };
+    }
+    if (args.length === 2) {
+      const team = args[0]!;
+      const action = args[1]!.toLowerCase();
+      if (!AGENTS_BULK_ACTIONS.has(action)) {
+        return { ok: false, error: agentsUsage };
+      }
+      if (team.toLowerCase() === 'public') {
+        return { ok: false, error: 'Bulk lifecycle is not supported for the public team' };
+      }
+      const agents = await fetchAgentsByTeam(manager, team, signal);
+      if (agents.length === 0) {
+        return { ok: false, error: `No agents found in team ${team}` };
+      }
+
+      const rows: { agent: string; action: string; ok: boolean; error?: string }[] = [];
+      for (const agent of agents) {
+        try {
+          await runRemoteCommand(manager, executor, `/agent ${agent.name} ${action}`, signal, team);
+          rows.push({ agent: agent.name, action, ok: true });
+        } catch (err: unknown) {
+          const error = err instanceof Error ? err.message : String(err);
+          rows.push({ agent: agent.name, action, ok: false, error });
+        }
+        if (rows.length < agents.length) {
+          await sleep(250);
+        }
+      }
+      return rows;
     }
     const teams = await fetchTeams(manager, signal);
     const agents = await fetchAgentsAllTeams(manager, teams, signal);
@@ -189,6 +246,7 @@ const HEARTBEAT_MUTATORS = new Set(['enable', 'disable']);
 // Phase 4: subcommands that escalate from Y/N to retype.
 const SCHEDULE_RETYPE = new Set(['remove']);
 const TASK_RETYPE = new Set(['remove', 'delete']);
+const AGENT_RETYPE = new Set(['stop']);
 
 const REGISTRY: Record<string, CommandSpec> = {
   // ── Phase 1 ──────────────────────────────────────────────────────
@@ -266,6 +324,7 @@ const REGISTRY: Record<string, CommandSpec> = {
     'powerful',
     {
       shouldConfirm: (args) => AGENT_MUTATORS.has(args[1]?.toLowerCase() ?? ''),
+      shouldRetype: (args) => AGENT_RETYPE.has(args[1]?.toLowerCase() ?? ''),
       confirmPreview: (args) => {
         const sub = args[1]?.toLowerCase();
         const name = args[0] ?? '<agent>';
@@ -377,8 +436,12 @@ export function confirmationLevel(spec: CommandSpec, args: string[]): Confirmati
 
 // One-line preview text under the Y/N prompt, or null to fall back to
 // the raw command line in the rendering layer.
-export function commandConfirmPreview(spec: CommandSpec, args: string[]): string | null {
-  return spec.confirmPreview ? spec.confirmPreview(args) : null;
+export function commandConfirmPreview(
+  spec: CommandSpec,
+  args: string[],
+  ctx?: ConfirmPreviewContext,
+): string | null {
+  return spec.confirmPreview ? spec.confirmPreview(args, ctx) : null;
 }
 
 // Phase 5 helper: ordered iteration over all catalog entries grouped

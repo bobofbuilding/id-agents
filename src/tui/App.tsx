@@ -1181,7 +1181,9 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
             return;
           }
         }
-        const renderer = spec.resultRenderer ?? 'auto';
+        const renderer = typeof spec.resultRenderer === 'function'
+          ? spec.resultRenderer(parsed.args)
+          : spec.resultRenderer ?? 'auto';
         const table = renderer === 'json' ? null : detectTabularResult(data);
         const tableError = renderer === 'table' && !table
           ? `expected tabular result, got: ${previewJson(data)}`
@@ -1394,7 +1396,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           if (level === 'retype' && parsed && spec) {
             setCommandRetype({
               expected: raw,
-              preview: commandConfirmPreview(spec, parsed.args) ?? raw,
+              preview: commandConfirmPreview(spec, parsed.args, { teamCounts }) ?? raw,
               typed: '',
               mismatchSeen: false,
             });
@@ -1402,7 +1404,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           } else if (level === 'yn' && parsed && spec) {
             setCommandPending({
               raw,
-              preview: commandConfirmPreview(spec, parsed.args) ?? raw,
+              preview: commandConfirmPreview(spec, parsed.args, { teamCounts }) ?? raw,
             });
             setCommandError(null);
           } else {

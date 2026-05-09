@@ -3,7 +3,7 @@
  * TUI command catalog safety tiers and Phase 4 confirmation defaults.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   catalogEntriesByTier,
   completeBuffer,
@@ -32,6 +32,9 @@ describe('TUI command registry tiers', () => {
   it('keeps destructive Phase 4 commands behind exact retype confirmation', () => {
     expect(confirmationLevel(command('delete'), ['worker'])).toBe('retype');
     expect(commandConfirmPreview(command('delete'), ['worker'])).toBe('delete agent worker');
+
+    expect(confirmationLevel(command('agent'), ['worker', 'stop'])).toBe('retype');
+    expect(commandConfirmPreview(command('agent'), ['worker', 'stop'])).toBe('stop agent worker');
 
     expect(confirmationLevel(command('cancel'), ['worker'])).toBe('retype');
     expect(confirmationLevel(command('clear'), ['worker'])).toBe('retype');
@@ -65,6 +68,16 @@ describe('TUI command registry tiers', () => {
     expect(command('meta').resultRenderer).toBeUndefined();
     expect(command('configs').resultRenderer).toBeUndefined();
     expect(command('output').resultRenderer).toBe('table');
+  });
+
+  it('selects table rendering only for :agents team lifecycle fan-out', () => {
+    const renderer = command('agents').resultRenderer;
+    expect(typeof renderer).toBe('function');
+    if (typeof renderer !== 'function') throw new Error('expected dynamic :agents renderer');
+
+    expect(renderer([])).toBe('json');
+    expect(renderer(['idchain'])).toBe('json');
+    expect(renderer(['idchain', 'rebuild'])).toBe('table');
   });
 
   it('routes :configs to a TUI action instead of /remote dispatch', async () => {
@@ -166,7 +179,7 @@ describe('TUI command registry tiers', () => {
     }
   });
 
-  it('rejects :agents with too many args and completes team names', async () => {
+  it('rejects invalid :agents lifecycle args and completes team names plus actions', async () => {
     const originalFetch = globalThis.fetch;
     const calls: string[] = [];
     globalThis.fetch = (async (url: string | URL | Request) => {
@@ -184,15 +197,121 @@ describe('TUI command registry tiers', () => {
         signal: new AbortController().signal,
         args: ['foo', 'bar'],
       });
+      const tooMany = await command('agents').run({
+        manager: 'http://127.0.0.1:0',
+        executor: 'tui',
+        signal: new AbortController().signal,
+        args: ['foo', 'bar', 'baz'],
+      });
+      const publicTeam = await command('agents').run({
+        manager: 'http://127.0.0.1:0',
+        executor: 'tui',
+        signal: new AbortController().signal,
+        args: ['public', 'start'],
+      });
 
-      expect(result).toEqual({ ok: false, error: 'Usage: :agents [team]' });
+      expect(result).toEqual({
+        ok: false,
+        error: 'Usage: :agents [team] | :agents <team> <rebuild|start|stop>',
+      });
+      expect(tooMany).toEqual({
+        ok: false,
+        error: 'Usage: :agents [team] | :agents <team> <rebuild|start|stop>',
+      });
+      expect(publicTeam).toEqual({
+        ok: false,
+        error: 'Bulk lifecycle is not supported for the public team',
+      });
       expect(calls).toEqual([]);
       expect(completeBuffer(':agents id', {
         agentNames: [],
         teamNames: ['idchain', 'public'],
       })).toBe(':agents idchain ');
+      expect(completeBuffer(':agents idchain s', {
+        agentNames: [],
+        teamNames: ['idchain', 'public'],
+      })).toBe(':agents idchain st');
     } finally {
       globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('gates :agents team lifecycle fan-out by action risk', () => {
+    const spec = command('agents');
+
+    expect(confirmationLevel(spec, ['idchain'])).toBe('none');
+    expect(confirmationLevel(spec, ['idchain', 'start'])).toBe('yn');
+    expect(confirmationLevel(spec, ['idchain', 'rebuild'])).toBe('yn');
+    expect(confirmationLevel(spec, ['idchain', 'stop'])).toBe('retype');
+    expect(commandConfirmPreview(spec, ['idchain', 'stop'])).toBe('stop agents in team idchain');
+    expect(commandConfirmPreview(spec, ['idchain', 'stop'], {
+      teamCounts: new Map([['idchain', 16]]),
+    })).toBe('stop 16 agents in team idchain');
+  });
+
+  it('fans :agents team lifecycle through per-agent /remote calls and keeps going after failures', async () => {
+    vi.useFakeTimers();
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      calls.push({ url: href, init: init ?? {} });
+      if (href.endsWith('/agents?team=idchain')) {
+        return new Response(JSON.stringify({
+          agents: [
+            { id: '1', name: 'cto' },
+            { id: '2', name: 'tui' },
+          ],
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      const body = JSON.parse(String(init?.body ?? '{}')) as { command?: string };
+      if (body.command === '/agent tui rebuild') {
+        return new Response(JSON.stringify({ ok: false, error: 'already rebuilding' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ ok: true, result: { ok: true } }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    try {
+      const promise = command('agents').run({
+        manager: 'http://127.0.0.1:0',
+        executor: 'tui',
+        signal: new AbortController().signal,
+        args: ['idchain', 'rebuild'],
+      });
+
+      await vi.advanceTimersByTimeAsync(250);
+      const result = await promise;
+
+      expect(result).toEqual([
+        { agent: 'cto', action: 'rebuild', ok: true },
+        { agent: 'tui', action: 'rebuild', ok: false, error: 'already rebuilding' },
+      ]);
+      expect(calls.map((c) => c.url)).toEqual([
+        'http://127.0.0.1:0/agents?team=idchain',
+        'http://127.0.0.1:0/remote',
+        'http://127.0.0.1:0/remote',
+      ]);
+      expect(calls.slice(1).map((c) => JSON.parse(String(c.init.body)))).toEqual([
+        { agent: 'tui', command: '/agent cto rebuild' },
+        { agent: 'tui', command: '/agent tui rebuild' },
+      ]);
+      expect(calls.slice(1).map((c) => (c.init.headers as Record<string, string>)['x-id-team'])).toEqual([
+        'idchain',
+        'idchain',
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+      vi.useRealTimers();
     }
   });
 
