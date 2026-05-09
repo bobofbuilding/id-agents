@@ -1789,6 +1789,16 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
   const renderCountRef = useRef(0);
   renderCountRef.current += 1;
 
+  const prevViewRef = useRef(view);
+  useEffect(() => {
+    if (prevViewRef.current !== view) {
+      prevViewRef.current = view;
+      setCommandResult(null);
+      setCommandError(null);
+      setCommandResultScroll(0);
+    }
+  }, [view]);
+
   return (
     <Box flexDirection="column">
       {debugViewEnabled ? (
