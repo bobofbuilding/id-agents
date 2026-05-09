@@ -193,14 +193,27 @@ const agentsCommand: CommandSpec = {
       }
 
       const rows: { agent: string; action: string; ok: boolean; error?: string }[] = [];
-      for (const agent of agents) {
+      // Skip already-running agents on `start` — sending /agent <name> start
+      // to a running agent is wasted RPC and may bounce it. Stop and rebuild
+      // dispatch unconditionally; rebuild is meant to refresh a live agent.
+      const dispatchTargets = action === 'start'
+        ? agents.filter((a) => a.status !== 'running')
+        : agents;
+      const skipped = action === 'start'
+        ? agents.filter((a) => a.status === 'running')
+        : [];
+      for (const a of skipped) {
+        rows.push({ agent: a.name, action: 'skip (already running)', ok: true });
+      }
+      for (let i = 0; i < dispatchTargets.length; i++) {
+        const agent = dispatchTargets[i]!;
         try {
           await runRemoteCommand(manager, executor, `/agent ${agent.name} ${action}`, signal, team);
           rows.push({ agent: agent.name, action, ok: true });
         } catch (err: unknown) {
           rows.push({ agent: agent.name, action, ok: false, error: summarizeBulkLifecycleError(err) });
         }
-        if (rows.length < agents.length) {
+        if (i < dispatchTargets.length - 1) {
           await sleep(250);
         }
       }

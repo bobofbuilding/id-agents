@@ -319,6 +319,57 @@ describe('TUI command registry tiers', () => {
     }
   });
 
+  it('skips already-running agents on /agents <team> start', async () => {
+    vi.useFakeTimers();
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      calls.push({ url: href, init: init ?? {} });
+      if (href.endsWith('/agents?team=idchain')) {
+        return new Response(JSON.stringify({
+          agents: [
+            { id: '1', name: 'cto', status: 'running' },
+            { id: '2', name: 'cli', status: 'stopped' },
+            { id: '3', name: 'tui', status: 'running' },
+          ],
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ ok: true, result: { ok: true } }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    try {
+      const promise = command('agents').run({
+        manager: 'http://127.0.0.1:0',
+        executor: 'tui',
+        signal: new AbortController().signal,
+        args: ['idchain', 'start'],
+      });
+      await vi.advanceTimersByTimeAsync(250);
+      const result = await promise;
+
+      expect(result).toEqual([
+        { agent: 'cto', action: 'skip (already running)', ok: true },
+        { agent: 'tui', action: 'skip (already running)', ok: true },
+        { agent: 'cli', action: 'start', ok: true },
+      ]);
+      // Only one /remote call (for `cli`); the running pair was skipped.
+      const dispatched = calls
+        .filter((c) => c.url.endsWith('/remote'))
+        .map((c) => JSON.parse(String(c.init.body)) as { command: string });
+      expect(dispatched).toEqual([{ agent: 'tui', command: '/agent cli start' }]);
+    } finally {
+      globalThis.fetch = originalFetch;
+      vi.useRealTimers();
+    }
+  });
+
   it('routes :output <agent> to a scoped TUI action and requires an agent argument', async () => {
     const calls: Array<{ url: string; init: RequestInit }> = [];
     const originalFetch = globalThis.fetch;
