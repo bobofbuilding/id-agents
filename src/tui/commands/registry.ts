@@ -133,6 +133,17 @@ const heartbeatSlots: NonNullable<CommandSpec['argCompleter']> = (slot, ctx) => 
 const AGENTS_BULK_ACTIONS = new Set(['rebuild', 'start', 'stop']);
 const agentsUsage = 'Usage: /agents [team] | /agents <team> <rebuild|start|stop>';
 
+function summarizeBulkLifecycleError(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  const lines = raw
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\t/g, ' ').trim())
+    .filter(Boolean);
+  if (lines.length === 0) return raw.replace(/[\r\n\t]+/g, ' ').trim() || 'unknown error';
+  if (lines.length === 1) return lines[0]!;
+  return `${lines[0]} (${lines.length - 1} more lines hidden)`;
+}
+
 const agentsCommand: CommandSpec = {
   name: 'agents',
   description: 'List agents, or run team lifecycle: `/agents <team> <rebuild|start|stop>`',
@@ -188,8 +199,7 @@ const agentsCommand: CommandSpec = {
           await runRemoteCommand(manager, executor, `/agent ${agent.name} ${action}`, signal, team);
           rows.push({ agent: agent.name, action, ok: true });
         } catch (err: unknown) {
-          const error = err instanceof Error ? err.message : String(err);
-          rows.push({ agent: agent.name, action, ok: false, error });
+          rows.push({ agent: agent.name, action, ok: false, error: summarizeBulkLifecycleError(err) });
         }
         if (rows.length < agents.length) {
           await sleep(250);

@@ -270,7 +270,10 @@ describe('TUI command registry tiers', () => {
 
       const body = JSON.parse(String(init?.body ?? '{}')) as { command?: string };
       if (body.command === '/agent tui rebuild') {
-        return new Response(JSON.stringify({ ok: false, error: 'already rebuilding' }), {
+        return new Response(JSON.stringify({
+          ok: false,
+          error: 'Failed to rebuild tui:\nreports/\n2026-04-30-erc8217-migration-report.md\n2026-05-07-erc8004-coverage-report.md',
+        }), {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
         });
@@ -294,7 +297,12 @@ describe('TUI command registry tiers', () => {
 
       expect(result).toEqual([
         { agent: 'cto', action: 'rebuild', ok: true },
-        { agent: 'tui', action: 'rebuild', ok: false, error: 'already rebuilding' },
+        {
+          agent: 'tui',
+          action: 'rebuild',
+          ok: false,
+          error: 'Failed to rebuild tui: (3 more lines hidden)',
+        },
       ]);
       expect(calls.map((c) => c.url)).toEqual([
         'http://127.0.0.1:0/agents?team=idchain',

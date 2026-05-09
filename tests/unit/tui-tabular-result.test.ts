@@ -102,4 +102,22 @@ describe('CommandResultTable', () => {
     const tree = CommandResultTable({ rows: [], scroll: 0, windowSize: 3 });
     expect(textContent(tree)).toBe('(no rows)');
   });
+
+  it('normalizes multiline and tabbed cells onto one rendered line', () => {
+    const tree = CommandResultTable({
+      rows: [
+        {
+          agent: 'tui',
+          error: 'first line\nsecond\tvalue\r\nthird line',
+        },
+      ],
+      scroll: 0,
+      windowSize: 3,
+    });
+    const text = textContent(tree);
+
+    expect(text).toContain('first line second value third line');
+    expect(text).not.toContain('\nsecond');
+    expect(text).not.toContain('\t');
+  });
 });

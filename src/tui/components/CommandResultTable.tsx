@@ -32,14 +32,15 @@ function shortIso(value: number): string {
 }
 
 function formatCell(value: unknown): string {
+  const normalize = (cell: string) => cell.replace(/[\r\n\t]+/g, ' ');
   if (value === null || value === undefined) return '';
   if (typeof value === 'number') return isEpochMs(value) ? shortIso(value) : String(value);
   if (typeof value === 'boolean') return value ? 'true' : 'false';
-  if (typeof value === 'string') return value;
+  if (typeof value === 'string') return normalize(value);
   try {
-    return JSON.stringify(value);
+    return normalize(JSON.stringify(value));
   } catch {
-    return String(value);
+    return normalize(String(value));
   }
 }
 
