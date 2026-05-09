@@ -33,9 +33,6 @@ describe('TUI command registry tiers', () => {
     expect(confirmationLevel(command('delete'), ['worker'])).toBe('retype');
     expect(commandConfirmPreview(command('delete'), ['worker'])).toBe('delete agent worker');
 
-    expect(confirmationLevel(command('agent'), ['worker', 'stop'])).toBe('retype');
-    expect(commandConfirmPreview(command('agent'), ['worker', 'stop'])).toBe('stop agent worker');
-
     expect(confirmationLevel(command('cancel'), ['worker'])).toBe('retype');
     expect(confirmationLevel(command('clear'), ['worker'])).toBe('retype');
   });
@@ -43,6 +40,8 @@ describe('TUI command registry tiers', () => {
   it('keeps powerful Phase 3 mutators behind Y/N confirmation by default', () => {
     expect(confirmationLevel(command('agent'), ['worker', 'rebuild'])).toBe('yn');
     expect(commandConfirmPreview(command('agent'), ['worker', 'rebuild'])).toBe('rebuild agent worker');
+    expect(confirmationLevel(command('agent'), ['worker', 'stop'])).toBe('yn');
+    expect(commandConfirmPreview(command('agent'), ['worker', 'stop'])).toBe('stop agent worker');
     expect(confirmationLevel(command('agent'), ['worker', 'probe'])).toBe('none');
 
     expect(confirmationLevel(command('model'), ['worker', 'gpt-5.4'])).toBe('yn');

@@ -255,7 +255,9 @@ const HEARTBEAT_MUTATORS = new Set(['enable', 'disable']);
 // Phase 4: subcommands that escalate from Y/N to retype.
 const SCHEDULE_RETYPE = new Set(['remove']);
 const TASK_RETYPE = new Set(['remove', 'delete']);
-const AGENT_RETYPE = new Set(['stop']);
+// Per-agent stop only needs Y/N. The bulk team-wide /agents <team> stop
+// keeps the retype gate (defined inline on agentsCommand).
+const AGENT_RETYPE = new Set<string>();
 
 const REGISTRY: Record<string, CommandSpec> = {
   // ── Phase 1 ──────────────────────────────────────────────────────
