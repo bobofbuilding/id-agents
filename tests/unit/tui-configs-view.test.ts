@@ -56,7 +56,6 @@ describe('TUI configs components', () => {
         selectedIndex: 1,
         windowStart: 0,
         windowSize: 4,
-        wrapMode: 'truncate-end',
       }),
     );
 
@@ -75,7 +74,6 @@ describe('TUI configs components', () => {
         positionLabel: 'config 2 of 2',
         windowSize: 2,
         scrollOffset: 1,
-        wrapMode: 'truncate-end',
       }),
     );
 

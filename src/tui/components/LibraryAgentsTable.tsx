@@ -2,7 +2,6 @@ import React from 'react';
 import { Box, Text } from 'ink';
 import { padRight } from '../util/format.js';
 import type { LibraryAgentRow } from '../api/manager.js';
-import { fixedWindowWrapMode, type TextWrapMode } from '../util/wrap.js';
 
 interface LibraryAgentsTableProps {
   entries: LibraryAgentRow[];
@@ -13,7 +12,6 @@ interface LibraryAgentsTableProps {
   windowSize: number;
   loading: boolean;
   error: Error | null;
-  wrapMode: TextWrapMode;
 }
 
 const COLS = {
@@ -34,7 +32,6 @@ export function LibraryAgentsTable(props: LibraryAgentsTableProps): React.ReactE
     windowSize,
     loading,
     error,
-    wrapMode,
   } = props;
   const total = entries.length;
   const windowEnd = Math.min(total, windowStart + windowSize);
@@ -53,7 +50,7 @@ export function LibraryAgentsTable(props: LibraryAgentsTableProps): React.ReactE
         </Text>
       </Box>
       <Text dimColor>{libraryRoot ?? '(no library configured)'}</Text>
-      <Header wrapMode={wrapMode} />
+      <Header />
       <Text dimColor>{hiddenAbove > 0 ? `↑ ${hiddenAbove} more above` : ' '}</Text>
       {visible.length === 0 && !loading ? (
         <Text dimColor>
@@ -63,7 +60,7 @@ export function LibraryAgentsTable(props: LibraryAgentsTableProps): React.ReactE
         </Text>
       ) : (
         visible.map((row, i) => (
-          <Row key={row.name} row={row} selected={windowStart + i === selectedIndex} wrapMode={wrapMode} />
+          <Row key={row.name} row={row} selected={windowStart + i === selectedIndex} />
         ))
       )}
       {Array.from(
@@ -82,9 +79,9 @@ export function LibraryAgentsTable(props: LibraryAgentsTableProps): React.ReactE
   );
 }
 
-function Header(props: { wrapMode: TextWrapMode }): React.ReactElement {
+function Header(): React.ReactElement {
   return (
-    <Text bold dimColor wrap={fixedWindowWrapMode()}>
+    <Text bold dimColor wrap="truncate-end">
       {padRight('', COLS.marker)}
       {padRight('NAME', COLS.name)}
       {NAME_SHAPE_GAP}
@@ -93,11 +90,11 @@ function Header(props: { wrapMode: TextWrapMode }): React.ReactElement {
   );
 }
 
-function Row(props: { row: LibraryAgentRow; selected: boolean; wrapMode: TextWrapMode }): React.ReactElement {
+function Row(props: { row: LibraryAgentRow; selected: boolean }): React.ReactElement {
   const { row, selected } = props;
   const marker = selected ? '▶ ' : '  ';
   return (
-    <Text inverse={selected} wrap={fixedWindowWrapMode()}>
+    <Text inverse={selected} wrap="truncate-end">
       {marker}
       {padRight(row.name, COLS.name)}
       {NAME_SHAPE_GAP}

@@ -60,7 +60,6 @@ import {
   formatTotalMemory,
   totalMemoryColor as totalMemColor,
 } from './util/memory.js';
-import { isWrapToggleInput, textWrapMode, toggleWrapEnabled } from './util/wrap.js';
 import { detectTabularResult, type TabularDetection } from './util/tabular.js';
 import { copyToClipboard } from './util/clipboard.js';
 import { listConfigFiles } from './util/configs.js';
@@ -161,7 +160,6 @@ export function commandResultConsumesInput(
       (key.ctrl && input === 'c') ||
       input === 'q' ||
       input === '?' ||
-      isWrapToggleInput(input) ||
       (input === 'j' && canShowJson) ||
       key.upArrow ||
       key.downArrow ||
@@ -237,7 +235,6 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
   const [showQuitConfirm, setShowQuitConfirm] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const [helpScroll, setHelpScroll] = useState(0);
-  const [wrapEnabled, setWrapEnabled] = useState(false);
   const [cooldownEpoch, setCooldownEpoch] = useState<number>(() => Date.now());
 
   // ── Command bar state (Phase 1) ────────────────────────────────────
@@ -300,7 +297,6 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
     const rest = teamsRaw.filter((t) => t.name !== 'public');
     return [...pub, ...rest];
   }, [teamsRaw]);
-  const wrapMode = textWrapMode(wrapEnabled);
 
   const agentsFetcher = useCallback(
     (signal: AbortSignal): Promise<Agent[]> => {
@@ -1255,10 +1251,6 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           exit();
           return;
         }
-        if (isWrapToggleInput(input)) {
-          setWrapEnabled(toggleWrapEnabled);
-          return;
-        }
         if (key.escape || key.leftArrow || input === '?' || input === 'q') {
           setShowHelp(false);
           setHelpScroll(0);
@@ -1505,10 +1497,6 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           setShowHelp(true);
           return;
         }
-        if (isWrapToggleInput(input)) {
-          setWrapEnabled(toggleWrapEnabled);
-          return;
-        }
         if (input === 'j' && (commandResult.table || commandResult.tableError) && !commandResult.showJson) {
           setCommandResult({ ...commandResult, showJson: true });
           setCommandResultScroll(0);
@@ -1550,10 +1538,6 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
       }
       if (input === '?') {
         setShowHelp(true);
-        return;
-      }
-      if (isWrapToggleInput(input)) {
-        setWrapEnabled(toggleWrapEnabled);
         return;
       }
       if (view === 'agents') {
@@ -1850,7 +1834,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         </Box>
       ) : null}
       {showHelp ? (
-        <HelpView windowSize={helpWindowSize} scrollOffset={helpScroll} wrapMode={wrapMode} />
+        <HelpView windowSize={helpWindowSize} scrollOffset={helpScroll} />
       ) : commandResult ? (
         commandResult.showJson || commandResult.renderer === 'json' || (!commandResult.table && !commandResult.tableError) ? (
           <CommandResultView
@@ -1883,7 +1867,6 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
                 rows={commandResult.table.rows}
                 scroll={commandResultScroll}
                 windowSize={detailWindowSize}
-                wrapMode={wrapMode}
               />
             ) : null}
           </Box>
@@ -1910,7 +1893,6 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
             loading={agentsPoll.lastUpdated === 0 && !agentsPoll.error && !staticMode}
             error={agentsPoll.error}
             nowMs={pollTs || Date.now()}
-            wrapMode={wrapMode}
           />
           {teamsPoll.error ? (
             <Box paddingX={1}>
@@ -1926,9 +1908,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           }
           windowSize={detailWindowSize}
           scrollOffset={agentDetailScroll}
-          contentWidth={DETAIL_CONTENT_WIDTH}
           nowMs={pollTs || Date.now()}
-          wrapMode={wrapMode}
         />
       ) : view === 'configs-list' ? (
         <ConfigsList
@@ -1936,7 +1916,6 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           selectedIndex={configSelectedIndex}
           windowStart={configWindowStart}
           windowSize={configsWindowSize}
-          wrapMode={wrapMode}
         />
       ) : view === 'config-detail' ? (
         <ConfigDetail
@@ -1950,8 +1929,6 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           }
           windowSize={detailWindowSize}
           scrollOffset={configDetailScroll}
-          contentWidth={DETAIL_CONTENT_WIDTH}
-          wrapMode={wrapMode}
         />
       ) : view === 'output-list' ? (
         <OutputList
@@ -1960,7 +1937,6 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           selectedIndex={outputSelectedIndex}
           windowStart={outputWindowStart}
           windowSize={outputWindowSize}
-          wrapMode={wrapMode}
           error={outputListError}
         />
       ) : view === 'output-detail' ? (
@@ -1976,8 +1952,6 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           }
           windowSize={detailWindowSize}
           scrollOffset={outputDetailScroll}
-          contentWidth={DETAIL_CONTENT_WIDTH}
-          wrapMode={wrapMode}
         />
       ) : view === 'tasks' ? (
         <>
@@ -2006,7 +1980,6 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           windowSize={calendarWindowSize}
           loading={schedulesPoll.lastUpdated === 0 && !schedulesPoll.error && !staticMode}
           error={schedulesPoll.error}
-          wrapMode={wrapMode}
         />
       ) : view === 'heartbeats' ? (
         <HeartbeatsView
@@ -2017,7 +1990,6 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           windowSize={heartbeatsWindowSize}
           loading={schedulesPoll.lastUpdated === 0 && !schedulesPoll.error && !staticMode}
           error={schedulesPoll.error}
-          wrapMode={wrapMode}
         />
       ) : view === 'heartbeat-detail' ? (
         (() => {
@@ -2045,8 +2017,6 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
               positionLabel={`agent ${hbSelectedIndex + 1} of ${hbTotal}`}
               windowSize={detailWindowSize}
               scrollOffset={hbDetailScroll}
-              contentWidth={DETAIL_CONTENT_WIDTH}
-              wrapMode={wrapMode}
             />
           );
         })()
@@ -2070,7 +2040,6 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           windowSize={libraryWindowSize}
           loading={libraryAgentsPoll.lastUpdated === 0 && !libraryAgentsPoll.error && !staticMode}
           error={libraryAgentsPoll.error}
-          wrapMode={wrapMode}
         />
       ) : view === 'library-agent-detail' ? (
         <LibraryAgentDetail
@@ -2087,8 +2056,6 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           }
           windowSize={detailWindowSize}
           scrollOffset={libAgentDetailScroll}
-          contentWidth={DETAIL_CONTENT_WIDTH}
-          wrapMode={wrapMode}
         />
       ) : view === 'library-skills' ? (
         <LibrarySkillsTable
@@ -2099,7 +2066,6 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           windowSize={libraryWindowSize}
           loading={librarySkillsPoll.lastUpdated === 0 && !librarySkillsPoll.error && !staticMode}
           error={librarySkillsPoll.error}
-          wrapMode={wrapMode}
         />
       ) : view === 'library-skill-detail' ? (
         <LibrarySkillDetail
@@ -2116,8 +2082,6 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           }
           windowSize={detailWindowSize}
           scrollOffset={libSkillDetailScroll}
-          contentWidth={DETAIL_CONTENT_WIDTH}
-          wrapMode={wrapMode}
         />
       ) : view === 'news' ? (
         <NewsView
@@ -2130,7 +2094,6 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           selectedIndex={newsSelectedIndex}
           messageWidth={NEWS_MESSAGE_WIDTH}
           cooldownEpoch={cooldownEpoch}
-          wrapMode={wrapMode}
         />
       ) : (
         <NewsDetail
@@ -2143,8 +2106,6 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           }
           windowSize={detailWindowSize}
           scrollOffset={detailScroll}
-          contentWidth={DETAIL_CONTENT_WIDTH}
-          wrapMode={wrapMode}
         />
       )}
       {flashMessage ? (
@@ -2192,7 +2153,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         </Box>
       ) : null}
       {commandMode ? <CommandBar buffer={commandBuffer} running={commandRunning} /> : null}
-      <Footer view={view} wrapEnabled={wrapEnabled} />
+      <Footer view={view} />
     </Box>
   );
 }

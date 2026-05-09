@@ -9,16 +9,13 @@ import { Box, Text } from 'ink';
 import type { Agent } from '../api/types.js';
 import { humanizeLastSeen } from '../util/format.js';
 import { healthColor } from '../util/colors.js';
-import { fixedWindowWrapMode, type TextWrapMode } from '../util/wrap.js';
 
 interface AgentDetailProps {
   agent: Agent | null;
   positionLabel: string;
   windowSize: number;
   scrollOffset: number;
-  contentWidth: number;
   nowMs: number;
-  wrapMode: TextWrapMode;
 }
 
 function fieldRow(label: string, value: string | null | undefined, color?: string): string {
@@ -29,7 +26,7 @@ function fieldRow(label: string, value: string | null | undefined, color?: strin
 }
 
 export function AgentDetail(props: AgentDetailProps): React.ReactElement {
-  const { agent, positionLabel, windowSize, scrollOffset, contentWidth, nowMs, wrapMode } = props;
+  const { agent, positionLabel, windowSize, scrollOffset, nowMs } = props;
 
   if (!agent) {
     return (
@@ -95,10 +92,10 @@ export function AgentDetail(props: AgentDetailProps): React.ReactElement {
       {visible.map((row, i) => {
         if (!row.label && !row.value) return <Text key={i}> </Text>;
         if (row.label.startsWith('---')) {
-          return <Text key={i} bold dimColor wrap={fixedWindowWrapMode()}>{row.label}</Text>;
+          return <Text key={i} bold dimColor wrap="truncate-end">{row.label}</Text>;
         }
         return (
-          <Text key={i} wrap={fixedWindowWrapMode()}>
+          <Text key={i} wrap="truncate-end">
             <Text dimColor>{row.label.padEnd(W)}</Text>
             {row.color
               ? <Text color={row.color}>{row.value}</Text>

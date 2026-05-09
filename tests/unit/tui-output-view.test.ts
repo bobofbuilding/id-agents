@@ -89,7 +89,6 @@ describe('TUI output components', () => {
         selectedIndex: 1,
         windowStart: 0,
         windowSize: 4,
-        wrapMode: 'truncate-end',
         error: null,
       }),
     );
@@ -111,7 +110,6 @@ describe('TUI output components', () => {
         positionLabel: 'file 1 of 2',
         windowSize: 2,
         scrollOffset: 1,
-        wrapMode: 'truncate-end',
       }),
     );
 

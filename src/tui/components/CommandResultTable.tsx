@@ -1,6 +1,5 @@
 import React from 'react';
 import { Box, Text } from 'ink';
-import { fixedWindowWrapMode, type TextWrapMode } from '../util/wrap.js';
 
 const TRUNCATE_MAX_WIDTH = 40;
 const MIN_COLUMN_WIDTH = 3;
@@ -9,7 +8,6 @@ interface CommandResultTableProps {
   rows: Array<Record<string, unknown>>;
   scroll: number;
   windowSize: number;
-  wrapMode?: TextWrapMode;
 }
 
 function orderedColumns(rows: Array<Record<string, unknown>>): string[] {
@@ -58,7 +56,6 @@ function padEnd(value: string, width: number): string {
 function columnWidths(
   rows: Array<Record<string, unknown>>,
   columns: string[],
-  wrapMode: TextWrapMode,
 ): number[] {
   return columns.map((column) => {
     const rawWidth = Math.max(
@@ -66,31 +63,30 @@ function columnWidths(
       ...rows.map((row) => formatCell(row[column]).length),
       MIN_COLUMN_WIDTH,
     );
-    return wrapMode === 'wrap' ? rawWidth : Math.min(rawWidth, TRUNCATE_MAX_WIDTH);
+    return Math.min(rawWidth, TRUNCATE_MAX_WIDTH);
   });
 }
 
-function renderLine(values: string[], widths: number[], wrapMode: TextWrapMode): string {
+function renderLine(values: string[], widths: number[]): string {
   return values
     .map((value, index) => {
-      const rendered = wrapMode === 'wrap' ? value : truncate(value, widths[index]!);
+      const rendered = truncate(value, widths[index]!);
       return padEnd(rendered, widths[index]!);
     })
     .join('  ');
 }
 
 export function CommandResultTable(props: CommandResultTableProps): React.ReactElement {
-  const wrapMode = fixedWindowWrapMode();
   if (props.rows.length === 0) {
     return <Text dimColor>(no rows)</Text>;
   }
 
   const columns = orderedColumns(props.rows);
-  const widths = columnWidths(props.rows, columns, wrapMode);
-  const header = renderLine(columns, widths, wrapMode);
+  const widths = columnWidths(props.rows, columns);
+  const header = renderLine(columns, widths);
   const separator = widths.map((width) => '─'.repeat(width)).join('  ');
   const dataLines = props.rows.map((row) =>
-    renderLine(columns.map((column) => formatCell(row[column])), widths, wrapMode),
+    renderLine(columns.map((column) => formatCell(row[column])), widths),
   );
   const total = dataLines.length;
   const maxStart = Math.max(0, total - props.windowSize);
@@ -100,10 +96,10 @@ export function CommandResultTable(props: CommandResultTableProps): React.ReactE
 
   return (
     <Box flexDirection="column">
-      <Text bold wrap={wrapMode}>{header}</Text>
-      <Text dimColor wrap={wrapMode}>{separator}</Text>
+      <Text bold wrap="truncate-end">{header}</Text>
+      <Text dimColor wrap="truncate-end">{separator}</Text>
       {visible.map((line, index) => (
-        <Text key={`cmd-table-row-${start + index}`} wrap={wrapMode}>{line}</Text>
+        <Text key={`cmd-table-row-${start + index}`} wrap="truncate-end">{line}</Text>
       ))}
       {Array.from({ length: padCount }, (_, index) => (
         <Text key={`cmd-table-pad-${index}`}> </Text>

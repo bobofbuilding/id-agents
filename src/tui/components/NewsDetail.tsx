@@ -1,7 +1,6 @@
 import React from 'react';
 import { Box, Text } from 'ink';
 import type { NewsItem } from '../api/types.js';
-import { fixedWindowWrapMode, type TextWrapMode } from '../util/wrap.js';
 
 interface NewsDetailProps {
   agentName: string | null;
@@ -9,15 +8,13 @@ interface NewsDetailProps {
   positionLabel: string;
   windowSize: number;
   scrollOffset: number;
-  contentWidth: number;
-  wrapMode: TextWrapMode;
 }
 
 export function NewsDetail(props: NewsDetailProps): React.ReactElement {
-  const { agentName, item, positionLabel, windowSize, scrollOffset, contentWidth, wrapMode } = props;
+  const { agentName, item, positionLabel, windowSize, scrollOffset } = props;
 
   const lines = item
-    ? buildBodyLines(item, contentWidth)
+    ? buildBodyLines(item)
     : ['(no news item selected)'];
   const total = lines.length;
   const start = clamp(scrollOffset, 0, Math.max(0, total - windowSize));
@@ -33,19 +30,19 @@ export function NewsDetail(props: NewsDetailProps): React.ReactElement {
         <Text dimColor>{positionLabel}</Text>
       </Box>
       <Text dimColor>{hiddenAbove > 0 ? `↑ ${hiddenAbove} more above` : ' '}</Text>
-      <Body visible={visible} windowSize={windowSize} wrapMode={wrapMode} />
+      <Body visible={visible} windowSize={windowSize} />
       <Text dimColor>{hiddenBelow > 0 ? `↓ ${hiddenBelow} more below` : ' '}</Text>
     </Box>
   );
 }
 
-function Body(props: { visible: string[]; windowSize: number; wrapMode: TextWrapMode }): React.ReactElement {
-  const { visible, windowSize, wrapMode } = props;
+function Body(props: { visible: string[]; windowSize: number }): React.ReactElement {
+  const { visible, windowSize } = props;
   const padCount = Math.max(0, windowSize - visible.length);
   return (
     <>
       {visible.map((line, i) => (
-        <Text key={`line-${i}`} wrap={fixedWindowWrapMode()}>{line || ' '}</Text>
+        <Text key={`line-${i}`} wrap="truncate-end">{line || ' '}</Text>
       ))}
       {Array.from({ length: padCount }, (_, i) => (
         <Text key={`pad-${i}`}> </Text>
@@ -54,14 +51,14 @@ function Body(props: { visible: string[]; windowSize: number; wrapMode: TextWrap
   );
 }
 
-function buildBodyLines(item: NewsItem, width: number): string[] {
+function buildBodyLines(item: NewsItem): string[] {
   const out: string[] = [];
   const header = `${formatTime(item.timestamp)}   ${item.type}`;
   out.push(header);
   out.push('');
   out.push('── message ──');
   const message = rewriteRemote(oneLine(item.message ?? '(no message)'));
-  out.push(...wrap(message, width));
+  out.push(message);
   if (item.data !== undefined && item.data !== null) {
     out.push('');
     out.push('── data ──');
@@ -72,21 +69,9 @@ function buildBodyLines(item: NewsItem, width: number): string[] {
       pretty = String(item.data);
     }
     for (const line of pretty.split('\n')) {
-      out.push(...wrap(line, width));
+      out.push(line);
     }
   }
-  return out;
-}
-
-function wrap(s: string, width: number): string[] {
-  if (width <= 0) return [s];
-  const out: string[] = [];
-  let remaining = s;
-  while (remaining.length > width) {
-    out.push(remaining.slice(0, width));
-    remaining = remaining.slice(width);
-  }
-  out.push(remaining);
   return out;
 }
 

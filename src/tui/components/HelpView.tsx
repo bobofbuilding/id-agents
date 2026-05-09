@@ -1,12 +1,10 @@
 import React from 'react';
 import { Box, Text } from 'ink';
 import { catalogEntriesByTier, type RiskTier } from '../commands/registry.js';
-import { fixedWindowWrapMode, type TextWrapMode } from '../util/wrap.js';
 
 interface HelpViewProps {
   windowSize: number;
   scrollOffset: number;
-  wrapMode: TextWrapMode;
 }
 
 // Outer border (2) + header (1) + spacer (1) = 4 rows that don't belong to the
@@ -31,13 +29,11 @@ const NAVIGATE_BINDINGS: Array<[string, string]> = [
   ['PgUp/Dn', 'Move page'],
   ['→', 'Open detail'],
   ['← Esc', 'Back'],
-  ['w', 'Wrap detail'],
   ['Tab', 'Cycle team'],
 ];
 
 const GLOBAL_BINDINGS: Array<[string, string]> = [
   ['?', 'Toggle help'],
-  ['w', 'Toggle wrap'],
   ['q', 'Quit'],
   ['^C', 'Force quit'],
 ];
@@ -90,7 +86,7 @@ function buildRows(): Row[] {
 
 const NAME_COL_WIDTH = 16;
 
-function renderRow(row: Row, key: string, wrapMode: TextWrapMode): React.ReactElement {
+function renderRow(row: Row, key: string): React.ReactElement {
   if (row.kind === 'spacer') return <Text key={key}> </Text>;
   if (row.kind === 'section') {
     return (
@@ -106,7 +102,7 @@ function renderRow(row: Row, key: string, wrapMode: TextWrapMode): React.ReactEl
         <Box width={NAME_COL_WIDTH}>
           <Text color="yellow">{`  ${row.key}`}</Text>
         </Box>
-        <Text wrap={fixedWindowWrapMode()}>{row.description}</Text>
+        <Text wrap="truncate-end">{row.description}</Text>
       </Box>
     );
   }
@@ -115,7 +111,7 @@ function renderRow(row: Row, key: string, wrapMode: TextWrapMode): React.ReactEl
       <Box width={NAME_COL_WIDTH}>
         <Text color={TIER_COLOR[row.tier]}>{`  /${row.name}`}</Text>
       </Box>
-      <Text wrap={fixedWindowWrapMode()}>{row.description}</Text>
+      <Text wrap="truncate-end">{row.description}</Text>
     </Box>
   );
 }
@@ -142,7 +138,7 @@ export function HelpViewImpl(props: HelpViewProps): React.ReactElement {
         </Text>
       </Box>
       <Text dimColor> </Text>
-      {visible.map((row, i) => renderRow(row, `help-row-${start + i}`, props.wrapMode))}
+      {visible.map((row, i) => renderRow(row, `help-row-${start + i}`))}
       {Array.from({ length: padCount }, (_, i) => (
         <Text key={`help-pad-${i}`}> </Text>
       ))}

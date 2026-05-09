@@ -3,7 +3,6 @@ import { Box, Text } from 'ink';
 import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { formatInterval } from '../util/schedule.js';
-import { fixedWindowWrapMode, wrapLinesForViewport, type TextWrapMode } from '../util/wrap.js';
 
 interface HeartbeatDetailProps {
   agentName: string;
@@ -14,8 +13,6 @@ interface HeartbeatDetailProps {
   positionLabel: string;
   windowSize: number;
   scrollOffset: number;
-  contentWidth: number;
-  wrapMode: TextWrapMode;
 }
 
 interface FileRead {
@@ -35,13 +32,11 @@ export function HeartbeatDetail(props: HeartbeatDetailProps): React.ReactElement
     positionLabel,
     windowSize,
     scrollOffset,
-    contentWidth,
-    wrapMode,
   } = props;
 
   const file: FileRead = useMemo(
-    () => readHeartbeatFile(workingDirectory, contentWidth),
-    [workingDirectory, contentWidth],
+    () => readHeartbeatFile(workingDirectory),
+    [workingDirectory],
   );
 
   const header = useMemo(
@@ -63,7 +58,7 @@ export function HeartbeatDetail(props: HeartbeatDetailProps): React.ReactElement
       ? [`Failed to read HEARTBEAT.md: ${file.error}`]
       : file.lines;
 
-  const lines = wrapLinesForViewport([...header, '', '── HEARTBEAT.md ──', ...body], contentWidth, wrapMode);
+  const lines = [...header, '', '── HEARTBEAT.md ──', ...body];
   const total = lines.length;
   const start = clamp(scrollOffset, 0, Math.max(0, total - windowSize));
   const end = Math.min(total, start + windowSize);
@@ -80,19 +75,19 @@ export function HeartbeatDetail(props: HeartbeatDetailProps): React.ReactElement
         <Text dimColor>{positionLabel}</Text>
       </Box>
       <Text dimColor>{hiddenAbove > 0 ? `↑ ${hiddenAbove} more above` : ' '}</Text>
-      <Body visible={visible} windowSize={windowSize} wrapMode={wrapMode} />
+      <Body visible={visible} windowSize={windowSize} />
       <Text dimColor>{hiddenBelow > 0 ? `↓ ${hiddenBelow} more below` : ' '}</Text>
     </Box>
   );
 }
 
-function Body(props: { visible: string[]; windowSize: number; wrapMode: TextWrapMode }): React.ReactElement {
-  const { visible, windowSize, wrapMode } = props;
+function Body(props: { visible: string[]; windowSize: number }): React.ReactElement {
+  const { visible, windowSize } = props;
   const padCount = Math.max(0, windowSize - visible.length);
   return (
     <>
       {visible.map((line, i) => (
-        <Text key={`line-${i}`} wrap={fixedWindowWrapMode()}>{line || ' '}</Text>
+        <Text key={`line-${i}`} wrap="truncate-end">{line || ' '}</Text>
       ))}
       {Array.from({ length: padCount }, (_, i) => (
         <Text key={`pad-${i}`}> </Text>
@@ -120,7 +115,7 @@ function buildHeader(args: {
   return out;
 }
 
-function readHeartbeatFile(workingDirectory: string | null, width: number): FileRead {
+function readHeartbeatFile(workingDirectory: string | null): FileRead {
   if (!workingDirectory) {
     return { lines: [], missing: true, error: null, path: null };
   }
@@ -141,7 +136,7 @@ function readHeartbeatFile(workingDirectory: string | null, width: number): File
         out.push('');
         continue;
       }
-      out.push(...wrap(line, width));
+      out.push(line);
     }
     return { lines: out, missing: false, error: null, path };
   } catch (err) {
@@ -152,18 +147,6 @@ function readHeartbeatFile(workingDirectory: string | null, width: number): File
       path,
     };
   }
-}
-
-function wrap(s: string, width: number): string[] {
-  if (width <= 0) return [s];
-  const out: string[] = [];
-  let remaining = s;
-  while (remaining.length > width) {
-    out.push(remaining.slice(0, width));
-    remaining = remaining.slice(width);
-  }
-  out.push(remaining);
-  return out;
 }
 
 function formatSec(sec: number): string {

@@ -2,7 +2,6 @@ import React from 'react';
 import { Box, Text } from 'ink';
 import { padRight } from '../util/format.js';
 import { formatBytes, type OutputFileRow } from '../util/output-files.js';
-import { fixedWindowWrapMode, type TextWrapMode } from '../util/wrap.js';
 
 interface OutputListProps {
   agentName: string | null;
@@ -10,7 +9,6 @@ interface OutputListProps {
   selectedIndex: number;
   windowStart: number;
   windowSize: number;
-  wrapMode: TextWrapMode;
   error: string | null;
 }
 
@@ -24,7 +22,7 @@ const COLS = {
 const GAP = '  ';
 
 export function OutputList(props: OutputListProps): React.ReactElement {
-  const { agentName, entries, selectedIndex, windowStart, windowSize, wrapMode, error } = props;
+  const { agentName, entries, selectedIndex, windowStart, windowSize, error } = props;
   const total = entries.length;
   const windowEnd = Math.min(total, windowStart + windowSize);
   const visible = entries.slice(windowStart, windowEnd);
@@ -38,13 +36,13 @@ export function OutputList(props: OutputListProps): React.ReactElement {
         <Text bold>Output · {agentName ?? '(none)'} ({total})</Text>
         <Text dimColor>{agentName ? `${agentName}/output/` : 'output/'}</Text>
       </Box>
-      <Header wrapMode={wrapMode} />
+      <Header />
       <Text dimColor>{hiddenAbove > 0 ? `↑ ${hiddenAbove} more above` : ' '}</Text>
       {visible.length === 0 ? (
         <Text color={error ? 'red' : undefined} dimColor={!error}>{emptyLine}</Text>
       ) : (
         visible.map((row, i) => (
-          <Row key={row.name} row={row} selected={windowStart + i === selectedIndex} wrapMode={wrapMode} />
+          <Row key={row.name} row={row} selected={windowStart + i === selectedIndex} />
         ))
       )}
       {Array.from(
@@ -58,9 +56,9 @@ export function OutputList(props: OutputListProps): React.ReactElement {
   );
 }
 
-function Header(props: { wrapMode: TextWrapMode }): React.ReactElement {
+function Header(): React.ReactElement {
   return (
-    <Text bold dimColor wrap={fixedWindowWrapMode()}>
+    <Text bold dimColor wrap="truncate-end">
       {padRight('', COLS.marker)}
       {padRight('FILE', COLS.file)}
       {GAP}
@@ -71,11 +69,11 @@ function Header(props: { wrapMode: TextWrapMode }): React.ReactElement {
   );
 }
 
-function Row(props: { row: OutputFileRow; selected: boolean; wrapMode: TextWrapMode }): React.ReactElement {
+function Row(props: { row: OutputFileRow; selected: boolean }): React.ReactElement {
   const { row, selected } = props;
   const marker = selected ? '▶ ' : '  ';
   return (
-    <Text inverse={selected} wrap={fixedWindowWrapMode()}>
+    <Text inverse={selected} wrap="truncate-end">
       {marker}
       {padRight(row.name, COLS.file)}
       {GAP}

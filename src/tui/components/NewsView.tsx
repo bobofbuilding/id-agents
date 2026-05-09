@@ -3,7 +3,6 @@ import { Box, Text } from 'ink';
 import type { NewsItem } from '../api/types.js';
 import { padRight, truncate } from '../util/format.js';
 import { newsAgeColor } from '../util/colors.js';
-import { fixedWindowWrapMode, type TextWrapMode } from '../util/wrap.js';
 
 interface NewsViewProps {
   agentName: string | null;
@@ -15,7 +14,6 @@ interface NewsViewProps {
   selectedIndex: number;
   messageWidth: number;
   cooldownEpoch: number;
-  wrapMode: TextWrapMode;
 }
 
 const TIME_COL = 8;
@@ -33,7 +31,6 @@ export function NewsView(props: NewsViewProps): React.ReactElement {
     selectedIndex,
     messageWidth,
     cooldownEpoch,
-    wrapMode,
   } = props;
 
   const total = items.length;
@@ -58,7 +55,6 @@ export function NewsView(props: NewsViewProps): React.ReactElement {
         messageWidth={messageWidth}
         windowSize={windowSize}
         cooldownEpoch={cooldownEpoch}
-        wrapMode={wrapMode}
       />
       <Text dimColor>
         {total - windowEnd > 0 ? `↓ ${total - windowEnd} more below` : ' '}
@@ -78,7 +74,6 @@ interface BodyProps {
   messageWidth: number;
   windowSize: number;
   cooldownEpoch: number;
-  wrapMode: TextWrapMode;
 }
 
 function Body(props: BodyProps): React.ReactElement {
@@ -93,7 +88,6 @@ function Body(props: BodyProps): React.ReactElement {
     messageWidth,
     windowSize,
     cooldownEpoch,
-    wrapMode,
   } = props;
 
   const lines: React.ReactElement[] = [];
@@ -130,12 +124,12 @@ function Body(props: BodyProps): React.ReactElement {
       const ageColor = newsAgeColor(item.timestamp, cooldownEpoch);
       const tColor = typeColor(item.type);
       const party = extractParty(item);
-      const message = rewriteMessage(item.message ?? '', messageWidth, wrapMode);
+      const message = rewriteMessage(item.message ?? '', messageWidth);
       // Selection inverse wraps the marker and the right-hand content, but
       // NOT the age square — the square stays on a default background so
       // its color reads cleanly against the selection bar.
       lines.push(
-        <Text key={`${item.timestamp}-${i}`} wrap={fixedWindowWrapMode()}>
+        <Text key={`${item.timestamp}-${i}`} wrap="truncate-end">
           <Text inverse={selected}>{selected ? '▶ ' : '  '}</Text>
           <Text color={ageColor}>■</Text>
           <Text inverse={selected}>
@@ -202,9 +196,9 @@ function extractParty(item: NewsItem): string {
 // The agent news log uses "remote" as the protocol-level name for the
 // admin channel (the manager agent driving this TUI). Rewrite to "manager"
 // client-side so the UI reads clearly; underlying data stays unchanged.
-function rewriteMessage(msg: string, width: number, wrapMode: TextWrapMode): string {
+function rewriteMessage(msg: string, width: number): string {
   const rewritten = oneLine(msg).replace(/\bremote\b/g, 'manager');
-  return wrapMode === 'wrap' ? rewritten : truncate(rewritten, width);
+  return truncate(rewritten, width);
 }
 
 function typeColor(type: string): string {

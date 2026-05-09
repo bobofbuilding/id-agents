@@ -2,14 +2,12 @@ import React from 'react';
 import { Box, Text } from 'ink';
 import { padRight } from '../util/format.js';
 import type { ConfigFileRow } from '../util/configs.js';
-import { fixedWindowWrapMode, type TextWrapMode } from '../util/wrap.js';
 
 interface ConfigsListProps {
   entries: ConfigFileRow[];
   selectedIndex: number;
   windowStart: number;
   windowSize: number;
-  wrapMode: TextWrapMode;
 }
 
 const COLS = {
@@ -21,7 +19,7 @@ const COLS = {
 const FILE_MODIFIED_GAP = '  ';
 
 export function ConfigsList(props: ConfigsListProps): React.ReactElement {
-  const { entries, selectedIndex, windowStart, windowSize, wrapMode } = props;
+  const { entries, selectedIndex, windowStart, windowSize } = props;
   const total = entries.length;
   const windowEnd = Math.min(total, windowStart + windowSize);
   const visible = entries.slice(windowStart, windowEnd);
@@ -34,13 +32,13 @@ export function ConfigsList(props: ConfigsListProps): React.ReactElement {
         <Text bold>Configs ({total})</Text>
         <Text dimColor>configs/*.yaml</Text>
       </Box>
-      <Header wrapMode={wrapMode} />
+      <Header />
       <Text dimColor>{hiddenAbove > 0 ? `↑ ${hiddenAbove} more above` : ' '}</Text>
       {visible.length === 0 ? (
         <Text dimColor>no YAML config files found in configs/</Text>
       ) : (
         visible.map((row, i) => (
-          <Row key={row.relativePath} row={row} selected={windowStart + i === selectedIndex} wrapMode={wrapMode} />
+          <Row key={row.relativePath} row={row} selected={windowStart + i === selectedIndex} />
         ))
       )}
       {Array.from(
@@ -54,9 +52,9 @@ export function ConfigsList(props: ConfigsListProps): React.ReactElement {
   );
 }
 
-function Header(props: { wrapMode: TextWrapMode }): React.ReactElement {
+function Header(): React.ReactElement {
   return (
-    <Text bold dimColor wrap={fixedWindowWrapMode()}>
+    <Text bold dimColor wrap="truncate-end">
       {padRight('', COLS.marker)}
       {padRight('FILE', COLS.file)}
       {FILE_MODIFIED_GAP}
@@ -65,11 +63,11 @@ function Header(props: { wrapMode: TextWrapMode }): React.ReactElement {
   );
 }
 
-function Row(props: { row: ConfigFileRow; selected: boolean; wrapMode: TextWrapMode }): React.ReactElement {
+function Row(props: { row: ConfigFileRow; selected: boolean }): React.ReactElement {
   const { row, selected } = props;
   const marker = selected ? '▶ ' : '  ';
   return (
-    <Text inverse={selected} wrap={fixedWindowWrapMode()}>
+    <Text inverse={selected} wrap="truncate-end">
       {marker}
       {padRight(row.relativePath, COLS.file)}
       {FILE_MODIFIED_GAP}
