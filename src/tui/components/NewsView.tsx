@@ -3,7 +3,7 @@ import { Box, Text } from 'ink';
 import type { NewsItem } from '../api/types.js';
 import { padRight, truncate } from '../util/format.js';
 import { newsAgeColor } from '../util/colors.js';
-import type { TextWrapMode } from '../util/wrap.js';
+import { fixedWindowWrapMode, type TextWrapMode } from '../util/wrap.js';
 
 interface NewsViewProps {
   agentName: string | null;
@@ -135,7 +135,7 @@ function Body(props: BodyProps): React.ReactElement {
       // NOT the age square — the square stays on a default background so
       // its color reads cleanly against the selection bar.
       lines.push(
-        <Text key={`${item.timestamp}-${i}`} wrap={wrapMode}>
+        <Text key={`${item.timestamp}-${i}`} wrap={fixedWindowWrapMode()}>
           <Text inverse={selected}>{selected ? '▶ ' : '  '}</Text>
           <Text color={ageColor}>■</Text>
           <Text inverse={selected}>

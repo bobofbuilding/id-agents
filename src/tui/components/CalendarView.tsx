@@ -3,7 +3,7 @@ import { Box, Text } from 'ink';
 import type { Schedule } from '../api/types.js';
 import { padRight, truncate } from '../util/format.js';
 import { cadenceLabel, formatNextFire, nextFireSec } from '../util/schedule.js';
-import type { TextWrapMode } from '../util/wrap.js';
+import { fixedWindowWrapMode, type TextWrapMode } from '../util/wrap.js';
 
 interface CalendarRow {
   schedule: Schedule;
@@ -95,7 +95,7 @@ export function CalendarView(props: CalendarViewProps): React.ReactElement {
 
 function Header(props: { wrapMode: TextWrapMode }): React.ReactElement {
   return (
-    <Text bold dimColor wrap={props.wrapMode}>
+    <Text bold dimColor wrap={fixedWindowWrapMode()}>
       {padRight('', COLS.marker)}
       {padRight('TIME', COLS.time)}
       {padRight('AGENT', COLS.agent)}
@@ -112,7 +112,7 @@ interface RowInnerProps {
   wrapMode: TextWrapMode;
 }
 
-function RowInner({ row, nowSec, selected, wrapMode }: RowInnerProps): React.ReactElement {
+function RowInner({ row, nowSec, selected }: RowInnerProps): React.ReactElement {
   const { schedule, nextFire } = row;
   const marker = selected ? '▶ ' : '  ';
   const timeCell =
@@ -122,7 +122,7 @@ function RowInner({ row, nowSec, selected, wrapMode }: RowInnerProps): React.Rea
   const cadence = padRight(cadenceLabel(schedule), COLS.cadence);
   const kindColor = schedule.kind === 'heartbeat' ? 'cyan' : 'magenta';
   return (
-    <Text inverse={selected} wrap={wrapMode}>
+    <Text inverse={selected} wrap={fixedWindowWrapMode()}>
       {marker}
       <Text color={schedule.active ? 'white' : 'gray'}>{timeCell}</Text>
       {agent}

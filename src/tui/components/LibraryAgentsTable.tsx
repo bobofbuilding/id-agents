@@ -2,7 +2,7 @@ import React from 'react';
 import { Box, Text } from 'ink';
 import { padRight } from '../util/format.js';
 import type { LibraryAgentRow } from '../api/manager.js';
-import type { TextWrapMode } from '../util/wrap.js';
+import { fixedWindowWrapMode, type TextWrapMode } from '../util/wrap.js';
 
 interface LibraryAgentsTableProps {
   entries: LibraryAgentRow[];
@@ -84,7 +84,7 @@ export function LibraryAgentsTable(props: LibraryAgentsTableProps): React.ReactE
 
 function Header(props: { wrapMode: TextWrapMode }): React.ReactElement {
   return (
-    <Text bold dimColor wrap={props.wrapMode}>
+    <Text bold dimColor wrap={fixedWindowWrapMode()}>
       {padRight('', COLS.marker)}
       {padRight('NAME', COLS.name)}
       {NAME_SHAPE_GAP}
@@ -94,10 +94,10 @@ function Header(props: { wrapMode: TextWrapMode }): React.ReactElement {
 }
 
 function Row(props: { row: LibraryAgentRow; selected: boolean; wrapMode: TextWrapMode }): React.ReactElement {
-  const { row, selected, wrapMode } = props;
+  const { row, selected } = props;
   const marker = selected ? '▶ ' : '  ';
   return (
-    <Text inverse={selected} wrap={wrapMode}>
+    <Text inverse={selected} wrap={fixedWindowWrapMode()}>
       {marker}
       {padRight(row.name, COLS.name)}
       {NAME_SHAPE_GAP}

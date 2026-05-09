@@ -1,7 +1,7 @@
 import React from 'react';
 import { Box, Text } from 'ink';
 import type { LibraryAgentDetailResponse } from '../api/manager.js';
-import type { TextWrapMode } from '../util/wrap.js';
+import { fixedWindowWrapMode, wrapLinesForViewport, type TextWrapMode } from '../util/wrap.js';
 
 interface LibraryAgentDetailProps {
   agent: LibraryAgentDetailResponse | null;
@@ -20,7 +20,7 @@ const README_PREVIEW_LINES = 18;
 export function LibraryAgentDetail(props: LibraryAgentDetailProps): React.ReactElement {
   const { agent, agentName, loading, error, positionLabel, windowSize, scrollOffset, contentWidth, wrapMode } = props;
 
-  const lines = buildBodyLines(agent, contentWidth, loading, error);
+  const lines = wrapLinesForViewport(buildBodyLines(agent, contentWidth, loading, error), contentWidth, wrapMode);
   const total = lines.length;
   const start = clamp(scrollOffset, 0, Math.max(0, total - windowSize));
   const end = Math.min(total, start + windowSize);
@@ -50,7 +50,7 @@ function Body(props: { visible: string[]; windowSize: number; wrapMode: TextWrap
   return (
     <>
       {visible.map((line, i) => (
-        <Text key={`line-${i}`} wrap={wrapMode}>{line || ' '}</Text>
+        <Text key={`line-${i}`} wrap={fixedWindowWrapMode()}>{line || ' '}</Text>
       ))}
       {Array.from({ length: padCount }, (_, i) => (
         <Text key={`pad-${i}`}> </Text>

@@ -3,7 +3,7 @@ import { Box, Text } from 'ink';
 import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { formatInterval } from '../util/schedule.js';
-import type { TextWrapMode } from '../util/wrap.js';
+import { fixedWindowWrapMode, wrapLinesForViewport, type TextWrapMode } from '../util/wrap.js';
 
 interface HeartbeatDetailProps {
   agentName: string;
@@ -63,7 +63,7 @@ export function HeartbeatDetail(props: HeartbeatDetailProps): React.ReactElement
       ? [`Failed to read HEARTBEAT.md: ${file.error}`]
       : file.lines;
 
-  const lines = [...header, '', '── HEARTBEAT.md ──', ...body];
+  const lines = wrapLinesForViewport([...header, '', '── HEARTBEAT.md ──', ...body], contentWidth, wrapMode);
   const total = lines.length;
   const start = clamp(scrollOffset, 0, Math.max(0, total - windowSize));
   const end = Math.min(total, start + windowSize);
@@ -92,7 +92,7 @@ function Body(props: { visible: string[]; windowSize: number; wrapMode: TextWrap
   return (
     <>
       {visible.map((line, i) => (
-        <Text key={`line-${i}`} wrap={wrapMode}>{line || ' '}</Text>
+        <Text key={`line-${i}`} wrap={fixedWindowWrapMode()}>{line || ' '}</Text>
       ))}
       {Array.from({ length: padCount }, (_, i) => (
         <Text key={`pad-${i}`}> </Text>

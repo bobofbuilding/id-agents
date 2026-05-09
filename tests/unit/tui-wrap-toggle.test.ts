@@ -4,9 +4,12 @@
  */
 
 import React from 'react';
-import { Text } from 'ink';
+import { Box, Text, render as inkRender } from 'ink';
+import { Writable, PassThrough } from 'node:stream';
 import { describe, expect, it } from 'vitest';
 import { AgentsTable } from '../../src/tui/components/AgentsTable.js';
+import { ConfigDetail } from '../../src/tui/components/ConfigDetail.js';
+import { ConfigsList } from '../../src/tui/components/ConfigsList.js';
 import { Footer } from '../../src/tui/components/Footer.js';
 import { HelpViewImpl } from '../../src/tui/components/HelpView.js';
 import { NewsView } from '../../src/tui/components/NewsView.js';
@@ -127,17 +130,110 @@ describe('TUI wrap toggle', () => {
   });
 
   it('renders HelpView wrap state and documents the global w binding', () => {
-    const off = HelpViewImpl({ windowSize: 3, scrollOffset: 0, wrapMode: textWrapMode(false) });
-    const on = HelpViewImpl({ windowSize: 3, scrollOffset: 0, wrapMode: textWrapMode(true) });
+    const off = HelpViewImpl({ windowSize: 60, scrollOffset: 0, wrapMode: textWrapMode(false) });
+    const on = HelpViewImpl({ windowSize: 60, scrollOffset: 0, wrapMode: textWrapMode(true) });
 
-    const keybindGroups = collectProps(off, (props) => Array.isArray((props.group as { rows?: unknown })?.rows));
-    expect(JSON.stringify(keybindGroups)).toContain('Toggle wrap');
+    expect(textContent(off)).toContain('Toggle wrap');
     expect(collectProps(off, (props) => props.wrap === 'truncate-end' && props.children != null).length).toBeGreaterThan(0);
-    expect(collectProps(on, (props) => props.wrap === 'wrap' && props.children != null).length).toBeGreaterThan(0);
+    expect(collectProps(on, (props) => props.wrap === 'wrap' && props.children != null).length).toBe(0);
   });
 
   it('renders the footer indicator for the current global wrap state', () => {
     expect(textContent(Footer({ view: 'agents', wrapEnabled: false }))).toContain('w wrap off');
     expect(textContent(Footer({ view: 'news', wrapEnabled: true }))).toContain('w wrap on');
   });
+
+  it('keeps a fixed-height list frame single-line when wrap is enabled', async () => {
+    const frame = await renderInkFrame(
+      React.createElement(
+        Box,
+        { flexDirection: 'column' },
+        React.createElement(ConfigsList, {
+          entries: [
+            {
+              name: 'long',
+              relativePath: 'configs/agents/frontend-react/skills/systematic-debugging/extremely-long-file-name-that-wraps.yaml',
+              absolutePath: '/tmp/long.yaml',
+              mtimeMs: 1_700_000_000_000,
+            },
+            {
+              name: 'short',
+              relativePath: 'short.yaml',
+              absolutePath: '/tmp/short.yaml',
+              mtimeMs: 1_700_000_000_000,
+            },
+          ],
+          selectedIndex: 0,
+          windowStart: 0,
+          windowSize: 4,
+          wrapMode: 'wrap',
+        }),
+        React.createElement(Text, null, 'FOOTER_SENTINEL'),
+      ),
+      50,
+    );
+
+    expect(visibleLines(frame)).toHaveLength(11);
+    expect(frame).toContain('short.yaml');
+    expect(frame).toContain('FOOTER_SENTINEL');
+  });
+
+  it('wraps detail text into scrollable visual lines before padding', async () => {
+    const frame = await renderInkFrame(
+      React.createElement(
+        Box,
+        { flexDirection: 'column' },
+        React.createElement(ConfigDetail, {
+          config: {
+            name: 'demo',
+            relativePath: 'demo.yaml',
+            absolutePath: '/tmp/demo.yaml',
+            mtimeMs: 1_700_000_000_000,
+          },
+          contents: 'alpha beta gamma delta epsilon zeta eta theta iota kappa',
+          error: null,
+          positionLabel: 'config 1 of 1',
+          windowSize: 4,
+          scrollOffset: 0,
+          contentWidth: 20,
+          wrapMode: 'wrap',
+        }),
+        React.createElement(Text, null, 'FOOTER_SENTINEL'),
+      ),
+      50,
+    );
+
+    expect(visibleLines(frame)).toHaveLength(10);
+    expect(frame).toContain('alpha beta gamma');
+    expect(frame).toContain('ta epsilon zeta eta');
+    expect(frame).toContain('FOOTER_SENTINEL');
+  });
 });
+
+async function renderInkFrame(node: React.ReactElement, columns: number): Promise<string> {
+  let output = '';
+  const stdout = new Writable({
+    write(chunk, _encoding, callback) {
+      output += chunk.toString('utf8');
+      callback();
+    },
+  }) as Writable & { columns: number; rows: number; isTTY: boolean };
+  stdout.columns = columns;
+  stdout.rows = 12;
+  stdout.isTTY = true;
+  const stdin = new PassThrough();
+  const stderr = new PassThrough();
+  const instance = inkRender(node, { stdout, stdin, stderr, debug: true, patchConsole: false });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const frame = stripAnsi(output);
+  instance.unmount();
+  return frame;
+}
+
+function visibleLines(frame: string): string[] {
+  return frame.split('\n').filter((line) => line.length > 0);
+}
+
+function stripAnsi(value: string): string {
+  return value.replace(/\x1b\[[0-9?;]*[A-Za-z]/g, '');
+}

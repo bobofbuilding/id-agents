@@ -3,7 +3,7 @@ import { Box, Text } from 'ink';
 import type { Schedule } from '../api/types.js';
 import { padRight, truncate } from '../util/format.js';
 import { formatInterval } from '../util/schedule.js';
-import type { TextWrapMode } from '../util/wrap.js';
+import { fixedWindowWrapMode, type TextWrapMode } from '../util/wrap.js';
 
 export interface HeartbeatRow {
   agent: string;
@@ -84,7 +84,7 @@ export function HeartbeatsView(props: HeartbeatsViewProps): React.ReactElement {
 
 function Header(props: { wrapMode: TextWrapMode }): React.ReactElement {
   return (
-    <Text bold dimColor wrap={props.wrapMode}>
+    <Text bold dimColor wrap={fixedWindowWrapMode()}>
       {padRight('', COLS.marker)}
       {padRight('AGENT', COLS.agent)}
       {padRight('INTERVAL', COLS.interval)}
@@ -101,7 +101,7 @@ interface RowInnerProps {
   wrapMode: TextWrapMode;
 }
 
-function RowInner({ row, nowSec, selected, wrapMode }: RowInnerProps): React.ReactElement {
+function RowInner({ row, nowSec, selected }: RowInnerProps): React.ReactElement {
   const marker = selected ? '▶ ' : '  ';
   const agent = padRight(truncate(row.agent, COLS.agent - 1), COLS.agent);
   const interval = padRight(formatInterval(row.intervalSec), COLS.interval);
@@ -112,7 +112,7 @@ function RowInner({ row, nowSec, selected, wrapMode }: RowInnerProps): React.Rea
   const next = padRight(bucketedCountdown(row.nextFireSec - nowSec), COLS.next);
   const activeColor = row.schedule.active ? 'white' : 'gray';
   return (
-    <Text inverse={selected} wrap={wrapMode}>
+    <Text inverse={selected} wrap={fixedWindowWrapMode()}>
       {marker}
       <Text color={activeColor}>{agent}</Text>
       {interval}

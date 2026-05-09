@@ -1,7 +1,7 @@
 import React from 'react';
 import { Box, Text } from 'ink';
 import type { NewsItem } from '../api/types.js';
-import type { TextWrapMode } from '../util/wrap.js';
+import { fixedWindowWrapMode, type TextWrapMode } from '../util/wrap.js';
 
 interface NewsDetailProps {
   agentName: string | null;
@@ -45,7 +45,7 @@ function Body(props: { visible: string[]; windowSize: number; wrapMode: TextWrap
   return (
     <>
       {visible.map((line, i) => (
-        <Text key={`line-${i}`} wrap={wrapMode}>{line || ' '}</Text>
+        <Text key={`line-${i}`} wrap={fixedWindowWrapMode()}>{line || ' '}</Text>
       ))}
       {Array.from({ length: padCount }, (_, i) => (
         <Text key={`pad-${i}`}> </Text>

@@ -1948,6 +1948,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           }
           windowSize={detailWindowSize}
           scrollOffset={configDetailScroll}
+          contentWidth={DETAIL_CONTENT_WIDTH}
           wrapMode={wrapMode}
         />
       ) : view === 'output-list' ? (
@@ -1973,6 +1974,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           }
           windowSize={detailWindowSize}
           scrollOffset={outputDetailScroll}
+          contentWidth={DETAIL_CONTENT_WIDTH}
           wrapMode={wrapMode}
         />
       ) : view === 'tasks' ? (

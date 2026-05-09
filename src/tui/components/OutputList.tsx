@@ -2,7 +2,7 @@ import React from 'react';
 import { Box, Text } from 'ink';
 import { padRight } from '../util/format.js';
 import { formatBytes, type OutputFileRow } from '../util/output-files.js';
-import type { TextWrapMode } from '../util/wrap.js';
+import { fixedWindowWrapMode, type TextWrapMode } from '../util/wrap.js';
 
 interface OutputListProps {
   agentName: string | null;
@@ -60,7 +60,7 @@ export function OutputList(props: OutputListProps): React.ReactElement {
 
 function Header(props: { wrapMode: TextWrapMode }): React.ReactElement {
   return (
-    <Text bold dimColor wrap={props.wrapMode}>
+    <Text bold dimColor wrap={fixedWindowWrapMode()}>
       {padRight('', COLS.marker)}
       {padRight('FILE', COLS.file)}
       {GAP}
@@ -72,10 +72,10 @@ function Header(props: { wrapMode: TextWrapMode }): React.ReactElement {
 }
 
 function Row(props: { row: OutputFileRow; selected: boolean; wrapMode: TextWrapMode }): React.ReactElement {
-  const { row, selected, wrapMode } = props;
+  const { row, selected } = props;
   const marker = selected ? '▶ ' : '  ';
   return (
-    <Text inverse={selected} wrap={wrapMode}>
+    <Text inverse={selected} wrap={fixedWindowWrapMode()}>
       {marker}
       {padRight(row.name, COLS.file)}
       {GAP}

@@ -1,6 +1,6 @@
 import React from 'react';
 import { Box, Text } from 'ink';
-import type { TextWrapMode } from '../util/wrap.js';
+import { fixedWindowWrapMode, type TextWrapMode } from '../util/wrap.js';
 
 const TRUNCATE_MAX_WIDTH = 40;
 const MIN_COLUMN_WIDTH = 3;
@@ -80,7 +80,7 @@ function renderLine(values: string[], widths: number[], wrapMode: TextWrapMode):
 }
 
 export function CommandResultTable(props: CommandResultTableProps): React.ReactElement {
-  const wrapMode = props.wrapMode ?? 'truncate-end';
+  const wrapMode = fixedWindowWrapMode();
   if (props.rows.length === 0) {
     return <Text dimColor>(no rows)</Text>;
   }

@@ -1,7 +1,7 @@
 import React from 'react';
 import { Box, Text } from 'ink';
 import { catalogEntriesByTier, type RiskTier } from '../commands/registry.js';
-import type { TextWrapMode } from '../util/wrap.js';
+import { fixedWindowWrapMode, type TextWrapMode } from '../util/wrap.js';
 
 interface HelpViewProps {
   windowSize: number;
@@ -106,7 +106,7 @@ function renderRow(row: Row, key: string, wrapMode: TextWrapMode): React.ReactEl
         <Box width={NAME_COL_WIDTH}>
           <Text color="yellow">{`  ${row.key}`}</Text>
         </Box>
-        <Text wrap={wrapMode}>{row.description}</Text>
+        <Text wrap={fixedWindowWrapMode()}>{row.description}</Text>
       </Box>
     );
   }
@@ -115,7 +115,7 @@ function renderRow(row: Row, key: string, wrapMode: TextWrapMode): React.ReactEl
       <Box width={NAME_COL_WIDTH}>
         <Text color={TIER_COLOR[row.tier]}>{`  /${row.name}`}</Text>
       </Box>
-      <Text wrap={wrapMode}>{row.description}</Text>
+      <Text wrap={fixedWindowWrapMode()}>{row.description}</Text>
     </Box>
   );
 }

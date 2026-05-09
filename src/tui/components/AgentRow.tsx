@@ -5,7 +5,7 @@ import { padRight, truncate, humanizeLastSeen } from '../util/format.js';
 import { statusColor, healthColor, healthDot } from '../util/colors.js';
 import { formatMemory, memoryColor } from '../util/memory.js';
 import { abbrevModel } from '../util/models.js';
-import type { TextWrapMode } from '../util/wrap.js';
+import { fixedWindowWrapMode, type TextWrapMode } from '../util/wrap.js';
 
 interface AgentRowProps {
   agent: Agent;
@@ -95,7 +95,7 @@ function AgentRowInner({ agent, selected, uptime, newsColor, memBytes, nowMs, wr
     const remoteStatus = padRight(remoteStatusLabel, COLS.status);
 
     return (
-      <Text inverse={selected} wrap={wrapMode}>
+      <Text inverse={selected} wrap={fixedWindowWrapMode()}>
         {marker}
         <Text bold={selected}>{name}</Text>
         <Text dimColor>{portCell}</Text>
@@ -121,7 +121,7 @@ function AgentRowInner({ agent, selected, uptime, newsColor, memBytes, nowMs, wr
   const uptimeCell = padRight(uptime, COLS.uptime);
 
   return (
-    <Text inverse={selected} wrap={wrapMode}>
+    <Text inverse={selected} wrap={fixedWindowWrapMode()}>
       {marker}
       <Text bold={selected}>{name}</Text>
       {port}
@@ -166,7 +166,7 @@ export const AgentRow = React.memo(AgentRowInner, (prev, next) => {
 export function AgentRowHeader(props: { hasRemote?: boolean; wrapMode: TextWrapMode }): React.ReactElement {
   if (props.hasRemote) {
     return (
-      <Text bold dimColor wrap={props.wrapMode}>
+      <Text bold dimColor wrap={fixedWindowWrapMode()}>
         {padRight('', REMOTE_COLS.marker)}
         {padRight('NAME', REMOTE_COLS.name)}
         {padRight('PORT', REMOTE_COLS.port)}
@@ -184,7 +184,7 @@ export function AgentRowHeader(props: { hasRemote?: boolean; wrapMode: TextWrapM
     );
   }
   return (
-    <Text bold dimColor wrap={props.wrapMode}>
+    <Text bold dimColor wrap={fixedWindowWrapMode()}>
       {padRight('', COLS.marker)}
       {padRight('NAME', COLS.name)}
       {padRight('PORT', COLS.port)}

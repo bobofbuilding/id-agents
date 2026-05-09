@@ -2,7 +2,7 @@ import React from 'react';
 import { Box, Text } from 'ink';
 import { padRight } from '../util/format.js';
 import type { ConfigFileRow } from '../util/configs.js';
-import type { TextWrapMode } from '../util/wrap.js';
+import { fixedWindowWrapMode, type TextWrapMode } from '../util/wrap.js';
 
 interface ConfigsListProps {
   entries: ConfigFileRow[];
@@ -56,7 +56,7 @@ export function ConfigsList(props: ConfigsListProps): React.ReactElement {
 
 function Header(props: { wrapMode: TextWrapMode }): React.ReactElement {
   return (
-    <Text bold dimColor wrap={props.wrapMode}>
+    <Text bold dimColor wrap={fixedWindowWrapMode()}>
       {padRight('', COLS.marker)}
       {padRight('FILE', COLS.file)}
       {FILE_MODIFIED_GAP}
@@ -66,10 +66,10 @@ function Header(props: { wrapMode: TextWrapMode }): React.ReactElement {
 }
 
 function Row(props: { row: ConfigFileRow; selected: boolean; wrapMode: TextWrapMode }): React.ReactElement {
-  const { row, selected, wrapMode } = props;
+  const { row, selected } = props;
   const marker = selected ? '▶ ' : '  ';
   return (
-    <Text inverse={selected} wrap={wrapMode}>
+    <Text inverse={selected} wrap={fixedWindowWrapMode()}>
       {marker}
       {padRight(row.relativePath, COLS.file)}
       {FILE_MODIFIED_GAP}
