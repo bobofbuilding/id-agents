@@ -1599,6 +1599,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
 
       if (view === 'config-detail') {
         if (key.leftArrow || key.escape) return setView('configs-list');
+        if (key.return) return copyPathToClipboard(selectedConfig?.absolutePath);
         if (input === 'k' || key.upArrow) return moveConfigDetailScroll(-1);
         if (input === 'j' || key.downArrow) return moveConfigDetailScroll(1);
         if (key.pageUp) return moveConfigDetailScroll(-detailWindowSize);
@@ -1629,6 +1630,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
 
       if (view === 'output-detail') {
         if (key.leftArrow || key.escape) return setView('output-list');
+        if (key.return) return copyPathToClipboard(selectedOutputFile?.absolutePath);
         if (input === 'k' || key.upArrow) return moveOutputDetailScroll(-1);
         if (input === 'j' || key.downArrow) return moveOutputDetailScroll(1);
         if (key.pageUp) return moveOutputDetailScroll(-detailWindowSize);
