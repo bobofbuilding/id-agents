@@ -404,6 +404,102 @@ describe('TUI command registry tiers', () => {
     }
   });
 
+  it('rejects /schedule list/show with a hint pointing at the calendar view', async () => {
+    const calls: string[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push(String(url));
+      return new Response(JSON.stringify({ ok: true, result: {} }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+      void init;
+    }) as typeof fetch;
+
+    try {
+      const spec = command('schedule');
+      const list = await spec.run({
+        manager: 'http://127.0.0.1:0',
+        executor: 'tui',
+        signal: new AbortController().signal,
+        args: ['list'],
+      });
+      const show = await spec.run({
+        manager: 'http://127.0.0.1:0',
+        executor: 'tui',
+        signal: new AbortController().signal,
+        args: ['show', 'sched_1'],
+      });
+      const bare = await spec.run({
+        manager: 'http://127.0.0.1:0',
+        executor: 'tui',
+        signal: new AbortController().signal,
+        args: [],
+      });
+
+      const hint = 'Use `c` to open the calendar view. /schedule only handles add, pause, resume, remove.';
+      expect(list).toEqual({ ok: false, error: hint });
+      expect(show).toEqual({ ok: false, error: hint });
+      expect(bare).toEqual({ ok: false, error: hint });
+      expect(calls).toEqual([]);
+
+      // Mutators still dispatch.
+      await spec.run({
+        manager: 'http://127.0.0.1:0',
+        executor: 'tui',
+        signal: new AbortController().signal,
+        args: ['pause', 'sched_1'],
+      });
+      expect(calls).toEqual(['http://127.0.0.1:0/remote']);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('rejects /task list/show with a hint pointing at the tasks view', async () => {
+    const calls: string[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      calls.push(String(url));
+      return new Response(JSON.stringify({ ok: true, result: {} }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    try {
+      const spec = command('task');
+      const list = await spec.run({
+        manager: 'http://127.0.0.1:0',
+        executor: 'tui',
+        signal: new AbortController().signal,
+        args: ['list'],
+      });
+      const bare = await spec.run({
+        manager: 'http://127.0.0.1:0',
+        executor: 'tui',
+        signal: new AbortController().signal,
+        args: [],
+      });
+
+      const hint = 'Use `t` to open the tasks view. /task only handles create, claim, done, remove, delete.';
+      expect(list).toEqual({ ok: false, error: hint });
+      expect(bare).toEqual({ ok: false, error: hint });
+      expect(calls).toEqual([]);
+
+      // Mutators still dispatch.
+      await spec.run({
+        manager: 'http://127.0.0.1:0',
+        executor: 'tui',
+        signal: new AbortController().signal,
+        args: ['create', 'foo'],
+      });
+      expect(calls).toEqual(['http://127.0.0.1:0/remote']);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it('routes :team <name> through /remote as a safe switch', async () => {
     const calls: Array<{ url: string; init: RequestInit }> = [];
     const originalFetch = globalThis.fetch;

@@ -304,30 +304,49 @@ const REGISTRY: Record<string, CommandSpec> = {
   list: remote('list', 'Show all pending queries in the active team', 'safe', { resultRenderer: 'table' }),
 
   // ── Phase 2/3/4 hybrids — tier reflects worst-case subcommand ────
-  schedule: remote(
-    'schedule',
-    'Schedules: list/show (read), add/pause/resume (Y/N), remove (retype)',
-    'powerful',
-    {
-      shouldConfirm: (args) => SCHEDULE_MUTATORS.has(args[0]?.toLowerCase() ?? ''),
-      shouldRetype: (args) => SCHEDULE_RETYPE.has(args[0]?.toLowerCase() ?? ''),
-      confirmPreview: (args) =>
-        SCHEDULE_MUTATORS.has(args[0]?.toLowerCase() ?? '')
-          ? `schedule ${args.join(' ')}`
-          : null,
+  // /schedule and /task are mutation-only in the TUI. The calendar view (`c`)
+  // covers schedule browsing and the tasks view (`t`) covers task browsing,
+  // so list/show are rejected with a hint pointing at the visual surface.
+  schedule: {
+    name: 'schedule',
+    description: 'Mutate schedules: add/pause/resume (Y/N), remove (retype). Browse with `c`.',
+    tier: 'powerful',
+    shouldConfirm: (args) => SCHEDULE_MUTATORS.has(args[0]?.toLowerCase() ?? ''),
+    shouldRetype: (args) => SCHEDULE_RETYPE.has(args[0]?.toLowerCase() ?? ''),
+    confirmPreview: (args) =>
+      SCHEDULE_MUTATORS.has(args[0]?.toLowerCase() ?? '')
+        ? `schedule ${args.join(' ')}`
+        : null,
+    run: async ({ manager, executor, signal, args, teamName }) => {
+      const sub = args[0]?.toLowerCase() ?? '';
+      if (!SCHEDULE_MUTATORS.has(sub)) {
+        return {
+          ok: false,
+          error: 'Use `c` to open the calendar view. /schedule only handles add, pause, resume, remove.',
+        };
+      }
+      return runRemoteCommand(manager, executor, ['/schedule', ...args].join(' '), signal, teamName);
     },
-  ),
-  task: remote(
-    'task',
-    'Tasks: list/show (read), create/claim/done (Y/N), remove/delete (retype)',
-    'powerful',
-    {
-      shouldConfirm: (args) => TASK_MUTATORS.has(args[0]?.toLowerCase() ?? ''),
-      shouldRetype: (args) => TASK_RETYPE.has(args[0]?.toLowerCase() ?? ''),
-      confirmPreview: (args) =>
-        TASK_MUTATORS.has(args[0]?.toLowerCase() ?? '') ? `task ${args.join(' ')}` : null,
+  },
+  task: {
+    name: 'task',
+    description: 'Mutate tasks: create/claim/done (Y/N), remove/delete (retype). Browse with `t`.',
+    tier: 'powerful',
+    shouldConfirm: (args) => TASK_MUTATORS.has(args[0]?.toLowerCase() ?? ''),
+    shouldRetype: (args) => TASK_RETYPE.has(args[0]?.toLowerCase() ?? ''),
+    confirmPreview: (args) =>
+      TASK_MUTATORS.has(args[0]?.toLowerCase() ?? '') ? `task ${args.join(' ')}` : null,
+    run: async ({ manager, executor, signal, args, teamName }) => {
+      const sub = args[0]?.toLowerCase() ?? '';
+      if (!TASK_MUTATORS.has(sub)) {
+        return {
+          ok: false,
+          error: 'Use `t` to open the tasks view. /task only handles create, claim, done, remove, delete.',
+        };
+      }
+      return runRemoteCommand(manager, executor, ['/task', ...args].join(' '), signal, teamName);
     },
-  ),
+  },
   // ── Phase 3: powerful, always-gated entries ──────────────────────
   agent: remote(
     'agent',
