@@ -1219,6 +1219,16 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         if (TEAM_MUTATING_COMMANDS.has(parsed.name)) {
           setTeamsRefreshKey((k) => k + 1);
         }
+        // `/team <name>` switches the dashboard to that team. `/team delete
+        // <name>` does NOT switch — the deleted team disappears, and we
+        // leave the operator's current view alone.
+        if (parsed.name === 'team'
+          && parsed.args.length === 1
+          && parsed.args[0]?.toLowerCase() !== 'delete') {
+          setSelectedTeam(parsed.args[0]!);
+          setSelectedIndex(0);
+          setWindowStart(0);
+        }
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         // Phase 6: typed errors from runRemoteCommand → split rendering.
