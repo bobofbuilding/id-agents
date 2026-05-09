@@ -5,8 +5,8 @@
 // completion and key-field highlighting.
 // Phase 3 adds the powerful (mutating) command families behind a single
 // Y/N confirmation gate: `agent <name> rebuild|start|stop|wallet`,
-// `model`, `deploy`, `sync`, `registry push`, schedule/task mutators,
-// and `heartbeat enable|disable`. The plural `agents rebuild`
+// `model`, `deploy`, `sync`, schedule/task mutators, and
+// `heartbeat enable|disable`. The plural `agents rebuild`
 // is intentionally NOT included — Track B owns that command and is
 // paused pending the operator's A/B/A-admin-gated pick.
 
@@ -245,7 +245,7 @@ const outputCommand: CommandSpec = {
 
 // ── Phase 3 predicates ─────────────────────────────────────────────
 // These keep a single catalog entry per top-level token (`schedule`,
-// `task`, `registry`, `agent`, `heartbeat`) and decide on the args
+// `task`, `agent`, `heartbeat`) and decide on the args
 // alone whether to pop the confirmation prompt.
 
 const SCHEDULE_MUTATORS = new Set(['add', 'pause', 'resume', 'remove']);
@@ -313,19 +313,6 @@ const REGISTRY: Record<string, CommandSpec> = {
         TASK_MUTATORS.has(args[0]?.toLowerCase() ?? '') ? `task ${args.join(' ')}` : null,
     },
   ),
-  registry: remote(
-    'registry',
-    'Registry: bare show (read), `push` (gated bulk onchain register)',
-    'powerful',
-    {
-      shouldConfirm: (args) => (args[0]?.toLowerCase() ?? '') === 'push',
-      confirmPreview: (args) =>
-        (args[0]?.toLowerCase() ?? '') === 'push'
-          ? 'registry push — register every unregistered agent onchain'
-          : null,
-    },
-  ),
-
   // ── Phase 3: powerful, always-gated entries ──────────────────────
   agent: remote(
     'agent',

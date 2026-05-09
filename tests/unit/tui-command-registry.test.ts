@@ -53,7 +53,6 @@ describe('TUI command registry tiers', () => {
 
     expect(confirmationLevel(command('deploy'), ['idchain'])).toBe('yn');
     expect(confirmationLevel(command('sync'), ['idchain'])).toBe('yn');
-    expect(confirmationLevel(command('registry'), ['push'])).toBe('yn');
     expect(confirmationLevel(command('heartbeat'), ['enable', 'worker'])).toBe('yn');
     expect(confirmationLevel(command('heartbeat'), ['worker'])).toBe('none');
   });
