@@ -66,6 +66,19 @@ describe('detectTabularResult', () => {
     expect(detectTabularResult({ queries: [{ id: 'q1' }], agents: [{ name: 'tui' }] })).toBeNull();
     expect(detectTabularResult({ rows: [{ id: '1' }, { name: 'orphan' }] })).toBeNull();
   });
+
+  it('detects top-level arrays of plain objects (e.g. bulk lifecycle fan-out)', () => {
+    const detection = detectTabularResult([
+      { agent: 'researcher', action: 'rebuild', ok: true },
+      { agent: 'coder', action: 'rebuild', ok: true },
+    ]);
+    expect(detection).not.toBeNull();
+    expect(detection?.fieldName).toBe('rows');
+    expect(detection?.rows).toHaveLength(2);
+    // Top-level array detection still rejects empty / non-object members.
+    expect(detectTabularResult([])).toBeNull();
+    expect(detectTabularResult(['a', 'b'])).toBeNull();
+  });
 });
 
 describe('CommandResultTable', () => {

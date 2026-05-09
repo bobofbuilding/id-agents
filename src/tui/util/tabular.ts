@@ -10,13 +10,22 @@ export function isPlainObject(value: unknown): value is Record<string, unknown> 
 }
 
 export function detectTabularResult(result: unknown): TabularDetection | null {
-  if (!isPlainObject(result)) return null;
+  let fieldName: string;
+  let rows: unknown[];
 
-  const arrayEntries = Object.entries(result).filter(([, value]) => Array.isArray(value));
-  if (arrayEntries.length !== 1) return null;
+  if (Array.isArray(result)) {
+    // Top-level array of plain objects (e.g. the bulk lifecycle fan-out
+    // returns rows directly). Synthesize a field name for the renderer.
+    fieldName = 'rows';
+    rows = result;
+  } else if (isPlainObject(result)) {
+    const arrayEntries = Object.entries(result).filter(([, value]) => Array.isArray(value));
+    if (arrayEntries.length !== 1) return null;
+    [fieldName, rows] = arrayEntries[0] as [string, unknown[]];
+  } else {
+    return null;
+  }
 
-  const [fieldName, value] = arrayEntries[0]!;
-  const rows = value as unknown[];
   if (rows.length === 0) return null;
   if (!rows.every(isPlainObject)) return null;
 
