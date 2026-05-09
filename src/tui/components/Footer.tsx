@@ -52,7 +52,7 @@ const HAS_BACK: Record<FooterView, boolean> = {
 function hintFor(view: FooterView, wrapEnabled: boolean): string {
   const back = HAS_BACK[view] ? ' · ← back' : '';
   const wrap = wrapEnabled ? 'wrap on' : 'wrap off';
-  return `↑↓ nav${back} · w ${wrap} · : cmd · ? help · q quit`;
+  return `↑↓ nav${back} · w ${wrap} · / cmd · ? help · q quit`;
 }
 
 export function Footer({ view, wrapEnabled }: FooterProps): React.ReactElement {

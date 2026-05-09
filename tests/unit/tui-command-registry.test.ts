@@ -212,11 +212,11 @@ describe('TUI command registry tiers', () => {
 
       expect(result).toEqual({
         ok: false,
-        error: 'Usage: :agents [team] | :agents <team> <rebuild|start|stop>',
+        error: 'Usage: /agents [team] | /agents <team> <rebuild|start|stop>',
       });
       expect(tooMany).toEqual({
         ok: false,
-        error: 'Usage: :agents [team] | :agents <team> <rebuild|start|stop>',
+        error: 'Usage: /agents [team] | /agents <team> <rebuild|start|stop>',
       });
       expect(publicTeam).toEqual({
         ok: false,
@@ -342,7 +342,7 @@ describe('TUI command registry tiers', () => {
       });
 
       expect(ok).toEqual({ tuiAction: 'output', agent: 'cto' });
-      expect(missing).toEqual({ ok: false, error: 'Usage: :output <agent>' });
+      expect(missing).toEqual({ ok: false, error: 'Usage: /output <agent>' });
       expect(calls).toEqual([]);
     } finally {
       globalThis.fetch = originalFetch;

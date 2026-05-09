@@ -112,13 +112,13 @@ const agentTwoSlot: NonNullable<CommandSpec['argCompleter']> = (slot, ctx) => {
   return [];
 };
 
-// `:model <name> <model>` — slot 0 is name. Model strings are open-
+// `/model <name> <model>` — slot 0 is name. Model strings are open-
 // ended so we don't try to enumerate slot 1.
 const modelSlots: NonNullable<CommandSpec['argCompleter']> = (slot, ctx) =>
   slot === 0 ? ctx.agentNames : [];
 
-// `:heartbeat enable|disable <name>` — slot 0 is the subcommand,
-// slot 1 is the agent name. Bare `:heartbeat <name>` (status read)
+// `/heartbeat enable|disable <name>` — slot 0 is the subcommand,
+// slot 1 is the agent name. Bare `/heartbeat <name>` (status read)
 // also lands in slot 0; we fall back to suggesting agent names there
 // alongside enable/disable.
 const HEARTBEAT_SUBACTIONS = ['enable', 'disable'];
@@ -131,11 +131,11 @@ const heartbeatSlots: NonNullable<CommandSpec['argCompleter']> = (slot, ctx) => 
 // `agents` keeps the Phase 1 cross-team semantics when invoked without
 // args. With one team arg, it scopes the list through /agents?team=<name>.
 const AGENTS_BULK_ACTIONS = new Set(['rebuild', 'start', 'stop']);
-const agentsUsage = 'Usage: :agents [team] | :agents <team> <rebuild|start|stop>';
+const agentsUsage = 'Usage: /agents [team] | /agents <team> <rebuild|start|stop>';
 
 const agentsCommand: CommandSpec = {
   name: 'agents',
-  description: 'List agents, or run team lifecycle: `:agents <team> <rebuild|start|stop>`',
+  description: 'List agents, or run team lifecycle: `/agents <team> <rebuild|start|stop>`',
   tier: 'destructive',
   // The dashboard already has a dedicated agents view with rich rendering;
   // surfacing :agents as a command is for raw inspection, so force JSON
@@ -224,14 +224,14 @@ const configsCommand: CommandSpec = {
 
 const outputCommand: CommandSpec = {
   name: 'output',
-  description: "Open an agent's navigable ./output browser (`:output <agent>`)",
+  description: "Open an agent's navigable ./output browser (`/output <agent>`)",
   tier: 'safe',
   argCompleter: agentNameSlot0,
   resultRenderer: 'table',
   run: async ({ args }) =>
     args[0]
       ? { tuiAction: 'output', agent: args[0] }
-      : { ok: false, error: 'Usage: :output <agent>' },
+      : { ok: false, error: 'Usage: /output <agent>' },
 };
 
 // ── Phase 3 predicates ─────────────────────────────────────────────
@@ -260,7 +260,7 @@ const REGISTRY: Record<string, CommandSpec> = {
   teams: remote('teams', 'List all teams in the manager DB', 'safe', { resultRenderer: 'table' }),
   team: remote(
     'team',
-    'Show/switch active team; delete empty team: `:team delete <name>`',
+    'Show/switch active team; delete empty team: `/team delete <name>`',
     'powerful',
     {
       shouldConfirm: (args) =>
@@ -276,7 +276,7 @@ const REGISTRY: Record<string, CommandSpec> = {
   ),
   configs: configsCommand,
   output: outputCommand,
-  meta: remote('meta', 'Show agent metadata (`:meta <agent>`)', 'safe', { argCompleter: agentNameSlot0 }),
+  meta: remote('meta', 'Show agent metadata (`/meta <agent>`)', 'safe', { argCompleter: agentNameSlot0 }),
   list: remote('list', 'Show all pending queries in the active team', 'safe', { resultRenderer: 'table' }),
 
   // ── Phase 2/3/4 hybrids — tier reflects worst-case subcommand ────
@@ -320,7 +320,7 @@ const REGISTRY: Record<string, CommandSpec> = {
   // ── Phase 3: powerful, always-gated entries ──────────────────────
   agent: remote(
     'agent',
-    'Per-agent control: `:agent <name> <rebuild|start|stop|wallet provision|probe|logs>`',
+    'Per-agent control: `/agent <name> <rebuild|start|stop|wallet provision|probe|logs>`',
     'powerful',
     {
       shouldConfirm: (args) => AGENT_MUTATORS.has(args[1]?.toLowerCase() ?? ''),
@@ -336,23 +336,23 @@ const REGISTRY: Record<string, CommandSpec> = {
       argCompleter: agentTwoSlot,
     },
   ),
-  model: remote('model', 'Set agent model: `:model <agent> <model>`', 'powerful', {
+  model: remote('model', 'Set agent model: `/model <agent> <model>`', 'powerful', {
     shouldConfirm: (args) => args.length >= 2,
     confirmPreview: (args) =>
       args.length >= 2 ? `set model ${args[1]} on agent ${args[0]}` : null,
     argCompleter: modelSlots,
   }),
-  deploy: remote('deploy', 'Deploy a team config: `:deploy <config-name>`', 'powerful', {
+  deploy: remote('deploy', 'Deploy a team config: `/deploy <config-name>`', 'powerful', {
     shouldConfirm: () => true,
     confirmPreview: (args) =>
       args.length > 0 ? `deploy config: ${args.join(' ')}` : 'deploy (no args — will error)',
   }),
-  sync: remote('sync', 'Sync team against YAML: `:sync <team>`', 'powerful', {
+  sync: remote('sync', 'Sync team against YAML: `/sync <team>`', 'powerful', {
     shouldConfirm: () => true,
     confirmPreview: (args) =>
       args.length > 0 ? `sync team: ${args.join(' ')}` : 'sync (no args — will error)',
   }),
-  register: remote('register', 'Register one agent onchain: `:register <agent>`', 'powerful', {
+  register: remote('register', 'Register one agent onchain: `/register <agent>`', 'powerful', {
     shouldConfirm: () => true,
     confirmPreview: (args) =>
       args.length > 0 ? `register agent ${args[0]} onchain` : 'register (no args — will error)',
@@ -376,7 +376,7 @@ const REGISTRY: Record<string, CommandSpec> = {
   // ── Phase 4: retype-tier (always-on exact-line confirmation) ─────
   delete: remote(
     'delete',
-    'Delete agent(s): `:delete <name>` | `:delete *` | `:delete --team <name>`',
+    'Delete agent(s): `/delete <name>` | `/delete *` | `/delete --team <name>`',
     'destructive',
     {
       shouldRetype: () => true,
@@ -393,13 +393,13 @@ const REGISTRY: Record<string, CommandSpec> = {
       argCompleter: agentNameSlot0,
     },
   ),
-  cancel: remote('cancel', "Cancel an agent's running query: `:cancel <agent>`", 'destructive', {
+  cancel: remote('cancel', "Cancel an agent's running query: `/cancel <agent>`", 'destructive', {
     shouldRetype: () => true,
     confirmPreview: (args) =>
       args[0] ? `cancel running query on agent ${args[0]}` : 'cancel (no args — will error)',
     argCompleter: agentNameSlot0,
   }),
-  clear: remote('clear', "Clear an agent's session: `:clear <agent>`", 'destructive', {
+  clear: remote('clear', "Clear an agent's session: `/clear <agent>`", 'destructive', {
     shouldRetype: () => true,
     confirmPreview: (args) =>
       args[0] ? `clear session on agent ${args[0]}` : 'clear (no args — will error)',
