@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Box, Text, useApp, useInput, useStdout } from 'ink';
 import { Footer } from './components/Footer.js';
 import { HelpView } from './components/HelpView.js';
@@ -1785,8 +1785,23 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
     { isActive: process.stdin.isTTY === true },
   );
 
+  const debugViewEnabled = process.env.ID_TUI_DEBUG_VIEW === '1';
+  const renderCountRef = useRef(0);
+  renderCountRef.current += 1;
+
   return (
     <Box flexDirection="column">
+      {debugViewEnabled ? (
+        <Box paddingX={1}>
+          <Text color="magenta">
+            [debug] view={view} cmdResult={commandResult ? 'set' : 'null'}
+            {' '}cmdErr={commandError ? 'set' : 'null'}
+            {' '}cmdMode={commandMode ? '1' : '0'}
+            {' '}showHelp={showHelp ? '1' : '0'}
+            {' '}render#{renderCountRef.current}
+          </Text>
+        </Box>
+      ) : null}
       {showQuitConfirm ? (
         <Box borderStyle="round" borderColor="yellow" paddingX={1}>
           <Text bold color="yellow">Quit? </Text>
