@@ -162,6 +162,7 @@ export function commandResultConsumesInput(
       (input === 'j' && canShowJson) ||
       key.upArrow ||
       key.downArrow ||
+      key.rightArrow ||
       key.pageUp ||
       key.pageDown,
   );
