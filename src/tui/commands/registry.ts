@@ -116,13 +116,13 @@ const agentTwoSlot: NonNullable<CommandSpec['argCompleter']> = (slot, ctx) => {
 const modelSlots: NonNullable<CommandSpec['argCompleter']> = (slot, ctx) =>
   slot === 0 ? ctx.agentNames : [];
 
-// `/heartbeat enable|disable <name>` — slot 0 is the subcommand,
-// slot 1 is the agent name. Bare `/heartbeat <name>` (status read)
-// also lands in slot 0; we fall back to suggesting agent names there
-// alongside enable/disable.
+// `/heartbeat enable|disable <name>` — slot 0 is the subcommand from a
+// fixed set, slot 1 is the agent name. Heartbeat status browsing lives
+// behind the `h` keybind, so the bare and one-arg read-only forms are
+// rejected with a hint at run() time.
 const HEARTBEAT_SUBACTIONS = ['enable', 'disable'];
 const heartbeatSlots: NonNullable<CommandSpec['argCompleter']> = (slot, ctx) => {
-  if (slot === 0) return [...HEARTBEAT_SUBACTIONS, ...ctx.agentNames];
+  if (slot === 0) return HEARTBEAT_SUBACTIONS;
   if (slot === 1) return ctx.agentNames;
   return [];
 };
@@ -400,20 +400,28 @@ const REGISTRY: Record<string, CommandSpec> = {
       return runRemoteCommand(manager, executor, ['/sync', ...normalized].join(' '), signal, teamName);
     },
   },
-  heartbeat: remote(
-    'heartbeat',
-    'Heartbeat: bare status (read), `enable|disable <agent>` (gated)',
-    'powerful',
-    {
-      shouldConfirm: (args) => HEARTBEAT_MUTATORS.has(args[0]?.toLowerCase() ?? ''),
-      confirmPreview: (args) => {
-        const sub = args[0]?.toLowerCase() ?? '';
-        const name = args[1] ?? '<agent>';
-        return HEARTBEAT_MUTATORS.has(sub) ? `${sub} heartbeat for agent ${name}` : null;
-      },
-      argCompleter: heartbeatSlots,
+  heartbeat: {
+    name: 'heartbeat',
+    description: 'Toggle heartbeat: `/heartbeat enable|disable <agent>`. Browse with `h`.',
+    tier: 'powerful',
+    shouldConfirm: (args) => HEARTBEAT_MUTATORS.has(args[0]?.toLowerCase() ?? ''),
+    confirmPreview: (args) => {
+      const sub = args[0]?.toLowerCase() ?? '';
+      const name = args[1] ?? '<agent>';
+      return HEARTBEAT_MUTATORS.has(sub) ? `${sub} heartbeat for agent ${name}` : null;
     },
-  ),
+    argCompleter: heartbeatSlots,
+    run: async ({ manager, executor, signal, args, teamName }) => {
+      const sub = args[0]?.toLowerCase() ?? '';
+      if (!HEARTBEAT_MUTATORS.has(sub)) {
+        return {
+          ok: false,
+          error: 'Use `h` to open the heartbeats view. /heartbeat only handles enable, disable.',
+        };
+      }
+      return runRemoteCommand(manager, executor, ['/heartbeat', ...args].join(' '), signal, teamName);
+    },
+  },
 
   // ── Phase 4: retype-tier (always-on exact-line confirmation) ─────
   delete: remote(

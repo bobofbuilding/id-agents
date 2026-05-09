@@ -456,6 +456,50 @@ describe('TUI command registry tiers', () => {
     }
   });
 
+  it('rejects bare /heartbeat with a hint pointing at the heartbeats view', async () => {
+    const calls: string[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      calls.push(String(url));
+      return new Response(JSON.stringify({ ok: true, result: {} }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    try {
+      const spec = command('heartbeat');
+      const bare = await spec.run({
+        manager: 'http://127.0.0.1:0',
+        executor: 'tui',
+        signal: new AbortController().signal,
+        args: [],
+      });
+      const justAgent = await spec.run({
+        manager: 'http://127.0.0.1:0',
+        executor: 'tui',
+        signal: new AbortController().signal,
+        args: ['worker'],
+      });
+
+      const hint = 'Use `h` to open the heartbeats view. /heartbeat only handles enable, disable.';
+      expect(bare).toEqual({ ok: false, error: hint });
+      expect(justAgent).toEqual({ ok: false, error: hint });
+      expect(calls).toEqual([]);
+
+      // Mutators still dispatch.
+      await spec.run({
+        manager: 'http://127.0.0.1:0',
+        executor: 'tui',
+        signal: new AbortController().signal,
+        args: ['enable', 'worker'],
+      });
+      expect(calls).toEqual(['http://127.0.0.1:0/remote']);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it('rejects /task list/show with a hint pointing at the tasks view', async () => {
     const calls: string[] = [];
     const originalFetch = globalThis.fetch;
