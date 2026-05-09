@@ -1142,7 +1142,12 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
       let resolvedTeam: string | undefined = selectedTeam ?? undefined;
       if (AGENT_TARGETED_COMMANDS.has(parsed.name) && parsed.args.length > 0) {
         const targetName = parsed.args[0];
-        const matches = allAgents.filter((a) => a.name === targetName);
+        // Match exact names AND ENS-style prefix shorthands (`cli` should
+        // match `cli.agent-28.xid.eth`). Mirrors the daemon's lenient name
+        // resolution so the operator can use the short form everywhere.
+        const matches = allAgents.filter(
+          (a) => a.name === targetName || a.name.startsWith(`${targetName}.`),
+        );
         const distinctTeams = Array.from(new Set(matches.map((m) => m.teamName)));
         if (distinctTeams.length === 1) {
           resolvedTeam = distinctTeams[0];
