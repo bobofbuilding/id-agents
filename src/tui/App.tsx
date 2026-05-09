@@ -1134,13 +1134,13 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         });
         return;
       }
-      // Resolve the X-Id-Team header. When the operator has a specific team
-      // selected, use it. When on the All view, agent-targeted commands
-      // (meta, news, output, ...) try to find the agent across all teams
-      // so the dispatch lands in the right place. Same-name agents in
-      // different teams are ambiguous: report and bail.
+      // Resolve the X-Id-Team header. For agent-targeted commands we always
+      // search every team by agent name so the dispatch lands where the
+      // agent actually lives, ignoring the currently-selected team. Same-
+      // name agents in different teams are ambiguous: report and bail.
+      // For non-agent-targeted commands, fall back to the selected team.
       let resolvedTeam: string | undefined = selectedTeam ?? undefined;
-      if (!resolvedTeam && AGENT_TARGETED_COMMANDS.has(parsed.name) && parsed.args.length > 0) {
+      if (AGENT_TARGETED_COMMANDS.has(parsed.name) && parsed.args.length > 0) {
         const targetName = parsed.args[0];
         const matches = allAgents.filter((a) => a.name === targetName);
         const distinctTeams = Array.from(new Set(matches.map((m) => m.teamName)));
@@ -1150,6 +1150,12 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           setCommandError({
             kind: 'manager',
             message: `${parsed.name}: agent "${targetName}" exists in multiple teams (${distinctTeams.join(', ')}). Switch to the team you want first.`,
+          });
+          return;
+        } else {
+          setCommandError({
+            kind: 'manager',
+            message: `${parsed.name}: agent "${targetName}" not found in any team.`,
           });
           return;
         }
