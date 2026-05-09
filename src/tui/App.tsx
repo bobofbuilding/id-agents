@@ -153,6 +153,7 @@ export function commandResultConsumesInput(
 ): boolean {
   return Boolean(
     key.escape ||
+      key.leftArrow ||
       input === ':' ||
       input === '/' ||
       (key.ctrl && input === 'c') ||
@@ -1467,7 +1468,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
       if (commandResult && commandResultConsumesInput(input, key, {
         canShowJson: Boolean(commandResult.table || commandResult.tableError) && !commandResult.showJson,
       })) {
-        if (key.escape) {
+        if (key.escape || key.leftArrow) {
           setCommandResult(null);
           setCommandError(null);
           setCommandResultScroll(0);

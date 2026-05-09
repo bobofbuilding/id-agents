@@ -88,10 +88,9 @@ describe('TUI configs components', () => {
 });
 
 describe('TUI command-result panel input policy', () => {
-  it('swallows forward nav but lets view-back fall through', () => {
-    // leftArrow falls through. The view-change effect dismisses the panel as a
-    // side effect, giving operators a "back out + auto-dismiss" escape hatch.
-    expect(commandResultConsumesInput('', { leftArrow: true }, { canShowJson: false })).toBe(false);
+  it('consumes nav arrows: left dismisses like Esc, right is a no-op', () => {
+    // leftArrow dismisses the panel like Esc — operator preference.
+    expect(commandResultConsumesInput('', { leftArrow: true }, { canShowJson: false })).toBe(true);
     // rightArrow is consumed so the JSON panel doesn't accidentally drill into
     // a sub-view (`:agents <team>` + Right would otherwise open news/detail).
     expect(commandResultConsumesInput('', { rightArrow: true }, { canShowJson: false })).toBe(true);
