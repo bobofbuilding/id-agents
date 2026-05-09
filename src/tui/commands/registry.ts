@@ -449,13 +449,23 @@ export function commandConfirmPreview(
 // risk order (safe, powerful, destructive); commands within each tier
 // are sorted alphabetically. Sourcing from the catalog (rather than a
 // hand-maintained list) is mandated by the Phase 5 brief.
+// Pinned to the front of their tier in the help catalog, in the order
+// listed. Everything else stays alphabetical underneath.
+const PINNED_FIRST = ['help'];
+
 export function catalogEntriesByTier(): Record<RiskTier, CommandSpec[]> {
   const out: Record<RiskTier, CommandSpec[]> = {
     safe: [],
     powerful: [],
     destructive: [],
   };
+  const pinned = new Set(PINNED_FIRST);
+  for (const name of PINNED_FIRST) {
+    const spec = lookupCommand(name);
+    if (spec) out[spec.tier].push(spec);
+  }
   for (const name of knownCommandNames()) {
+    if (pinned.has(name)) continue;
     const spec = lookupCommand(name);
     if (!spec) continue;
     out[spec.tier].push(spec);
