@@ -62,6 +62,7 @@ import {
 } from './util/memory.js';
 import { isWrapToggleInput, textWrapMode, toggleWrapEnabled } from './util/wrap.js';
 import { detectTabularResult, type TabularDetection } from './util/tabular.js';
+import { copyToClipboard } from './util/clipboard.js';
 import { listConfigFiles } from './util/configs.js';
 import { listOutputFiles, readOutputFileDetail } from './util/output-files.js';
 import type { CommandResultRenderer } from './commands/registry.js';
@@ -111,6 +112,7 @@ const LIBRARY_CHROME_ROWS = 8;
 const DETAIL_CONTENT_WIDTH = 76;
 const MIN_VISIBLE = 3;
 const SELF_AGENT = 'tui';
+const FLASH_MS = 1500;
 const TERMINAL_CONTENT_WIDTH = 76;
 const TEAM_MUTATING_COMMANDS: ReadonlySet<string> = new Set(['team', 'deploy', 'sync']);
 // Commands whose first positional arg is an agent name. When the operator
@@ -249,6 +251,9 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
   const [commandHistoryIndex, setCommandHistoryIndex] = useState<number | null>(null);
   const [commandResult, setCommandResult] = useState<CommandResultState | null>(null);
   const [commandResultScroll, setCommandResultScroll] = useState(0);
+  // Transient one-line confirmation (e.g. "copied: <path>"). Auto-clears
+  // after FLASH_MS so it doesn't linger.
+  const [flashMessage, setFlashMessage] = useState<string | null>(null);
   // Phase 6: error kind drives the visual treatment. 'network' renders
   // yellow with a connectivity glyph (transient — try again later);
   // 'manager' renders red (semantic — server understood and rejected).
@@ -1582,6 +1587,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         if (input === 's') return openLibrarySkills();
         if (key.leftArrow || key.escape) return setView('agents');
         if (key.rightArrow) return openConfigDetail();
+        if (key.return) return copyPathToClipboard(selectedConfig?.absolutePath);
         if (input === 'k' || key.upArrow) return moveConfigSel(-1);
         if (input === 'j' || key.downArrow) return moveConfigSel(1);
         if (key.pageUp) return moveConfigSel(-configsWindowSize);
@@ -1611,6 +1617,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         if (input === 's') return openLibrarySkills();
         if (key.leftArrow || key.escape) return setView('agents');
         if (key.rightArrow) return openOutputDetail();
+        if (key.return) return copyPathToClipboard(selectedOutputFile?.absolutePath);
         if (input === 'k' || key.upArrow) return moveOutputSel(-1);
         if (input === 'j' || key.downArrow) return moveOutputSel(1);
         if (key.pageUp) return moveOutputSel(-outputWindowSize);
@@ -1808,6 +1815,18 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
       setCommandResultScroll(0);
     }
   }, [view]);
+
+  useEffect(() => {
+    if (!flashMessage) return;
+    const t = setTimeout(() => setFlashMessage(null), FLASH_MS);
+    return () => clearTimeout(t);
+  }, [flashMessage]);
+
+  const copyPathToClipboard = useCallback((absolutePath: string | null | undefined) => {
+    if (!absolutePath) return;
+    const ok = copyToClipboard(absolutePath, stdout);
+    setFlashMessage(ok ? `copied: ${absolutePath}` : `clipboard unavailable: ${absolutePath}`);
+  }, [stdout]);
 
   return (
     <Box flexDirection="column">
@@ -2124,6 +2143,11 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           wrapMode={wrapMode}
         />
       )}
+      {flashMessage ? (
+        <Box paddingX={1}>
+          <Text color="green" wrap="truncate-end">{flashMessage}</Text>
+        </Box>
+      ) : null}
       {commandError ? (
         <Box paddingX={1}>
           <Text
