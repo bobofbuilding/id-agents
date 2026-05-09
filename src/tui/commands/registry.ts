@@ -163,7 +163,7 @@ const agentsCommand: CommandSpec = {
   shouldRetype: (args) => args.length === 2 && args[1]?.toLowerCase() === 'stop',
   confirmPreview: (args, ctx) => {
     if (args.length !== 2) return null;
-    const team = args[0] ?? '<team>';
+    const team = (args[0] ?? '<team>').toLowerCase();
     const action = args[1]?.toLowerCase() ?? '';
     if (!AGENTS_BULK_ACTIONS.has(action)) return null;
     const count = ctx?.teamCounts?.get(team);
@@ -175,16 +175,17 @@ const agentsCommand: CommandSpec = {
       return { ok: false, error: agentsUsage };
     }
     if (args.length === 1) {
-      const agents = await fetchAgentsByTeam(manager, args[0]!, signal);
+      const team = args[0]!.toLowerCase();
+      const agents = await fetchAgentsByTeam(manager, team, signal);
       return { count: agents.length, agents };
     }
     if (args.length === 2) {
-      const team = args[0]!;
+      const team = args[0]!.toLowerCase();
       const action = args[1]!.toLowerCase();
       if (!AGENTS_BULK_ACTIONS.has(action)) {
         return { ok: false, error: agentsUsage };
       }
-      if (team.toLowerCase() === 'public') {
+      if (team === 'public') {
         return { ok: false, error: 'Bulk lifecycle is not supported for the public team' };
       }
       const agents = await fetchAgentsByTeam(manager, team, signal);
@@ -282,22 +283,29 @@ const REGISTRY: Record<string, CommandSpec> = {
   // ── Phase 2: read-only safe defaults ─────────────────────────────
   status: remote('status', 'Team health summary (running/offline + per-agent health)', 'safe', { resultRenderer: 'table' }),
   teams: remote('teams', 'List all teams in the manager DB', 'safe', { resultRenderer: 'table' }),
-  team: remote(
-    'team',
-    'Show/switch active team; delete empty team: `/team delete <name>`',
-    'powerful',
-    {
-      shouldConfirm: (args) =>
-        args[0]?.toLowerCase() === 'delete' && Boolean(args[1]),
-      shouldRetype: (args) => args[0]?.toLowerCase() === 'delete' && Boolean(args[1]),
-      confirmPreview: (args) => {
-        if (args[0]?.toLowerCase() === 'delete') {
-          return args[1] ? `DELETE team ${args[1]}` : null;
-        }
-        return null;
-      },
+  team: {
+    name: 'team',
+    description: 'Show/switch active team; delete empty team: `/team delete <name>`',
+    tier: 'powerful',
+    shouldConfirm: (args) =>
+      args[0]?.toLowerCase() === 'delete' && Boolean(args[1]),
+    shouldRetype: (args) => args[0]?.toLowerCase() === 'delete' && Boolean(args[1]),
+    confirmPreview: (args) => {
+      if (args[0]?.toLowerCase() === 'delete') {
+        return args[1] ? `DELETE team ${args[1].toLowerCase()}` : null;
+      }
+      return null;
     },
-  ),
+    run: async ({ manager, executor, signal, args, teamName }) => {
+      // Team names are lowercase by convention. Normalize whichever arg slot
+      // carries the team name before dispatch so `/team Idchain` and
+      // `/team delete Idchain` work the same as the lowercase form.
+      const normalized = args[0]?.toLowerCase() === 'delete'
+        ? ['delete', ...(args.slice(1).map((a, i) => i === 0 ? a.toLowerCase() : a))]
+        : args.map((a, i) => i === 0 ? a.toLowerCase() : a);
+      return runRemoteCommand(manager, executor, ['/team', ...normalized].join(' '), signal, teamName);
+    },
+  },
   configs: configsCommand,
   output: outputCommand,
   meta: remote('meta', 'Show agent metadata (`/meta <agent>`)', 'safe', { argCompleter: agentNameSlot0 }),
@@ -377,11 +385,21 @@ const REGISTRY: Record<string, CommandSpec> = {
     confirmPreview: (args) =>
       args.length > 0 ? `deploy config: ${args.join(' ')}` : 'deploy (no args — will error)',
   }),
-  sync: remote('sync', 'Sync team against YAML: `/sync <team>`', 'powerful', {
+  sync: {
+    name: 'sync',
+    description: 'Sync team against YAML: `/sync <team>`',
+    tier: 'powerful',
     shouldConfirm: () => true,
-    confirmPreview: (args) =>
-      args.length > 0 ? `sync team: ${args.join(' ')}` : 'sync (no args — will error)',
-  }),
+    confirmPreview: (args) => {
+      if (args.length === 0) return 'sync (no args — will error)';
+      const team = args[0]!.toLowerCase();
+      return args.length === 1 ? `sync team: ${team}` : `sync team: ${team} ${args.slice(1).join(' ')}`;
+    },
+    run: async ({ manager, executor, signal, args, teamName }) => {
+      const normalized = args.map((a, i) => (i === 0 ? a.toLowerCase() : a));
+      return runRemoteCommand(manager, executor, ['/sync', ...normalized].join(' '), signal, teamName);
+    },
+  },
   heartbeat: remote(
     'heartbeat',
     'Heartbeat: bare status (read), `enable|disable <agent>` (gated)',

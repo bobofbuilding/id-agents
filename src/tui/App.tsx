@@ -1223,11 +1223,13 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         }
         // `/team <name>` switches the dashboard to that team. `/team delete
         // <name>` does NOT switch — the deleted team disappears, and we
-        // leave the operator's current view alone.
+        // leave the operator's current view alone. Team names are lowercase
+        // by convention; normalize so `/team Idchain` and `/team idchain`
+        // both land on the same selection.
         if (parsed.name === 'team'
           && parsed.args.length === 1
           && parsed.args[0]?.toLowerCase() !== 'delete') {
-          setSelectedTeam(parsed.args[0]!);
+          setSelectedTeam(parsed.args[0]!.toLowerCase());
           setSelectedIndex(0);
           setWindowStart(0);
         }

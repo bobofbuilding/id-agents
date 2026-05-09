@@ -525,12 +525,24 @@ describe('TUI command registry tiers', () => {
         args: ['skunkworks'],
       });
 
-      expect(calls).toHaveLength(1);
+      // Mixed-case team names are normalized to lowercase before dispatch.
+      await spec.run({
+        manager: 'http://127.0.0.1:0',
+        executor: 'tui',
+        signal: new AbortController().signal,
+        args: ['Idchain'],
+      });
+
+      expect(calls).toHaveLength(2);
       expect(calls[0]?.url).toBe('http://127.0.0.1:0/remote');
       expect(calls[0]?.init.method).toBe('POST');
       expect(JSON.parse(String(calls[0]?.init.body))).toEqual({
         agent: 'tui',
         command: '/team skunkworks',
+      });
+      expect(JSON.parse(String(calls[1]?.init.body))).toEqual({
+        agent: 'tui',
+        command: '/team idchain',
       });
     } finally {
       globalThis.fetch = originalFetch;
