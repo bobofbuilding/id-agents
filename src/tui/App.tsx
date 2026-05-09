@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Box, Text, useApp, useInput, useStdout } from 'ink';
 import { Footer } from './components/Footer.js';
-import { HelpView } from './components/HelpView.js';
+import { HelpView, HELP_VIEW_CHROME_ROWS } from './components/HelpView.js';
 import { TeamsPanel } from './components/TeamsPanel.js';
 import { AgentsTable } from './components/AgentsTable.js';
 import { NewsView } from './components/NewsView.js';
@@ -173,6 +173,10 @@ function previewJson(value: unknown): string {
   return JSON.stringify(value, null, 2).slice(0, 200);
 }
 
+export function helpWindowSizeForRows(rows: number): number {
+  return Math.max(MIN_VISIBLE, rows - HELP_VIEW_CHROME_ROWS);
+}
+
 export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
   const manager = useMemo(getManagerUrl, []);
   const { exit } = useApp();
@@ -262,23 +266,24 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
     typed: string;
     mismatchSeen: boolean;
   } | null>(null);
+  const backgroundPaused = showHelp || showQuitConfirm;
 
   // Cooldown tick runs on news AND agents so the news-freshness dot in
   // the agents table colours against the same 10s epoch rather than a
   // free-running clock. Bucketed colour thresholds mean re-renders only
   // fire when an item crosses a 60/300/900s band.
   useEffect(() => {
-    const needsTick = view === 'news' || view === 'agents';
+    const needsTick = !backgroundPaused && (view === 'news' || view === 'agents');
     if (!needsTick || staticMode) return;
     setCooldownEpoch(Date.now());
     const id = setInterval(() => setCooldownEpoch(Date.now()), NEWS_COOLDOWN_TICK_MS);
     return () => clearInterval(id);
-  }, [view, staticMode]);
+  }, [view, staticMode, backgroundPaused]);
 
   const teamsPoll = usePolling<Team[]>(
     (signal) => fetchTeams(manager, signal),
     TEAMS_POLL_MS,
-    staticMode,
+    staticMode || backgroundPaused,
     [manager, teamsRefreshKey],
   );
   const teamsRaw = staticMode ? staticTeams ?? [] : teamsPoll.data ?? [];
@@ -303,8 +308,8 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
   const agentsPoll = usePolling<Agent[]>(
     agentsFetcher,
     AGENTS_POLL_MS,
-    staticMode,
-    [manager, teams.length],
+    staticMode || backgroundPaused,
+    [manager, teams.length, backgroundPaused],
   );
   const allAgents = staticMode ? staticAllAgents ?? [] : agentsPoll.data ?? [];
 
@@ -322,8 +327,8 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
   const newsFreshnessPoll = usePolling<Array<[string, number | null]>>(
     newsFreshnessFetcher,
     AGENTS_POLL_MS,
-    staticMode || view !== 'agents',
-    [manager, allAgents.length, view],
+    staticMode || backgroundPaused || view !== 'agents',
+    [manager, allAgents.length, view, backgroundPaused],
   );
   const latestNewsTsById = useMemo(() => {
     const m = new Map<string, number | null>();
@@ -404,8 +409,8 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
   const memoryPoll = usePolling<Array<[string, number | null]>>(
     memoryFetcher,
     AGENTS_POLL_MS,
-    staticMode || view !== 'agents',
-    [pidByAgentId, view],
+    staticMode || backgroundPaused || view !== 'agents',
+    [pidByAgentId, view, backgroundPaused],
   );
   const memBytesById = useMemo(() => {
     const m = new Map<string, number | null>();
@@ -439,6 +444,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
   const agentsWindowSize = Math.max(MIN_VISIBLE, rows - AGENTS_CHROME_ROWS);
   const newsWindowSize = Math.max(MIN_VISIBLE, rows - NEWS_CHROME_ROWS);
   const detailWindowSize = Math.max(MIN_VISIBLE, rows - DETAIL_CHROME_ROWS);
+  const helpWindowSize = helpWindowSizeForRows(rows);
   const tasksWindowSize = Math.max(MIN_VISIBLE, rows - TASKS_CHROME_ROWS);
   const calendarWindowSize = Math.max(MIN_VISIBLE, rows - CALENDAR_CHROME_ROWS);
   const heartbeatsWindowSize = Math.max(MIN_VISIBLE, rows - HEARTBEATS_CHROME_ROWS);
@@ -1262,11 +1268,11 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           return;
         }
         if (key.pageUp) {
-          setHelpScroll((s) => Math.max(0, s - detailWindowSize));
+          setHelpScroll((s) => Math.max(0, s - helpWindowSize));
           return;
         }
         if (key.pageDown) {
-          setHelpScroll((s) => s + detailWindowSize);
+          setHelpScroll((s) => s + helpWindowSize);
           return;
         }
         if (isHomeKey(input)) {
@@ -1823,7 +1829,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         </Box>
       ) : null}
       {showHelp ? (
-        <HelpView windowSize={detailWindowSize} scrollOffset={helpScroll} wrapMode={wrapMode} />
+        <HelpView windowSize={helpWindowSize} scrollOffset={helpScroll} wrapMode={wrapMode} />
       ) : commandResult ? (
         commandResult.showJson || commandResult.renderer === 'json' || (!commandResult.table && !commandResult.tableError) ? (
           <CommandResultView

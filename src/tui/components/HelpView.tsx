@@ -9,6 +9,11 @@ interface HelpViewProps {
   wrapMode: TextWrapMode;
 }
 
+// Outer border/header + keybinding block + spacer + App footer. App.tsx
+// subtracts this from terminal rows so only the command catalog gets the
+// remaining rows.
+export const HELP_VIEW_CHROME_ROWS = 15;
+
 // ── Keybinding groups (hand-maintained; restored from the pre-Phase-5
 //    HelpModal at commit 1bdba04). The command catalog below is still
 //    auto-sourced from the registry; only these three groups document
@@ -129,7 +134,7 @@ function renderRow(row: Row, key: string, wrapMode: TextWrapMode): React.ReactEl
   );
 }
 
-function HelpViewImpl(props: HelpViewProps): React.ReactElement {
+export function HelpViewImpl(props: HelpViewProps): React.ReactElement {
   const rows = buildRows();
   const total = rows.length;
   const maxStart = Math.max(0, total - props.windowSize);

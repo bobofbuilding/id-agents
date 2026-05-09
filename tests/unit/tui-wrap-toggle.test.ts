@@ -8,7 +8,7 @@ import { Text } from 'ink';
 import { describe, expect, it } from 'vitest';
 import { AgentsTable } from '../../src/tui/components/AgentsTable.js';
 import { Footer } from '../../src/tui/components/Footer.js';
-import { HelpView } from '../../src/tui/components/HelpView.js';
+import { HelpViewImpl } from '../../src/tui/components/HelpView.js';
 import { NewsView } from '../../src/tui/components/NewsView.js';
 import type { Agent, NewsItem } from '../../src/tui/api/types.js';
 import {
@@ -127,8 +127,8 @@ describe('TUI wrap toggle', () => {
   });
 
   it('renders HelpView wrap state and documents the global w binding', () => {
-    const off = HelpView({ windowSize: 3, scrollOffset: 0, wrapMode: textWrapMode(false) });
-    const on = HelpView({ windowSize: 3, scrollOffset: 0, wrapMode: textWrapMode(true) });
+    const off = HelpViewImpl({ windowSize: 3, scrollOffset: 0, wrapMode: textWrapMode(false) });
+    const on = HelpViewImpl({ windowSize: 3, scrollOffset: 0, wrapMode: textWrapMode(true) });
 
     const keybindGroups = collectProps(off, (props) => Array.isArray((props.group as { rows?: unknown })?.rows));
     expect(JSON.stringify(keybindGroups)).toContain('Toggle wrap');
