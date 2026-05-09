@@ -136,7 +136,7 @@ const agentsUsage = 'Usage: /agents [team] | /agents <team> <rebuild|start|stop>
 const agentsCommand: CommandSpec = {
   name: 'agents',
   description: 'List agents, or run team lifecycle: `/agents <team> <rebuild|start|stop>`',
-  tier: 'destructive',
+  tier: 'powerful',
   // The dashboard already has a dedicated agents view with rich rendering;
   // surfacing :agents as a command is for raw inspection, so force JSON
   // instead of letting auto-detection fold it into a stripped-down table.
@@ -283,7 +283,7 @@ const REGISTRY: Record<string, CommandSpec> = {
   schedule: remote(
     'schedule',
     'Schedules: list/show (read), add/pause/resume (Y/N), remove (retype)',
-    'destructive',
+    'powerful',
     {
       shouldConfirm: (args) => SCHEDULE_MUTATORS.has(args[0]?.toLowerCase() ?? ''),
       shouldRetype: (args) => SCHEDULE_RETYPE.has(args[0]?.toLowerCase() ?? ''),
@@ -296,7 +296,7 @@ const REGISTRY: Record<string, CommandSpec> = {
   task: remote(
     'task',
     'Tasks: list/show (read), create/claim/done (Y/N), remove/delete (retype)',
-    'destructive',
+    'powerful',
     {
       shouldConfirm: (args) => TASK_MUTATORS.has(args[0]?.toLowerCase() ?? ''),
       shouldRetype: (args) => TASK_RETYPE.has(args[0]?.toLowerCase() ?? ''),
@@ -393,13 +393,13 @@ const REGISTRY: Record<string, CommandSpec> = {
       argCompleter: agentNameSlot0,
     },
   ),
-  cancel: remote('cancel', "Cancel an agent's running query: `/cancel <agent>`", 'destructive', {
+  cancel: remote('cancel', "Cancel an agent's running query: `/cancel <agent>`", 'powerful', {
     shouldRetype: () => true,
     confirmPreview: (args) =>
       args[0] ? `cancel running query on agent ${args[0]}` : 'cancel (no args — will error)',
     argCompleter: agentNameSlot0,
   }),
-  clear: remote('clear', "Clear an agent's session: `/clear <agent>`", 'destructive', {
+  clear: remote('clear', "Clear an agent's session: `/clear <agent>`", 'powerful', {
     shouldRetype: () => true,
     confirmPreview: (args) =>
       args[0] ? `clear session on agent ${args[0]}` : 'clear (no args — will error)',
@@ -408,7 +408,7 @@ const REGISTRY: Record<string, CommandSpec> = {
   'sync-wallets': remote(
     'sync-wallets',
     'Bulk-sync multi-chain wallet addresses for all registered agents',
-    'destructive',
+    'powerful',
     {
       shouldRetype: () => true,
       confirmPreview: () => 'sync wallet addresses for every registered agent in the team',
