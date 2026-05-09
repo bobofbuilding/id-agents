@@ -5,8 +5,8 @@
 // completion and key-field highlighting.
 // Phase 3 adds the powerful (mutating) command families behind a single
 // Y/N confirmation gate: `agent <name> rebuild|start|stop|wallet`,
-// `model`, `deploy`, `sync`, `register`, `registry push`, schedule/task
-// mutators, and `heartbeat enable|disable`. The plural `agents rebuild`
+// `model`, `deploy`, `sync`, `registry push`, schedule/task mutators,
+// and `heartbeat enable|disable`. The plural `agents rebuild`
 // is intentionally NOT included — Track B owns that command and is
 // paused pending the operator's A/B/A-admin-gated pick.
 
@@ -96,8 +96,7 @@ function remote(
 }
 
 // Common slot-0 agent-name completer used by every command whose first
-// positional arg is an agent name (output, meta, cancel, clear,
-// delete, register).
+// positional arg is an agent name (output, meta, cancel, clear, delete).
 const agentNameSlot0: NonNullable<CommandSpec['argCompleter']> = (slot, ctx) =>
   slot === 0 ? ctx.agentNames : [];
 
@@ -362,12 +361,6 @@ const REGISTRY: Record<string, CommandSpec> = {
     confirmPreview: (args) =>
       args.length > 0 ? `sync team: ${args.join(' ')}` : 'sync (no args — will error)',
   }),
-  register: remote('register', 'Register one agent onchain: `/register <agent>`', 'powerful', {
-    shouldConfirm: () => true,
-    confirmPreview: (args) =>
-      args.length > 0 ? `register agent ${args[0]} onchain` : 'register (no args — will error)',
-    argCompleter: agentNameSlot0,
-  }),
   heartbeat: remote(
     'heartbeat',
     'Heartbeat: bare status (read), `enable|disable <agent>` (gated)',
@@ -415,15 +408,6 @@ const REGISTRY: Record<string, CommandSpec> = {
       args[0] ? `clear session on agent ${args[0]}` : 'clear (no args — will error)',
     argCompleter: agentNameSlot0,
   }),
-  'sync-wallets': remote(
-    'sync-wallets',
-    'Bulk-sync multi-chain wallet addresses for all registered agents',
-    'powerful',
-    {
-      shouldRetype: () => true,
-      confirmPreview: () => 'sync wallet addresses for every registered agent in the team',
-    },
-  ),
 };
 
 export function lookupCommand(name: string): CommandSpec | null {

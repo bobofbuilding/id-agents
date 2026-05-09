@@ -38,7 +38,6 @@ describe('TUI command registry tiers', () => {
 
     expect(confirmationLevel(command('cancel'), ['worker'])).toBe('retype');
     expect(confirmationLevel(command('clear'), ['worker'])).toBe('retype');
-    expect(confirmationLevel(command('sync-wallets'), [])).toBe('retype');
   });
 
   it('keeps powerful Phase 3 mutators behind Y/N confirmation by default', () => {
@@ -54,7 +53,6 @@ describe('TUI command registry tiers', () => {
 
     expect(confirmationLevel(command('deploy'), ['idchain'])).toBe('yn');
     expect(confirmationLevel(command('sync'), ['idchain'])).toBe('yn');
-    expect(confirmationLevel(command('register'), ['worker'])).toBe('yn');
     expect(confirmationLevel(command('registry'), ['push'])).toBe('yn');
     expect(confirmationLevel(command('heartbeat'), ['enable', 'worker'])).toBe('yn');
     expect(confirmationLevel(command('heartbeat'), ['worker'])).toBe('none');
