@@ -5745,6 +5745,7 @@ export class AgentManagerDb {
         if (agentName === '*' || agentName === '--team') {
           let bulkTeamId = teamId;
           let bulkTeamName = 'current';
+          let shouldDeleteTeamRow = false;
           if (agentName === '--team') {
             const targetTeam = args[1];
             if (!targetTeam) {
@@ -5755,10 +5756,11 @@ export class AgentManagerDb {
             }
             bulkTeamId = await this.db.teams.getOrCreateTeamId(targetTeam);
             bulkTeamName = targetTeam;
+            shouldDeleteTeamRow = targetTeam !== 'default';
           }
 
           const agents = await this.dbListAgents(bulkTeamId, true);
-          if (agents.length === 0) {
+          if (agents.length === 0 && !shouldDeleteTeamRow) {
             return { ok: true, result: { deleted: [], count: 0, team: bulkTeamName, message: 'No agents to delete' } };
           }
 
@@ -5788,13 +5790,25 @@ export class AgentManagerDb {
             this.broadcastAgentsChanged(bulkTeamId, { reason: 'remove', removed: deletedNames });
           }
 
+          let teamDeleted = false;
+          if (shouldDeleteTeamRow) {
+            const deletedTeam = await this.deleteEmptyTeamByName(bulkTeamName);
+            if (!deletedTeam.ok) {
+              return { ok: false, error: deletedTeam.error };
+            }
+            teamDeleted = true;
+          }
+
           return {
             ok: true,
             result: {
               deleted: deletedNames,
               count: deletedNames.length,
               team: bulkTeamName,
-              message: `Deleted ${deletedNames.length} agents: ${deletedNames.join(', ')}`
+              teamDeleted,
+              message: teamDeleted
+                ? `Deleted ${deletedNames.length} agents and team ${bulkTeamName}${deletedNames.length ? `: ${deletedNames.join(', ')}` : ''}`
+                : `Deleted ${deletedNames.length} agents: ${deletedNames.join(', ')}`
             }
           };
         }

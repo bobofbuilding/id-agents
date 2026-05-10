@@ -178,4 +178,37 @@ describe('POST /remote /team', () => {
     const deleted = await db.teams.getTeamByName('empty-team');
     expect(deleted).toBeNull();
   });
+
+  it('cascades /delete --team through agent removal and team-row deletion', async () => {
+    const teamName = 'cascade-delete-team';
+    const teamId = await db.teams.getOrCreateTeamId(teamName);
+    await insertAgent(db.adapter, teamId, 'lead');
+    await insertAgent(db.adapter, teamId, 'scout');
+    await insertAgent(db.adapter, teamId, 'dev');
+
+    const res = await fetch(`${baseUrl}/remote`, {
+      method: 'POST',
+      headers: headers(teamName),
+      body: JSON.stringify({ agent: 'tui', command: `/delete --team ${teamName}` }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as {
+      ok: boolean;
+      result?: { deleted?: string[]; count?: number; team?: string; teamDeleted?: boolean; message?: string };
+    };
+    expect(body.ok).toBe(true);
+    expect(body.result).toMatchObject({
+      count: 3,
+      team: teamName,
+      teamDeleted: true,
+    });
+    expect(body.result?.deleted?.sort()).toEqual(['dev', 'lead', 'scout']);
+
+    const remainingAgents = await db.adapter.query<{ count: number }>(
+      `SELECT COUNT(*) as count FROM agents WHERE team_id = ?`,
+      [teamId],
+    );
+    expect(Number(remainingAgents.rows[0]?.count ?? 0)).toBe(0);
+    expect(await db.teams.getTeamByName(teamName)).toBeNull();
+  });
 });
