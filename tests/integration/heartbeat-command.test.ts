@@ -17,6 +17,7 @@ import { SqliteSchedulesRepo } from '../../src/db/repos/sqlite/schedules-repo.js
 import { SqliteSubscriptionsRepo } from '../../src/db/repos/sqlite/subscriptions-repo.js';
 import { SqliteTasksRepo } from '../../src/db/repos/sqlite/tasks-repo.js';
 import { SqliteTeamsRepo } from '../../src/db/repos/sqlite/teams-repo.js';
+import { heartbeatToSchedule } from '../../src/scheduling/schedule-config.js';
 
 async function createInMemoryDb() {
   const adapter = new SqliteAdapter(':memory:');
@@ -91,7 +92,7 @@ describe('/remote heartbeat commands', () => {
     // Explicit no-op so this suite mirrors other manager integration files.
   });
 
-  it('sets metadata.heartbeat false when disabling an agent heartbeat', async () => {
+  it('sets metadata.heartbeat false and removes the schedule when disabling an agent heartbeat', async () => {
     await withManager(async ({ baseUrl, db }) => {
       const teamName = `heartbeat-disable-${Date.now()}`;
       const teamId = await db.teams.getOrCreateTeamId(teamName);
@@ -110,8 +111,12 @@ describe('/remote heartbeat commands', () => {
         runtime: 'claude-agent-sdk',
         metadata: { heartbeat: true, retained: 'value' },
       });
+      const { definition, agentIds } = heartbeatToSchedule(agentId, 'worker', 86400, now);
+      await db.schedules.upsertDefinition(definition);
+      await db.schedules.replaceTargets(definition.id, agentIds);
 
       expect((await db.agents.getById(agentId))?.metadata?.heartbeat).toBe(true);
+      expect(await db.schedules.listSchedulesForAgent(agentId)).toHaveLength(1);
 
       const body = await postRemote(baseUrl, teamName, '/heartbeat disable worker');
 
@@ -123,6 +128,7 @@ describe('/remote heartbeat commands', () => {
         heartbeat: false,
         retained: 'value',
       });
+      expect(await db.schedules.listSchedulesForAgent(agentId)).toHaveLength(0);
     });
   });
 });

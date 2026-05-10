@@ -140,6 +140,62 @@ describe('SQLite migration — tasks uniqueness upgrade', () => {
     // Same name should return the same id on repeated calls
     expect(id1).toEqual(id2);
   });
+
+  it('repairs task_event_links foreign keys that reference tasks_old', async () => {
+    const adapter = await freshDb();
+    const teamsRepo = new SqliteTeamsRepo(adapter);
+    const teamId = await teamsRepo.getOrCreateTeamId('legacy-fk-team');
+    const now = Math.floor(Date.now() / 1000);
+
+    await adapter.query(
+      `INSERT INTO tasks
+         (id, name, uuid, team_id, title, description, status, created_by, owner, created_at, updated_at, completed_at)
+       VALUES ('task-legacy-fk', 'legacy-fk', ?, ?, 'Legacy FK', NULL, 'todo', NULL, NULL, ?, ?, NULL)`,
+      [crypto.randomUUID(), teamId, now, now],
+    );
+    await adapter.query(
+      `INSERT INTO schedule_definitions
+         (id, kind, title, description, active, message, delivery_mode, timezone,
+          catch_up_policy, dedupe_window_seconds, interval_seconds, anchor_at,
+          max_runs, expires_at, local_time_seconds, local_date, days_of_week,
+          source_type, source_key, sender, created_at, updated_at)
+       VALUES ('sched-legacy-fk', 'calendar', 'Legacy FK', NULL, 1, 'msg', 'talk', 'UTC',
+          'skip', 90, NULL, NULL, NULL, NULL, 3600, NULL, 'mon',
+          'cli', 'legacy-fk', 'schedule', ?, ?)`,
+      [now, now],
+    );
+
+    adapter.exec(`
+      PRAGMA foreign_keys = OFF;
+      DROP INDEX IF EXISTS task_event_links_schedule_idx;
+      DROP TABLE task_event_links;
+      CREATE TABLE task_event_links (
+        task_id TEXT NOT NULL REFERENCES "tasks_old"(id) ON DELETE CASCADE,
+        schedule_id TEXT NOT NULL REFERENCES schedule_definitions(id) ON DELETE CASCADE,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (task_id, schedule_id)
+      );
+      INSERT INTO task_event_links (task_id, schedule_id, created_at)
+        VALUES ('task-legacy-fk', 'sched-legacy-fk', ${now});
+      PRAGMA foreign_keys = ON;
+    `);
+
+    await migrateSqlite(adapter);
+
+    const ddl = await adapter.query<{ sql: string }>(
+      `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'task_event_links'`,
+    );
+    expect(ddl.rows[0]?.sql).not.toContain('tasks_old');
+    expect(ddl.rows[0]?.sql).toContain('REFERENCES tasks(id)');
+
+    const links = await adapter.query<{ c: number }>(
+      `SELECT COUNT(*) as c FROM task_event_links WHERE task_id = 'task-legacy-fk'`,
+    );
+    expect(Number(links.rows[0]?.c)).toBe(1);
+    await expect(adapter.query(`DELETE FROM schedule_definitions WHERE id = 'sched-legacy-fk'`)).resolves.toBeDefined();
+
+    await adapter.close();
+  });
 });
 
 // =====================================================================

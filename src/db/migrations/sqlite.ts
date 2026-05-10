@@ -559,6 +559,7 @@ export async function migrateSqlite(adapter: SqliteAdapter): Promise<void> {
   // SQLite does not support DROP CONSTRAINT, so we use the rename-copy-swap pattern
   // guarded by a PRAGMA check to detect whether the old global uniqueness is still present.
   await migrateTasks_TeamNameUnique(adapter);
+  await migrateTaskEventLinks_TasksReference(adapter);
 }
 
 /**
@@ -616,6 +617,37 @@ async function migrateTasks_TeamNameUnique(adapter: SqliteAdapter): Promise<void
     CREATE INDEX IF NOT EXISTS tasks_team_idx ON tasks(team_id, status, updated_at);
     CREATE UNIQUE INDEX IF NOT EXISTS tasks_uuid_idx ON tasks(uuid);
   `);
+}
+
+/**
+ * Repair task_event_links databases that were present during the tasks table
+ * rebuild above. SQLite rewrites child foreign-key DDL on ALTER TABLE RENAME,
+ * so task_event_links can end up referencing the temporary tasks_old table
+ * after tasks_old is dropped.
+ */
+async function migrateTaskEventLinks_TasksReference(adapter: SqliteAdapter): Promise<void> {
+  const { rows } = await adapter.query<{ sql: string }>(
+    `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'task_event_links'`,
+  );
+  const ddl = rows[0]?.sql || '';
+  if (!ddl.includes('tasks_old')) return;
+
+  adapter.exec(`DROP INDEX IF EXISTS task_event_links_schedule_idx`);
+  adapter.exec(`
+    CREATE TABLE task_event_links_new (
+      task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      schedule_id TEXT NOT NULL REFERENCES schedule_definitions(id) ON DELETE CASCADE,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (task_id, schedule_id)
+    );
+
+    INSERT INTO task_event_links_new (task_id, schedule_id, created_at)
+      SELECT task_id, schedule_id, created_at FROM task_event_links;
+
+    DROP TABLE task_event_links;
+    ALTER TABLE task_event_links_new RENAME TO task_event_links;
+  `);
+  adapter.exec(`CREATE INDEX IF NOT EXISTS task_event_links_schedule_idx ON task_event_links(schedule_id, task_id)`);
 }
 
 /**
