@@ -5,7 +5,7 @@
 // completion and key-field highlighting.
 // Phase 3 adds the powerful (mutating) command families behind a single
 // Y/N confirmation gate: `agent <name> rebuild|start|stop|wallet`,
-// `model`, `deploy`, `sync`, schedule/task mutators, and
+// `deploy`, `sync`, schedule/task mutators, and
 // `heartbeat enable|disable`. The plural `agents rebuild`
 // is intentionally NOT included — Track B owns that command and is
 // paused pending the operator's A/B/A-admin-gated pick.
@@ -110,11 +110,6 @@ const agentTwoSlot: NonNullable<CommandSpec['argCompleter']> = (slot, ctx) => {
   if (slot === 1) return AGENT_SUBACTIONS;
   return [];
 };
-
-// `/model <name> <model>` — slot 0 is name. Model strings are open-
-// ended so we don't try to enumerate slot 1.
-const modelSlots: NonNullable<CommandSpec['argCompleter']> = (slot, ctx) =>
-  slot === 0 ? ctx.agentNames : [];
 
 // `/heartbeat enable|disable <name>` — slot 0 is the subcommand from a
 // fixed set, slot 1 is the agent name. Heartbeat status browsing lives
@@ -374,12 +369,6 @@ const REGISTRY: Record<string, CommandSpec> = {
       argCompleter: agentTwoSlot,
     },
   ),
-  model: remote('model', 'Set agent model: `/model <agent> <model>`', 'powerful', {
-    shouldConfirm: (args) => args.length >= 2,
-    confirmPreview: (args) =>
-      args.length >= 2 ? `set model ${args[1]} on agent ${args[0]}` : null,
-    argCompleter: modelSlots,
-  }),
   deploy: remote('deploy', 'Deploy a team config: `/deploy <config-name>`', 'powerful', {
     shouldConfirm: () => true,
     confirmPreview: (args) =>

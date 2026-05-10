@@ -44,12 +44,6 @@ describe('TUI command registry tiers', () => {
     expect(commandConfirmPreview(command('agent'), ['worker', 'stop'])).toBe('stop agent worker');
     expect(confirmationLevel(command('agent'), ['worker', 'probe'])).toBe('none');
 
-    expect(confirmationLevel(command('model'), ['worker', 'gpt-5.4'])).toBe('yn');
-    expect(commandConfirmPreview(command('model'), ['worker', 'gpt-5.4'])).toBe(
-      'set model gpt-5.4 on agent worker',
-    );
-    expect(confirmationLevel(command('model'), ['worker'])).toBe('none');
-
     expect(confirmationLevel(command('deploy'), ['idchain'])).toBe('yn');
     expect(confirmationLevel(command('sync'), ['idchain'])).toBe('yn');
     expect(confirmationLevel(command('heartbeat'), ['enable', 'worker'])).toBe('yn');
