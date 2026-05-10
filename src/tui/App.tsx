@@ -1142,7 +1142,14 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
       // name agents in different teams are ambiguous: report and bail.
       // For non-agent-targeted commands, fall back to the selected team.
       let resolvedTeam: string | undefined = selectedTeam ?? undefined;
-      if (AGENT_TARGETED_COMMANDS.has(parsed.name) && parsed.args.length > 0) {
+      // Skip cross-team resolution when the first arg is clearly not an agent
+      // name: flags (`--team`, `--force`, ...) and the `*` wildcard. Those
+      // dispatch to the daemon's flag/glob handler with the X-Id-Team header
+      // pointing at the currently-selected team.
+      const firstArgLooksLikeAgent = parsed.args.length > 0
+        && parsed.args[0] !== '*'
+        && !parsed.args[0]!.startsWith('-');
+      if (AGENT_TARGETED_COMMANDS.has(parsed.name) && firstArgLooksLikeAgent) {
         const targetName = parsed.args[0];
         // Match exact names AND ENS-style prefix shorthands (`cli` should
         // match `cli.agent-28.xid.eth`). Mirrors the daemon's lenient name
