@@ -983,6 +983,14 @@ export class AgentManagerDb {
     return this.db.agents.resolve(teamId, ref);
   }
 
+  private async dbDeleteAgentRow(teamId: string, agentId: string): Promise<boolean> {
+    const result = await this.db.adapter.query(
+      `DELETE FROM agents WHERE team_id = $1 AND id = $2`,
+      [teamId, agentId],
+    );
+    return (result.rowCount ?? 0) > 0;
+  }
+
   private async dbNextPort(_teamId?: string): Promise<number> {
     return this.db.agents.nextPort();
   }
@@ -5769,10 +5777,10 @@ export class AgentManagerDb {
               await this.schedulerService.removeAgentSchedules(agent.id);
             }
             await this.cancelPendingQueriesForAgent(bulkTeamId, agent.id);
-            await this.db.adapter.query(
-              `UPDATE agents SET deleted_at = $3, status = 'stopped' WHERE team_id = $1 AND id = $2`,
-              [bulkTeamId, agent.id, Date.now()]
-            );
+            const deleted = await this.dbDeleteAgentRow(bulkTeamId, agent.id);
+            if (!deleted) {
+              return { ok: false, error: `Failed to delete agent "${agent.name || agent.id}"` };
+            }
             deletedNames.push(agent.name || agent.id);
           }
 
@@ -5831,11 +5839,10 @@ export class AgentManagerDb {
         // Cancel any pending queries so they don't show as orphaned
         await this.cancelPendingQueriesForAgent(teamId, a.id);
 
-        // Soft-delete by setting deleted_at and status
-        await this.db.adapter.query(
-          `UPDATE agents SET deleted_at = $3, status = 'stopped' WHERE team_id = $1 AND id = $2`,
-          [teamId, a.id, Date.now()]
-        );
+        const deleted = await this.dbDeleteAgentRow(teamId, a.id);
+        if (!deleted) {
+          return { ok: false, error: `Failed to delete agent "${agentName}"` };
+        }
 
         this.broadcastAgentsChanged(teamId, { reason: 'remove', removed: [a.name || a.id] });
 

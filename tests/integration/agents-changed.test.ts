@@ -192,4 +192,41 @@ describe('agents_changed WebSocket broadcast', () => {
 
     client.ws.close();
   });
+
+  it('POST /remote /delete <name> hard-deletes the agent row and removes it from listings', async () => {
+    const agentName = `remote-victim-${randomUUID().slice(0, 8)}`;
+    const agentId = `agent-${randomUUID()}`;
+    await (manager as any).db.agents.create({
+      team_id: teamId,
+      id: agentId,
+      name: agentName,
+      type: 'virtual',
+      model: 'sonnet',
+      status: 'running',
+      created_at: Math.floor(Date.now() / 1000),
+      port: 0,
+    });
+
+    const deleteResp = await fetch(`${baseUrl}/remote`, {
+      method: 'POST',
+      headers: adminHeaders('default'),
+      body: JSON.stringify({ agent: 'tui', command: `/delete ${agentName}` }),
+    });
+    expect(deleteResp.ok).toBe(true);
+    const deleteBody = await deleteResp.json() as { ok: boolean; result?: { deleted?: string }; error?: string };
+    expect(deleteBody).toEqual({ ok: true, result: { deleted: agentName } });
+
+    const row = await (manager as any).db.adapter.query(
+      `SELECT id, name, status, deleted_at FROM agents WHERE team_id = $1 AND id = $2`,
+      [teamId, agentId],
+    );
+    expect(row.rows).toHaveLength(0);
+
+    const listResp = await fetch(`${baseUrl}/agents?team=default`, {
+      headers: adminHeaders('default'),
+    });
+    expect(listResp.ok).toBe(true);
+    const listBody = await listResp.json() as { agents: Array<{ id: string; name: string }> };
+    expect(listBody.agents.find(a => a.id === agentId || a.name === agentName)).toBeUndefined();
+  });
 });
