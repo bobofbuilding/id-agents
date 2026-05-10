@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.95-beta
+
+### Features
+
+- Operator `/cancel <agent>` now writes a "Cancelled by operator" marker into both the team news feed (manager-inbox owned) and the target agent's own inbox (agent owned) before sending the kill, so the cancellation is visible in the TUI even when the agent's own `/cancel` handler races the process kill. Manager-inbox surfaces it on the team-level `GET /news` for operator-side tooling. Agent-owned surfaces it via the TUI's per-agent NewsView path, which fetches the agent's local `/news`.
+- `/task delete` is now an alias for `/task remove` and both accept bulk forms. `/task delete *` removes every task in the active team. `/task delete --team <name>` removes every task in the named team.
+- New `/task status <task-ref> <todo|doing|done>` sets a task's status directly, including rolling a doing task back to todo. Owner field is intentionally not touched. Use `/task assign` to change ownership.
+
+### Fixes
+
+- TUI tasks view now fetches the union of all teams' tasks in parallel via `fetchTasksAllTeams`, mirroring the agents view. Task counts in the `TeamsPanel` stay stable when the operator switches the selected team. Previously the fetcher always defaulted to the `default` team and the client filter then stripped everything when the selected team was anything else.
+
+### UX
+
+- TUI command bar drops `/clear` from the registry and the help menu.
+- TUI `/task` bar narrows to `assign | status | done | remove | delete`. `create` and `claim` are intentionally not surfaced. Agents create and claim their own tasks via the inter-agent skill, and the manager dispatch path handles operator-initiated task creation.
+- Single-task `/task delete <ref>` confirms with Y/N. Bulk delete (`*` or `--team <name>`) keeps the retype gate so the operator has to retype the full line.
+- Help view replaces the Safe, Powerful, and Destructive sections with one flat alphabetical command list rendered in a single neutral color. Per-command safety still runs at dispatch via `shouldConfirm` and `shouldRetype`.
+
 ## 0.1.94-beta
 
 ### Refactors

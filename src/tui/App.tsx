@@ -44,7 +44,7 @@ import {
   fetchLibrarySkill,
   fetchLibrarySkills,
   fetchSchedulesAllTeams,
-  fetchTasks,
+  fetchTasksAllTeams,
   fetchTeams,
   getManagerUrl,
   type LibraryAgentDetailResponse,
@@ -118,7 +118,7 @@ const TEAM_MUTATING_COMMANDS: ReadonlySet<string> = new Set(['team', 'deploy', '
 // is on the All view (selectedTeam === null), App.tsx tries to resolve
 // the agent across all teams to pick the right X-Id-Team header.
 const AGENT_TARGETED_COMMANDS: ReadonlySet<string> = new Set([
-  'meta', 'output', 'cancel', 'clear', 'delete',
+  'meta', 'output', 'cancel', 'delete',
   'ask', 'hey', 'agent',
 ]);
 const NEWS_MESSAGE_WIDTH = TERMINAL_CONTENT_WIDTH - 8 - 1 - 17 - 4;
@@ -456,16 +456,19 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
   const outputWindowSize = libraryWindowSize;
   const total = visibleAgents.length;
 
-  // Tasks polling
+  // Tasks polling — fan out across all teams in parallel so allTasks is
+  // the union and task counts stay stable when the operator switches the
+  // selected team. visibleTasks narrows by selectedTeam client-side.
   const tasksFetcher = useCallback(
-    (signal: AbortSignal): Promise<Task[]> => fetchTasks(manager, SELF_AGENT, signal),
-    [manager],
+    (signal: AbortSignal): Promise<Task[]> =>
+      fetchTasksAllTeams(manager, SELF_AGENT, teams, signal),
+    [manager, teams],
   );
   const tasksPoll = usePolling<Task[]>(
     tasksFetcher,
     TASKS_POLL_MS,
     staticMode || (view !== 'tasks' && view !== 'task-detail'),
-    [manager, view],
+    [manager, view, teams.length],
   );
   const allTasks = tasksPoll.data ?? [];
   const visibleTasks = useMemo(

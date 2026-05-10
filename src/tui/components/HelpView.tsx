@@ -1,6 +1,6 @@
 import React from 'react';
 import { Box, Text } from 'ink';
-import { catalogEntriesByTier, type RiskTier } from '../commands/registry.js';
+import { knownCommandNames, lookupCommand } from '../commands/registry.js';
 
 interface HelpViewProps {
   windowSize: number;
@@ -41,22 +41,8 @@ const GLOBAL_BINDINGS: Array<[string, string]> = [
 type Row =
   | { kind: 'section'; title: string; color: string; count?: number }
   | { kind: 'kbd'; key: string; description: string }
-  | { kind: 'cmd'; name: string; description: string; tier: RiskTier }
+  | { kind: 'cmd'; name: string; description: string }
   | { kind: 'spacer' };
-
-const TIER_LABEL: Record<RiskTier, string> = {
-  safe: 'Safe',
-  powerful: 'Powerful',
-  destructive: 'Destructive',
-};
-
-const TIER_COLOR: Record<RiskTier, string> = {
-  safe: 'green',
-  powerful: 'yellow',
-  destructive: 'red',
-};
-
-const TIER_ORDER: RiskTier[] = ['safe', 'powerful', 'destructive'];
 
 function buildRows(): Row[] {
   const rows: Row[] = [];
@@ -64,15 +50,17 @@ function buildRows(): Row[] {
   for (const [key, desc] of VIEW_BINDINGS) rows.push({ kind: 'kbd', key, description: desc });
   rows.push({ kind: 'spacer' });
 
-  const grouped = catalogEntriesByTier();
-  for (const tier of TIER_ORDER) {
-    const entries = grouped[tier];
-    rows.push({ kind: 'section', title: TIER_LABEL[tier], color: TIER_COLOR[tier], count: entries.length });
-    for (const spec of entries) {
-      rows.push({ kind: 'cmd', name: spec.name, description: spec.description, tier });
-    }
-    rows.push({ kind: 'spacer' });
+  // Flat alphabetical command list. Safety (Y/N or retype confirmation) is
+  // enforced at dispatch by each spec's shouldConfirm/shouldRetype, so the
+  // help view doesn't need to surface tiers visually.
+  const names = knownCommandNames();
+  rows.push({ kind: 'section', title: 'Commands', color: 'cyan', count: names.length });
+  for (const name of names) {
+    const spec = lookupCommand(name);
+    if (!spec) continue;
+    rows.push({ kind: 'cmd', name: spec.name, description: spec.description });
   }
+  rows.push({ kind: 'spacer' });
 
   rows.push({ kind: 'section', title: 'Navigate', color: 'cyan' });
   for (const [key, desc] of NAVIGATE_BINDINGS) rows.push({ kind: 'kbd', key, description: desc });
@@ -109,7 +97,7 @@ function renderRow(row: Row, key: string): React.ReactElement {
   return (
     <Box key={key}>
       <Box width={NAME_COL_WIDTH}>
-        <Text color={TIER_COLOR[row.tier]}>{`  /${row.name}`}</Text>
+        <Text color="cyan">{`  /${row.name}`}</Text>
       </Box>
       <Text wrap="truncate-end">{row.description}</Text>
     </Box>

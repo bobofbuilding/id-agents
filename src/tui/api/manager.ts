@@ -101,10 +101,13 @@ export async function fetchTasks(
   manager: string,
   executor: string,
   signal: AbortSignal,
+  teamName?: string,
 ): Promise<Task[]> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (teamName) headers['x-id-team'] = teamName;
   const res = await fetch(`${manager}/remote`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify({ agent: executor, command: '/task' }),
     signal,
   });
@@ -116,6 +119,24 @@ export async function fetchTasks(
     throw new Error(data.error ?? 'unknown manager error');
   }
   return data.result?.tasks ?? [];
+}
+
+// Fan out per-team in parallel so the union of all teams' tasks is what
+// the tasks view sees as "allTasks". Mirrors fetchAgentsAllTeams. This is
+// what keeps task counts stable when the operator switches teams: the
+// fetcher doesn't depend on selectedTeam, so allTasks.length is constant
+// and only the client-side filter narrows visibleTasks.
+export async function fetchTasksAllTeams(
+  manager: string,
+  executor: string,
+  teams: Team[],
+  signal: AbortSignal,
+): Promise<Task[]> {
+  if (teams.length === 0) return [];
+  const results = await Promise.all(
+    teams.map((t) => fetchTasks(manager, executor, signal, t.name)),
+  );
+  return results.flat();
 }
 
 export async function fetchAgentNews(

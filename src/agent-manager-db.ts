@@ -7380,6 +7380,36 @@ export class AgentManagerDb {
         const agent = matches[0];
         const baseEndpoint = agent.endpoint || `http://localhost:${agent.port}`;
 
+        // Write the cancellation marker BEFORE killing the running query so it
+        // shows up before the agent's /cancel handler races the process kill.
+        // Two writes for two surfaces:
+        //   1. Agent-owned row → visible in the TUI's per-agent NewsView
+        //      (which fetches /news <agent> → the agent's local /news, which
+        //      reads news_items keyed by agent_id).
+        //   2. Manager-inbox-owned row → visible to any operator-side tool
+        //      that reads the team-level GET /news feed.
+        // May duplicate the agent's own /cancel news entry (claude-agent-server
+        // line 817) in the no-race case; the duplication is intentional so the
+        // marker is guaranteed even when the kill wins the race.
+        {
+          const cancelTs = Date.now();
+          const managerInbox = this.getManagerInboxRef(teamId, teamName);
+          await this.db.news.add(teamId, null, {
+            timestamp: cancelTs,
+            type: 'query.cancelled',
+            message: `Cancelled by operator: ${agent.name}`,
+            data: { reason: 'operator_cancel', agent: agent.name },
+            owner_kind: managerInbox.ownerKind,
+            owner_id: managerInbox.ownerId,
+          });
+          await this.db.news.add(teamId, agent.id, {
+            timestamp: cancelTs,
+            type: 'query.cancelled',
+            message: 'Cancelled by operator',
+            data: { reason: 'operator_cancel', agent: agent.name },
+          });
+        }
+
         try {
           const cancelResp = await fetch(`${baseEndpoint}/cancel`, {
             method: 'POST',
@@ -7746,15 +7776,74 @@ export class AgentManagerDb {
           return { ok: true, result: { task: await this.buildTaskResult(updated!, teamId) } };
         }
 
-        if (subCmd === 'remove') {
-          // /task remove <task-name|#shortid>
+        if (subCmd === 'status') {
+          // /task status <task-name|#shortid> <todo|doing|done>
+          // Sets the status field directly. Does not touch `owner` — use
+          // /task assign or /task claim to change ownership.
           const taskRef = args[1];
-          if (!taskRef) {
-            return { ok: false, error: 'Usage: /task remove <task-name|#shortid>' };
+          const newStatus = args[2]?.toLowerCase();
+          if (!taskRef || !newStatus) {
+            return { ok: false, error: 'Usage: /task status <task-name|#shortid> <todo|doing|done>' };
+          }
+          if (newStatus !== 'todo' && newStatus !== 'doing' && newStatus !== 'done') {
+            return { ok: false, error: `Invalid status "${newStatus}". Must be todo, doing, or done.` };
           }
 
           const { task, error: taskErr } = await this.resolveTaskRef(taskRef, teamId);
           if (!task) return { ok: false, error: taskErr || `Task "${taskRef}" not found` };
+
+          if (task.team_id && task.team_id !== teamId) {
+            return { ok: false, error: `Task "${taskRef}" not found` };
+          }
+
+          const now = Math.floor(Date.now() / 1000);
+          await this.db.tasks.updateFields(task.id, {
+            status: newStatus,
+            completed_at: newStatus === 'done' ? now : null,
+            updated_at: now,
+          });
+
+          const updated = await this.db.tasks.getByNameForTeam(task.name, teamId);
+          return { ok: true, result: { task: await this.buildTaskResult(updated!, teamId) } };
+        }
+
+        if (subCmd === 'remove' || subCmd === 'delete') {
+          // /task remove <task-name|#shortid>
+          // /task remove *                  → delete all tasks in active team
+          // /task remove --team <team>      → delete all tasks in named team
+          const first = args[1];
+          if (!first) {
+            return { ok: false, error: 'Usage: /task remove <task-name|#shortid> | /task remove * | /task remove --team <team>' };
+          }
+
+          if (first === '*') {
+            const tasks = await this.db.tasks.list({ teamId });
+            const removed: string[] = [];
+            for (const t of tasks) {
+              await this.db.tasks.delete(t.id);
+              removed.push(t.name);
+            }
+            return { ok: true, result: { removed, count: removed.length, scope: 'active-team' } };
+          }
+
+          if (first === '--team') {
+            const teamRef = args[2];
+            if (!teamRef) {
+              return { ok: false, error: 'Usage: /task remove --team <team>' };
+            }
+            const teamRow = await this.db.teams.getTeamByName(teamRef);
+            if (!teamRow) return { ok: false, error: `Team "${teamRef}" not found` };
+            const tasks = await this.db.tasks.list({ teamId: teamRow.id });
+            const removed: string[] = [];
+            for (const t of tasks) {
+              await this.db.tasks.delete(t.id);
+              removed.push(t.name);
+            }
+            return { ok: true, result: { removed, count: removed.length, team: teamRow.name } };
+          }
+
+          const { task, error: taskErr } = await this.resolveTaskRef(first, teamId);
+          if (!task) return { ok: false, error: taskErr || `Task "${first}" not found` };
 
           await this.db.tasks.delete(task.id);
           return { ok: true, result: { removed: task.name } };
@@ -7762,7 +7851,7 @@ export class AgentManagerDb {
 
         return {
           ok: false,
-          error: 'Usage: /task <create|list|assign|claim|done|remove> ...',
+          error: 'Usage: /task <create|list|assign|claim|done|remove|delete> ...',
         };
       }
 

@@ -258,7 +258,11 @@ const outputCommand: CommandSpec = {
 // alone whether to pop the confirmation prompt.
 
 const SCHEDULE_MUTATORS = new Set(['add', 'pause', 'resume', 'remove']);
-const TASK_MUTATORS = new Set(['create', 'claim', 'done', 'remove', 'delete']);
+// Operator-facing task bar is intentionally narrow: assign / status /
+// done / delete. Task creation and claiming live on the manager dispatch
+// path (agents create+claim their own tasks via the inter-agent skill),
+// so the bar doesn't surface them.
+const TASK_MUTATORS = new Set(['assign', 'status', 'done', 'remove', 'delete']);
 const AGENT_MUTATORS = new Set(['rebuild', 'start', 'stop', 'wallet']);
 const HEARTBEAT_MUTATORS = new Set(['enable', 'disable']);
 // Phase 4: subcommands that escalate from Y/N to retype.
@@ -333,18 +337,45 @@ const REGISTRY: Record<string, CommandSpec> = {
   },
   task: {
     name: 'task',
-    description: 'Mutate tasks: create/claim/done (Y/N), remove/delete (retype). Browse with `t`.',
-    tier: 'powerful',
+    description: 'Mutate tasks: assign/status/done/delete (Y/N), bulk delete (retype). Browse with `t`.',
+    tier: 'destructive',
     shouldConfirm: (args) => TASK_MUTATORS.has(args[0]?.toLowerCase() ?? ''),
-    shouldRetype: (args) => TASK_RETYPE.has(args[0]?.toLowerCase() ?? ''),
-    confirmPreview: (args) =>
-      TASK_MUTATORS.has(args[0]?.toLowerCase() ?? '') ? `task ${args.join(' ')}` : null,
+    // Retype is reserved for BULK deletes (`*` or `--team`). Single-task
+    // delete falls back to Y/N via shouldConfirm — recoverable scope, no
+    // need to make the operator retype the whole line.
+    shouldRetype: (args) => {
+      const sub = args[0]?.toLowerCase() ?? '';
+      if (!TASK_RETYPE.has(sub)) return false;
+      const first = args[1];
+      return first === '*' || first === '--team';
+    },
+    confirmPreview: (args) => {
+      const sub = args[0]?.toLowerCase() ?? '';
+      if (!TASK_MUTATORS.has(sub)) return null;
+      if (sub === 'remove' || sub === 'delete') {
+        const first = args[1];
+        if (!first) return null;
+        if (first === '*') return 'DELETE ALL tasks in the active team';
+        if (first === '--team') {
+          const t = args[2];
+          return t ? `DELETE ALL tasks in team ${t}` : 'remove --team (no team name)';
+        }
+        return `delete task ${first}`;
+      }
+      if (sub === 'status') {
+        const ref = args[1];
+        const target = args[2];
+        if (!ref || !target) return null;
+        return `set task ${ref} to ${target}`;
+      }
+      return `task ${args.join(' ')}`;
+    },
     run: async ({ manager, executor, signal, args, teamName }) => {
       const sub = args[0]?.toLowerCase() ?? '';
       if (!TASK_MUTATORS.has(sub)) {
         return {
           ok: false,
-          error: 'Use `t` to open the tasks view. /task only handles create, claim, done, remove, delete.',
+          error: 'Use `t` to open the tasks view. /task only handles assign, status, done, remove, delete. Use the manager dispatch path for /task create.',
         };
       }
       return runRemoteCommand(manager, executor, ['/task', ...args].join(' '), signal, teamName);
@@ -436,12 +467,6 @@ const REGISTRY: Record<string, CommandSpec> = {
     shouldRetype: () => true,
     confirmPreview: (args) =>
       args[0] ? `cancel running query on agent ${args[0]}` : 'cancel (no args — will error)',
-    argCompleter: agentNameSlot0,
-  }),
-  clear: remote('clear', "Clear an agent's session: `/clear <agent>`", 'powerful', {
-    shouldRetype: () => true,
-    confirmPreview: (args) =>
-      args[0] ? `clear session on agent ${args[0]}` : 'clear (no args — will error)',
     argCompleter: agentNameSlot0,
   }),
 };
