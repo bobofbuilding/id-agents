@@ -64,9 +64,10 @@ function buildBodyLines(
   if (skill.skillName && skill.skillName !== skill.name) {
     out.push(`frontmatter: ${skill.skillName}`);
   }
-  out.push(`source path: ${skill.source_path}`);
-  out.push(`SKILL.md:    ${skill.skillFile}`);
-  out.push(`body length: ${skill.bodyLength.toLocaleString()} chars`);
+  // README-first: for skills the SKILL.md frontmatter `description` is the
+  // canonical human-written summary (skills don't ship a separate README),
+  // so surface it directly under the identity lines before any of the
+  // sparse path/byte-count metadata below.
   out.push('');
   out.push('── description ──');
   if (!skill.description || skill.description.trim() === '') {
@@ -81,6 +82,10 @@ function buildBodyLines(
       out.push(line);
     }
   }
+  out.push('');
+  out.push(`source path: ${skill.source_path}`);
+  out.push(`SKILL.md:    ${skill.skillFile}`);
+  out.push(`body length: ${skill.bodyLength.toLocaleString()} chars`);
   return out;
 }
 

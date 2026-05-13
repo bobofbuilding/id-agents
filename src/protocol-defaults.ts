@@ -36,6 +36,18 @@ Every non-trivial unit of work MUST go through the task lifecycle.
 - Single-line answers, greetings, simple look-ups
 - Work that is already part of an existing task you claimed
 
+### Assigned vs self-initiated work
+- **Assigned**: the dispatch brief contains \`task: <name>\` and explicit
+  claim/done URLs. The manager has already created the task. Use the
+  brief's URLs verbatim — do NOT create a parallel task.
+- **Self-initiated**: you discovered the work yourself. Run the full
+  lifecycle below (create → claim → do → done).
+
+Creating a parallel task under a different name leaves the dispatcher's
+checkin firing against a phantom row. See \`skills/task-discipline/SKILL.md\`
+and \`skills/inter-agent/SKILL.md\` (section "Dispatch brief template") for
+the full guidance.
+
 ### Lifecycle
 1. **Create**: \`POST $MANAGER_URL/tasks\` with \`{ title, name, from: "<your-name>" }\`
 2. **Claim**: \`POST $MANAGER_URL/tasks/<name>/claim\` with \`{ agent_id: "<your-name>" }\`
@@ -58,6 +70,15 @@ Avoid reserved command verbs (delete, deploy, sync, etc.).
 A verifier walking the task stream can see every unit of work, every
 artifact, every completion or failure — but only if every agent uses
 the system. Your discipline makes the team auditable.
+
+### Orphan cleanup notes
+If a cleanup pass closes a checkin or task that should not block
+acceptance because another agent's task covers the same work, write
+the close note in this exact format:
+
+\`\`\`
+closed-by-cleanup: see <implementer-task-name> (uuid <short>)
+\`\`\`
 
 ## Output Convention
 

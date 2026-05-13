@@ -1,7 +1,28 @@
 // SPDX-License-Identifier: MIT
 
-import type { SchedulePayload, DispatchResult, DispatchTarget, LinkedTaskSummary } from './schedule-types.js';
+import {
+  buildSchedulePayload,
+  type DispatchResult,
+  type DispatchTarget,
+  type LinkedTaskSummary,
+} from './schedule-types.js';
 import type { ScheduleDefinitionRow } from '../db/types.js';
+
+/**
+ * Optional inputs accepted by `ScheduleDispatcher.dispatch`. Kept narrow
+ * so the manual-fire path goes through the same code path as the
+ * scheduler tick — the only allowed deviations from a real beat are
+ * the `manual` flag and the scheduled-key timestamp.
+ */
+export interface DispatchOptions {
+  linkedTasks?: LinkedTaskSummary[];
+  /**
+   * Manual operator fire (`/heartbeat fire <agent>`). When true, the
+   * outgoing payload carries `schedule.manual: true` so the receiving
+   * agent can branch on operator-fired vs scheduler-fired wakes.
+   */
+  manual?: boolean;
+}
 
 /**
  * Delivers scheduled payloads to agent /talk or /schedule endpoints.
@@ -15,8 +36,14 @@ export class ScheduleDispatcher {
     def: ScheduleDefinitionRow,
     target: DispatchTarget,
     scheduledKey: string,
-    linkedTasks?: LinkedTaskSummary[],
+    optsOrLinkedTasks?: DispatchOptions | LinkedTaskSummary[],
   ): Promise<DispatchResult> {
+    // Backwards-compatible signature: callers can still pass the
+    // legacy `linkedTasks?: LinkedTaskSummary[]` positional argument.
+    const opts: DispatchOptions = Array.isArray(optsOrLinkedTasks)
+      ? { linkedTasks: optsOrLinkedTasks }
+      : (optsOrLinkedTasks ?? {});
+
     const result: DispatchResult = {
       scheduleId: def.id,
       agentId: target.id,
@@ -34,21 +61,10 @@ export class ScheduleDispatcher {
       return result;
     }
 
-    const payload: SchedulePayload = {
-      from: def.sender || 'schedule',
-      mode: def.delivery_mode,
-      schedule: {
-        id: def.id,
-        kind: def.kind,
-        title: def.title,
-        scheduledKey,
-      },
-      message: def.message,
-    };
-
-    if (linkedTasks && linkedTasks.length > 0) {
-      payload.linkedTasks = linkedTasks;
-    }
+    const payload = buildSchedulePayload(def, scheduledKey, {
+      linkedTasks: opts.linkedTasks,
+      manual: opts.manual,
+    });
 
     const path = def.delivery_mode === 'internal' ? target.schedulePath : target.talkPath;
     if (def.delivery_mode === 'internal' && !path) {

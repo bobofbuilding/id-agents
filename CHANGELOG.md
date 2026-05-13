@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.96-beta
+
+### Features
+
+- **Team-templates library** in the TUI, parallel to the existing agent and skill libraries. Team templates live under `configs/teams/<template>/team.yaml` and are immutable; the install pipeline (`POST /library/install`) copies the template to `configs/<dest>.yaml` (mutable, deploy target), rewrites the top-level `team:` key when the operator picks a different destination name, and refuses to overwrite an existing config without `force: true`. The TUI surfaces this through the `m` keybind (`library / teams`), a `LibraryTeamsTable` view, a `LibraryTeamDetail` view with an inline install panel (idle → prompt → running → success/error), and a `/library install team <template> [as <dest>]` command bar entry. Two seed templates ship in this release: `starter-pair` (minimal lead + dev, no library refs) and `solidity-pair` (Foundry builder backed by `foundry-dev` plus an adversarial reviewer).
+- **`/heartbeat fire <agent>`** for manual heartbeat firing. Synthesizes the same wake payload the scheduler emits on a real beat, dispatches through the existing `/talk-to` path, records a `manual: true` beat event, and returns the spawned `queryId` so the operator can poll for the agent's reply. Supports `--force` to fire even when no heartbeat is configured (synthesizes a generic schedule in memory; never persisted). Manual fires do NOT update `lastFireAt` and do NOT consume `maxBeats`/`max_runs`, so testing never perturbs the scheduled cadence or budgets. Backed by a hard parity test: drives both the real scheduler dispatch and the manual-fire path through `fetch` spies, asserts the two payloads differ only in `schedule.scheduledKey`, `schedule.manual`, and `mode`. Every other field is asserted equal individually. The TUI binds `f` on a selected heartbeat row as a one-key fire trigger.
+
+### Fixes
+
+- **Task-discipline divergence**: agents delegated work by another agent (typically a CTO dispatching to a coder) used to follow the `task-discipline` skill literally and CREATE a new task with a name they invented, instead of CLAIMING the task the dispatcher had already created. This left dispatchers' task rows stuck in `doing`, broke checkin supervision (the supervisor probed for tasks that returned `not_found`), and split the work across two parallel namespaces. The `task-discipline` skill (`skills/task-discipline/SKILL.md`) and the same content injected via `defaults.claudeMd` now distinguish **assigned work** (claim the task your dispatcher gave you, do not create) from **self-initiated work** (create + claim, the original flow). The fix shipped via controlled rebuild across all teams. Verification dispatch (`test-claim-not-create`) proves the new behavior holds end-to-end. Documented `closed-by-cleanup: see <task-name> (uuid <short>)` note format for closing orphan rows when a janitor pass discovers them.
+
+### UX
+
+- TUI help view picks up three new bindings: `m` for library/teams, `i` to install a library team from the detail view, `F` to toggle force on the install prompt, `f` to fire a heartbeat from the heartbeats view.
+
 ## 0.1.95-beta
 
 ### Features

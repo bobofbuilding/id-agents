@@ -274,6 +274,12 @@ export interface LibraryAgentRow {
   hasLicense: boolean;
   subfolders: string[];
   source_path: string;
+  /**
+   * README-first description from the manager. First body paragraph of
+   * the entry's README.md, or null when no README is present. Slice-2
+   * inventory contract — prefer this over any config-derived summary.
+   */
+  description: string | null;
 }
 
 export interface LibraryAgentListResponse {
@@ -293,6 +299,12 @@ export interface LibrarySkillRow {
   name: string;
   hasSkillMd: boolean;
   source_path: string;
+  /**
+   * README-first description from the manager. SKILL.md frontmatter
+   * `description:` first, then first body paragraph; null when neither
+   * is available. Slice-2 inventory contract.
+   */
+  description: string | null;
 }
 
 export interface LibrarySkillListResponse {
@@ -345,4 +357,128 @@ export async function fetchLibrarySkill(
     throw new Error(`GET /library/skills/${name} → ${res.status} ${res.statusText}`);
   }
   return (await res.json()) as LibrarySkillDetailResponse;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Slice 4: library teams + install (manager /library/teams + /install) */
+/* ------------------------------------------------------------------ */
+
+export interface LibraryTeamRow {
+  name: string;
+  hasReadme: boolean;
+  hasLicense: boolean;
+  hasTeamYaml: boolean;
+  source_path: string;
+  /**
+   * README-first description from the manager. First body paragraph of
+   * the team's README.md, or null when no README is present. Slice-2
+   * inventory contract.
+   */
+  description: string | null;
+}
+
+export interface LibraryTeamListResponse {
+  libraryRoot: string | null;
+  entries: LibraryTeamRow[];
+}
+
+export interface LibraryTeamDetailResponse extends LibraryTeamRow {
+  teamYamlFile: string;
+  readme: string | null;
+  teamYaml: string;
+  declaredTeam: string | null;
+  agents: string[];
+}
+
+export async function fetchLibraryTeams(
+  manager: string,
+  signal: AbortSignal,
+): Promise<LibraryTeamListResponse> {
+  return getJson<LibraryTeamListResponse>(`${manager}/library/teams`, signal);
+}
+
+export async function fetchLibraryTeam(
+  manager: string,
+  name: string,
+  signal: AbortSignal,
+): Promise<LibraryTeamDetailResponse | null> {
+  const res = await fetch(`${manager}/library/teams/${encodeURIComponent(name)}`, { signal });
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    throw new Error(`GET /library/teams/${name} → ${res.status} ${res.statusText}`);
+  }
+  return (await res.json()) as LibraryTeamDetailResponse;
+}
+
+export interface InstallLibraryTeamRequest {
+  template: string;
+  dest: string;
+  force?: boolean;
+}
+
+export interface InstallLibraryTeamSuccess {
+  ok: true;
+  kind: 'team';
+  template: string;
+  dest: string;
+  destPath: string;
+  overwritten: boolean;
+  declaredTeamBefore: string | null;
+  declaredTeamAfter: string;
+}
+
+export interface InstallLibraryTeamFailure {
+  ok: false;
+  error: string;
+  status: number;
+  [k: string]: unknown;
+}
+
+export type InstallLibraryTeamResponse =
+  | InstallLibraryTeamSuccess
+  | InstallLibraryTeamFailure;
+
+// POST /library/install — wraps the backend selector grammar
+// (from: "team:<template>", to: "team:<dest>") behind a typed
+// helper for the TUI install prompt. Returns a normalized result
+// so the caller can render success/failure without rewriting the
+// `team:` envelope at every call site.
+export async function installLibraryTeam(
+  manager: string,
+  req: InstallLibraryTeamRequest,
+  signal: AbortSignal,
+): Promise<InstallLibraryTeamResponse> {
+  const body = {
+    from: `team:${req.template}`,
+    to: `team:${req.dest}`,
+    force: req.force === true,
+  };
+  let res: Response;
+  try {
+    res = await fetch(`${manager}/library/install`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal,
+    });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new NetworkError(msg);
+  }
+  const text = await res.text();
+  let parsed: Record<string, unknown> = {};
+  try {
+    parsed = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+  } catch {
+    parsed = { error: text || res.statusText };
+  }
+  if (!res.ok) {
+    return {
+      ok: false,
+      status: res.status,
+      error: typeof parsed.error === 'string' ? parsed.error : `HTTP ${res.status}`,
+      ...parsed,
+    };
+  }
+  return parsed as unknown as InstallLibraryTeamSuccess;
 }

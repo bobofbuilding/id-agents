@@ -1,6 +1,6 @@
 {
   "name": "id-agents",
-  "version": "0.1.95-beta",
+  "version": "0.1.96-beta",
   "description": "Multi-agent orchestration platform with REST-AP interfaces",
   "type": "module",
   "main": "dist/index.js",
@@ -76,7 +76,8 @@
     "node-fetch": "^3.3.2",
     "pg": "^8.16.3",
     "viem": "^2.37.5",
-    "ws": "^8.19.0"
+    "ws": "^8.19.0",
+    "yaml": "^2.9.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",

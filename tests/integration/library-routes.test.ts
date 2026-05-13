@@ -113,6 +113,10 @@ describe('library inventory routes — mounted foundry-dev fixture', () => {
       hasLicense: false,
       subfolders: ['skills'],
       source_path: FIXTURE_AGENT_ROOT,
+      // README-first one-line description (slice-2 contract). Pinned to
+      // the exact string so a fixture README rewrite has to be intentional.
+      description:
+        'Opinionated Foundry / Solidity developer agent for day-to-day contract work. Claude-native shape (`CLAUDE.md` inside this folder).',
     });
   });
 
@@ -228,6 +232,9 @@ describe('library inventory routes — standalone skills in a tmp library', () =
         name: 'using-foundry',
         hasSkillMd: true,
         source_path: path.join(libraryRoot, 'skills', 'using-foundry'),
+        // Slice-2 contract: README-first description. For skills the
+        // frontmatter `description:` is the canonical source.
+        description: 'Day-to-day Foundry project work.',
       },
     ]);
   });
@@ -293,5 +300,128 @@ describe('library inventory routes — no library configured', () => {
     const { status, body } = await getJson(baseUrl, '/library/skills/anything');
     expect(status).toBe(404);
     expect(body.error).toBe('not_found');
+  });
+
+  it('GET /library/teams returns { libraryRoot: null, entries: [] }', async () => {
+    const { status, body } = await getJson(baseUrl, '/library/teams');
+    expect(status).toBe(200);
+    expect(body).toEqual({ libraryRoot: null, entries: [] });
+  });
+
+  it('GET /library/teams/:name returns 404 when no library is configured', async () => {
+    const { status, body } = await getJson(baseUrl, '/library/teams/starter-pair');
+    expect(status).toBe(404);
+    expect(body.error).toBe('not_found');
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  With team templates under <libraryRoot>/teams/                     */
+/* ------------------------------------------------------------------ */
+
+describe('library inventory routes — team templates in a tmp library', () => {
+  let manager: AgentManagerDb;
+  let db: Awaited<ReturnType<typeof createInMemoryDb>>;
+  let baseUrl: string;
+  let workDir: string;
+  let libraryRoot: string;
+
+  beforeAll(async () => {
+    const port = await findFreePort();
+    baseUrl = `http://127.0.0.1:${port}`;
+    workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'library-routes-teams-test-'));
+    libraryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'library-routes-teams-root-'));
+
+    // Two seed templates: one with a README (description-bearing), one
+    // without (description should be null). Covers the slice-2
+    // README-first contract on the wire for both branches.
+    const starterDir = path.join(libraryRoot, 'teams', 'starter-pair');
+    fs.mkdirSync(starterDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(starterDir, 'team.yaml'),
+      [
+        'version: "1"',
+        'team: starter-pair',
+        'agents:',
+        '  - name: lead',
+        '    description: "Plans the work"',
+        '  - name: dev',
+        '    description: "Implements the work"',
+        '',
+      ].join('\n'),
+    );
+    fs.writeFileSync(
+      path.join(starterDir, 'README.md'),
+      '# starter-pair\n\nA minimal two-agent team — lead plans and reviews, dev implements.\n',
+    );
+
+    const bareDir = path.join(libraryRoot, 'teams', 'bare');
+    fs.mkdirSync(bareDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(bareDir, 'team.yaml'),
+      'version: "1"\nteam: bare\nagents:\n  - name: solo\n',
+    );
+
+    db = await createInMemoryDb();
+    manager = new AgentManagerDb(workDir, db as any, { libraryRoot });
+    await manager.start(port);
+  }, 15000);
+
+  afterAll(async () => {
+    if (manager) await stopManager(manager);
+    try { fs.rmSync(workDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    try { fs.rmSync(libraryRoot, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  it('GET /library/teams enumerates both templates with README-first descriptions', async () => {
+    const { status, body } = await getJson(baseUrl, '/library/teams');
+    expect(status).toBe(200);
+    expect(body.libraryRoot).toBe(libraryRoot);
+
+    // Sorted alphabetically by the enumerator.
+    expect(body.entries).toEqual([
+      {
+        name: 'bare',
+        hasReadme: false,
+        hasLicense: false,
+        hasTeamYaml: true,
+        source_path: path.join(libraryRoot, 'teams', 'bare'),
+        description: null,
+      },
+      {
+        name: 'starter-pair',
+        hasReadme: true,
+        hasLicense: false,
+        hasTeamYaml: true,
+        source_path: path.join(libraryRoot, 'teams', 'starter-pair'),
+        description: 'A minimal two-agent team — lead plans and reviews, dev implements.',
+      },
+    ]);
+  });
+
+  it('GET /library/teams/:name returns declaredTeam, parsed agents, README body, and description', async () => {
+    const { status, body } = await getJson(baseUrl, '/library/teams/starter-pair');
+    expect(status).toBe(200);
+    expect(body.name).toBe('starter-pair');
+    expect(body.hasReadme).toBe(true);
+    expect(body.hasTeamYaml).toBe(true);
+    expect(body.declaredTeam).toBe('starter-pair');
+    expect(body.agents).toEqual(['lead', 'dev']);
+    expect(body.description).toBe(
+      'A minimal two-agent team — lead plans and reviews, dev implements.',
+    );
+    expect(typeof body.readme).toBe('string');
+    expect(body.readme).toContain('A minimal two-agent team');
+    expect(body.teamYamlFile).toBe(path.join(libraryRoot, 'teams', 'starter-pair', 'team.yaml'));
+  });
+
+  it('GET /library/teams/:name returns 404 for an unknown template', async () => {
+    const { status, body } = await getJson(baseUrl, '/library/teams/missing');
+    expect(status).toBe(404);
+    expect(body).toEqual({
+      error: 'not_found',
+      resource: 'library-team',
+      name: 'missing',
+    });
   });
 });

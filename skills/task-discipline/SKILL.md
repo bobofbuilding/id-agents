@@ -23,6 +23,37 @@ The task lifecycle is mandatory for any multi-step work or work that produces an
 - Single-line answers, greetings, simple look-ups
 - Work that is already part of an existing task you claimed
 
+## Assigned work vs self-initiated work
+
+There are **two** ways a task lifecycle starts. Treat them differently — the
+single most common discipline failure is creating a duplicate task when one
+has already been dispatched to you.
+
+### Assigned work (someone delegated to you)
+
+If you received a dispatch brief that names a task — i.e. the message
+contains `task: <name>` plus explicit claim/done URLs (see the
+`inter-agent` skill, section "Dispatch brief template") — the manager
+**already created the task**. Do **not** create a new task.
+
+Use the brief's URLs verbatim:
+
+1. `POST <claim URL>` with `{"agent_id": "<your-name>"}` — flips to `doing`.
+2. Do the work.
+3. `POST <done URL>` with `{"agent_id": "<your-name>"}` — flips to `done`.
+4. Reply citing the assigned task name.
+
+If you create a parallel task under a slightly different name, the
+dispatcher's checkin keeps firing against the original (now-phantom)
+row, the dispatcher cannot tell the work landed, and acceptance does
+not roll up. Use the assigned name **verbatim**.
+
+### Self-initiated work (you discovered it)
+
+If you found work that needs doing during a heartbeat, review, or
+ordinary flow — and nobody dispatched a brief — follow the full
+lifecycle below: create → claim → do → done.
+
 ## The lifecycle
 
 1. Create: `POST $MANAGER_URL/tasks` with `{title, name, from: <your-name> }`
@@ -44,6 +75,34 @@ Avoid reserved command verbs (delete, deploy, sync, etc.) which will be rejected
 ## Why this matters
 
 A verifier agent walking the task stream can see every unit of work, every artifact, every completion or failure, but only if every agent uses the system. Your discipline is what makes the team auditable.
+
+## Orphan cleanup notes
+
+If you're running a cleanup pass and need to close a checkin or task
+that should not block acceptance because a different agent's task
+already covers the same work, write the close note in this **exact**
+format:
+
+```
+closed-by-cleanup: see <implementer-task-name> (uuid <short>)
+```
+
+Where `<short>` is the implementer's `shortId` (e.g. `#7b03a518`). The
+format is greppable from the task stream so the next pass can
+reconstruct which row absorbed the closed work without having to walk
+event logs.
+
+## Future hardening (deferred — not in this slice)
+
+Manager-side duplicate-task rejection — refusing `POST /tasks` when a
+dispatch has already created a task for the same logical unit of work
+— is a known followup. Until that lands, dispatchers and implementers
+prevent duplicates manually by:
+
+- Dispatchers including `task: <name>` and explicit claim/done URLs
+  in every brief (see `inter-agent` skill, "Dispatch brief template").
+- Implementers using the assigned task name **verbatim** (see
+  "Assigned work vs self-initiated work" above).
 
 ## See also
 

@@ -29,4 +29,18 @@ describe('PROTOCOL_DEFAULTS', () => {
     expect(PROTOCOL_DEFAULTS).toContain('/tasks/<name>/claim');
     expect(PROTOCOL_DEFAULTS).toContain('/tasks/<name>/done');
   });
+
+  it('distinguishes assigned vs self-initiated work and points at the skills', () => {
+    expect(PROTOCOL_DEFAULTS).toContain('Assigned vs self-initiated work');
+    expect(PROTOCOL_DEFAULTS).toContain('do NOT create a parallel task');
+    expect(PROTOCOL_DEFAULTS).toContain('skills/task-discipline/SKILL.md');
+    expect(PROTOCOL_DEFAULTS).toContain('skills/inter-agent/SKILL.md');
+  });
+
+  it('documents the orphan-cleanup close-note format verbatim', () => {
+    expect(PROTOCOL_DEFAULTS).toContain('Orphan cleanup notes');
+    expect(PROTOCOL_DEFAULTS).toContain(
+      'closed-by-cleanup: see <implementer-task-name> (uuid <short>)',
+    );
+  });
 });

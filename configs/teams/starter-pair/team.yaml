@@ -1,0 +1,32 @@
+# starter-pair — minimal 2-agent team template.
+#
+# Install via the manager:
+#   POST /library/install { from: "team:starter-pair", to: "team:<your-team>" }
+# The install endpoint rewrites the top-level `team:` field via YAML AST
+# (the `yaml` package's Document API — never regex) and prepends a
+# provenance header to the written file.
+#
+# Inline-only — agents declare their persona via `description:` and do
+# not reference a `configs/agents/` library entry. Clone this template
+# when you want a clean starting point; use solidity-pair when you
+# want a worked example of peer `agent:` and `skills:`.
+
+version: "1"
+team: starter-pair
+
+defaults:
+  local: true
+  runtime: claude-code-cli
+  model: claude-opus-4-7
+  skills:
+    - identity
+    - inter-agent
+    - catalog
+
+agents:
+  - name: lead
+    description: "Plans the work, splits it into tasks, reviews the result."
+    model: claude-opus-4-7
+
+  - name: dev
+    description: "Implements features against the lead's plan."

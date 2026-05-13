@@ -111,11 +111,13 @@ const agentTwoSlot: NonNullable<CommandSpec['argCompleter']> = (slot, ctx) => {
   return [];
 };
 
-// `/heartbeat enable|disable <name>` — slot 0 is the subcommand from a
-// fixed set, slot 1 is the agent name. Heartbeat status browsing lives
+// `/heartbeat enable|disable|fire <name>` — slot 0 is the subcommand from
+// a fixed set, slot 1 is the agent name. Heartbeat status browsing lives
 // behind the `h` keybind, so the bare and one-arg read-only forms are
-// rejected with a hint at run() time.
-const HEARTBEAT_SUBACTIONS = ['enable', 'disable'];
+// rejected with a hint at run() time. `fire` is the operator/debug
+// manual-fire action — distinct from the scheduled cadence — and lands
+// here so tab-completion surfaces it alongside enable/disable.
+const HEARTBEAT_SUBACTIONS = ['enable', 'disable', 'fire'];
 const heartbeatSlots: NonNullable<CommandSpec['argCompleter']> = (slot, ctx) => {
   if (slot === 0) return HEARTBEAT_SUBACTIONS;
   if (slot === 1) return ctx.agentNames;
@@ -264,7 +266,9 @@ const SCHEDULE_MUTATORS = new Set(['add', 'pause', 'resume', 'remove']);
 // so the bar doesn't surface them.
 const TASK_MUTATORS = new Set(['assign', 'status', 'done', 'remove', 'delete']);
 const AGENT_MUTATORS = new Set(['rebuild', 'start', 'stop', 'wallet']);
-const HEARTBEAT_MUTATORS = new Set(['enable', 'disable']);
+// `fire` is a one-shot manual wake — treat it as a mutator so the bar
+// pops a Y/N confirmation before dispatching, matching enable/disable.
+const HEARTBEAT_MUTATORS = new Set(['enable', 'disable', 'fire']);
 // Phase 4: subcommands that escalate from Y/N to retype.
 const SCHEDULE_RETYPE = new Set(['remove']);
 const TASK_RETYPE = new Set(['remove', 'delete']);
@@ -422,13 +426,15 @@ const REGISTRY: Record<string, CommandSpec> = {
   },
   heartbeat: {
     name: 'heartbeat',
-    description: 'Toggle heartbeat: `/heartbeat enable|disable <agent>`. Browse with `h`.',
+    description: 'Toggle/fire heartbeat: `/heartbeat enable|disable|fire <agent>`. Browse with `h`.',
     tier: 'powerful',
     shouldConfirm: (args) => HEARTBEAT_MUTATORS.has(args[0]?.toLowerCase() ?? ''),
     confirmPreview: (args) => {
       const sub = args[0]?.toLowerCase() ?? '';
       const name = args[1] ?? '<agent>';
-      return HEARTBEAT_MUTATORS.has(sub) ? `${sub} heartbeat for agent ${name}` : null;
+      if (!HEARTBEAT_MUTATORS.has(sub)) return null;
+      if (sub === 'fire') return `manually fire heartbeat for agent ${name}`;
+      return `${sub} heartbeat for agent ${name}`;
     },
     argCompleter: heartbeatSlots,
     run: async ({ manager, executor, signal, args, teamName }) => {
@@ -436,7 +442,7 @@ const REGISTRY: Record<string, CommandSpec> = {
       if (!HEARTBEAT_MUTATORS.has(sub)) {
         return {
           ok: false,
-          error: 'Use `h` to open the heartbeats view. /heartbeat only handles enable, disable.',
+          error: 'Use `h` to open the heartbeats view. /heartbeat only handles enable, disable, fire.',
         };
       }
       return runRemoteCommand(manager, executor, ['/heartbeat', ...args].join(' '), signal, teamName);

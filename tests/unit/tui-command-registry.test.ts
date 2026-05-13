@@ -476,7 +476,7 @@ describe('TUI command registry tiers', () => {
         args: ['worker'],
       });
 
-      const hint = 'Use `h` to open the heartbeats view. /heartbeat only handles enable, disable.';
+      const hint = 'Use `h` to open the heartbeats view. /heartbeat only handles enable, disable, fire.';
       expect(bare).toEqual({ ok: false, error: hint });
       expect(justAgent).toEqual({ ok: false, error: hint });
       expect(calls).toEqual([]);

@@ -1,0 +1,43 @@
+# solidity-pair — builder + adversarial auditor for smart contracts.
+#
+# Install via the manager:
+#   POST /library/install { from: "team:solidity-pair", to: "team:<your-team>" }
+# The install endpoint rewrites the top-level `team:` field via YAML AST
+# (the `yaml` package's Document API — never regex) and prepends a
+# provenance header to the written file.
+#
+# Worked example of v3 peer surfaces on agent entries:
+#   - `agent:`  selects one entry under configs/agents/<name>/
+#   - `skills:` selects zero or more entries under configs/skills/<name>/
+# These two are peers — NOT nested. `skills:` here overlays on top of
+# the bundled skills shipped with the library agent (deploy is Step A
+# entry copy, then Step B skill overlay).
+
+version: "1"
+team: solidity-pair
+
+defaults:
+  local: true
+  runtime: claude-code-cli
+  skills:
+    - identity
+    - inter-agent
+    - catalog
+
+agents:
+  - name: builder
+    description: "Day-to-day Foundry/Solidity developer."
+    agent: foundry-dev
+    # `agent:` and `skills:` are peers on the agent entry.
+    skills:
+      - identity
+      - inter-agent
+      - catalog
+
+  - name: auditor
+    description: "Adversarial security reviewer paired with the builder."
+    agent: solidity-security
+    skills:
+      - identity
+      - inter-agent
+      - catalog

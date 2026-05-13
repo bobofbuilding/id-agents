@@ -19,8 +19,9 @@ const VIEW_BINDINGS: Array<[string, string]> = [
   ['n', 'News'],
   ['c', 'Calendar'],
   ['h', 'Heartbeats'],
-  ['l', 'Library'],
-  ['s', 'Skills'],
+  ['l', 'Library / agents'],
+  ['s', 'Library / skills'],
+  ['m', 'Library / teams'],
 ];
 
 const NAVIGATE_BINDINGS: Array<[string, string]> = [
@@ -30,6 +31,9 @@ const NAVIGATE_BINDINGS: Array<[string, string]> = [
   ['→', 'Open detail'],
   ['← Esc', 'Back'],
   ['Tab', 'Cycle team'],
+  ['i', 'Install (library team detail)'],
+  ['F', 'Toggle force (install prompt)'],
+  ['f', 'Fire heartbeat (heartbeats view)'],
 ];
 
 const GLOBAL_BINDINGS: Array<[string, string]> = [

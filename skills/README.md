@@ -4,7 +4,7 @@ This directory contains skills for agents and external tools.
 
 **Agent skills** (deployed to each agent's `.claude/skills/` at deploy time): `identity`, `inter-agent`, `catalog`, `wallet`, `xmtp`. All YAML configs should include `skills: [identity, inter-agent, catalog]` at minimum.
 
-**External skills** (used by external Claude Code sessions, not deployed to agents): `idagents-admin-control`.
+**External skills** (used by external Claude Code sessions, not deployed to agents): `idagents-admin-control`, `idagents-team-builder`, `idagents-register-public-agents`.
 
 ## What are Skills?
 
@@ -54,6 +54,12 @@ Enables Claude Code to act as an admin agent for remote management of the team. 
 - `remote-command.sh` - Execute CLI commands on the manager
 - `start-listener.js` - Start temporary HTTP listener for replies
 - `admin-session.js` - Interactive admin session
+
+### idagents-team-builder
+
+How to build an id-agents team correctly from scratch. Covers YAML structure, per-agent workspaces, role files, library agent templates, skill bundling, and the gotchas (silent default drops, symlinks vs copies, cpSync collisions). Use whenever designing a new team config or debugging a misconfigured agent.
+
+- `SKILL.md` - The seven rules, role file template, architecture patterns, failure modes by symptom
 
 ## Using Skills
 

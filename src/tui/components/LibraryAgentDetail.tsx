@@ -67,6 +67,17 @@ function buildBodyLines(
   const out: string[] = [];
   out.push(`name:        ${agent.name}`);
   out.push(`shape:       ${agent.shape}`);
+  // README-first: surface the README's first paragraph (or memory-file
+  // first paragraph as a fallback) right under the identity lines, so
+  // the operator sees a human-written description before any of the
+  // sparse config text below.
+  const description = firstParagraph(agent.readme) ?? firstParagraph(agent.memory);
+  if (description) {
+    out.push('');
+    out.push('── description ──');
+    for (const line of description.split(/\r?\n/)) out.push(line.trimEnd());
+  }
+  out.push('');
   out.push(`source path: ${agent.source_path}`);
   out.push(`memory file: ${agent.memoryFile}`);
   out.push(`README:      ${agent.hasReadme ? 'present' : '—'}`);
@@ -110,4 +121,27 @@ function clamp(n: number, lo: number, hi: number): number {
   if (n < lo) return lo;
   if (n > hi) return hi;
   return n;
+}
+
+// Pull the first non-empty paragraph from a markdown body, skipping ATX
+// headings (`# foo`) and leading blank lines. Returns null when no usable
+// paragraph is found. Headings are intentionally skipped because they
+// duplicate the entry name on most templates.
+function firstParagraph(raw: string | null): string | null {
+  if (!raw) return null;
+  const lines = raw.split(/\r?\n/);
+  let buf: string[] = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed === '') {
+      if (buf.length > 0) return buf.join('\n');
+      continue;
+    }
+    if (trimmed.startsWith('#')) {
+      if (buf.length > 0) return buf.join('\n');
+      continue;
+    }
+    buf.push(line.trimEnd());
+  }
+  return buf.length > 0 ? buf.join('\n') : null;
 }

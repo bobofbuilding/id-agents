@@ -199,6 +199,50 @@ curl -s "$MANAGER_URL/tasks/fix-overflow" -H "X-Id-Team: $ID_TEAM" | jq
 
 Tasks have three statuses: `todo` (unclaimed), `doing` (someone is working on it), `done` (completed). When you find work during a review or heartbeat, create a task so it gets tracked.
 
+## Dispatch brief template
+
+When you delegate work that should become a manager task — i.e. an
+async delegation via `/news-to` with `"trigger":true`, or a `/talk-to`
+with `task: {title, name}` auto-attach — **always include both of the
+following in the brief** so the implementer can claim and close the
+lifecycle without having to construct URLs from memory:
+
+1. `task: <name>` — the exact kebab-case task name the manager will
+   create. Same name you pass in the `task: {title, name}` body field
+   of `/talk-to` auto-attach (or post manually via `POST /tasks`).
+2. **Explicit claim and done URLs**, pasted verbatim:
+
+   ```
+   claim URL: http://127.0.0.1:4100/tasks/<name>/claim
+   done URL:  http://127.0.0.1:4100/tasks/<name>/done
+   ```
+
+Why both: the task name alone is greppable but does not unambiguously
+tell the implementer which manager origin to address. The explicit
+URLs survive paste into a different agent / different shell context
+and remove any guesswork about route shape.
+
+A complete dispatch brief looks like:
+
+> Manager-approved slice 2 of foo. Task: implement-foo.
+>
+> Required explicit task URLs:
+> - claim URL: http://127.0.0.1:4100/tasks/implement-foo/claim
+> - done URL: http://127.0.0.1:4100/tasks/implement-foo/done
+>
+> Scope: …
+
+Implementers MUST use the assigned task name **verbatim** — see the
+`task-discipline` skill, section "Assigned work vs self-initiated
+work". A parallel task under a different name leaves the dispatcher's
+checkin firing against a phantom row.
+
+> **Future hardening (deferred):** manager-side duplicate-task
+> rejection — refusing `POST /tasks` when a dispatch has already
+> created a task for the same logical unit of work — would catch the
+> parallel-task mistake automatically. Not in scope for this slice;
+> the dispatch-brief convention above is the manual guardrail.
+
 ## Checkins (work supervision)
 
 ### What it is

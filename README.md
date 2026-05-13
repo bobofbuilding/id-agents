@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Version 0.1.95-beta**
+**Version 0.1.96-beta**
 
 Run a team of AI coding agents from a single chat. Each agent is a real process with full tool access — **Claude Code CLI**, **OpenAI Codex**, **Cursor CLI**, or a mix. No UI needed. Connect from any terminal, Telegram, or SSH session.
 
@@ -680,7 +680,7 @@ The repo ships an agent library and a set of example team configs. Each library 
 
 ```
 configs/
-  agents/                    # 9 library entries
+  agents/                    # 9 library entries (peer `agent:` target)
     copywriter/
     devops/
     editor/
@@ -690,6 +690,11 @@ configs/
     fullstack-nextjs/
     security/                # CC-BY-SA-4.0 (Trail of Bits skills bundled)
     solidity-security/
+  skills/                    # standalone skill entries (peer `skills:` target)
+    <name>/SKILL.md
+  teams/                     # team templates (peer of agents/, skills/)
+    starter-pair/            # minimal 2-agent starter
+    solidity-pair/           # builder + adversarial auditor, uses peer agent: + skills:
   demos/                     # 8 example team YAMLs
     editorial-team.yaml
     editorial-team-v2.yaml
@@ -700,6 +705,26 @@ configs/
     solidity-security-demo.yaml
     solidity-security-team.yaml
 ```
+
+### Team templates (`configs/teams/`)
+
+Each entry is a directory with a `team.yaml` and a `README.md`. Templates are installed into the library root via the manager:
+
+```
+POST /library/install
+{ "from": "team:starter-pair", "to": "team:<your-team>" }
+```
+
+The endpoint rewrites the top-level `team:` field using the `yaml` package's Document AST — never regex string-splicing, so nested `team:` keys inside maps, tags, or strings survive untouched. The written file at `<libraryRoot>/<your-team>.yaml` is prefixed with a provenance header so you can tell at a glance which template produced it:
+
+```yaml
+# Installed from configs/teams/starter-pair/team.yaml on 2026-05-11
+version: "1"
+team: <your-team>
+…
+```
+
+Re-installing requires `force:true`, and the source template under `configs/teams/<name>/` is never overwritten.
 
 See [`NOTICE`](./NOTICE) for upstream attributions and per-skill license posture (most skills are MIT, the `security/` bundle is CC-BY-SA-4.0, a couple of Anthropic-authored skills are source-available). Each bundled skill keeps its upstream `LICENSE` next to its `SKILL.md` so the original notice travels with any redistribution.
 
@@ -716,7 +741,7 @@ id-agents unsync <config> [--workspace <path>]    # remove managed files using t
 
 ### TUI library browsers
 
-Press `l` for the agents library and `s` for the skills library from any TUI top-level view. Both are read-only list/detail views fed by the manager's `/library/agents` and `/library/skills` endpoints. Set `ID_LIBRARY_ROOT` on the manager to point them at any clone of [public-agents](https://github.com/idchain-world/public-agents).
+Press `l` for the agents library and `s` for the skills library from any TUI top-level view. Both are read-only list/detail views fed by the manager's `/library/agents` and `/library/skills` endpoints; `/library/teams` is the matching read endpoint for team templates. List and detail responses surface a **README-first `description`** — the inventory prefers the first body paragraph of the entry's `README.md` (or, for skills, the SKILL.md frontmatter `description:`) over a sparse config-derived summary. Set `ID_LIBRARY_ROOT` on the manager to point them at any clone of [public-agents](https://github.com/idchain-world/public-agents).
 
 ## Onchain Identity
 

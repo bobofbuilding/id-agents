@@ -8,6 +8,7 @@ import os from 'os';
 import {
   enumerateLibraryAgents,
   enumerateLibrarySkills,
+  enumerateLibraryTeams,
   getLibraryPaths,
 } from '../../src/lib/agent-library.js';
 
@@ -33,10 +34,11 @@ function mkdir(p: string): void {
 /* ------------------------------------------------------------------ */
 
 describe('getLibraryPaths', () => {
-  it('returns agents and skills subpaths joined to the plural configs root', () => {
+  it('returns agents, skills, and teams subpaths joined to the plural configs root', () => {
     const paths = getLibraryPaths('/repo/configs');
     expect(paths.agents).toBe(path.join('/repo/configs', 'agents'));
     expect(paths.skills).toBe(path.join('/repo/configs', 'skills'));
+    expect(paths.teams).toBe(path.join('/repo/configs', 'teams'));
   });
 
   it('falls back to a sibling skills/ when nested skills/ is absent', () => {
@@ -296,6 +298,70 @@ describe('enumerateLibrarySkills', () => {
     writeFile(path.join(skillsDir, 'apple', 'SKILL.md'), '');
     writeFile(path.join(skillsDir, 'mango', 'SKILL.md'), '');
     const entries = enumerateLibrarySkills(skillsDir);
+
+    expect(entries.map(e => e.name)).toEqual(['apple', 'mango', 'zebra']);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  enumerateLibraryTeams                                              */
+/* ------------------------------------------------------------------ */
+
+describe('enumerateLibraryTeams', () => {
+  let tmpDir: string;
+  let teamsDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkTmp();
+    teamsDir = path.join(tmpDir, 'teams');
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('returns empty when teams dir does not exist', () => {
+    expect(enumerateLibraryTeams(path.join(tmpDir, 'missing'))).toEqual([]);
+  });
+
+  it('returns empty when teams dir is empty', () => {
+    mkdir(teamsDir);
+    expect(enumerateLibraryTeams(teamsDir)).toEqual([]);
+  });
+
+  it('detects a team directory with team.yaml', () => {
+    writeFile(path.join(teamsDir, 'demo', 'team.yaml'), 'team: demo\n');
+    const entries = enumerateLibraryTeams(teamsDir);
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toEqual({
+      name: 'demo',
+      dirPath: path.join(teamsDir, 'demo'),
+      teamYamlFile: path.join(teamsDir, 'demo', 'team.yaml'),
+    });
+  });
+
+  it('skips a directory without team.yaml', () => {
+    mkdir(path.join(teamsDir, 'half-baked'));
+    writeFile(path.join(teamsDir, 'half-baked', 'README.md'), 'no yaml here');
+    expect(enumerateLibraryTeams(teamsDir)).toEqual([]);
+  });
+
+  it('skips invalid names, hidden dirs, and stray files', () => {
+    writeFile(path.join(teamsDir, 'top.yaml'), 'team: top');
+    mkdir(path.join(teamsDir, '.hidden'));
+    writeFile(path.join(teamsDir, '.hidden', 'team.yaml'), 'team: hidden');
+    writeFile(path.join(teamsDir, 'ok', 'team.yaml'), 'team: ok');
+    const entries = enumerateLibraryTeams(teamsDir);
+
+    expect(entries.map(e => e.name)).toEqual(['ok']);
+  });
+
+  it('returns entries sorted alphabetically', () => {
+    writeFile(path.join(teamsDir, 'zebra', 'team.yaml'), '');
+    writeFile(path.join(teamsDir, 'apple', 'team.yaml'), '');
+    writeFile(path.join(teamsDir, 'mango', 'team.yaml'), '');
+    const entries = enumerateLibraryTeams(teamsDir);
 
     expect(entries.map(e => e.name)).toEqual(['apple', 'mango', 'zebra']);
   });

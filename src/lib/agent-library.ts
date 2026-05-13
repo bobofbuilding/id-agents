@@ -57,9 +57,16 @@ export interface LibrarySkillEntry {
   skillFile: string;
 }
 
+export interface LibraryTeamEntry {
+  name: string;
+  dirPath: string;
+  teamYamlFile: string;
+}
+
 export interface LibraryPaths {
   agents: string;
   skills: string;
+  teams: string;
 }
 
 /**
@@ -84,6 +91,7 @@ export function getLibraryPaths(libRoot: string): LibraryPaths {
   return {
     agents: path.join(libRoot, 'agents'),
     skills,
+    teams: path.join(libRoot, 'teams'),
   };
 }
 
@@ -250,6 +258,36 @@ export function enumerateLibrarySkills(skillsDir: string): LibrarySkillEntry[] {
     if (!isFile(skillFile)) continue;
 
     entries.push({ name, dirPath, skillFile });
+  }
+
+  entries.sort((a, b) => a.name.localeCompare(b.name));
+  return entries;
+}
+
+/**
+ * Enumerate team library entries under `teamsDir` (typically `<libRoot>/teams`).
+ *
+ * A directory is included iff it contains `team.yaml`. Names failing
+ * `ENTRY_NAME_RE` and non-directory children are silently skipped.
+ *
+ * Returns an empty array if `teamsDir` does not exist.
+ */
+export function enumerateLibraryTeams(teamsDir: string): LibraryTeamEntry[] {
+  if (!isDirectory(teamsDir)) return [];
+
+  const entries: LibraryTeamEntry[] = [];
+  const children = fs.readdirSync(teamsDir, { withFileTypes: true });
+
+  for (const child of children) {
+    if (!direntIsDirectory(child, teamsDir)) continue;
+    const name = child.name;
+    if (!isValidEntryName(name)) continue;
+
+    const dirPath = path.join(teamsDir, name);
+    const teamYamlFile = path.join(dirPath, 'team.yaml');
+    if (!isFile(teamYamlFile)) continue;
+
+    entries.push({ name, dirPath, teamYamlFile });
   }
 
   entries.sort((a, b) => a.name.localeCompare(b.name));

@@ -17,6 +17,7 @@ import yaml from 'js-yaml';
 import {
   enumerateLibraryAgents,
   enumerateLibrarySkills,
+  enumerateLibraryTeams,
   getLibraryPaths,
   type AgentLibraryShape,
   type LibraryAgentError,
@@ -31,6 +32,15 @@ export interface AgentListEntry {
   subfolders: string[];
   /** Absolute filesystem path to the entry's directory. */
   source_path: string;
+  /**
+   * README-first one-line description. Derived from the first body
+   * paragraph of `README.md` when present, otherwise `null`. The README
+   * is the canonical human-authored description surface for library
+   * entries — agent configs rarely carry enough context to identify
+   * what an agent is for. Inventory clients should prefer this field
+   * over any config-derived summary.
+   */
+  description: string | null;
 }
 
 export interface AgentDetail extends AgentListEntry {
@@ -55,6 +65,14 @@ export interface SkillListEntry {
   hasSkillMd: boolean;
   /** Absolute filesystem path to the skill directory. */
   source_path: string;
+  /**
+   * One-line description. Prefers SKILL.md frontmatter `description:`
+   * (the canonical authored field for skills — Anthropic's skill format
+   * makes it the README-equivalent), then falls back to the first body
+   * paragraph of SKILL.md after the frontmatter. `null` when neither is
+   * available.
+   */
+  description: string | null;
 }
 
 export interface SkillDetail extends SkillListEntry {
@@ -79,6 +97,56 @@ export interface AgentListResult {
 export interface SkillListResult {
   libraryRoot: string | null;
   entries: SkillListEntry[];
+}
+
+export interface TeamListEntry {
+  name: string;
+  hasReadme: boolean;
+  hasLicense: boolean;
+  /**
+   * Whether a `team.yaml` file is present under the team directory.
+   * Always true for enumerated entries (the enumerator requires it) but
+   * included so consumers can render the check uniformly and a future
+   * caller that loosens the enumerator still sees the flag — mirrors
+   * `SkillListEntry.hasSkillMd`.
+   */
+  hasTeamYaml: boolean;
+  /** Absolute filesystem path to the team directory. */
+  source_path: string;
+  /**
+   * README-first one-line description. Derived from the first body
+   * paragraph of `README.md`, otherwise `null`. The team.yaml comment
+   * banner is intentionally NOT used here — many templates lead with
+   * an "Install with" snippet that reads as instructions rather than
+   * a description.
+   */
+  description: string | null;
+}
+
+export interface TeamDetail extends TeamListEntry {
+  /** Absolute path to the `team.yaml` file. */
+  teamYamlFile: string;
+  /** README body, or null when no README.md is present. */
+  readme: string | null;
+  /** Raw `team.yaml` body (UTF-8). */
+  teamYaml: string;
+  /**
+   * Value of the top-level `team:` field parsed from `team.yaml`, or
+   * `null` if absent / not a string. Used by the install endpoint's
+   * approval guard and by clients that want to detect mismatched
+   * templates.
+   */
+  declaredTeam: string | null;
+  /**
+   * Best-effort list of `agents[].name` from `team.yaml`, in declaration
+   * order. Empty when `agents:` is missing, malformed, or empty.
+   */
+  agents: string[];
+}
+
+export interface TeamListResult {
+  libraryRoot: string | null;
+  entries: TeamListEntry[];
 }
 
 /**
@@ -129,6 +197,59 @@ function readFileIfExists(p: string): string | null {
   try { return fs.readFileSync(p, 'utf-8'); } catch { return null; }
 }
 
+/**
+ * Extract a one-line, README-first description from a markdown body.
+ *
+ * Skips a leading `# Title` heading and any blank lines, then returns
+ * the first non-empty paragraph's first line (trimmed). Skips block
+ * directives ("```", "<!--", "---" hr/frontmatter, ">" blockquote)
+ * because library READMEs commonly open with a fence or comment.
+ * Returns `null` when no usable line is found.
+ */
+function readmeFirstParagraph(md: string | null): string | null {
+  if (!md) return null;
+  const lines = md.split(/\r?\n/);
+  let i = 0;
+  // Skip leading blanks
+  while (i < lines.length && lines[i].trim() === '') i++;
+  // Skip exactly one leading H1/H2 title line if present.
+  if (i < lines.length && /^#{1,2}\s+/.test(lines[i])) {
+    i++;
+    while (i < lines.length && lines[i].trim() === '') i++;
+  }
+  // Skip non-prose openers and blanks.
+  while (i < lines.length) {
+    const line = lines[i];
+    const t = line.trim();
+    if (t === '') { i++; continue; }
+    if (t.startsWith('```') || t.startsWith('<!--') || t === '---' || t.startsWith('> ')) {
+      // Skip the whole block: walk forward until the closing fence or blank.
+      if (t.startsWith('```')) {
+        i++;
+        while (i < lines.length && !lines[i].trim().startsWith('```')) i++;
+        if (i < lines.length) i++;
+        continue;
+      }
+      if (t.startsWith('<!--')) {
+        i++;
+        while (i < lines.length && !lines[i].includes('-->')) i++;
+        if (i < lines.length) i++;
+        continue;
+      }
+      if (t === '---') {
+        // Treat as horizontal rule; skip.
+        i++;
+        continue;
+      }
+      // Blockquote — skip the contiguous block.
+      while (i < lines.length && lines[i].trim().startsWith('> ')) i++;
+      continue;
+    }
+    return t;
+  }
+  return null;
+}
+
 function bundledSkillNames(agentDir: string): string[] {
   const skillsDir = path.join(agentDir, 'skills');
   return enumerateLibrarySkills(skillsDir).map(e => e.name);
@@ -139,21 +260,27 @@ function decorateAgentEntry(
   shape: AgentLibraryShape,
   dirPath: string,
 ): AgentListEntry {
+  const readmePath = path.join(dirPath, 'README.md');
   return {
     name,
     shape,
-    hasReadme: fileExists(path.join(dirPath, 'README.md')),
+    hasReadme: fileExists(readmePath),
     hasLicense: fileExists(path.join(dirPath, 'LICENSE')),
     subfolders: listSubfolders(dirPath),
     source_path: dirPath,
+    description: readmeFirstParagraph(readFileIfExists(readmePath)),
   };
 }
 
-function decorateSkillEntry(name: string, dirPath: string): SkillListEntry {
+function decorateSkillEntry(name: string, dirPath: string, skillFile: string): SkillListEntry {
+  const raw = readFileIfExists(skillFile);
+  const { frontmatter, body } = raw ? parseSkillMd(raw) : { frontmatter: {}, body: '' };
+  const fmDesc = stringFieldOrNull(frontmatter, 'description');
   return {
     name,
-    hasSkillMd: fileExists(path.join(dirPath, 'SKILL.md')),
+    hasSkillMd: fileExists(skillFile),
     source_path: dirPath,
+    description: fmDesc ?? readmeFirstParagraph(body),
   };
 }
 
@@ -220,7 +347,7 @@ export function listLibrarySkills(libraryRoot: string | null): SkillListResult {
   const entries = enumerateLibrarySkills(skills);
   return {
     libraryRoot,
-    entries: entries.map(entry => decorateSkillEntry(entry.name, entry.dirPath)),
+    entries: entries.map(entry => decorateSkillEntry(entry.name, entry.dirPath, entry.skillFile)),
   };
 }
 
@@ -234,15 +361,94 @@ export function getLibrarySkill(
   const entry = entries.find(e => e.name === name);
   if (!entry) return null;
 
-  const base = decorateSkillEntry(entry.name, entry.dirPath);
+  const base = decorateSkillEntry(entry.name, entry.dirPath, entry.skillFile);
   const raw = readFileIfExists(entry.skillFile) ?? '';
   const { frontmatter, body } = parseSkillMd(raw);
 
+  // `description` here is the same README-first value as the list entry's:
+  // frontmatter `description:` first, then first body paragraph. Keeping
+  // detail and list in sync avoids surprising blank fields when frontmatter
+  // is absent but the body is informative.
   return {
     ...base,
     skillFile: entry.skillFile,
     skillName: stringFieldOrNull(frontmatter, 'name'),
-    description: stringFieldOrNull(frontmatter, 'description'),
+    description: base.description,
     bodyLength: body.length,
+  };
+}
+
+function decorateTeamEntry(name: string, dirPath: string): TeamListEntry {
+  const readmePath = path.join(dirPath, 'README.md');
+  return {
+    name,
+    hasReadme: fileExists(readmePath),
+    hasLicense: fileExists(path.join(dirPath, 'LICENSE')),
+    hasTeamYaml: fileExists(path.join(dirPath, 'team.yaml')),
+    source_path: dirPath,
+    description: readmeFirstParagraph(readFileIfExists(readmePath)),
+  };
+}
+
+function parseTeamYamlSummary(raw: string): { declaredTeam: string | null; agents: string[] } {
+  let doc: unknown;
+  try {
+    doc = yaml.load(raw);
+  } catch {
+    return { declaredTeam: null, agents: [] };
+  }
+  if (!doc || typeof doc !== 'object') {
+    return { declaredTeam: null, agents: [] };
+  }
+  const obj = doc as Record<string, unknown>;
+  const teamRaw = obj.team;
+  const declaredTeam = typeof teamRaw === 'string' ? teamRaw : null;
+
+  const agents: string[] = [];
+  const agentsRaw = obj.agents;
+  if (Array.isArray(agentsRaw)) {
+    for (const a of agentsRaw) {
+      if (a && typeof a === 'object' && typeof (a as Record<string, unknown>).name === 'string') {
+        agents.push((a as Record<string, string>).name);
+      }
+    }
+  }
+  return { declaredTeam, agents };
+}
+
+export function listLibraryTeams(libraryRoot: string | null): TeamListResult {
+  if (!libraryRoot) {
+    return { libraryRoot: null, entries: [] };
+  }
+  const { teams } = getLibraryPaths(libraryRoot);
+  const entries = enumerateLibraryTeams(teams);
+  return {
+    libraryRoot,
+    entries: entries.map(entry => decorateTeamEntry(entry.name, entry.dirPath)),
+  };
+}
+
+export function getLibraryTeam(
+  libraryRoot: string | null,
+  name: string,
+): TeamDetail | null {
+  if (!libraryRoot) return null;
+  const { teams } = getLibraryPaths(libraryRoot);
+  const entries = enumerateLibraryTeams(teams);
+  const entry = entries.find(e => e.name === name);
+  if (!entry) return null;
+
+  const base = decorateTeamEntry(entry.name, entry.dirPath);
+  const readmePath = path.join(entry.dirPath, 'README.md');
+  const teamYaml = readFileIfExists(entry.teamYamlFile) ?? '';
+  const { declaredTeam, agents } = parseTeamYamlSummary(teamYaml);
+
+  return {
+    ...base,
+    teamYamlFile: entry.teamYamlFile,
+    readme: readFileIfExists(readmePath),
+    teamYaml,
+    declaredTeam,
+    agents,
   };
 }

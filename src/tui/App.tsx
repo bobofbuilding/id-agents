@@ -18,6 +18,8 @@ import { LibraryAgentsTable } from './components/LibraryAgentsTable.js';
 import { LibraryAgentDetail } from './components/LibraryAgentDetail.js';
 import { LibrarySkillsTable } from './components/LibrarySkillsTable.js';
 import { LibrarySkillDetail } from './components/LibrarySkillDetail.js';
+import { LibraryTeamsTable } from './components/LibraryTeamsTable.js';
+import { LibraryTeamDetail, type InstallState as LibraryTeamInstallState } from './components/LibraryTeamDetail.js';
 import { ConfigsList } from './components/ConfigsList.js';
 import { ConfigDetail } from './components/ConfigDetail.js';
 import { OutputList } from './components/OutputList.js';
@@ -43,6 +45,9 @@ import {
   fetchLibraryAgents,
   fetchLibrarySkill,
   fetchLibrarySkills,
+  fetchLibraryTeam,
+  fetchLibraryTeams,
+  installLibraryTeam,
   fetchSchedulesAllTeams,
   fetchTasksAllTeams,
   fetchTeams,
@@ -51,6 +56,8 @@ import {
   type LibraryAgentListResponse,
   type LibrarySkillDetailResponse,
   type LibrarySkillListResponse,
+  type LibraryTeamDetailResponse,
+  type LibraryTeamListResponse,
 } from './api/manager.js';
 import { usePolling } from './hooks/usePolling.js';
 import { humanizeUptime } from './util/format.js';
@@ -80,6 +87,8 @@ type View =
   | 'library-agent-detail'
   | 'library-skills'
   | 'library-skill-detail'
+  | 'library-teams'
+  | 'library-team-detail'
   | 'configs-list'
   | 'config-detail'
   | 'output-list'
@@ -224,6 +233,14 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
   const [libSkillWindowStart, setLibSkillWindowStart] = useState(0);
   const [libAgentDetailScroll, setLibAgentDetailScroll] = useState(0);
   const [libSkillDetailScroll, setLibSkillDetailScroll] = useState(0);
+  // Slice 4 — teams library + install flow. The detail view holds an
+  // ephemeral InstallState that walks from idle → prompt → running →
+  // success/error; the prompt buffer (`dest`) is edited in-place by the
+  // input handler below.
+  const [libTeamSelectedIndex, setLibTeamSelectedIndex] = useState(0);
+  const [libTeamWindowStart, setLibTeamWindowStart] = useState(0);
+  const [libTeamDetailScroll, setLibTeamDetailScroll] = useState(0);
+  const [libTeamInstallState, setLibTeamInstallState] = useState<LibraryTeamInstallState>({ kind: 'idle' });
   const [configSelectedIndex, setConfigSelectedIndex] = useState(0);
   const [configWindowStart, setConfigWindowStart] = useState(0);
   const [configDetailScroll, setConfigDetailScroll] = useState(0);
@@ -982,6 +999,108 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
     setLibSkillDetailScroll((off) => Math.max(0, off + delta));
   }, []);
 
+  // ---------------------------------------------------------------- Library teams
+  // Slice 4 wires the same poll/window/select trio used for the agents
+  // and skills lists, plus an install action keyed by `i` from the
+  // detail view. The install state is local-only (no polling) — the
+  // backend write is one-shot and the result renders inline until the
+  // user navigates away.
+  const libraryTeamsFetcher = useCallback(
+    (signal: AbortSignal): Promise<LibraryTeamListResponse> =>
+      fetchLibraryTeams(manager, signal),
+    [manager],
+  );
+  const libraryTeamsPoll = usePolling<LibraryTeamListResponse>(
+    libraryTeamsFetcher,
+    LIBRARY_POLL_MS,
+    staticMode || (view !== 'library-teams' && view !== 'library-team-detail'),
+    [manager, view],
+  );
+  const libraryTeamRows = libraryTeamsPoll.data?.entries ?? [];
+  const libraryTeamRoot = libraryTeamsPoll.data?.libraryRoot ?? null;
+  const libraryTeamTotal = libraryTeamRows.length;
+  const selectedLibraryTeamName = libraryTeamRows[libTeamSelectedIndex]?.name ?? null;
+
+  const libraryTeamDetailFetcher = useCallback(
+    (signal: AbortSignal): Promise<LibraryTeamDetailResponse | null> => {
+      if (!selectedLibraryTeamName) return Promise.resolve(null);
+      return fetchLibraryTeam(manager, selectedLibraryTeamName, signal);
+    },
+    [manager, selectedLibraryTeamName],
+  );
+  const libraryTeamDetailPoll = usePolling<LibraryTeamDetailResponse | null>(
+    libraryTeamDetailFetcher,
+    LIBRARY_POLL_MS,
+    staticMode || view !== 'library-team-detail' || !selectedLibraryTeamName,
+    [manager, selectedLibraryTeamName ?? '', view],
+  );
+
+  useEffect(() => {
+    if (libraryTeamTotal === 0) {
+      if (libTeamSelectedIndex !== 0) setLibTeamSelectedIndex(0);
+      if (libTeamWindowStart !== 0) setLibTeamWindowStart(0);
+      return;
+    }
+    const clampedSel = Math.min(libTeamSelectedIndex, libraryTeamTotal - 1);
+    if (clampedSel !== libTeamSelectedIndex) setLibTeamSelectedIndex(clampedSel);
+    const maxStart = Math.max(0, libraryTeamTotal - libraryWindowSize);
+    let nextStart = libTeamWindowStart;
+    if (clampedSel < nextStart) nextStart = clampedSel;
+    if (clampedSel >= nextStart + libraryWindowSize)
+      nextStart = clampedSel - libraryWindowSize + 1;
+    if (nextStart > maxStart) nextStart = maxStart;
+    if (nextStart < 0) nextStart = 0;
+    if (nextStart !== libTeamWindowStart) setLibTeamWindowStart(nextStart);
+  }, [libraryTeamTotal, libTeamSelectedIndex, libTeamWindowStart, libraryWindowSize]);
+
+  const moveLibraryTeamSel = useCallback(
+    (delta: number) => {
+      if (libraryTeamTotal === 0) return;
+      setLibTeamSelectedIndex((idx) => clamp(idx + delta, 0, libraryTeamTotal - 1));
+    },
+    [libraryTeamTotal],
+  );
+
+  const openLibraryTeams = useCallback(() => {
+    setLibTeamSelectedIndex(0);
+    setLibTeamWindowStart(0);
+    setLibTeamInstallState({ kind: 'idle' });
+    setView('library-teams');
+  }, []);
+
+  const openLibraryTeamDetail = useCallback(() => {
+    if (!selectedLibraryTeamName) return;
+    setLibTeamDetailScroll(0);
+    setLibTeamInstallState({ kind: 'idle' });
+    setView('library-team-detail');
+  }, [selectedLibraryTeamName]);
+
+  const moveLibraryTeamDetailScroll = useCallback((delta: number) => {
+    setLibTeamDetailScroll((off) => Math.max(0, off + delta));
+  }, []);
+
+  // Kicks off POST /library/install with selectors team:<template> →
+  // team:<dest>. The backend handles AST rewrite, provenance header,
+  // and atomic rename; we just transition install state for the UI.
+  const runLibraryTeamInstall = useCallback(
+    async (template: string, dest: string, force: boolean) => {
+      setLibTeamInstallState({ kind: 'running', dest });
+      const ac = new AbortController();
+      try {
+        const result = await installLibraryTeam(
+          manager,
+          { template, dest, force },
+          ac.signal,
+        );
+        setLibTeamInstallState({ kind: 'success', result });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setLibTeamInstallState({ kind: 'error', message });
+      }
+    },
+    [manager],
+  );
+
   // ---------------------------------------------------------------- Configs
   // Local filesystem browser for configs/*.yaml. This is intentionally
   // TUI-side, not a /remote daemon command, because the dashboard process
@@ -1321,7 +1440,8 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         // input blocks already call so behavior is identical.
         if (
           input === 'a' || input === 't' || input === 'n' ||
-          input === 'c' || input === 'h' || input === 'l' || input === 's'
+          input === 'c' || input === 'h' || input === 'l' || input === 's' ||
+          input === 'm'
         ) {
           setShowHelp(false);
           setHelpScroll(0);
@@ -1332,6 +1452,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           if (input === 'h') return openHeartbeats();
           if (input === 'l') return openLibraryAgents();
           if (input === 's') return openLibrarySkills();
+          if (input === 'm') return openLibraryTeams();
           return;
         }
         // ':' / '/' close help and open the command bar with that
@@ -1581,6 +1702,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         if (input === 'h') return openHeartbeats();
         if (input === 'l') return openLibraryAgents();
         if (input === 's') return openLibrarySkills();
+        if (input === 'm') return openLibraryTeams();
         if (key.rightArrow) {
           // Remote agents get the detail panel; local agents get news
           const isRemote = selectedAgent?.deploymentShape === 'remote-endpoint' ||
@@ -1665,6 +1787,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         if (input === 'h') return openHeartbeats();
         if (input === 'l') return openLibraryAgents();
         if (input === 's') return openLibrarySkills();
+        if (input === 'm') return openLibraryTeams();
         if (key.leftArrow || key.escape) return setView('agents');
         if (key.rightArrow) return openTaskDetail();
         if (key.tab) return cycleTeam(key.shift ? -1 : 1);
@@ -1694,6 +1817,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         if (input === 'h') return openHeartbeats();
         if (input === 'l') return openLibraryAgents();
         if (input === 's') return openLibrarySkills();
+        if (input === 'm') return openLibraryTeams();
         if (key.leftArrow || key.escape) return setView('agents');
         if (key.upArrow) return moveSchedSel(-1);
         if (key.downArrow) return moveSchedSel(1);
@@ -1721,6 +1845,24 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         if (input === 'c') return openCalendar();
         if (input === 'l') return openLibraryAgents();
         if (input === 's') return openLibrarySkills();
+        if (input === 'm') return openLibraryTeams();
+        // Manual heartbeat fire — operator/debug action distinct from
+        // the scheduled cadence. Stages a Y/N confirm so an errant `f`
+        // keystroke never wakes an agent without intent. The pending
+        // prompt runs through the same dispatch path as `:heartbeat
+        // fire <agent>` typed in the bar, so confirm-tier logic stays
+        // single-sourced in commands/registry.ts.
+        if (input === 'f') {
+          const sel = heartbeatRows[hbSelectedIndex];
+          if (sel) {
+            const raw = `/heartbeat fire ${sel.agent}`;
+            setCommandPending({
+              raw,
+              preview: `manually fire heartbeat for agent ${sel.agent}`,
+            });
+          }
+          return;
+        }
         if (key.leftArrow || key.escape) return setView('agents');
         if (key.rightArrow) return openHeartbeatDetail();
         if (key.upArrow) return moveHbSel(-1);
@@ -1749,6 +1891,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         if (input === 'c') return openCalendar();
         if (input === 'h') return openHeartbeats();
         if (input === 's') return openLibrarySkills();
+        if (input === 'm') return openLibraryTeams();
         if (key.leftArrow || key.escape) return setView('agents');
         if (key.rightArrow) return openLibraryAgentDetail();
         if (key.upArrow) return moveLibraryAgentSel(-1);
@@ -1777,6 +1920,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         if (input === 'c') return openCalendar();
         if (input === 'h') return openHeartbeats();
         if (input === 'l') return openLibraryAgents();
+        if (input === 'm') return openLibraryTeams();
         if (key.leftArrow || key.escape) return openLibraryAgents();
         if (key.rightArrow) return openLibrarySkillDetail();
         if (key.upArrow) return moveLibrarySkillSel(-1);
@@ -1796,6 +1940,76 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         if (key.pageDown) return moveLibrarySkillDetailScroll(detailWindowSize);
         if (isHomeKey(input)) return setLibSkillDetailScroll(0);
         if (isEndKey(input)) return setLibSkillDetailScroll(Number.MAX_SAFE_INTEGER);
+        return;
+      }
+
+      if (view === 'library-teams') {
+        if (input === 'a') return setView('agents');
+        if (input === 't') return setView('tasks');
+        if (input === 'c') return openCalendar();
+        if (input === 'h') return openHeartbeats();
+        if (input === 'l') return openLibraryAgents();
+        if (input === 's') return openLibrarySkills();
+        if (key.leftArrow || key.escape) return setView('agents');
+        if (key.rightArrow) return openLibraryTeamDetail();
+        if (key.upArrow) return moveLibraryTeamSel(-1);
+        if (key.downArrow) return moveLibraryTeamSel(1);
+        if (key.pageUp) return moveLibraryTeamSel(-libraryWindowSize);
+        if (key.pageDown) return moveLibraryTeamSel(libraryWindowSize);
+        if (isHomeKey(input)) return setLibTeamSelectedIndex(0);
+        if (isEndKey(input)) return setLibTeamSelectedIndex(Math.max(0, libraryTeamTotal - 1));
+        return;
+      }
+
+      if (view === 'library-team-detail') {
+        // Install prompt owns keystrokes while it's open: dest editing,
+        // Enter dispatches, F toggles force, Esc cancels back to idle.
+        if (libTeamInstallState.kind === 'prompt') {
+          const template = libraryTeamDetailPoll.data?.name ?? selectedLibraryTeamName ?? null;
+          if (key.escape) {
+            setLibTeamInstallState({ kind: 'idle' });
+            return;
+          }
+          if (key.return) {
+            if (!template) return;
+            const dest = libTeamInstallState.dest.trim();
+            if (!dest) return;
+            void runLibraryTeamInstall(template, dest, libTeamInstallState.force);
+            return;
+          }
+          if (key.backspace || key.delete) {
+            setLibTeamInstallState((s) =>
+              s.kind === 'prompt' ? { ...s, dest: s.dest.slice(0, -1) } : s,
+            );
+            return;
+          }
+          if (input === 'F') {
+            setLibTeamInstallState((s) => (s.kind === 'prompt' ? { ...s, force: !s.force } : s));
+            return;
+          }
+          if (input && !key.ctrl && !key.meta && /^[a-zA-Z0-9_-]$/.test(input)) {
+            setLibTeamInstallState((s) =>
+              s.kind === 'prompt' ? { ...s, dest: s.dest + input } : s,
+            );
+            return;
+          }
+          return;
+        }
+        if (input === 'i' && (libTeamInstallState.kind === 'idle' || libTeamInstallState.kind === 'success' || libTeamInstallState.kind === 'error')) {
+          const template = libraryTeamDetailPoll.data?.name ?? selectedLibraryTeamName ?? '';
+          setLibTeamInstallState({ kind: 'prompt', dest: template, force: false });
+          return;
+        }
+        if (key.leftArrow || key.escape) {
+          setLibTeamInstallState({ kind: 'idle' });
+          return setView('library-teams');
+        }
+        if (key.upArrow) return moveLibraryTeamDetailScroll(-1);
+        if (key.downArrow) return moveLibraryTeamDetailScroll(1);
+        if (key.pageUp) return moveLibraryTeamDetailScroll(-detailWindowSize);
+        if (key.pageDown) return moveLibraryTeamDetailScroll(detailWindowSize);
+        if (isHomeKey(input)) return setLibTeamDetailScroll(0);
+        if (isEndKey(input)) return setLibTeamDetailScroll(Number.MAX_SAFE_INTEGER);
         return;
       }
 
@@ -2117,6 +2331,33 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           }
           windowSize={detailWindowSize}
           scrollOffset={libSkillDetailScroll}
+        />
+      ) : view === 'library-teams' ? (
+        <LibraryTeamsTable
+          entries={libraryTeamRows}
+          libraryRoot={libraryTeamRoot}
+          selectedIndex={libTeamSelectedIndex}
+          windowStart={libTeamWindowStart}
+          windowSize={libraryWindowSize}
+          loading={libraryTeamsPoll.lastUpdated === 0 && !libraryTeamsPoll.error && !staticMode}
+          error={libraryTeamsPoll.error}
+        />
+      ) : view === 'library-team-detail' ? (
+        <LibraryTeamDetail
+          team={libraryTeamDetailPoll.data ?? null}
+          teamName={selectedLibraryTeamName}
+          loading={
+            libraryTeamDetailPoll.lastUpdated === 0 && !libraryTeamDetailPoll.error
+          }
+          error={libraryTeamDetailPoll.error}
+          positionLabel={
+            libraryTeamTotal > 0
+              ? `team ${libTeamSelectedIndex + 1} of ${libraryTeamTotal}`
+              : ''
+          }
+          windowSize={detailWindowSize}
+          scrollOffset={libTeamDetailScroll}
+          installState={libTeamInstallState}
         />
       ) : view === 'news' ? (
         <NewsView

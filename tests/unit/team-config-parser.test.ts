@@ -73,6 +73,79 @@ agents:
     });
   });
 
+  it('parses v3 peer `agent:` and `skills:` as siblings on the same agent entry', () => {
+    // Slice-2/5 v3 surface contract — `agent:` selects one
+    // configs/agents/<name>/ entry and `skills:` selects zero or more
+    // configs/skills/<name>/ entries. The two are peers on the agent
+    // entry, NOT nested under each other. Regressing this shape would
+    // silently break library-backed teams.
+    tmpDir = mkTmp();
+    const configPath = path.join(tmpDir, 'configs', 'solidity-pair.yaml');
+    fs.mkdirSync(path.dirname(configPath), { recursive: true });
+    fs.writeFileSync(
+      configPath,
+      [
+        'version: "1"',
+        'team: solidity-pair',
+        '',
+        'agents:',
+        '  - name: builder',
+        '    agent: foundry-dev',
+        '    skills:',
+        '      - identity',
+        '      - inter-agent',
+        '  - name: auditor',
+        '    agent: solidity-security',
+        '    skills: []',
+        '',
+      ].join('\n'),
+    );
+
+    const config = parseTeamConfig(configPath);
+    expect(config.team).toBe('solidity-pair');
+    expect(config.agents).toHaveLength(2);
+
+    const builder = config.agents[0];
+    expect(builder.name).toBe('builder');
+    expect(builder.agent).toBe('foundry-dev');
+    expect(builder.skills).toEqual(['identity', 'inter-agent']);
+
+    const auditor = config.agents[1];
+    expect(auditor.name).toBe('auditor');
+    expect(auditor.agent).toBe('solidity-security');
+    // Empty peer skills array is a valid v3 surface (zero or more).
+    expect(auditor.skills).toEqual([]);
+
+    // validateConfig accepts the same v3 shape.
+    const validation = validateConfig(config);
+    expect(validation.valid).toBe(true);
+    expect(validation.errors).toEqual([]);
+  });
+
+  it('accepts an agent entry with only `agent:` (no peer `skills:`)', () => {
+    // Slice-5 contract: peer `skills:` is zero-or-more. A library-backed
+    // agent that relies entirely on the library entry's bundled skills
+    // should not require declaring `skills:` to validate.
+    const result = validateConfig({
+      version: '1',
+      agents: [{ name: 'auditor', agent: 'solidity-security' }],
+    });
+    expect(result.valid).toBe(true);
+    expect(result.errors).toEqual([]);
+  });
+
+  it('accepts an agent entry with only peer `skills:` (no `agent:`)', () => {
+    // The other zero-case: a fully inline agent that overlays skills
+    // without referencing a library agent entry. Both peers are
+    // optional.
+    const result = validateConfig({
+      version: '1',
+      agents: [{ name: 'fluent', skills: ['identity', 'inter-agent'] }],
+    });
+    expect(result.valid).toBe(true);
+    expect(result.errors).toEqual([]);
+  });
+
   it('rejects reserved manager name for automators with the hard-error message', () => {
     const result = validateConfig({
       version: '1',

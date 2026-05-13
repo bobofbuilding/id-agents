@@ -41,10 +41,16 @@ import {
 import {
   getLibraryAgent,
   getLibrarySkill,
+  getLibraryTeam,
   listLibraryAgents,
   listLibrarySkills,
+  listLibraryTeams,
   resolveDefaultLibraryRoot,
 } from './lib/library-inventory.js';
+import {
+  installLibraryTeam,
+  parseSelector,
+} from './lib/library-install.js';
 import { PROTOCOL_DEFAULTS } from './protocol-defaults.js';
 import { computeSyncPlan, formatSyncSummary, formatSyncVerbose } from './sync.js';
 import { validateName } from './name-validation.js';
@@ -73,7 +79,8 @@ import type { CheckinRow } from './db/types.js';
 import { parseAgentRef, normalizeAlias, buildAmbiguityWarning, type AgentMatch } from './core/agent-identifier.js';
 import { resolveNewsTrigger } from './core/messaging-service.js';
 import type { HarnessType } from './harness/types.js';
-import { SchedulerService } from './scheduling/scheduler-service.js';
+import { SchedulerService, synthesizeForceHeartbeat } from './scheduling/scheduler-service.js';
+import type { DispatchTarget } from './scheduling/schedule-types.js';
 import { heartbeatToSchedule, calendarToSchedule, validateIntervalSeconds, HEARTBEAT_GENERIC_MESSAGE } from './scheduling/schedule-config.js';
 import {
   getAvailableRuntimes,
@@ -1883,6 +1890,61 @@ export class AgentManagerDb {
         return;
       }
       res.json(detail);
+    });
+
+    // Team-template inventory (slice 1). Mirrors /library/agents and
+    // /library/skills. Empty list / 404 when no library is configured.
+    this.managementApp.get('/library/teams', (_req, res) => {
+      res.json(listLibraryTeams(this.libraryRoot));
+    });
+
+    this.managementApp.get('/library/teams/:name', (req, res) => {
+      const detail = getLibraryTeam(this.libraryRoot, req.params.name);
+      if (!detail) {
+        res.status(404).json({ error: 'not_found', resource: 'library-team', name: req.params.name });
+        return;
+      }
+      res.json(detail);
+    });
+
+    // POST /library/install — installs a library entry into the manager's
+    // library root. Slice 1: only `team:<template>` -> `team:<dest>` is
+    // implemented; agent/skill installs return 400 with `unsupported_kind`
+    // so future slices can add them without a breaking change.
+    this.managementApp.post('/library/install', (req, res) => {
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const fromSel = parseSelector((body as Record<string, unknown>).from);
+      const toSel = parseSelector((body as Record<string, unknown>).to);
+      const force = (body as Record<string, unknown>).force === true;
+
+      if (!fromSel) {
+        res.status(400).json({ error: 'bad_selector', field: 'from', value: (body as Record<string, unknown>).from ?? null });
+        return;
+      }
+      if (!toSel) {
+        res.status(400).json({ error: 'bad_selector', field: 'to', value: (body as Record<string, unknown>).to ?? null });
+        return;
+      }
+      if (fromSel.kind !== toSel.kind) {
+        res.status(400).json({ error: 'kind_mismatch', fromKind: fromSel.kind, toKind: toSel.kind });
+        return;
+      }
+      if (fromSel.kind !== 'team') {
+        res.status(400).json({ error: 'unsupported_kind', kind: fromSel.kind });
+        return;
+      }
+
+      const result = installLibraryTeam(this.libraryRoot, {
+        template: fromSel.name,
+        dest: toSel.name,
+        force,
+      });
+      if (!result.ok) {
+        const { ok: _ok, status, ...rest } = result;
+        res.status(status).json(rest);
+        return;
+      }
+      res.json(result);
     });
 
     // GET /agents/status - check health of all agents (server-side ping)
@@ -5622,7 +5684,77 @@ export class AgentManagerDb {
         // /heartbeat <agent> - show heartbeat status for specific agent
         // /heartbeat enable <agent> - enable heartbeat for agent
         // /heartbeat disable <agent> - disable heartbeat for agent
+        // /heartbeat fire <agent> [--force] - operator-fire a one-off beat
         const subCmd = args[0];
+
+        // /heartbeat fire <agent> [--force]
+        //
+        // Operator-triggered one-off beat. Does NOT advance scheduler
+        // cadence or count against max_runs (slice 1 of
+        // ship-heartbeat-fire). With --force, synthesize a generic
+        // heartbeat schedule for agents that have no config — useful
+        // for testing HEARTBEAT.md wake behavior on a fresh agent.
+        if (subCmd === 'fire') {
+          const agentName = args[1];
+          const force = args.includes('--force');
+          if (!agentName) {
+            return { ok: false, error: 'Usage: /heartbeat fire <agent> [--force]' };
+          }
+          if (!this.schedulerService) {
+            return { ok: false, error: 'Scheduler service is not running' };
+          }
+          const matches = await this.dbResolveAgents(teamId, agentName);
+          if (matches.length === 0) {
+            return { ok: false, error: `Agent "${agentName}" not found` };
+          }
+          if (matches.length > 1) {
+            return { ok: false, error: `Multiple agents match "${agentName}". Be more specific.` };
+          }
+          const agent = matches[0];
+          if (!agent.endpoint && (!agent.port || agent.port === 0)) {
+            return { ok: false, error: `Agent "${agent.name}" has no endpoint to fire against` };
+          }
+
+          // Resolve the agent's heartbeat schedule. When --force is set
+          // and no real schedule exists, synthesize a generic in-memory
+          // definition (never persisted).
+          const schedules = await this.db.schedules.listSchedulesForAgent(agent.id);
+          let hbSchedule = schedules.find(s => s.source_key === `heartbeat:${agent.id}`);
+          if (!hbSchedule) {
+            if (!force) {
+              return {
+                ok: false,
+                error: `Agent "${agent.name}" has no heartbeat schedule. Re-run with --force to fire a synthesized generic beat.`,
+              };
+            }
+            hbSchedule = synthesizeForceHeartbeat(agent.id, agent.name);
+          }
+
+          const target: DispatchTarget = {
+            id: agent.id,
+            name: agent.name,
+            endpoint: agent.endpoint || `http://localhost:${agent.port}`,
+            talkPath: '/talk',
+            schedulePath: '/schedule',
+            status: agent.status,
+          };
+
+          const result = await this.schedulerService.fireManual(hbSchedule, target);
+          if (!result.success) {
+            return { ok: false, error: `Manual fire failed: ${result.error || 'unknown error'}` };
+          }
+          return {
+            ok: true,
+            result: {
+              message: `Fired ${force && !schedules.find(s => s.source_key === `heartbeat:${agent.id}`) ? '(synthesized) ' : ''}heartbeat to ${agent.name}`,
+              agent: agent.name,
+              scheduleId: hbSchedule.id,
+              scheduledKey: result.scheduledKey,
+              manual: true,
+              force,
+            },
+          };
+        }
 
         // Handle enable/disable subcommands
         if (subCmd === 'enable' || subCmd === 'disable') {

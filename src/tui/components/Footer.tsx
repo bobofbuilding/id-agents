@@ -15,6 +15,8 @@ export type FooterView =
   | 'library-agent-detail'
   | 'library-skills'
   | 'library-skill-detail'
+  | 'library-teams'
+  | 'library-team-detail'
   | 'configs-list'
   | 'config-detail'
   | 'output-list'
@@ -42,6 +44,8 @@ const HAS_BACK: Record<FooterView, boolean> = {
   'library-agent-detail': true,
   'library-skills': true,
   'library-skill-detail': true,
+  'library-teams': true,
+  'library-team-detail': true,
   'configs-list': true,
   'config-detail': true,
   'output-list': true,
