@@ -1,24 +1,27 @@
 # SkillMesh Agent Team
 # Deploy with: /deploy skillmesh-team
 #
-# Runtime × API × Model options:
+# Full roster — data sourced from the SkillMesh repo:
+#   workspace/projects/skillmesh/agents/configs/
 #
-#   runtime: codex           → OpenAI (OPENAI_API_KEY)
-#     model: codex-1         → Codex flagship (code-focused)
-#     model: gpt-4o          → GPT-4o (general purpose)
+# To re-sync this file from the latest SkillMesh agent configs:
+#   node workspace/projects/skillmesh/agents/sync.mjs
 #
-#   runtime: claude-code-cli → Anthropic via Claude Code CLI login (no API key needed)
-#     model: claude-sonnet-4-6     → Sonnet 4.6 (balanced)
-#     model: claude-haiku-4-5-20251001 → Haiku (fastest/cheapest)
-#
-#   runtime: claude-agent-sdk → Anthropic via ANTHROPIC_API_KEY
+# Runtime options:
+#   claude-code-cli  → Anthropic via Claude Code CLI login (no API key needed)
+#     model: claude-sonnet-4-6
+#     model: claude-haiku-4-5-20251001
+#   codex            → OpenAI (OPENAI_API_KEY)
+#     model: codex-1
+#     model: gpt-4o
+#   claude-agent-sdk → Anthropic via ANTHROPIC_API_KEY
 #
 # Prerequisites:
 #   1. Add to your .env:
-#        SKILLMESH_PRIVATE_KEY=0x...          # signing key — one per agent or share one for testing
+#        SKILLMESH_PRIVATE_KEY=0x...
 #        SKILLMESH_APP_URL=https://skillmesh.bittrees.org
-#   2. Get Sepolia ETH (https://sepoliafaucet.com), then register once:
-#        node plugins/claude-code/skillmesh/tools/register.mjs
+#   2. Register once (Sepolia ETH needed):
+#        node workspace/projects/skillmesh/agents/plugins/skillmesh/tools/register.mjs
 #   3. Deploy: /deploy skillmesh-team
 
 version: "1"
@@ -34,31 +37,270 @@ defaults:
     - catalog
   plugins:
     - name: skillmesh
-      path: plugins/claude-code/skillmesh
+      path: workspace/projects/skillmesh/agents/plugins/skillmesh
 
 agents:
+
+  # ── Team Lead ──────────────────────────────────────────────────────────────
+  - name: skillmesh-ops-lead
+    description: >
+      SkillMesh operations team lead — coordinates the full agent roster across
+      marketplace ops, research, content, and protocol monitoring. Assigns work,
+      tracks blockers, and ensures agents and skills stay in sync with on-chain
+      state. Orchestrates multi-agent workflows and escalates to the human operator.
+    catalog:
+      role: lead
+      expertise:
+        - orchestration
+        - team-coordination
+        - marketplace-ops
+        - protocol-oversight
+        - on-chain-sync
+      costTier: high
+      status: available
+
+  # ── Marketplace Ops (source: skillmesh-ops.yaml) ───────────────────────────
   - name: marketplace-manager
-    description: "Marketplace health — listings, pricing, demand analysis, and inventory optimization"
+    description: >
+      Marketplace health — listings, pricing, demand analysis, and inventory
+      optimization. Monitors provider activity, flags stale listings, and
+      surfaces actionable improvements.
     runtime: codex
     model: codex-1
+    catalog:
+      role: manager
+      expertise:
+        - marketplace
+        - pricing
+        - inventory
+        - demand-analysis
+      costTier: high
 
   - name: skill-master
-    description: "Skill catalog growth — discovery, generation, validation, and publishing"
+    description: >
+      Skill catalog growth — discovery, generation, validation, and publishing.
+      Proposes new skills based on demand signals and publishes them on-chain
+      via publish-skills.mjs.
+    catalog:
+      role: developer
+      expertise:
+        - skill-design
+        - ipfs
+        - on-chain-publishing
+        - catalog-growth
+      costTier: medium
 
   - name: skill-tester
-    description: "Skill quality assurance — test case execution, reliability scoring, failure reporting"
+    description: >
+      Skill quality assurance — test case execution, reliability scoring, and
+      failure reporting. Runs skills against sample inputs and grades output
+      against declared schemas.
     runtime: codex
     model: codex-1
+    catalog:
+      role: qa
+      expertise:
+        - testing
+        - reliability
+        - schema-validation
+        - failure-analysis
+      costTier: medium
 
   - name: skill-rater
-    description: "Skill ratings, creator reputation, security monitoring, and anomaly detection"
+    description: >
+      Skill ratings, creator reputation, security monitoring, and anomaly
+      detection. Assigns quality tiers and flags suspicious token activity.
     runtime: codex
     model: codex-1
+    catalog:
+      role: auditor
+      expertise:
+        - reputation
+        - security
+        - ratings
+        - anomaly-detection
+      costTier: medium
 
+  # ── Research Stack (source: research-stack.yaml) ───────────────────────────
+  - name: research-analyst
+    description: >
+      Research Stack lead — coordinates market parsing, entity extraction, summary
+      formatting, and alert routing for analysts and crypto ops teams. Delegates
+      to market-parser, alert-router, and summary tools.
+    catalog:
+      role: analyst
+      expertise:
+        - market-data
+        - entity-extraction
+        - summarization
+        - alert-routing
+      costTier: medium
+
+  - name: market-parser
+    description: >
+      Parses raw market data, headlines, and price feeds into normalized JSON.
+      Feeds structured output to entity-extractor and summary-formatter.
+    catalog:
+      role: skill-executor
+      expertise:
+        - market-data
+        - parsing
+        - normalization
+      costTier: low
+
+  - name: entity-extractor
+    description: >
+      Extracts named entities (addresses, tokens, protocols, people) from
+      unstructured text. Returns typed arrays with confidence scores.
+    catalog:
+      role: skill-executor
+      expertise:
+        - entity-extraction
+        - nlp
+        - classification
+      costTier: low
+
+  - name: summary-formatter
+    description: >
+      Condenses long-form content into structured summaries at configurable
+      depth levels, optimized for both human readers and agent consumption.
+    catalog:
+      role: skill-executor
+      expertise:
+        - summarization
+        - content-processing
+        - depth-control
+      costTier: low
+
+  - name: alert-router
+    description: >
+      Classifies signals by severity and routes them to webhook, A2A message,
+      or structured log. Receives output from summary-formatter or anomaly-classifier.
+    catalog:
+      role: skill-executor
+      expertise:
+        - routing
+        - notification
+        - signal-classification
+      costTier: low
+
+  # ── Web Design + Content Ops (source: skillmesh-ops.yaml / content-ops.yaml) ─
   - name: web-design
-    description: "React frontend design and UX review — audits UI quality, accessibility, and visual consistency"
+    description: >
+      React frontend design and UX review — audits UI quality, accessibility,
+      and visual consistency across the SkillMesh web app.
     plugins:
       - name: skillmesh
-        path: plugins/claude-code/skillmesh
+        path: workspace/projects/skillmesh/agents/plugins/skillmesh
       - name: frontend-design
         path: plugins/claude-code/frontend-design
+    catalog:
+      role: designer
+      expertise:
+        - react
+        - accessibility
+        - ux-review
+        - visual-design
+      costTier: medium
+
+  - name: content-ops
+    description: >
+      Content Ops Stack — moderates inbound content for safety and compliance,
+      rewrites drafts for tone and clarity, generates structured metadata (title,
+      tags, SEO signals), and formats output for distribution channels.
+    catalog:
+      role: content-lead
+      expertise:
+        - content-moderation
+        - rewriting
+        - metadata-generation
+        - channel-formatting
+      costTier: medium
+
+  - name: content-moderator
+    description: >
+      Classifies inbound content for safety, compliance, and quality. Returns
+      verdict with category labels and confidence scores. Gates rewrite-assistant.
+    catalog:
+      role: skill-executor
+      expertise:
+        - moderation
+        - safety
+        - classification
+      costTier: low
+
+  - name: channel-formatter
+    description: >
+      Transforms structured content into channel-specific formats: Markdown,
+      HTML, plain text, or JSON feed. Last step in the content ops pipeline.
+    catalog:
+      role: skill-executor
+      expertise:
+        - formatting
+        - markdown
+        - distribution
+      costTier: low
+
+  # ── Protocol Monitor (source: protocol-monitor.yaml) ──────────────────────
+  - name: protocol-monitor
+    description: >
+      Protocol Monitoring Stack — watches on-chain event streams, classifies
+      anomalies against baselines, summarizes incidents with timeline and
+      recommendations, and dispatches alerts to operator endpoints.
+    catalog:
+      role: monitor
+      expertise:
+        - on-chain-events
+        - anomaly-detection
+        - incident-reporting
+        - alert-dispatch
+      costTier: medium
+
+  - name: event-watcher
+    description: >
+      Monitors on-chain event streams for specified contract addresses and event
+      signatures. Emits structured payloads to anomaly-classifier on each match.
+    catalog:
+      role: skill-executor
+      expertise:
+        - blockchain
+        - event-streaming
+        - contract-monitoring
+      costTier: low
+
+  - name: anomaly-classifier
+    description: >
+      Classifies observed chain activity against baseline patterns. Flags
+      anomalies by type, severity, and affected protocol components.
+    catalog:
+      role: skill-executor
+      expertise:
+        - anomaly-detection
+        - classification
+        - baseline-analysis
+      costTier: low
+
+  - name: incident-summarizer
+    description: >
+      Aggregates anomaly signals into a human-readable incident report with
+      timeline, affected systems, root cause hypothesis, and recommended actions.
+    catalog:
+      role: skill-executor
+      expertise:
+        - incident-management
+        - summarization
+        - root-cause-analysis
+      costTier: medium
+
+  - name: notification-dispatcher
+    description: >
+      Dispatches incident reports and alerts to operator endpoints via webhook,
+      A2A message, or structured log. Supports deduplication and rate limiting.
+    catalog:
+      role: skill-executor
+      expertise:
+        - notifications
+        - webhook
+        - a2a-messaging
+        - deduplication
+      costTier: low
