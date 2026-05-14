@@ -55,15 +55,6 @@ agents:
     runtime: codex
     model: codex-1
 
-  - name: research-analyst
-    description: "Research Stack — market parsing, entity extraction, summary formatting, and alert routing for analysts and crypto ops teams"
-
-  - name: content-ops
-    description: "Content Ops Stack — content moderation, rewrite assistance, metadata generation, and channel formatting for publishers and growth teams"
-
-  - name: protocol-monitor
-    description: "Protocol Monitoring Stack — on-chain event watching, anomaly classification, incident summarization, and notification dispatch for protocol contributors"
-
   - name: web-design
     description: "React frontend design and UX review — audits UI quality, accessibility, and visual consistency"
     plugins:
