@@ -26,6 +26,7 @@ import { registerOnIdChain, createSubnameOnIdChain, setMultiChainAddresses } fro
 import { defaultDeliverFn, redactSshTarget, type DeliverFn } from './lib/ssh-deliver.js';
 import { probeRemoteAgent, defaultHealthProbeFn, type HealthProbeFn } from './lib/remote-heartbeat.js';
 import { filterClaudeEnvVars } from './lib/env-hygiene.js';
+import { loadMasterKey, deriveKeyAtIndex } from './lib/skillmesh-key-manager.js';
 import { type Db } from './db/db-service.js';
 import type { AgentRow, ScheduleDefinitionRow, TaskRow } from './db/types.js';
 import fetch from 'node-fetch';
@@ -589,6 +590,14 @@ export class AgentManagerDb {
       env.ID_TALK_TIMEOUT = String(agent.metadata.talkTimeout);
     }
 
+    // Inject per-agent SkillMesh signing key so the agent can call SkillMesh APIs
+    const skillmeshKey = (agent.metadata as any)?.skillmesh_private_key;
+    if (skillmeshKey) {
+      env.SKILLMESH_PRIVATE_KEY = skillmeshKey;
+      env.SKILLMESH_APP_URL = process.env.SKILLMESH_APP_URL || 'https://skillmesh.bittrees.org';
+      env.SKILLMESH_RPC_URL = process.env.SKILLMESH_RPC_URL || 'https://sepolia.drpc.org';
+    }
+
     return env;
   }
 
@@ -1000,6 +1009,42 @@ export class AgentManagerDb {
    * Get the shared deployer address.
    * Uses OWS wallet if OWS_REGISTRAR_WALLET is set, otherwise derives from PRIVATE_KEY.
    */
+  /** Return the next available SkillMesh key index (≥20, above the 20 pre-named agent slots). */
+  private async getNextSkillmeshKeyIndex(): Promise<number> {
+    try {
+      const { rows } = await this.db.adapter.query<{ max_idx: number | null }>(
+        `SELECT MAX(CAST(json_extract(metadata, '$.skillmesh_key_index') AS INTEGER)) AS max_idx
+         FROM agents WHERE deleted_at IS NULL`,
+      );
+      const max = rows[0]?.max_idx ?? null;
+      return max !== null && max >= 33 ? max + 1 : 33;
+    } catch {
+      return 20;
+    }
+  }
+
+  /** Derive and persist a SkillMesh key for a newly created agent. Returns updated metadata. */
+  private async assignSkillmeshKey(agentId: string, currentMeta: AgentMetadata): Promise<AgentMetadata> {
+    const masterKey = loadMasterKey(process.env.ID_WORKSPACE_DIR || this.baseWorkDir);
+    if (!masterKey) return currentMeta;
+    try {
+      const index = await this.getNextSkillmeshKeyIndex();
+      const keyInfo = deriveKeyAtIndex(masterKey, index);
+      const updated: AgentMetadata = {
+        ...currentMeta,
+        skillmesh_address: keyInfo.address,
+        skillmesh_key_index: keyInfo.keyIndex,
+        skillmesh_key_path: keyInfo.derivationPath,
+        skillmesh_private_key: keyInfo.privateKey,
+      };
+      await this.db.agents.updateMetadata(agentId, updated);
+      return updated;
+    } catch (err) {
+      console.warn(`[SkillmeshKeys] Key assignment failed for ${agentId}:`, err);
+      return currentMeta;
+    }
+  }
+
   private getDeployerAddress(): string | null {
     const owsWallet = process.env.OWS_REGISTRAR_WALLET;
     if (owsWallet) {
@@ -3229,10 +3274,14 @@ export class AgentManagerDb {
           local: true,
           runtime: effectiveRuntime
         };
+        // Assign a unique SkillMesh key to every new agent
+        const skillmeshMeta = await this.assignSkillmeshKey(id, finalMeta);
+        // Strip private key before sending in API response (stays in DB for worker env injection)
+        const { skillmesh_private_key: _smKey, ...skillmeshMetaPublic } = skillmeshMeta as any;
         await this.db.agents.updateStatus(id, 'pending', {
           port: allocatedPort,
           endpoint: url,
-          metadata: finalMeta,
+          metadata: skillmeshMeta,
         });
 
         // Use host paths for local agents
@@ -3258,7 +3307,7 @@ export class AgentManagerDb {
           local: true,
           url,
           restap: `${url}/.well-known/restap.json`,
-          metadata: finalMeta,
+          metadata: skillmeshMetaPublic,
           // Info for CLI to spawn local agent process
           teamId,
           teamName,

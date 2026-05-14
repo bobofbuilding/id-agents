@@ -1,0 +1,64 @@
+# SkillMesh — Platform Health Team
+# Deploy with: /deploy skillmesh-health
+#
+# Owns: REST API uptime, IPFS pin integrity, Vercel deployment status
+# Passive watchers — run continuously, feed alert-router on failures.
+
+version: "1"
+team: skillmesh-health
+
+defaults:
+  local: true
+  runtime: claude-code-cli
+  model: claude-sonnet-4-6
+  skills:
+    - identity
+    - inter-agent
+    - catalog
+  plugins:
+    - name: skillmesh
+      path: ../workspace/projects/skillmesh/agents/plugins/skillmesh
+
+agents:
+
+  - name: api-monitor
+    description: >
+      Polls SkillMesh REST endpoints on a schedule, tracking uptime, response
+      latency, and error rates. Surfaces degradation to alert-router and
+      escalates outages to skillmesh-ops-lead immediately.
+    catalog:
+      role: monitor
+      expertise:
+        - api-health
+        - uptime
+        - latency
+        - error-rates
+      costTier: low
+
+  - name: ipfs-guardian
+    description: >
+      Verifies all published skill CIDs are still accessible and pinned on
+      Pinata. Re-pins any cold CIDs and flags definition mismatches between
+      on-chain hash and IPFS content to skill-master.
+    catalog:
+      role: guardian
+      expertise:
+        - ipfs
+        - pinata
+        - cid-verification
+        - skill-integrity
+      costTier: low
+
+  - name: deployment-watcher
+    description: >
+      Monitors Vercel deployment status for the SkillMesh web app. Reports
+      build failures, environment variable drift, and failed function
+      invocations to skillmesh-ops-lead and the operator.
+    catalog:
+      role: monitor
+      expertise:
+        - vercel
+        - deployments
+        - ci-cd
+        - build-health
+      costTier: low

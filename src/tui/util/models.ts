@@ -18,7 +18,13 @@ export const MODEL_ABBREVIATIONS: Record<string, string> = {
   'claude-fable-5': 'fable-5',
   'claude-mythos-5': 'myth-5',
 
-  // OpenAI Codex
+  // OpenAI / Codex
+  'codex-1': 'codex-1',
+  'gpt-4o': 'gpt-4o',
+  'gpt-4o-mini': '4o-mini',
+  'o3': 'o3',
+  'o3-mini': 'o3-mini',
+  'o4-mini': 'o4-mini',
   'gpt-5.4': 'gpt-5.4',
   'gpt-5.5': 'gpt-5.5',
 

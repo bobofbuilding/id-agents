@@ -1,0 +1,84 @@
+# SkillMesh — Research Stack Team
+# Deploy with: /deploy skillmesh-research
+#
+# Owns: market data parsing, entity extraction, summarization, alert routing
+# Lead: research-analyst (delegates to skill-executor agents below)
+
+version: "1"
+team: skillmesh-research
+
+defaults:
+  local: true
+  runtime: claude-code-cli
+  model: claude-sonnet-4-6
+  skills:
+    - identity
+    - inter-agent
+    - catalog
+  plugins:
+    - name: skillmesh
+      path: ../workspace/projects/skillmesh/agents/plugins/skillmesh
+
+agents:
+
+  - name: research-analyst
+    description: >
+      Research Stack lead — coordinates market parsing, entity extraction, summary
+      formatting, and alert routing for analysts and crypto ops teams. Delegates
+      to market-parser, alert-router, and summary tools.
+    catalog:
+      role: analyst
+      expertise:
+        - market-data
+        - entity-extraction
+        - summarization
+        - alert-routing
+      costTier: medium
+
+  - name: market-parser
+    description: >
+      Parses raw market data, headlines, and price feeds into normalized JSON.
+      Feeds structured output to entity-extractor and summary-formatter.
+    catalog:
+      role: skill-executor
+      expertise:
+        - market-data
+        - parsing
+        - normalization
+      costTier: low
+
+  - name: entity-extractor
+    description: >
+      Extracts named entities (addresses, tokens, protocols, people) from
+      unstructured text. Returns typed arrays with confidence scores.
+    catalog:
+      role: skill-executor
+      expertise:
+        - entity-extraction
+        - nlp
+        - classification
+      costTier: low
+
+  - name: summary-formatter
+    description: >
+      Condenses long-form content into structured summaries at configurable
+      depth levels, optimized for both human readers and agent consumption.
+    catalog:
+      role: skill-executor
+      expertise:
+        - summarization
+        - content-processing
+        - depth-control
+      costTier: low
+
+  - name: alert-router
+    description: >
+      Classifies signals by severity and routes them to webhook, A2A message,
+      or structured log. Receives output from summary-formatter or anomaly-classifier.
+    catalog:
+      role: skill-executor
+      expertise:
+        - routing
+        - notification
+        - signal-classification
+      costTier: low

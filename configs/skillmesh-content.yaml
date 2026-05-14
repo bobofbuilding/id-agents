@@ -1,0 +1,91 @@
+# SkillMesh — Content Ops Team
+# Deploy with: /deploy skillmesh-content
+#
+# Owns: content moderation, rewriting, metadata generation, channel formatting
+# Lead: content-ops (orchestrates the moderation → rewrite → metadata → format pipeline)
+# Pipeline: content-moderator (5) → rewrite-assistant (6) → metadata-generator (7) → channel-formatter (8)
+
+version: "1"
+team: skillmesh-content
+
+defaults:
+  local: true
+  runtime: claude-code-cli
+  model: claude-sonnet-4-6
+  skills:
+    - identity
+    - inter-agent
+    - catalog
+  plugins:
+    - name: skillmesh
+      path: ../workspace/projects/skillmesh/agents/plugins/skillmesh
+
+agents:
+
+  - name: content-ops
+    description: >
+      Content Ops Stack lead — moderates inbound content for safety and compliance,
+      rewrites drafts for tone and clarity, generates structured metadata (title,
+      tags, SEO signals), and formats output for distribution channels.
+    catalog:
+      role: content-lead
+      expertise:
+        - content-moderation
+        - rewriting
+        - metadata-generation
+        - channel-formatting
+      costTier: medium
+
+  - name: content-moderator
+    description: >
+      Classifies inbound content for safety, compliance, and quality. Returns
+      verdict with category labels and confidence scores. Gates rewrite-assistant.
+    runtime: codex
+    model: codex-5.5
+    catalog:
+      role: skill-executor
+      expertise:
+        - moderation
+        - safety
+        - classification
+      costTier: low
+
+  - name: rewrite-assistant
+    description: >
+      Rewrites approved content for tone, clarity, and reading level. Accepts
+      moderation-passed drafts and returns polished copy ready for metadata
+      tagging. Supports formal, casual, and technical registers.
+    catalog:
+      role: skill-executor
+      expertise:
+        - rewriting
+        - tone-adjustment
+        - copy-editing
+        - readability
+      costTier: low
+
+  - name: metadata-generator
+    description: >
+      Generates structured metadata for content: title, summary, tags, keywords,
+      and SEO signals. Feeds output to channel-formatter for final distribution
+      packaging. Works on rewritten or raw approved content.
+    catalog:
+      role: skill-executor
+      expertise:
+        - metadata
+        - seo
+        - tagging
+        - content-structure
+      costTier: low
+
+  - name: channel-formatter
+    description: >
+      Transforms structured content into channel-specific formats: Markdown,
+      HTML, plain text, or JSON feed. Last step in the content ops pipeline.
+    catalog:
+      role: skill-executor
+      expertise:
+        - formatting
+        - markdown
+        - distribution
+      costTier: low

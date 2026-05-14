@@ -1,19 +1,19 @@
-# SkillMesh Agent Team
-# Deploy with: /deploy skillmesh-team
+# SkillMesh Agent Team — Full Roster
+# Deploy with: /deploy skillmesh-team  (all 32 agents, one team)
 #
-# Full roster — data sourced from the SkillMesh repo:
-#   workspace/projects/skillmesh/agents/configs/
-#
-# To re-sync this file from the latest SkillMesh agent configs:
-#   node workspace/projects/skillmesh/agents/sync.mjs
+# ── Sub-team configs (deploy groups independently) ────────────────────────────
+#   /deploy skillmesh-ops       → Marketplace ops, skill catalog, QA (7 agents)
+#   /deploy skillmesh-research  → Market data, entity extraction, alerts (5 agents)
+#   /deploy skillmesh-content   → Moderation, rewriting, formatting (5 agents)
+#   /deploy skillmesh-protocol  → On-chain monitoring, incident reporting (5 agents)
+#   /deploy skillmesh-chain     → Wallet, settlement, gas, tokenomics (4 agents)
+#   /deploy skillmesh-health    → API, IPFS, deployment monitoring (3 agents)
+#   /deploy skillmesh-growth    → Analytics, brokering, onboarding (3 agents)
+# ─────────────────────────────────────────────────────────────────────────────
 #
 # Runtime options:
 #   claude-code-cli  → Anthropic via Claude Code CLI login (no API key needed)
-#     model: claude-sonnet-4-6
-#     model: claude-haiku-4-5-20251001
-#   codex            → OpenAI (OPENAI_API_KEY)
-#     model: codex-1
-#     model: gpt-4o
+#   codex            → OpenAI (OPENAI_API_KEY required)
 #   claude-agent-sdk → Anthropic via ANTHROPIC_API_KEY
 #
 # Prerequisites:
@@ -37,7 +37,7 @@ defaults:
     - catalog
   plugins:
     - name: skillmesh
-      path: workspace/projects/skillmesh/agents/plugins/skillmesh
+      path: ../workspace/projects/skillmesh/agents/plugins/skillmesh
 
 agents:
 
@@ -111,7 +111,7 @@ agents:
       Skill ratings, creator reputation, security monitoring, and anomaly
       detection. Assigns quality tiers and flags suspicious token activity.
     runtime: codex
-    model: codex-1
+    model: codex-5.5
     catalog:
       role: auditor
       expertise:
@@ -191,9 +191,9 @@ agents:
       and visual consistency across the SkillMesh web app.
     plugins:
       - name: skillmesh
-        path: workspace/projects/skillmesh/agents/plugins/skillmesh
+        path: ../workspace/projects/skillmesh/agents/plugins/skillmesh
       - name: frontend-design
-        path: plugins/claude-code/frontend-design
+        path: ../plugins/claude-code/frontend-design
     catalog:
       role: designer
       expertise:
@@ -221,6 +221,8 @@ agents:
     description: >
       Classifies inbound content for safety, compliance, and quality. Returns
       verdict with category labels and confidence scores. Gates rewrite-assistant.
+    runtime: codex
+    model: codex-5.5
     catalog:
       role: skill-executor
       expertise:
@@ -247,6 +249,8 @@ agents:
       Protocol Monitoring Stack — watches on-chain event streams, classifies
       anomalies against baselines, summarizes incidents with timeline and
       recommendations, and dispatches alerts to operator endpoints.
+    runtime: codex
+    model: codex-5.5
     catalog:
       role: monitor
       expertise:
@@ -260,6 +264,8 @@ agents:
     description: >
       Monitors on-chain event streams for specified contract addresses and event
       signatures. Emits structured payloads to anomaly-classifier on each match.
+    runtime: codex
+    model: codex-5.5
     catalog:
       role: skill-executor
       expertise:
@@ -272,6 +278,8 @@ agents:
     description: >
       Classifies observed chain activity against baseline patterns. Flags
       anomalies by type, severity, and affected protocol components.
+    runtime: codex
+    model: codex-5.5
     catalog:
       role: skill-executor
       expertise:
@@ -284,6 +292,8 @@ agents:
     description: >
       Aggregates anomaly signals into a human-readable incident report with
       timeline, affected systems, root cause hypothesis, and recommended actions.
+    runtime: codex
+    model: codex-5.5
     catalog:
       role: skill-executor
       expertise:
@@ -303,4 +313,176 @@ agents:
         - webhook
         - a2a-messaging
         - deduplication
+      costTier: low
+
+  # ── Content Ops gap-fills (source: skillmesh-content.yaml) ────────────────
+  - name: rewrite-assistant
+    description: >
+      Rewrites moderation-passed content for tone, clarity, and reading level.
+      Accepts a draft and target register; returns polished copy ready for
+      metadata-generator.
+    catalog:
+      role: skill-executor
+      expertise:
+        - rewriting
+        - tone-control
+        - readability
+      costTier: low
+
+  - name: metadata-generator
+    description: >
+      Generates structured metadata for content: title, summary, tags, keywords,
+      and SEO signals. Output feeds channel-formatter in the content pipeline.
+    catalog:
+      role: skill-executor
+      expertise:
+        - metadata
+        - seo
+        - tagging
+      costTier: low
+
+  # ── Ops Expansion (source: skillmesh-ops.yaml) ─────────────────────────────
+  - name: contract-auditor
+    description: >
+      Reviews smart contract interaction patterns in skill definitions and agent
+      transactions before on-chain submission. Flags reentrancy risks, unsafe
+      patterns, and permission mismatches.
+    catalog:
+      role: auditor
+      expertise:
+        - smart-contracts
+        - security
+        - reentrancy
+        - permission-audit
+      costTier: high
+
+  # ── On-Chain Ops (source: skillmesh-chain.yaml) ────────────────────────────
+  - name: wallet-guardian
+    description: >
+      Monitors ETH and AST balances across all registered agent addresses. Alerts
+      when any wallet drops below threshold and generates a prioritized top-up list.
+    catalog:
+      role: monitor
+      expertise:
+        - wallet-monitoring
+        - balance-alerts
+        - gas-management
+      costTier: low
+
+  - name: settlement-watcher
+    description: >
+      Scans ComputeEscrow for stalled sessions where proposeSettlement has not been
+      called. Identifies responsible agent and generates nudge messages.
+    catalog:
+      role: monitor
+      expertise:
+        - escrow
+        - settlement
+        - session-management
+      costTier: low
+
+  - name: gas-oracle
+    description: >
+      Monitors Sepolia gas prices and caches optimal transaction windows. Returns
+      current gas price, recommended wait time, and a 24h forecast.
+    catalog:
+      role: skill-executor
+      expertise:
+        - gas-optimization
+        - transaction-timing
+        - cost-reduction
+      costTier: low
+
+  - name: token-economist
+    description: >
+      Tracks AST token velocity, circulating supply, staking patterns, and compute
+      session economics. Returns demand signals and anomaly flags.
+    catalog:
+      role: analyst
+      expertise:
+        - tokenomics
+        - demand-analysis
+        - staking
+        - compute-economics
+      costTier: medium
+
+  # ── Platform Health (source: skillmesh-health.yaml) ───────────────────────
+  - name: api-monitor
+    description: >
+      Polls SkillMesh REST endpoints and tracks uptime, response latency, and error
+      rates. Returns a health report with degraded endpoints and p95 latency.
+    catalog:
+      role: monitor
+      expertise:
+        - api-monitoring
+        - uptime
+        - latency
+        - health-reporting
+      costTier: low
+
+  - name: ipfs-guardian
+    description: >
+      Verifies all published skill CIDs are accessible and pinned on Pinata. Re-pins
+      cold CIDs and flags definition hash mismatches between on-chain and IPFS.
+    catalog:
+      role: monitor
+      expertise:
+        - ipfs
+        - pinata
+        - cid-verification
+        - data-integrity
+      costTier: low
+
+  - name: deployment-watcher
+    description: >
+      Monitors Vercel deployment status for the SkillMesh web app. Reports build
+      failures, environment variable drift, and failed serverless function invocations.
+    catalog:
+      role: monitor
+      expertise:
+        - vercel
+        - deployment
+        - build-monitoring
+        - env-drift
+      costTier: low
+
+  # ── Growth & Analytics (source: skillmesh-growth.yaml) ────────────────────
+  - name: growth-analyst
+    description: >
+      Tracks weekly marketplace KPIs: new skill listings, transaction volume, unique
+      agent registrations, compute session counts, and AST flow. Returns week-on-week
+      growth reports.
+    catalog:
+      role: analyst
+      expertise:
+        - growth-analytics
+        - kpi-tracking
+        - marketplace-metrics
+        - reporting
+      costTier: medium
+
+  - name: skill-broker
+    description: >
+      Matches incoming skill execution requests to the best available provider based
+      on price, quality score, and availability. Returns ordered provider recommendations.
+    catalog:
+      role: skill-executor
+      expertise:
+        - matchmaking
+        - provider-routing
+        - price-quality-tradeoff
+      costTier: low
+
+  - name: onboarding-guide
+    description: >
+      Walks new agents through the full SkillMesh onboarding flow: wallet funding check,
+      registration, skill inventory setup, and first compute session. Responds to
+      discovery:ping from unknown agents.
+    catalog:
+      role: guide
+      expertise:
+        - onboarding
+        - agent-registration
+        - discovery
+        - first-session
       costTier: low

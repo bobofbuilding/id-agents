@@ -1,0 +1,87 @@
+# SkillMesh — Protocol Monitor Team
+# Deploy with: /deploy skillmesh-protocol
+#
+# Owns: on-chain event watching, anomaly classification, incident reporting, alert dispatch
+# Lead: protocol-monitor (coordinates the watch → classify → report → dispatch pipeline)
+
+version: "1"
+team: skillmesh-protocol
+
+defaults:
+  local: true
+  runtime: codex
+  model: codex-5.5
+  skills:
+    - identity
+    - inter-agent
+    - catalog
+  plugins:
+    - name: skillmesh
+      path: ../workspace/projects/skillmesh/agents/plugins/skillmesh
+
+agents:
+
+  - name: protocol-monitor
+    description: >
+      Protocol Monitoring Stack lead — watches on-chain event streams, classifies
+      anomalies against baselines, summarizes incidents with timeline and
+      recommendations, and dispatches alerts to operator endpoints.
+    catalog:
+      role: monitor
+      expertise:
+        - on-chain-events
+        - anomaly-detection
+        - incident-reporting
+        - alert-dispatch
+      costTier: medium
+
+  - name: event-watcher
+    description: >
+      Monitors on-chain event streams for specified contract addresses and event
+      signatures. Emits structured payloads to anomaly-classifier on each match.
+    catalog:
+      role: skill-executor
+      expertise:
+        - blockchain
+        - event-streaming
+        - contract-monitoring
+      costTier: low
+
+  - name: anomaly-classifier
+    description: >
+      Classifies observed chain activity against baseline patterns. Flags
+      anomalies by type, severity, and affected protocol components.
+    catalog:
+      role: skill-executor
+      expertise:
+        - anomaly-detection
+        - classification
+        - baseline-analysis
+      costTier: low
+
+  - name: incident-summarizer
+    description: >
+      Aggregates anomaly signals into a human-readable incident report with
+      timeline, affected systems, root cause hypothesis, and recommended actions.
+    catalog:
+      role: skill-executor
+      expertise:
+        - incident-management
+        - summarization
+        - root-cause-analysis
+      costTier: medium
+
+  - name: notification-dispatcher
+    description: >
+      Dispatches incident reports and alerts to operator endpoints via webhook,
+      A2A message, or structured log. Supports deduplication and rate limiting.
+    runtime: claude-code-cli
+    model: claude-sonnet-4-6
+    catalog:
+      role: skill-executor
+      expertise:
+        - notifications
+        - webhook
+        - a2a-messaging
+        - deduplication
+      costTier: low

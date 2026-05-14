@@ -1,0 +1,132 @@
+# SkillMesh — Marketplace Ops Team
+# Deploy with: /deploy skillmesh-ops
+#
+# Owns: skill catalog, marketplace health, QA pipeline, UI quality
+# Lead: skillmesh-ops-lead (coordinates all four sub-teams)
+
+version: "1"
+team: skillmesh-ops
+
+defaults:
+  local: true
+  runtime: claude-code-cli
+  model: claude-sonnet-4-6
+  skills:
+    - identity
+    - inter-agent
+    - catalog
+  plugins:
+    - name: skillmesh
+      path: ../workspace/projects/skillmesh/agents/plugins/skillmesh
+
+agents:
+
+  - name: skillmesh-ops-lead
+    description: >
+      SkillMesh operations team lead — coordinates the full agent roster across
+      marketplace ops, research, content, and protocol monitoring. Assigns work,
+      tracks blockers, and ensures agents and skills stay in sync with on-chain
+      state. Orchestrates multi-agent workflows and escalates to the human operator.
+    catalog:
+      role: lead
+      expertise:
+        - orchestration
+        - team-coordination
+        - marketplace-ops
+        - protocol-oversight
+        - on-chain-sync
+      costTier: high
+      status: available
+
+  - name: marketplace-manager
+    description: >
+      Marketplace health — listings, pricing, demand analysis, and inventory
+      optimization. Monitors provider activity, flags stale listings, and
+      surfaces actionable improvements.
+    runtime: codex
+    model: codex-1
+    catalog:
+      role: manager
+      expertise:
+        - marketplace
+        - pricing
+        - inventory
+        - demand-analysis
+      costTier: high
+
+  - name: skill-master
+    description: >
+      Skill catalog growth — discovery, generation, validation, and publishing.
+      Proposes new skills based on demand signals and publishes them on-chain
+      via publish-skills.mjs.
+    catalog:
+      role: developer
+      expertise:
+        - skill-design
+        - ipfs
+        - on-chain-publishing
+        - catalog-growth
+      costTier: medium
+
+  - name: skill-tester
+    description: >
+      Skill quality assurance — test case execution, reliability scoring, and
+      failure reporting. Runs skills against sample inputs and grades output
+      against declared schemas.
+    runtime: codex
+    model: codex-1
+    catalog:
+      role: qa
+      expertise:
+        - testing
+        - reliability
+        - schema-validation
+        - failure-analysis
+      costTier: medium
+
+  - name: skill-rater
+    description: >
+      Skill ratings, creator reputation, security monitoring, and anomaly
+      detection. Assigns quality tiers and flags suspicious token activity.
+    runtime: codex
+    model: codex-5.5
+    catalog:
+      role: auditor
+      expertise:
+        - reputation
+        - security
+        - ratings
+        - anomaly-detection
+      costTier: medium
+
+  - name: contract-auditor
+    description: >
+      Reviews smart contract interaction patterns in skill definitions and agent
+      transactions before they go on-chain. Flags unsafe patterns, reentrancy
+      risks, and permission mismatches. Advises skill-master pre-publish.
+    catalog:
+      role: auditor
+      expertise:
+        - smart-contracts
+        - solidity
+        - security-review
+        - pre-publish-checks
+      costTier: medium
+
+  - name: web-design
+    description: >
+      React frontend design and UX review — audits UI quality, accessibility,
+      and visual consistency across the SkillMesh web app.
+    plugins:
+      - name: skillmesh
+        path: ../workspace/projects/skillmesh/agents/plugins/skillmesh
+      - name: frontend-design
+        path: ../plugins/claude-code/frontend-design
+    catalog:
+      role: designer
+      expertise:
+        - react
+        - accessibility
+        - ux-review
+        - visual-design
+      costTier: medium

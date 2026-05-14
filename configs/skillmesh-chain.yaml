@@ -1,0 +1,78 @@
+# SkillMesh — On-chain Ops Team
+# Deploy with: /deploy skillmesh-chain
+#
+# Owns: agent wallet health, ComputeEscrow settlements, gas timing, token economics
+# These agents watch the contract and wallet layer — nothing in the base stack does this.
+
+version: "1"
+team: skillmesh-chain
+
+defaults:
+  local: true
+  runtime: claude-code-cli
+  model: claude-sonnet-4-6
+  skills:
+    - identity
+    - inter-agent
+    - catalog
+  plugins:
+    - name: skillmesh
+      path: ../workspace/projects/skillmesh/agents/plugins/skillmesh
+
+agents:
+
+  - name: wallet-guardian
+    description: >
+      Monitors ETH and AST balances across all registered agent addresses.
+      Alerts when any wallet drops below the gas or compute threshold and
+      generates a prioritized top-up list for the operator.
+    catalog:
+      role: monitor
+      expertise:
+        - wallet-health
+        - balance-monitoring
+        - sepolia-eth
+        - ast-tokens
+      costTier: low
+
+  - name: settlement-watcher
+    description: >
+      Scans ComputeEscrow for sessions where one or both parties have not
+      called proposeSettlement. Nudges the responsible agent via A2A and
+      escalates stalled sessions to skillmesh-ops-lead.
+    catalog:
+      role: monitor
+      expertise:
+        - compute-escrow
+        - settlement
+        - a2a-messaging
+        - on-chain-ops
+      costTier: low
+
+  - name: gas-oracle
+    description: >
+      Monitors Sepolia gas prices and caches optimal transaction windows.
+      Advises other agents on when to submit on-chain transactions to
+      minimize gas spend. Integrates with wallet-guardian alerts.
+    catalog:
+      role: oracle
+      expertise:
+        - gas-optimization
+        - transaction-timing
+        - sepolia
+        - cost-reduction
+      costTier: low
+
+  - name: token-economist
+    description: >
+      Tracks AST token velocity, circulating supply, staking patterns, and
+      compute session economics. Feeds demand signals to marketplace-manager
+      and flags anomalies to protocol-monitor.
+    catalog:
+      role: analyst
+      expertise:
+        - tokenomics
+        - ast-token
+        - compute-economics
+        - demand-signals
+      costTier: medium

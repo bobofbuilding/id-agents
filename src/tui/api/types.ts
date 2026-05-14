@@ -3,6 +3,9 @@ export interface AgentMetadata {
   description?: string;
   heartbeat?: boolean;
   pid?: number;
+  skillmesh_address?: string;
+  skillmesh_key_index?: number;
+  skillmesh_key_path?: string;
   [key: string]: unknown;
 }
 

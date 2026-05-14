@@ -77,7 +77,7 @@ const PROFILES: Record<RuntimeId, RuntimeProfile> = {
     canonicalId: 'codex',
     displayName: 'Codex',
     providerName: 'Codex CLI',
-    defaultModel: 'gpt-5.4',
+    defaultModel: '',  // let Codex CLI pick model based on account; override per-agent in YAML
     sessionPolicy: 'fresh-per-query',
     deploymentShape: 'local-process',
     auth: {
@@ -253,6 +253,7 @@ function classifyModelFamily(model: string | undefined): 'claude' | 'openai' | '
   }
 
   if (
+    normalized.startsWith('codex-') ||
     normalized.startsWith('gpt-') ||
     normalized.startsWith('o1') ||
     normalized.startsWith('o3') ||

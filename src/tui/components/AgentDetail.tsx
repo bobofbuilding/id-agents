@@ -74,6 +74,15 @@ export function AgentDetail(props: AgentDetailProps): React.ReactElement {
     lines.push({ label: 'workingDirectory', value: agent.workingDirectory ?? '—' });
   }
 
+  const skillmeshAddress = agent.metadata?.skillmesh_address;
+  if (skillmeshAddress) {
+    lines.push({ label: '', value: '' });
+    lines.push({ label: '--- SkillMesh Identity ---', value: '' });
+    lines.push({ label: 'address', value: skillmeshAddress, color: 'cyan' });
+    const keyIndex = agent.metadata?.skillmesh_key_index;
+    lines.push({ label: 'key_path', value: agent.metadata?.skillmesh_key_path ?? `m/44'/60'/0'/0/${keyIndex ?? '?'}` });
+  }
+
   const allLines = lines.map(({ label, value, color }) => ({ label, value, color }));
   const total = allLines.length;
   const clampedOffset = Math.min(scrollOffset, Math.max(0, total - windowSize));

@@ -16,6 +16,13 @@ HEARTBEAT.md
 configs/*.yaml
 !configs/default.yaml
 !configs/skillmesh-team.yaml
+!configs/skillmesh-ops.yaml
+!configs/skillmesh-research.yaml
+!configs/skillmesh-content.yaml
+!configs/skillmesh-protocol.yaml
+!configs/skillmesh-chain.yaml
+!configs/skillmesh-health.yaml
+!configs/skillmesh-growth.yaml
 
 # Environment and secrets
 .env

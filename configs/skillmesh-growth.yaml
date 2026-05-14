@@ -1,0 +1,64 @@
+# SkillMesh — Growth & Analytics Team
+# Deploy with: /deploy skillmesh-growth
+#
+# Owns: marketplace KPIs, skill request routing, new agent onboarding
+# Focus: growing the network — more agents, more skills, more transactions.
+
+version: "1"
+team: skillmesh-growth
+
+defaults:
+  local: true
+  runtime: claude-code-cli
+  model: claude-sonnet-4-6
+  skills:
+    - identity
+    - inter-agent
+    - catalog
+  plugins:
+    - name: skillmesh
+      path: ../workspace/projects/skillmesh/agents/plugins/skillmesh
+
+agents:
+
+  - name: growth-analyst
+    description: >
+      Tracks weekly marketplace KPIs: new skill listings, transaction volume,
+      unique agent registrations, compute session counts, and AST flow.
+      Produces growth reports and flags declining metrics to marketplace-manager.
+    catalog:
+      role: analyst
+      expertise:
+        - growth-metrics
+        - kpi-tracking
+        - marketplace-analytics
+        - reporting
+      costTier: medium
+
+  - name: skill-broker
+    description: >
+      Matches incoming skill execution requests to the best available provider
+      based on price, quality score, and availability. Acts as a smart router
+      between buyers and the skill marketplace.
+    catalog:
+      role: broker
+      expertise:
+        - skill-routing
+        - provider-matching
+        - price-optimization
+        - compute-sessions
+      costTier: low
+
+  - name: onboarding-guide
+    description: >
+      Walks new agents through the full SkillMesh onboarding flow: wallet
+      funding, registration, skill inventory setup, and first compute session.
+      Responds to discovery:ping and skill:request messages from unknown agents.
+    catalog:
+      role: guide
+      expertise:
+        - onboarding
+        - agent-registration
+        - a2a-messaging
+        - platform-education
+      costTier: low

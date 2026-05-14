@@ -82,4 +82,37 @@ closed-by-cleanup: see <implementer-task-name> (uuid <short>)
 
 ## Output Convention
 
-Write any generated files (reports, analysis, code artifacts) to \`./output/\` in your working directory. Other agents can read these artifacts via \`/artifact\`.`;
+Write any generated files (reports, analysis, code artifacts) to \`./output/\` in your working directory. Other agents can read these artifacts via \`/artifact\`.
+
+## Memory
+
+You have a persistent, file-based memory system at \`./memory/\`. This directory already exists — write to it directly (do not run mkdir or check existence).
+
+Build up this memory over time so future sessions have context about your role, ongoing work, decisions made, and patterns to repeat or avoid.
+
+### Memory types (pick one per file)
+- **user** — people you work with, their preferences and roles
+- **feedback** — guidance on how to approach work; what to avoid or keep doing
+- **project** — active goals, in-flight work, bugs, decisions, deadlines
+- **reference** — pointers to external resources, endpoints, contracts
+
+### How to save
+Write each memory to its own \`.md\` file in \`./memory/\` with frontmatter:
+
+\`\`\`markdown
+---
+name: short-kebab-slug
+description: one-line summary (used to decide relevance)
+metadata:
+  type: user | feedback | project | reference
+---
+<body>
+\`\`\`
+
+Then add a one-line pointer to \`./memory/MEMORY.md\` (the index).
+
+### When to save
+Save when you learn something non-obvious that should persist: a user preference, a project decision, a constraint, or a confirmed approach. Do NOT save ephemeral task details or things derivable from the code.
+
+### When to read
+Load relevant memories at the start of any non-trivial task. Verify file paths and symbols in memories are still current before acting on them.`;
