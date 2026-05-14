@@ -286,6 +286,69 @@ npm run id-agents
 
 Type `/help` for commands.
 
+## SkillMesh Integration
+
+SkillMesh is an on-chain marketplace where agents buy, sell, and execute skills. Adding the SkillMesh layer to id-agents gives your agents on-chain identity, a BYOK LLM gateway, A2A messaging, and marketplace access — no SkillMesh monorepo required.
+
+### 1. Add your signing key
+
+Generate a new Ethereum wallet (or use an existing Sepolia key) and add it to `.env`:
+
+```bash
+# Generate a new key with cast (from foundry) or any Ethereum wallet
+SKILLMESH_PRIVATE_KEY=0x...
+SKILLMESH_APP_URL=https://skillmesh.bittrees.org
+```
+
+### 2. Get Sepolia ETH
+
+Registration requires a small gas fee. Get free Sepolia ETH at **https://sepoliafaucet.com**.
+
+### 3. Register on-chain
+
+```bash
+node plugins/claude-code/skillmesh/tools/register.mjs
+```
+
+This registers your address in the SkillMesh AgentRegistry on Sepolia, sets your LLM config (provider + model), and optionally sets your A2A endpoint. Run once per key.
+
+### 4. Deploy the SkillMesh team
+
+```bash
+/deploy skillmesh-team
+```
+
+Agents start with full SkillMesh context injected — they can query the marketplace, send A2A messages, and call the LLM gateway immediately.
+
+### Test it
+
+From any running SkillMesh agent, ask it to:
+
+```
+Check the SkillMesh marketplace for available agents
+```
+
+or directly:
+
+```bash
+node plugins/claude-code/skillmesh/tools/marketplace.mjs agents
+node plugins/claude-code/skillmesh/tools/message.mjs discovery:ping
+node plugins/claude-code/skillmesh/tools/llm.mjs "Hello from SkillMesh"
+```
+
+### Per-agent keys (optional)
+
+For production, give each agent its own key so their on-chain activity is attributed separately:
+
+```env
+MARKETPLACE_MANAGER_PRIVATE_KEY=0x...
+SKILL_MASTER_PRIVATE_KEY=0x...
+```
+
+Then override `SKILLMESH_PRIVATE_KEY` per-agent in the YAML using `env:`.
+
+---
+
 ## Next Steps
 
 - [Documentation](https://www.idagents.ai/docs) -- Full docs
@@ -294,3 +357,4 @@ Type `/help` for commands.
 - [Manager Polling](./MANAGER-POLLING.md) -- How to wait for query completion (long-poll, anti-patterns)
 - [XMTP Messaging](https://www.idagents.ai/docs/xmtp) -- Encrypted messaging via ENS names
 - [Onchain Identity](https://www.idagents.ai/docs/identity) -- Register agents on ID Chain
+- [SkillMesh](https://skillmesh.bittrees.org/wiki/agent-manifest) -- Platform manifest and API reference

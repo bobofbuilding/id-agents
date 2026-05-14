@@ -1,0 +1,8 @@
+{
+  "name": "skillmesh",
+  "version": "1.0.0",
+  "description": "SkillMesh integration — on-chain agent identity, LLM gateway, A2A messaging, and marketplace access",
+  "type": "local",
+  "entrypoint": "SKILL.md",
+  "scripts": []
+}

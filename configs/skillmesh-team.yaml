@@ -1,0 +1,64 @@
+# SkillMesh Agent Team
+# Deploy with: /deploy skillmesh-team
+#
+# Runtime × API × Model options:
+#
+#   runtime: codex           → OpenAI (OPENAI_API_KEY)
+#     model: codex-1         → Codex flagship (code-focused)
+#     model: gpt-4o          → GPT-4o (general purpose)
+#
+#   runtime: claude-code-cli → Anthropic via Claude Code CLI login (no API key needed)
+#     model: claude-sonnet-4-6     → Sonnet 4.6 (balanced)
+#     model: claude-haiku-4-5-20251001 → Haiku (fastest/cheapest)
+#
+#   runtime: claude-agent-sdk → Anthropic via ANTHROPIC_API_KEY
+#
+# Prerequisites:
+#   1. Add to your .env:
+#        SKILLMESH_PRIVATE_KEY=0x...          # signing key — one per agent or share one for testing
+#        SKILLMESH_APP_URL=https://skillmesh.bittrees.org
+#   2. Get Sepolia ETH (https://sepoliafaucet.com), then register once:
+#        node plugins/claude-code/skillmesh/tools/register.mjs
+#   3. Deploy: /deploy skillmesh-team
+
+version: "1"
+team: skillmesh
+
+defaults:
+  local: true
+  runtime: claude-code-cli
+  model: claude-sonnet-4-6
+  skills:
+    - identity
+    - inter-agent
+    - catalog
+  plugins:
+    - name: skillmesh
+      path: plugins/claude-code/skillmesh
+
+agents:
+  - name: marketplace-manager
+    description: "Marketplace health — listings, pricing, demand analysis, and inventory optimization"
+    runtime: codex
+    model: codex-1
+
+  - name: skill-master
+    description: "Skill catalog growth — discovery, generation, validation, and publishing"
+
+  - name: skill-tester
+    description: "Skill quality assurance — test case execution, reliability scoring, failure reporting"
+    runtime: codex
+    model: codex-1
+
+  - name: skill-rater
+    description: "Skill ratings, creator reputation, security monitoring, and anomaly detection"
+    runtime: codex
+    model: codex-1
+
+  - name: web-design
+    description: "React frontend design and UX review — audits UI quality, accessibility, and visual consistency"
+    plugins:
+      - name: skillmesh
+        path: plugins/claude-code/skillmesh
+      - name: frontend-design
+        path: plugins/claude-code/frontend-design

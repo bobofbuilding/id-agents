@@ -15,6 +15,7 @@ HEARTBEAT.md
 # drops into configs/ stays local.
 configs/*.yaml
 !configs/default.yaml
+!configs/skillmesh-team.yaml
 
 # Environment and secrets
 .env
