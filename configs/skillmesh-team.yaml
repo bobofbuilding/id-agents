@@ -96,7 +96,7 @@ agents:
       failure reporting. Runs skills against sample inputs and grades output
       against declared schemas.
     runtime: codex
-    model: codex-1
+    model: codex-5.5
     heartbeat: 21600
     dangerouslySkipPermissions: true
     catalog:
