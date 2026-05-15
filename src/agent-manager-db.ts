@@ -1009,7 +1009,7 @@ export class AgentManagerDb {
    * Get the shared deployer address.
    * Uses OWS wallet if OWS_REGISTRAR_WALLET is set, otherwise derives from PRIVATE_KEY.
    */
-  /** Return the next available SkillMesh key index (≥20, above the 20 pre-named agent slots). */
+  /** Return the next available SkillMesh key index above all pre-provisioned agent slots (0-33). */
   private async getNextSkillmeshKeyIndex(): Promise<number> {
     try {
       const { rows } = await this.db.adapter.query<{ max_idx: number | null }>(
@@ -1017,9 +1017,9 @@ export class AgentManagerDb {
          FROM agents WHERE deleted_at IS NULL`,
       );
       const max = rows[0]?.max_idx ?? null;
-      return max !== null && max >= 33 ? max + 1 : 33;
+      return max !== null ? max + 1 : 34;
     } catch {
-      return 20;
+      return 34;
     }
   }
 
