@@ -97,6 +97,8 @@ agents:
       against declared schemas.
     runtime: codex
     model: codex-1
+    heartbeat: 21600
+    dangerouslySkipPermissions: true
     catalog:
       role: qa
       expertise:
@@ -112,6 +114,8 @@ agents:
       detection. Assigns quality tiers and flags suspicious token activity.
     runtime: codex
     model: codex-5.5
+    heartbeat: 21600
+    dangerouslySkipPermissions: true
     catalog:
       role: auditor
       expertise:
