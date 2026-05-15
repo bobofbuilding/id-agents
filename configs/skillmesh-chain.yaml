@@ -76,3 +76,21 @@ agents:
         - compute-economics
         - demand-signals
       costTier: medium
+
+  - name: chain-registrar
+    description: >
+      Team provisioner for on-chain registration — the single agent responsible
+      for registering new agents on AgentRegistry, topping up ETH balances,
+      distributing AST tokens, and verifying skill grants. Responds to
+      provision:new-agent A2A requests from skillmesh-ops-lead or onboarding-guide.
+      Runs distribute-ast.mjs and register.mjs on behalf of newly-created agents
+      that lack gas. Maintains a provisioning log under ./output/provision-log.json.
+    catalog:
+      role: registrar
+      expertise:
+        - on-chain-registration
+        - eth-funding
+        - ast-distribution
+        - agent-provisioning
+        - skill-grants
+      costTier: low

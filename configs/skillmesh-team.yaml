@@ -486,3 +486,19 @@ agents:
         - discovery
         - first-session
       costTier: low
+
+  # ── Chain Registrar (source: skillmesh-chain.yaml) ─────────────────────────
+  - name: chain-registrar
+    description: >
+      Team provisioner — registers new agents on AgentRegistry, tops up ETH balances,
+      distributes AST tokens, and verifies skill grants. Responds to provision:new-agent
+      A2A requests. The single source of truth for agent on-chain provisioning state.
+    catalog:
+      role: registrar
+      expertise:
+        - on-chain-registration
+        - eth-funding
+        - ast-distribution
+        - agent-provisioning
+        - skill-grants
+      costTier: low

@@ -1025,6 +1025,11 @@ export class AgentManagerDb {
 
   /** Derive and persist a SkillMesh key for a newly created agent. Returns updated metadata. */
   private async assignSkillmeshKey(agentId: string, currentMeta: AgentMetadata): Promise<AgentMetadata> {
+    // If the spawn request already supplied a pre-provisioned key, use it as-is
+    if ((currentMeta as any).skillmesh_address && (currentMeta as any).skillmesh_private_key) {
+      await this.db.agents.updateMetadata(agentId, currentMeta);
+      return currentMeta;
+    }
     const masterKey = loadMasterKey(process.env.ID_WORKSPACE_DIR || this.baseWorkDir);
     if (!masterKey) return currentMeta;
     try {
