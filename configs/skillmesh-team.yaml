@@ -502,3 +502,22 @@ agents:
         - agent-provisioning
         - skill-grants
       costTier: low
+
+  # ── Self-Improvement Loop ──────────────────────────────────────────────────
+  - name: skill-discoverer
+    description: >
+      Autonomous self-improvement agent — runs on a 6-hour heartbeat to audit the
+      SkillMesh catalog, identify coverage gaps, publish up to 3 new skills per cycle,
+      create up to 2 new agents, and ensure all agent wallets hold sufficient ETH and
+      AST. Uses the creator key to publish on-chain. Reports actions to skillmesh-ops-lead.
+    heartbeat: 21600
+    dangerouslySkipPermissions: true
+    catalog:
+      role: orchestrator
+      expertise:
+        - skill-discovery
+        - skill-publishing
+        - agent-factory
+        - self-improvement
+        - wallet-health
+      costTier: high

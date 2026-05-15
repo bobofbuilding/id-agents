@@ -65,11 +65,13 @@ function loadAgentKeyMeta(agentName) {
   const derivation = env.SKILLMESH_KEY_PATH || env._DERIVATION;
   const indexMatch = derivation?.match(/\/(\d+)$/);
   const keyIndex = indexMatch ? Number(indexMatch[1]) : undefined;
+  const creatorKey = env.SKILLMESH_CREATOR_PRIVATE_KEY;
   return {
     skillmesh_address: address,
     skillmesh_key_index: keyIndex,
     skillmesh_key_path: derivation,
     skillmesh_private_key: privateKey,
+    ...(creatorKey && { skillmesh_creator_key: creatorKey }),
   };
 }
 

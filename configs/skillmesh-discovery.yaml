@@ -1,0 +1,46 @@
+# SkillMesh Self-Improvement Loop — skill-discoverer agent
+# Deploy with: node deploy-skillmesh.mjs --agent skill-discoverer
+#
+# Runs on a 6-hour heartbeat. On each tick the agent:
+#   1. Audits the live SkillMesh catalog for coverage gaps
+#   2. Publishes up to 3 new skills (uses SKILLMESH_CREATOR_PRIVATE_KEY)
+#   3. Creates up to 2 new agents via manager API
+#   4. Verifies all agent wallet balances (ETH + AST)
+#   5. Reports a brief summary to skillmesh-ops-lead
+#
+# Key: derived at m/44'/60'/0'/0/34 from skill-master seed
+#      (SKILLMESH_CREATOR_PRIVATE_KEY injected by manager from .env.skill-discoverer)
+
+version: "1"
+team: skillmesh
+
+defaults:
+  local: true
+  runtime: claude-code-cli
+  model: claude-sonnet-4-6
+  skills:
+    - identity
+    - inter-agent
+    - catalog
+  plugins:
+    - name: skillmesh
+      path: ../workspace/projects/skillmesh/agents/plugins/skillmesh
+
+agents:
+  - name: skill-discoverer
+    description: >
+      Autonomous self-improvement agent — runs on a 6-hour heartbeat to audit the
+      SkillMesh catalog, identify coverage gaps, publish up to 3 new skills per cycle,
+      create up to 2 new agents, and ensure all agent wallets hold sufficient ETH and
+      AST. Uses the creator key to publish on-chain. Reports actions to skillmesh-ops-lead.
+    heartbeat: 21600
+    dangerouslySkipPermissions: true
+    catalog:
+      role: orchestrator
+      expertise:
+        - skill-discovery
+        - skill-publishing
+        - agent-factory
+        - self-improvement
+        - wallet-health
+      costTier: high

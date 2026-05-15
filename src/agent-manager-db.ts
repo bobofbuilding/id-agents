@@ -597,6 +597,11 @@ export class AgentManagerDb {
       env.SKILLMESH_APP_URL = process.env.SKILLMESH_APP_URL || 'https://skillmesh.bittrees.org';
       env.SKILLMESH_RPC_URL = process.env.SKILLMESH_RPC_URL || 'https://sepolia.drpc.org';
     }
+    // Inject creator key for agents that need to publish skills on-chain
+    const skillmeshCreatorKey = (agent.metadata as any)?.skillmesh_creator_key;
+    if (skillmeshCreatorKey) {
+      env.SKILLMESH_CREATOR_PRIVATE_KEY = skillmeshCreatorKey;
+    }
 
     return env;
   }

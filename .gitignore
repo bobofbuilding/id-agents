@@ -23,6 +23,7 @@ configs/*.yaml
 !configs/skillmesh-chain.yaml
 !configs/skillmesh-health.yaml
 !configs/skillmesh-growth.yaml
+!configs/skillmesh-discovery.yaml
 
 # Environment and secrets
 .env
