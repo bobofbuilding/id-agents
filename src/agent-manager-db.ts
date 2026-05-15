@@ -3242,7 +3242,14 @@ export class AgentManagerDb {
           // Flag that heartbeat is enabled (actual config read from HEARTBEAT.yaml)
           ...(heartbeat && { heartbeat: true }),
           ...(openMode !== undefined && { openMode: openMode === true || openMode === 'true' }),
-          ...(dangerouslySkipPermissions !== undefined && { dangerouslySkipPermissions: dangerouslySkipPermissions === true || dangerouslySkipPermissions === 'true' })
+          ...(dangerouslySkipPermissions !== undefined && { dangerouslySkipPermissions: dangerouslySkipPermissions === true || dangerouslySkipPermissions === 'true' }),
+          // Pass through pre-provisioned SkillMesh key fields so assignSkillmeshKey can skip derivation
+          ...((reqMetadata as any)?.skillmesh_address && {
+            skillmesh_address: (reqMetadata as any).skillmesh_address,
+            skillmesh_private_key: (reqMetadata as any).skillmesh_private_key,
+            skillmesh_key_index: (reqMetadata as any).skillmesh_key_index,
+            skillmesh_key_path: (reqMetadata as any).skillmesh_key_path,
+          }),
         };
 
         await this.db.agents.create({
