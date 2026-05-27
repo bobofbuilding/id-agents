@@ -66,7 +66,7 @@ agents:
       optimization. Monitors provider activity, flags stale listings, and
       surfaces actionable improvements.
     runtime: codex
-    model: codex-1
+    model: gpt-5.3-codex
     catalog:
       role: manager
       expertise:
@@ -96,7 +96,7 @@ agents:
       failure reporting. Runs skills against sample inputs and grades output
       against declared schemas.
     runtime: codex
-    model: codex-5.5
+    model: gpt-5.3-codex
     heartbeat: 21600
     dangerouslySkipPermissions: true
     catalog:
@@ -113,7 +113,7 @@ agents:
       Skill ratings, creator reputation, security monitoring, and anomaly
       detection. Assigns quality tiers and flags suspicious token activity.
     runtime: codex
-    model: codex-5.5
+    model: gpt-5.3-codex
     heartbeat: 21600
     dangerouslySkipPermissions: true
     catalog:
@@ -226,7 +226,7 @@ agents:
       Classifies inbound content for safety, compliance, and quality. Returns
       verdict with category labels and confidence scores. Gates rewrite-assistant.
     runtime: codex
-    model: codex-5.5
+    model: gpt-5.3-codex
     catalog:
       role: skill-executor
       expertise:
@@ -254,7 +254,7 @@ agents:
       anomalies against baselines, summarizes incidents with timeline and
       recommendations, and dispatches alerts to operator endpoints.
     runtime: codex
-    model: codex-5.5
+    model: gpt-5.3-codex
     catalog:
       role: monitor
       expertise:
@@ -269,7 +269,7 @@ agents:
       Monitors on-chain event streams for specified contract addresses and event
       signatures. Emits structured payloads to anomaly-classifier on each match.
     runtime: codex
-    model: codex-5.5
+    model: gpt-5.3-codex
     catalog:
       role: skill-executor
       expertise:
@@ -283,7 +283,7 @@ agents:
       Classifies observed chain activity against baseline patterns. Flags
       anomalies by type, severity, and affected protocol components.
     runtime: codex
-    model: codex-5.5
+    model: gpt-5.3-codex
     catalog:
       role: skill-executor
       expertise:
@@ -297,7 +297,7 @@ agents:
       Aggregates anomaly signals into a human-readable incident report with
       timeline, affected systems, root cause hypothesis, and recommended actions.
     runtime: codex
-    model: codex-5.5
+    model: gpt-5.3-codex
     catalog:
       role: skill-executor
       expertise:

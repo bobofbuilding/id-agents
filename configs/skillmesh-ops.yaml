@@ -44,7 +44,7 @@ agents:
       optimization. Monitors provider activity, flags stale listings, and
       surfaces actionable improvements.
     runtime: codex
-    model: codex-1
+    model: gpt-5.3-codex
     catalog:
       role: manager
       expertise:
@@ -74,7 +74,7 @@ agents:
       failure reporting. Runs skills against sample inputs and grades output
       against declared schemas.
     runtime: codex
-    model: codex-1
+    model: gpt-5.3-codex
     catalog:
       role: qa
       expertise:
@@ -89,7 +89,7 @@ agents:
       Skill ratings, creator reputation, security monitoring, and anomaly
       detection. Assigns quality tiers and flags suspicious token activity.
     runtime: codex
-    model: codex-5.5
+    model: gpt-5.3-codex
     catalog:
       role: auditor
       expertise:

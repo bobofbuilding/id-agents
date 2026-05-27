@@ -10,7 +10,7 @@ team: skillmesh-protocol
 defaults:
   local: true
   runtime: codex
-  model: codex-5.5
+  model: gpt-5.3-codex
   skills:
     - identity
     - inter-agent
