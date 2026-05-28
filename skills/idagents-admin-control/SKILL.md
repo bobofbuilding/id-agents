@@ -1,6 +1,10 @@
 ---
 name: idagents-admin-control
 description: Programmatically manage an ID Agents team — add/remove agents, sync configs, rebuild and restart the manager, dispatch work to agents and poll replies. Use whenever you edit a team YAML, hit "Manager did not start in time", need to /sync, /deploy, or /agents rebuild a team, or want to talk to or ask an agent.
+source_kind: local-authored
+source: id-agents (this repo)
+license: MIT
+modified_locally: false
 ---
 
 # ID Agents Admin Control Skill
@@ -265,6 +269,59 @@ Each event has `seq` (cursor), `team`, `topic`, `actor`, `subject`, and a `data`
 # Probe a single named agent
 ./skills/idagents-admin-control/remote-command.sh "/agent jrdev probe"
 ```
+
+## Heartbeats (new model — agent reads `HEARTBEAT.md`)
+
+The manager has a built-in scheduler. Putting `heartbeat: <seconds>` on an agent in its team YAML enables the **new** heartbeat model: every `<seconds>` the manager sends the agent a fixed, generic wake message:
+
+> `Heartbeat. Re-read your HEARTBEAT.md from disk before acting (do not rely on session memory) and follow its current algorithm. Reply with the line your HEARTBEAT.md tells you to send.`
+
+The wake message contains **no work instructions**. The agent must read `HEARTBEAT.md` from the **root of its working directory** on every beat and follow what it says. Without a `HEARTBEAT.md` file, a heartbeat fires but is effectively a no-op (or errors on `/heartbeat <agent> enable`). The persona / `description:` field is NOT the wake script — `HEARTBEAT.md` is.
+
+`HEARTBEAT.md` is the algorithm and the source of truth — change behaviour by editing the file, not by re-syncing the team. The agent re-reads it from disk every beat.
+
+### Shared working directories are a footgun
+
+`HEARTBEAT.md` is resolved as `<workingDirectory>/HEARTBEAT.md`. If two agents share a working directory (common: a `cto` and a `dev` both rooted at the same repo), they will read the **same** `HEARTBEAT.md` and both try to act on it. Isolate scheduled agents in their own working directory — usually a sibling directory containing only `HEARTBEAT.md` — and have the algorithm operate on the real target repo via absolute paths plus `git -C` / `cd`.
+
+### `/heartbeat <agent>` — inspect schedule state
+
+`POST /remote` with `/heartbeat <agent>` returns the live schedule:
+
+```json
+{
+  "agent": {
+    "name": "systems",
+    "intervalSeconds": 1800,
+    "scheduleActive": true,
+    "runsSent": 3,
+    "maxRuns": null,
+    "expiresAt": null,
+    "status": "running"
+  }
+}
+```
+
+`intervalSeconds` is from the YAML `heartbeat:` value. `runsSent` is the count of beats fired since this schedule started. `maxRuns` is the cap on beats before the schedule auto-pauses; `null` means **no cap** — the schedule keeps beating until you `/heartbeat <agent> disable` or the agent goes away. `scheduleActive` is `true` while the schedule is running and flips `false` when paused or when a non-null `maxRuns` has been hit.
+
+**New-model heartbeats are uncapped by default** — schedules are persisted with `max_runs: null`. If you want a soft safety net, set `maxBeats: N` in a legacy `HEARTBEAT.yaml` (which persists `max_runs: N` at creation), or wire a cap into your custom schedule.
+
+`/heartbeat <agent> enable|disable` toggles the schedule. `enable` errors with `Agent "<name>" has no HEARTBEAT.yaml or HEARTBEAT.md in working directory` if the file is missing — fix that first.
+
+### Recipe — set up a heartbeat-driven loop
+
+1. Pick (or create) a dedicated working directory for the agent. If the agent will operate on another repo, it can do so via absolute paths from this dir.
+2. Write `HEARTBEAT.md` at that directory's root. The file IS the algorithm; describe exactly what to read, what to do, how much to do per beat (one item, a batch of N, until a wall-clock budget, etc.), and what one-line reply to send. Tell the agent to re-read `HEARTBEAT.md` from disk every beat (mirroring the manager's wake message).
+3. Add the agent to the team YAML with `workingDirectory:` pointing at that dir and `heartbeat: <seconds>`.
+4. `/sync <team>` (or `/deploy <team>`).
+5. Verify with `/heartbeat <agent>`: `intervalSeconds` set, `scheduleActive: true`. The first beat fires inside the interval.
+
+### Anti-patterns
+
+- **Putting the algorithm only in `description:`** — the wake message will not include it. Use `HEARTBEAT.md` for the algorithm and reserve `description:` for the agent's identity / persona.
+- **Letting two agents share a working directory when one of them has a heartbeat** — both will read and act on the same `HEARTBEAT.md`.
+- **Treating the heartbeat as a liveness ping** — it isn't, it's a periodic prompt that triggers real work via the file.
+- **Misreading `maxRuns`** — `null` is the default for new-model heartbeats and means **no cap**, not "use a default of 20." If you actually want a cap, set `maxBeats` in a legacy `HEARTBEAT.yaml`, or set `max_runs` on a custom schedule. The cap only fires when the persisted value is non-null.
 
 ## Public-Team Admin (direct daemon endpoints)
 

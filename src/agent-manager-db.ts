@@ -1916,6 +1916,10 @@ export class AgentManagerDb {
       const fromSel = parseSelector((body as Record<string, unknown>).from);
       const toSel = parseSelector((body as Record<string, unknown>).to);
       const force = (body as Record<string, unknown>).force === true;
+      const paramsRaw = (body as Record<string, unknown>).params;
+      const params: Record<string, unknown> = (paramsRaw && typeof paramsRaw === 'object' && !Array.isArray(paramsRaw))
+        ? (paramsRaw as Record<string, unknown>)
+        : {};
 
       if (!fromSel) {
         res.status(400).json({ error: 'bad_selector', field: 'from', value: (body as Record<string, unknown>).from ?? null });
@@ -1933,11 +1937,16 @@ export class AgentManagerDb {
         res.status(400).json({ error: 'unsupported_kind', kind: fromSel.kind });
         return;
       }
+      if (paramsRaw !== undefined && (paramsRaw === null || typeof paramsRaw !== 'object' || Array.isArray(paramsRaw))) {
+        res.status(400).json({ error: 'bad_params', message: 'params must be an object' });
+        return;
+      }
 
       const result = installLibraryTeam(this.libraryRoot, {
         template: fromSel.name,
         dest: toSel.name,
         force,
+        params,
       });
       if (!result.ok) {
         const { ok: _ok, status, ...rest } = result;
@@ -5828,7 +5837,7 @@ export class AgentManagerDb {
                 scheduleActive: hbSchedule?.active ?? false,
                 intervalSeconds: hbSchedule?.interval_seconds || config?.interval || 'no file',
                 runsSent: runCount,
-                maxRuns: hbSchedule?.max_runs ?? config?.maxBeats ?? 20,
+                maxRuns: hbSchedule?.max_runs ?? config?.maxBeats ?? null,
                 expiresAt: hbSchedule?.expires_at ?? null
               }
             }
@@ -5855,7 +5864,7 @@ export class AgentManagerDb {
             scheduleActive: hbSchedule?.active ?? false,
             intervalSeconds: hbSchedule?.interval_seconds || config?.interval || 'no file',
             runsSent: runCount,
-            maxRuns: hbSchedule?.max_runs ?? config?.maxBeats ?? 20,
+            maxRuns: hbSchedule?.max_runs ?? config?.maxBeats ?? null,
             expiresAt: hbSchedule?.expires_at ?? null
           });
         }
