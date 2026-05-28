@@ -102,7 +102,9 @@ const __dirname = path.dirname(__filename);
 const MODEL_ALIASES: Record<string, string> = {
   'haiku': 'claude-haiku-4-5-20251001',
   'sonnet': 'claude-sonnet-4-5-20250514',
-  'opus': 'claude-opus-4-5-20250514'
+  'opus': 'claude-opus-4-5-20250514',
+  'opus-4-8': 'claude-opus-4-8',
+  'opus-4.8': 'claude-opus-4-8'
 };
 
 function resolveModelAlias(model: string): string {
