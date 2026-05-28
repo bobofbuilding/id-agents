@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.97-beta
+
+### Features
+
+- **Opus 4.8 model nickname.** New shorthand aliases `opus-4-8` and `opus-4.8` resolve to `claude-opus-4-8` (`src/agent-manager-db.ts` MODEL_ALIASES). TUI agents table shows the short label `opus-4.8` for the new model (`src/tui/util/models.ts`).
+
+### Docs
+
+- **Heartbeats (new model — agent reads `HEARTBEAT.md`).** New section in `skills/idagents-admin-control/SKILL.md` documenting the manager's heartbeat scheduler: how `heartbeat: <seconds>` in a team YAML triggers a generic wake message, how the agent reads `HEARTBEAT.md` from its working directory on every beat, the shared-working-directory footgun, the `/heartbeat <agent>` state shape, the recipe for a heartbeat-driven loop, and anti-patterns.
+
+### Fixes
+
+- **`/heartbeat <agent>` `maxRuns` readback.** Previously the response fell back to the literal `20` when no cap was set, even though the scheduler treats `null` as unbounded. Both readback fallbacks now return `null` (in `src/agent-manager-db.ts`), so the JSON honestly reflects scheduler behavior. New-model heartbeats remain uncapped by default; legacy `HEARTBEAT.yaml` with `maxBeats: N` continues to opt into a real cap.
+
 ## 0.1.96-beta
 
 ### Features
