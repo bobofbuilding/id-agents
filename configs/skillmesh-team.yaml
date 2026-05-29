@@ -1,5 +1,10 @@
 # SkillMesh Agent Team — Full Roster
-# Deploy with: /deploy skillmesh-team  (all 32 agents, one team)
+# Deploy with: /deploy skillmesh-team  (all 38 agents, one team)
+#
+# ── Agent cap ─────────────────────────────────────────────────────────────────
+# MAX AGENTS: 69  — enforced by pre-sync check script:
+#   node workspace/projects/skillmesh/agents/plugins/skillmesh/tools/check-agent-cap.mjs
+# Do NOT add new agents without running this check first.
 #
 # ── Sub-team configs (deploy groups independently) ────────────────────────────
 #   /deploy skillmesh-ops       → Marketplace ops, skill catalog, QA (7 agents)
@@ -15,6 +20,7 @@
 #   claude-code-cli  → Anthropic via Claude Code CLI login (no API key needed)
 #   codex            → OpenAI (OPENAI_API_KEY required)
 #   claude-agent-sdk → Anthropic via ANTHROPIC_API_KEY
+#   ollama           → Local Ollama server (default: http://127.0.0.1:11434/v1, no API key)
 #
 # Prerequisites:
 #   1. Add to your .env:
@@ -41,6 +47,15 @@ defaults:
 
 agents:
 
+  # ── Runtime fallback policy ────────────────────────────────────────────────
+  # Primary runtimes: claude-code-cli (9 agents) | codex/gpt-5.3-codex (26 agents)
+  # Fallback chain when an agent is unresponsive or returns no output within SLA:
+  #   claude-code-cli → codex/gpt-5.3-codex → codex/gpt-5.4 (higher capacity)
+  #   codex/gpt-5.3-codex → codex/gpt-5.4 → codex/gpt-5.5 (highest)
+  # To switch a live agent: POST /remote {"command":"/model <agent> <model>"}
+  # task-master auto-detects probe failures and can trigger /model switches.
+  # ─────────────────────────────────────────────────────────────────────────
+
   # ── Team Lead ──────────────────────────────────────────────────────────────
   - name: skillmesh-ops-lead
     description: >
@@ -65,8 +80,8 @@ agents:
       Marketplace health — listings, pricing, demand analysis, and inventory
       optimization. Monitors provider activity, flags stale listings, and
       surfaces actionable improvements.
-    runtime: codex
-    model: gpt-5.3-codex
+    runtime: ollama
+    model: qwen3:4b
     catalog:
       role: manager
       expertise:
@@ -95,8 +110,8 @@ agents:
       Skill quality assurance — test case execution, reliability scoring, and
       failure reporting. Runs skills against sample inputs and grades output
       against declared schemas.
-    runtime: codex
-    model: gpt-5.3-codex
+    runtime: claude-code-cli
+    model: claude-opus-4-7
     heartbeat: 21600
     dangerouslySkipPermissions: true
     catalog:
@@ -112,8 +127,8 @@ agents:
     description: >
       Skill ratings, creator reputation, security monitoring, and anomaly
       detection. Assigns quality tiers and flags suspicious token activity.
-    runtime: codex
-    model: gpt-5.3-codex
+    runtime: claude-code-cli
+    model: claude-opus-4-7
     heartbeat: 21600
     dangerouslySkipPermissions: true
     catalog:
@@ -144,6 +159,8 @@ agents:
     description: >
       Parses raw market data, headlines, and price feeds into normalized JSON.
       Feeds structured output to entity-extractor and summary-formatter.
+    runtime: ollama
+    model: qwen3:4b
     catalog:
       role: skill-executor
       expertise:
@@ -156,6 +173,8 @@ agents:
     description: >
       Extracts named entities (addresses, tokens, protocols, people) from
       unstructured text. Returns typed arrays with confidence scores.
+    runtime: ollama
+    model: qwen3:4b
     catalog:
       role: skill-executor
       expertise:
@@ -168,6 +187,8 @@ agents:
     description: >
       Condenses long-form content into structured summaries at configurable
       depth levels, optimized for both human readers and agent consumption.
+    runtime: ollama
+    model: qwen3:4b
     catalog:
       role: skill-executor
       expertise:
@@ -180,6 +201,8 @@ agents:
     description: >
       Classifies signals by severity and routes them to webhook, A2A message,
       or structured log. Receives output from summary-formatter or anomaly-classifier.
+    runtime: ollama
+    model: qwen3:4b
     catalog:
       role: skill-executor
       expertise:
@@ -225,8 +248,8 @@ agents:
     description: >
       Classifies inbound content for safety, compliance, and quality. Returns
       verdict with category labels and confidence scores. Gates rewrite-assistant.
-    runtime: codex
-    model: gpt-5.3-codex
+    runtime: ollama
+    model: qwen3:4b
     catalog:
       role: skill-executor
       expertise:
@@ -239,6 +262,8 @@ agents:
     description: >
       Transforms structured content into channel-specific formats: Markdown,
       HTML, plain text, or JSON feed. Last step in the content ops pipeline.
+    runtime: ollama
+    model: qwen3:4b
     catalog:
       role: skill-executor
       expertise:
@@ -253,8 +278,8 @@ agents:
       Protocol Monitoring Stack — watches on-chain event streams, classifies
       anomalies against baselines, summarizes incidents with timeline and
       recommendations, and dispatches alerts to operator endpoints.
-    runtime: codex
-    model: gpt-5.3-codex
+    runtime: ollama
+    model: qwen3:4b
     catalog:
       role: monitor
       expertise:
@@ -268,8 +293,8 @@ agents:
     description: >
       Monitors on-chain event streams for specified contract addresses and event
       signatures. Emits structured payloads to anomaly-classifier on each match.
-    runtime: codex
-    model: gpt-5.3-codex
+    runtime: ollama
+    model: qwen3:4b
     catalog:
       role: skill-executor
       expertise:
@@ -282,8 +307,8 @@ agents:
     description: >
       Classifies observed chain activity against baseline patterns. Flags
       anomalies by type, severity, and affected protocol components.
-    runtime: codex
-    model: gpt-5.3-codex
+    runtime: ollama
+    model: qwen3:4b
     catalog:
       role: skill-executor
       expertise:
@@ -296,8 +321,8 @@ agents:
     description: >
       Aggregates anomaly signals into a human-readable incident report with
       timeline, affected systems, root cause hypothesis, and recommended actions.
-    runtime: codex
-    model: gpt-5.3-codex
+    runtime: ollama
+    model: qwen3:4b
     catalog:
       role: skill-executor
       expertise:
@@ -310,6 +335,8 @@ agents:
     description: >
       Dispatches incident reports and alerts to operator endpoints via webhook,
       A2A message, or structured log. Supports deduplication and rate limiting.
+    runtime: ollama
+    model: qwen3:4b
     catalog:
       role: skill-executor
       expertise:
@@ -325,6 +352,8 @@ agents:
       Rewrites moderation-passed content for tone, clarity, and reading level.
       Accepts a draft and target register; returns polished copy ready for
       metadata-generator.
+    runtime: ollama
+    model: qwen3:4b
     catalog:
       role: skill-executor
       expertise:
@@ -337,6 +366,8 @@ agents:
     description: >
       Generates structured metadata for content: title, summary, tags, keywords,
       and SEO signals. Output feeds channel-formatter in the content pipeline.
+    runtime: ollama
+    model: qwen3:4b
     catalog:
       role: skill-executor
       expertise:
@@ -365,6 +396,8 @@ agents:
     description: >
       Monitors ETH and AST balances across all registered agent addresses. Alerts
       when any wallet drops below threshold and generates a prioritized top-up list.
+    runtime: ollama
+    model: qwen3:4b
     catalog:
       role: monitor
       expertise:
@@ -377,6 +410,8 @@ agents:
     description: >
       Scans ComputeEscrow for stalled sessions where proposeSettlement has not been
       called. Identifies responsible agent and generates nudge messages.
+    runtime: ollama
+    model: qwen3:4b
     catalog:
       role: monitor
       expertise:
@@ -389,6 +424,8 @@ agents:
     description: >
       Monitors Sepolia gas prices and caches optimal transaction windows. Returns
       current gas price, recommended wait time, and a 24h forecast.
+    runtime: ollama
+    model: qwen3:4b
     catalog:
       role: skill-executor
       expertise:
@@ -401,6 +438,8 @@ agents:
     description: >
       Tracks AST token velocity, circulating supply, staking patterns, and compute
       session economics. Returns demand signals and anomaly flags.
+    runtime: ollama
+    model: qwen3:4b
     catalog:
       role: analyst
       expertise:
@@ -415,6 +454,8 @@ agents:
     description: >
       Polls SkillMesh REST endpoints and tracks uptime, response latency, and error
       rates. Returns a health report with degraded endpoints and p95 latency.
+    runtime: ollama
+    model: qwen3:4b
     catalog:
       role: monitor
       expertise:
@@ -428,6 +469,8 @@ agents:
     description: >
       Verifies all published skill CIDs are accessible and pinned on Pinata. Re-pins
       cold CIDs and flags definition hash mismatches between on-chain and IPFS.
+    runtime: ollama
+    model: qwen3:4b
     catalog:
       role: monitor
       expertise:
@@ -441,6 +484,8 @@ agents:
     description: >
       Monitors Vercel deployment status for the SkillMesh web app. Reports build
       failures, environment variable drift, and failed serverless function invocations.
+    runtime: ollama
+    model: qwen3:4b
     catalog:
       role: monitor
       expertise:
@@ -456,6 +501,8 @@ agents:
       Tracks weekly marketplace KPIs: new skill listings, transaction volume, unique
       agent registrations, compute session counts, and AST flow. Returns week-on-week
       growth reports.
+    runtime: ollama
+    model: qwen3:4b
     catalog:
       role: analyst
       expertise:
@@ -469,6 +516,8 @@ agents:
     description: >
       Matches incoming skill execution requests to the best available provider based
       on price, quality score, and availability. Returns ordered provider recommendations.
+    runtime: ollama
+    model: qwen3:4b
     catalog:
       role: skill-executor
       expertise:
@@ -482,6 +531,8 @@ agents:
       Walks new agents through the full SkillMesh onboarding flow: wallet funding check,
       registration, skill inventory setup, and first compute session. Responds to
       discovery:ping from unknown agents.
+    runtime: ollama
+    model: qwen3:4b
     catalog:
       role: guide
       expertise:
@@ -506,6 +557,76 @@ agents:
         - agent-provisioning
         - skill-grants
       costTier: low
+
+
+  # ── ETH Ecosystem Agents ──────────────────────────────────────────────────
+
+  - name: safe-guardian
+    description: >
+      Monitors Safe{Gnosis} multisig wallets — inspects configuration (owners,
+      threshold, modules), tracks pending transactions awaiting signatures, and
+      alerts when a transaction reaches threshold or stalls. Routes signature
+      requests to the right owners and reports executed settlements to skillmesh-ops-lead.
+    runtime: ollama
+    model: qwen3:4b
+    catalog:
+      role: monitor
+      expertise:
+        - safe-multisig
+        - gnosis-safe
+        - multisig-operations
+        - transaction-monitoring
+      costTier: low
+
+  - name: alchemy-agent
+    description: >
+      Alchemy-backed data agent — provides real-time ERC-20 token prices, 24-hour
+      market data, and NFT metadata lookups via the Alchemy API. Answers token
+      valuation queries from other agents and feeds the token-economist and
+      market-parser pipelines. Requires ALCHEMY_API_KEY in environment.
+    runtime: ollama
+    model: qwen3:4b
+    catalog:
+      role: data-provider
+      expertise:
+        - token-prices
+        - nft-metadata
+        - alchemy-api
+        - market-data
+      costTier: low
+
+  - name: chain-analyst
+    description: >
+      On-chain forensics — decodes EVM transaction calldata into human-readable
+      function calls, queries The Graph subgraphs for protocol-level data, and
+      cross-references event streams with anomaly signals. Used by contract-auditor
+      and protocol-monitor for deep transaction analysis.
+    runtime: ollama
+    model: qwen3:4b
+    catalog:
+      role: analyst
+      expertise:
+        - calldata-decoding
+        - the-graph
+        - subgraph-querying
+        - on-chain-forensics
+      costTier: medium
+
+  # ── Task Master (ops supervisor) ──────────────────────────────────────────
+  - name: task-master
+    description: >
+      Ops supervisor — runs on a 1-hour heartbeat to audit the task board, close
+      stale doing tasks with no assignee, dispatch unclaimed todos to the right
+      agents, probe the full fleet for offline agents and restart them, and send
+      a structured ops digest to skillmesh-ops-lead. Single point of fleet hygiene.
+    catalog:
+      role: supervisor
+      expertise:
+        - task-management
+        - fleet-health
+        - ops-automation
+        - agent-orchestration
+      costTier: medium
 
   # ── Self-Improvement Loop ──────────────────────────────────────────────────
   - name: skill-discoverer
