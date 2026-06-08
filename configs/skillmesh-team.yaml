@@ -41,6 +41,7 @@ defaults:
     - identity
     - inter-agent
     - catalog
+    - brain
   plugins:
     - name: skillmesh
       path: ../workspace/projects/skillmesh/agents/plugins/skillmesh
@@ -111,8 +112,8 @@ agents:
       failure reporting. Runs skills against sample inputs and grades output
       against declared schemas.
     runtime: claude-code-cli
-    model: claude-opus-4-7
-    heartbeat: 21600
+    model: claude-sonnet-4-6
+    heartbeat: 43200
     dangerouslySkipPermissions: true
     catalog:
       role: qa
@@ -128,8 +129,8 @@ agents:
       Skill ratings, creator reputation, security monitoring, and anomaly
       detection. Assigns quality tiers and flags suspicious token activity.
     runtime: claude-code-cli
-    model: claude-opus-4-7
-    heartbeat: 21600
+    model: claude-sonnet-4-6
+    heartbeat: 43200
     dangerouslySkipPermissions: true
     catalog:
       role: auditor
@@ -635,7 +636,7 @@ agents:
       SkillMesh catalog, identify coverage gaps, publish up to 3 new skills per cycle,
       create up to 2 new agents, and ensure all agent wallets hold sufficient ETH and
       AST. Uses the creator key to publish on-chain. Reports actions to skillmesh-ops-lead.
-    heartbeat: 21600
+    heartbeat: 43200
     dangerouslySkipPermissions: true
     catalog:
       role: orchestrator
