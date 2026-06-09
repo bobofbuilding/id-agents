@@ -12,7 +12,9 @@ import { AgentHarness, HarnessOptions, HarnessMessage, HarnessType, PluginConfig
 export const CLAUDE_MODELS = {
   HAIKU: 'claude-haiku-4-5-20251001',
   SONNET: 'claude-sonnet-4-20250514',
-  OPUS: 'claude-opus-4-20250514'
+  OPUS: 'claude-opus-4-20250514',
+  FABLE: 'claude-fable-5',
+  MYTHOS: 'claude-mythos-5'
 } as const;
 
 /**

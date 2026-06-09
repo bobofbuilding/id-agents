@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.98-beta
+
+### Features
+
+- **Fable 5 and Mythos 5 model aliases.** New shorthand aliases `fable`, `fable-5`, `mythos`, and `mythos-5` resolve to `claude-fable-5` and `claude-mythos-5`. Claude runtime validation, CLI display labels, harness constants, and TUI model abbreviations now recognize the new model IDs.
+
 ## 0.1.97-beta
 
 ### Features

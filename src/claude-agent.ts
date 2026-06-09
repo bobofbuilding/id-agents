@@ -36,8 +36,22 @@ export interface ClaudeAgentMessage {
 export const CLAUDE_MODELS = {
   HAIKU: 'claude-haiku-4-5-20251001',      // Cheapest: $0.25/$1.25 per 1M tokens
   SONNET: 'claude-sonnet-4-20250514',      // Balanced: $3/$15 per 1M tokens
-  OPUS: 'claude-opus-4-20250514'           // Most capable: $15/$75 per 1M tokens
+  OPUS: 'claude-opus-4-20250514',          // Most capable: $15/$75 per 1M tokens
+  FABLE: 'claude-fable-5',                 // Fable 5: $10/$50 per 1M tokens
+  MYTHOS: 'claude-mythos-5'                // Mythos 5: $10/$50 per 1M tokens (Project Glasswing access required)
 } as const;
+
+/**
+ * Human-friendly display label for a model id/alias.
+ * Falls back to the raw model string when unrecognized.
+ */
+export function modelDisplayName(model: string): string {
+  return model.includes('haiku') ? 'Haiku 4.5 (Cheap)' :
+         model.includes('sonnet') ? 'Sonnet 4 (Balanced)' :
+         model.includes('opus') ? 'Opus 4 (Premium)' :
+         model.includes('fable') ? 'Fable 5' :
+         model.includes('mythos') ? 'Mythos 5' : model;
+}
 
 /**
  * Execute Claude using the SDK query() function

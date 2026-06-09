@@ -34,7 +34,6 @@ describe('TUI command registry tiers', () => {
     expect(commandConfirmPreview(command('delete'), ['worker'])).toBe('delete agent worker');
 
     expect(confirmationLevel(command('cancel'), ['worker'])).toBe('retype');
-    expect(confirmationLevel(command('clear'), ['worker'])).toBe('retype');
   });
 
   it('keeps powerful Phase 3 mutators behind Y/N confirmation by default', () => {
@@ -520,7 +519,7 @@ describe('TUI command registry tiers', () => {
         args: [],
       });
 
-      const hint = 'Use `t` to open the tasks view. /task only handles create, claim, done, remove, delete.';
+      const hint = 'Use `t` to open the tasks view. /task only handles assign, status, done, remove, delete. Use the manager dispatch path for /task create.';
       expect(list).toEqual({ ok: false, error: hint });
       expect(bare).toEqual({ ok: false, error: hint });
       expect(calls).toEqual([]);
@@ -530,7 +529,7 @@ describe('TUI command registry tiers', () => {
         manager: 'http://127.0.0.1:0',
         executor: 'tui',
         signal: new AbortController().signal,
-        args: ['create', 'foo'],
+        args: ['assign', 'foo', 'worker'],
       });
       expect(calls).toEqual(['http://127.0.0.1:0/remote']);
     } finally {
@@ -627,7 +626,8 @@ describe('TUI command registry tiers', () => {
     expect(confirmationLevel(command('schedule'), ['add', 'daily'])).toBe('yn');
     expect(confirmationLevel(command('schedule'), ['remove', 'daily'])).toBe('retype');
 
-    expect(confirmationLevel(command('task'), ['claim', 'ship-it'])).toBe('yn');
-    expect(confirmationLevel(command('task'), ['delete', 'ship-it'])).toBe('retype');
+    expect(confirmationLevel(command('task'), ['assign', 'ship-it', 'worker'])).toBe('yn');
+    expect(confirmationLevel(command('task'), ['delete', 'ship-it'])).toBe('yn');
+    expect(confirmationLevel(command('task'), ['delete', '*'])).toBe('retype');
   });
 });

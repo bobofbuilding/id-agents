@@ -7,18 +7,16 @@
 
 import 'dotenv/config';
 import * as readline from 'readline';
-import { runClaudeAgent, CLAUDE_MODELS } from './claude-agent.js';
+import { runClaudeAgent, CLAUDE_MODELS, modelDisplayName } from './claude-agent.js';
 
 async function main() {
   console.log('🤖 Claude Agent SDK CLI');
   console.log('=======================\n');
-  
+
   // Get model from env or use default
   const model = process.env.CLAUDE_MODEL || CLAUDE_MODELS.HAIKU;
-  const modelName = model.includes('haiku') ? 'Haiku 4.5 (Cheap)' :
-                    model.includes('sonnet') ? 'Sonnet 4 (Balanced)' :
-                    model.includes('opus') ? 'Opus 4 (Premium)' : model;
-  
+  const modelName = modelDisplayName(model);
+
   console.log('Using Anthropic Claude Agent SDK');
   console.log('Runtime: Claude Code 1.0.x');
   console.log(`Model: ${modelName}\n`);

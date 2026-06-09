@@ -99,15 +99,19 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Model alias resolution
-const MODEL_ALIASES: Record<string, string> = {
+export const MODEL_ALIASES: Record<string, string> = {
   'haiku': 'claude-haiku-4-5-20251001',
   'sonnet': 'claude-sonnet-4-5-20250514',
   'opus': 'claude-opus-4-5-20250514',
   'opus-4-8': 'claude-opus-4-8',
-  'opus-4.8': 'claude-opus-4-8'
+  'opus-4.8': 'claude-opus-4-8',
+  'fable': 'claude-fable-5',
+  'fable-5': 'claude-fable-5',
+  'mythos': 'claude-mythos-5',
+  'mythos-5': 'claude-mythos-5'
 };
 
-function resolveModelAlias(model: string): string {
+export function resolveModelAlias(model: string): string {
   return MODEL_ALIASES[model.toLowerCase()] || model;
 }
 

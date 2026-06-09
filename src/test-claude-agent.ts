@@ -5,7 +5,7 @@
  */
 
 import 'dotenv/config';
-import { runClaudeAgent, CLAUDE_MODELS } from './claude-agent.js';
+import { runClaudeAgent, CLAUDE_MODELS, modelDisplayName } from './claude-agent.js';
 
 async function main() {
   console.log('🤖 Testing Claude Agent SDK...\n');
@@ -16,9 +16,7 @@ async function main() {
   }
 
   const model = process.env.CLAUDE_MODEL || CLAUDE_MODELS.HAIKU;
-  const modelName = model.includes('haiku') ? 'Haiku 4.5 (Cheap - $0.25/$1.25 per 1M)' :
-                    model.includes('sonnet') ? 'Sonnet 4 (Balanced - $3/$15 per 1M)' :
-                    model.includes('opus') ? 'Opus 4 (Premium - $15/$75 per 1M)' : model;
+  const modelName = modelDisplayName(model);
 
   console.log(`Using model: ${modelName}\n`);
   console.log('Prompt: "List the files in the src/ directory"\n');

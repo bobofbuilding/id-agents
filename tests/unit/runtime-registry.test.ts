@@ -81,6 +81,24 @@ describe('runtime registry', () => {
     expect(validateRuntimeModelCompatibility('codex', 'gpt-5.4')).toEqual([]);
     expect(validateRuntimeModelCompatibility('claude-code-cli', 'claude-sonnet-4-20250514')).toEqual([]);
     expect(validateRuntimeModelCompatibility('claude-agent-sdk', 'haiku')).toEqual([]);
+    expect(validateRuntimeModelCompatibility('claude-agent-sdk', 'fable')).toEqual([]);
+    expect(validateRuntimeModelCompatibility('claude-agent-sdk', 'fable-5')).toEqual([]);
+    expect(validateRuntimeModelCompatibility('claude-agent-sdk', 'mythos')).toEqual([]);
+    expect(validateRuntimeModelCompatibility('claude-agent-sdk', 'mythos-5')).toEqual([]);
+  });
+
+  it('treats fable/mythos short names as the Claude family', () => {
+    expect(validateRuntimeModelCompatibility('claude-agent-sdk', 'fable')).toEqual([]);
+    expect(validateRuntimeModelCompatibility('claude-agent-sdk', 'mythos')).toEqual([]);
+    expect(validateRuntimeModelCompatibility('claude-code-cli', 'claude-fable-5')).toEqual([]);
+    expect(validateRuntimeModelCompatibility('claude-code-cli', 'claude-mythos-5')).toEqual([]);
+    // ...and therefore incompatible with the codex (OpenAI) runtime
+    expect(validateRuntimeModelCompatibility('codex', 'fable')).toEqual([
+      {
+        code: 'runtime_model_mismatch',
+        message: 'runtime "codex" is incompatible with Claude model "fable"',
+      },
+    ]);
   });
 
   it('exposes the cursor-cli runtime profile', () => {
