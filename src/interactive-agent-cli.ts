@@ -16,6 +16,7 @@ import {
   readDotEnvFile as coreReadDotEnvFile,
 } from './core/index.js';
 import { getRuntimeDisplayName, resolveRuntime } from './runtime/registry.js';
+import { resolveModelAlias } from './core/model-aliases.js';
 import {
   addPublicAgent,
   listPublicAgents,
@@ -894,7 +895,7 @@ async function startLocalAgentProcess(agentData: any): Promise<{ success: boolea
       ID_TEAM: activeTeam,
       MANAGER_URL: MANAGER_URL,
       ...(sharedDir && { ID_SHARED_DIR: sharedDir }),
-      ...(agentModel && { CLAUDE_MODEL: agentModel }),
+      ...(agentModel && { CLAUDE_MODEL: resolveModelAlias(agentModel) }),
       // Pass tokenId so agent knows its registry identity
       ...(agentTokenId && { ID_AGENT_TOKEN_ID: agentTokenId })
     };
@@ -5001,7 +5002,7 @@ async function deployFromConfig(filePath: string, args: string[] = []) {
             ID_DB_TEAM_ID: result.teamId,
             ID_DB_AGENT_ID: result.id,
             ID_SHARED_DIR: result.sharedDirectory,
-            ...(agent.model && { CLAUDE_MODEL: agent.model }),
+            ...(agent.model && { CLAUDE_MODEL: resolveModelAlias(agent.model) }),
             ...((agent.verbose === true || agent.verbose === 'true') && { ID_AGENT_VERBOSE: 'true' }),
             // Default to skip-permissions; honor explicit false from config
             ID_AGENT_SKIP_PERMISSIONS: agent.dangerouslySkipPermissions === false ? 'false' : 'true'

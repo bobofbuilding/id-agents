@@ -98,22 +98,10 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Model alias resolution
-export const MODEL_ALIASES: Record<string, string> = {
-  'haiku': 'claude-haiku-4-5-20251001',
-  'sonnet': 'claude-sonnet-4-5-20250514',
-  'opus': 'claude-opus-4-5-20250514',
-  'opus-4-8': 'claude-opus-4-8',
-  'opus-4.8': 'claude-opus-4-8',
-  'fable': 'claude-fable-5',
-  'fable-5': 'claude-fable-5',
-  'mythos': 'claude-mythos-5',
-  'mythos-5': 'claude-mythos-5'
-};
-
-export function resolveModelAlias(model: string): string {
-  return MODEL_ALIASES[model.toLowerCase()] || model;
-}
+// Model alias resolution (canonical source in core/model-aliases.ts;
+// re-exported here for back-compat with existing import sites).
+import { MODEL_ALIASES, resolveModelAlias } from './core/model-aliases.js';
+export { MODEL_ALIASES, resolveModelAlias };
 
 function tokenizeCommand(command: string): string[] {
   const tokens: string[] = [];
@@ -8810,7 +8798,7 @@ export class AgentManagerDb {
       ID_AGENT_PORT: String(port),
       MANAGER_URL: `http://127.0.0.1:4100`,
       ID_AGENT_SKIP_PERMISSIONS: skipPermissions ? 'true' : 'false',
-      ...(model && { CLAUDE_MODEL: model }),
+      ...(model && { CLAUDE_MODEL: resolveModelAlias(model) }),
       ...(tokenId && { ID_AGENT_TOKEN_ID: tokenId }),
       ...(owsWallet && { OWS_WALLET: owsWallet }),
       ...(catalogEnv && { ID_AGENT_CATALOG: catalogEnv }),

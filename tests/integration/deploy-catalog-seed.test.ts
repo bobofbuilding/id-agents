@@ -383,4 +383,30 @@ agents:
     const bareEnv = (manager as any).buildLocalAgentEnv(TEST_TEAM, 24999, bareRow);
     expect(bareEnv.ID_AGENT_CATALOG).toBeUndefined();
   });
+
+  it('spawn env resolves configured model aliases before setting CLAUDE_MODEL', async () => {
+    await deploy(firstYamlPath);
+
+    const teamId = await db.teams.getOrCreateTeamId(TEST_TEAM);
+    const jrRow = await db.agents.getByName(teamId, AGENT_JR);
+    expect(jrRow).toBeTruthy();
+
+    const cases: Array<[string, string]> = [
+      ['fable', 'claude-fable-5'],
+      ['mythos', 'claude-mythos-5'],
+      ['haiku', 'claude-haiku-4-5-20251001'],
+      ['opus-4.8', 'claude-opus-4-8'],
+      ['claude-opus-4-8', 'claude-opus-4-8'],
+    ];
+
+    for (const [configuredModel, expectedModel] of cases) {
+      const env = (manager as any).buildLocalAgentEnv(
+        TEST_TEAM,
+        24999,
+        jrRow,
+        configuredModel,
+      );
+      expect(env.CLAUDE_MODEL).toBe(expectedModel);
+    }
+  });
 });

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.99-beta
+
+### Fixes
+
+- **Resolve model aliases before spawning Claude agents.** Agent spawn env builders now canonicalize config-supplied model aliases before setting `CLAUDE_MODEL`, so aliases like `fable`, `mythos`, `haiku`, and `opus-4.8` reach Claude Code as full model IDs instead of falling back to the CLI default. Operator-provided `process.env.CLAUDE_MODEL` passthroughs remain unchanged.
+
 ## 0.1.98-beta
 
 ### Features

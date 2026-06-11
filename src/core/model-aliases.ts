@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: MIT
+/**
+ * Model alias resolution.
+ *
+ * Maps operator-friendly short names (e.g. `opus`, `fable`, `opus-4.8`) to the
+ * canonical model id the runtimes expect. Resolution is case-insensitive and
+ * idempotent: a value that is already a canonical id (or an unknown string)
+ * passes through unchanged, so it is always safe to resolve again.
+ */
+export const MODEL_ALIASES: Record<string, string> = {
+  'haiku': 'claude-haiku-4-5-20251001',
+  'sonnet': 'claude-sonnet-4-5-20250514',
+  'opus': 'claude-opus-4-5-20250514',
+  'opus-4-8': 'claude-opus-4-8',
+  'opus-4.8': 'claude-opus-4-8',
+  'fable': 'claude-fable-5',
+  'fable-5': 'claude-fable-5',
+  'mythos': 'claude-mythos-5',
+  'mythos-5': 'claude-mythos-5'
+};
+
+export function resolveModelAlias(model: string): string {
+  return MODEL_ALIASES[model.toLowerCase()] || model;
+}
