@@ -4400,18 +4400,29 @@ export class AgentManagerDb {
       }
       try {
         const oldTeamId = agent.team_id;
-        // Essential: move the agent row.
-        await this.db.adapter.query(
-          'UPDATE agents SET team_id = $1 WHERE id = $2 AND team_id = $3',
+        // Essential: move the agent row. Guard on rowCount (+ deleted_at) so a
+        // concurrent move/delete in the read→write window aborts cleanly instead of
+        // running the aux updates and a destructive, misconfigured rebuild on a row
+        // that did not actually move. Mirrors dbDeleteAgentRow's rowCount check.
+        const moved = await this.db.adapter.query(
+          'UPDATE agents SET team_id = $1 WHERE id = $2 AND team_id = $3 AND deleted_at IS NULL',
           [targetTeam.id, agent.id, oldTeamId],
         );
-        // Move team-scoped child rows so a later delete of the (now-empty) old team
-        // can't CASCADE them. Best-effort: a missing table/rare PK clash on history
-        // must not abort a move that already updated the agent row.
+        if ((moved.rowCount ?? 0) === 0) {
+          return res.status(409).json({ error: 'Agent changed concurrently (moved or removed); move aborted' });
+        }
+        // Re-parent EVERY team-scoped, per-agent table so (a) the agent keeps its
+        // live state under the new team and (b) a later delete of the now-empty old
+        // team can't CASCADE these away. subscriptions (live event relays) and
+        // checkins break on the move alone if left behind. Best-effort: a missing
+        // table/rare clash must not abort a move that already updated the agent row.
         const aux: Array<[string, unknown[]]> = [
           ['UPDATE wallets SET team_id = $1 WHERE agent_id = $2', [targetTeam.id, agent.id]],
           ['UPDATE news_items SET team_id = $1 WHERE agent_id = $2 AND team_id = $3', [targetTeam.id, agent.id, oldTeamId]],
           ['UPDATE queries SET team_id = $1 WHERE agent_id = $2 AND team_id = $3', [targetTeam.id, agent.id, oldTeamId]],
+          ['UPDATE subscriptions SET team_id = $1 WHERE owner_agent_id = $2 AND team_id = $3', [targetTeam.id, agent.id, oldTeamId]],
+          ['UPDATE event_log SET team_id = $1 WHERE actor_agent_id = $2 AND team_id = $3', [targetTeam.id, agent.id, oldTeamId]],
+          ['UPDATE checkins SET team_id = $1 WHERE (owner_agent_id = $2 OR created_by_agent_id = $2) AND team_id = $3', [targetTeam.id, agent.id, oldTeamId]],
         ];
         for (const [sql, params] of aux) {
           try { await this.db.adapter.query(sql, params); }
