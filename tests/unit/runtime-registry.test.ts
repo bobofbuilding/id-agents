@@ -44,7 +44,9 @@ describe('runtime registry', () => {
   });
 
   it('returns runtime-specific default models', () => {
-    expect(getDefaultModelForRuntime('codex')).toBe('gpt-5.4');
+    // Codex intentionally has no built-in default — the Codex CLI picks a model
+    // based on the logged-in account, and agents override it per-agent in YAML.
+    expect(getDefaultModelForRuntime('codex')).toBe('');
     expect(getDefaultModelForRuntime('claude-agent-sdk')).toBe('claude-haiku-4-5-20251001');
   });
 
@@ -115,5 +117,21 @@ describe('runtime registry', () => {
     expect(validateRuntimeModelCompatibility('cursor-cli', 'gpt-5')).toEqual([]);
     expect(validateRuntimeModelCompatibility('cursor-cli', 'sonnet-4')).toEqual([]);
     expect(validateRuntimeModelCompatibility('cursor-cli', 'claude-opus-4-20250514')).toEqual([]);
+  });
+
+  it('exposes the ollama runtime profile', () => {
+    const profile = getRuntimeProfile('ollama');
+    expect(profile.id).toBe('ollama');
+    expect(profile.canonicalId).toBe('ollama');
+    expect(profile.displayName).toBe('Ollama (Local)');
+    expect(profile.auth.mode).toBe('api-key');
+    expect(profile.capabilities.supportsResume).toBe(false);
+    expect(getDefaultModelForRuntime('ollama')).toBe('qwen3:4b');
+  });
+
+  it('accepts any model string for ollama (no cross-family checks)', () => {
+    expect(validateRuntimeModelCompatibility('ollama', 'qwen3:4b')).toEqual([]);
+    expect(validateRuntimeModelCompatibility('ollama', 'gpt-5')).toEqual([]);
+    expect(validateRuntimeModelCompatibility('ollama', 'claude-opus-4-20250514')).toEqual([]);
   });
 });

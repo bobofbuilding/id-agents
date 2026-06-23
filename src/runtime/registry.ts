@@ -108,6 +108,25 @@ const PROFILES: Record<RuntimeId, RuntimeProfile> = {
       supportsAllowedTools: false,
     },
   },
+  ollama: {
+    id: 'ollama',
+    canonicalId: 'ollama',
+    displayName: 'Ollama (Local)',
+    providerName: 'Ollama',
+    defaultModel: 'qwen3:4b',
+    sessionPolicy: 'fresh-per-query',
+    deploymentShape: 'local-process',
+    auth: {
+      mode: 'api-key',
+      provider: 'Ollama',
+      requiredEnv: [],
+    },
+    capabilities: {
+      supportsResume: false,
+      supportsPlugins: false,
+      supportsAllowedTools: false,
+    },
+  },
   'public-agent-remote': {
     id: 'public-agent-remote',
     canonicalId: 'public-agent-remote',
@@ -189,7 +208,7 @@ export interface RuntimePaths {
 
 export function getRuntimePaths(runtime: HarnessType | string | undefined): RuntimePaths {
   const resolved = resolveRuntime(runtime);
-  if (resolved === 'codex') {
+  if (resolved === 'codex' || resolved === 'ollama') {
     return {
       templateDir: '.agents',
       overlayTarget: '.agents',
@@ -275,9 +294,8 @@ export function validateRuntimeModelCompatibility(
   const family = classifyModelFamily(model);
   const issues: RuntimeValidationIssue[] = [];
 
-  // Cursor Agent CLI supports both Claude-family (sonnet-4, sonnet-4-thinking)
-  // and OpenAI-family (gpt-5, ...) models, so skip cross-family checks for it.
-  if (resolvedRuntime === 'cursor-cli') return issues;
+  // Cursor and Ollama accept any model string — skip cross-family checks.
+  if (resolvedRuntime === 'cursor-cli' || resolvedRuntime === 'ollama') return issues;
 
   if (resolvedRuntime === 'codex' && family === 'claude') {
     issues.push({

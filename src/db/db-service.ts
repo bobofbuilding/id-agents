@@ -61,6 +61,13 @@ export interface TeamsRepository {
   /** Set both default_chain_id and default_registry_address in the team config. */
   setDefaultRegistry(teamId: string, chainId: string, registryAddress: string): Promise<void>;
 
+  /**
+   * Set the cross-team delegation allow-list (`delegates_to`). An array of
+   * team names (or `["*"]` for all) restricts delegation; `null` removes the
+   * key, restoring the permissive default.
+   */
+  setDelegatesTo(teamId: string, delegates: string[] | null): Promise<void>;
+
   /** Permanently delete a team row. */
   deleteTeam(teamId: string): Promise<void>;
 }
@@ -187,6 +194,7 @@ export interface AgentsRepository {
       endpoint?: string;
       metadata?: Record<string, unknown>;
       model?: string;
+      runtime?: string;
     },
   ): Promise<void>;
 

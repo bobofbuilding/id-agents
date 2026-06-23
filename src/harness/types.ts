@@ -6,20 +6,51 @@
  * All harnesses produce the same message format for REST-AP compatibility.
  */
 
-export type HarnessType = 'claude-agent-sdk' | 'claude-code-cli' | 'claude-code-local' | 'codex' | 'cursor-cli' | 'public-agent-remote';
+export type HarnessType = 'claude-agent-sdk' | 'claude-code-cli' | 'claude-code-local' | 'codex' | 'cursor-cli' | 'public-agent-remote' | 'ollama';
 
 export interface PluginConfig {
   name: string;
   path: string;
 }
 
+/** Transport used to reach an MCP server. */
+export type McpTransport = 'stdio' | 'http' | 'sse';
+
+/**
+ * Normalized MCP server definition. Serializable across the spawn boundary
+ * (env var / JSON), unlike the SDK's in-process `sdk` transport. A harness
+ * maps this onto whatever its underlying tool expects (the Claude Agent SDK
+ * `Options.mcpServers`, a `.mcp.json` file, etc.).
+ */
+export interface McpServerSpec {
+  /** Unique name; becomes the key in the SDK's mcpServers record. */
+  name: string;
+  /** stdio (spawn a command) | http | sse. Defaults to stdio. */
+  transport?: McpTransport;
+  /** stdio: executable to spawn. */
+  command?: string;
+  /** stdio: arguments for the command. */
+  args?: string[];
+  /** stdio: extra environment for the spawned server. */
+  env?: Record<string, string>;
+  /** http/sse: server URL. */
+  url?: string;
+  /** http/sse: extra request headers (e.g. Authorization). */
+  headers?: Record<string, string>;
+}
+
 export interface HarnessOptions {
   model?: string;
   workingDirectory?: string;
   plugins?: PluginConfig[];
+  /** External MCP servers to expose as tools (Claude runtimes only). */
+  mcpServers?: McpServerSpec[];
   allowedTools?: string[];
   resume?: string;
   env?: Record<string, string | undefined>;
+  /** The originating dispatch's query id, threaded through so live activity
+   *  steps can be attributed to the exact query (per-dispatch trace). */
+  queryId?: string;
 }
 
 /**

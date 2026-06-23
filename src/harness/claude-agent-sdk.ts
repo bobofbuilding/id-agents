@@ -7,6 +7,7 @@
 
 import { query, type Options, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import { AgentHarness, HarnessOptions, HarnessMessage, HarnessType, PluginConfig } from './types.js';
+import { toMcpServerRecord } from './mcp.js';
 
 // Available Claude models
 export const CLAUDE_MODELS = {
@@ -118,6 +119,14 @@ export class ClaudeAgentSdkHarness implements AgentHarness {
     // Add plugins if specified
     if (options.plugins && options.plugins.length > 0) {
       sdkOptions.plugins = options.plugins.map((p: PluginConfig) => ({ type: 'local' as const, path: p.path }));
+    }
+
+    // Add MCP servers if specified (external tools exposed to the agent)
+    if (options.mcpServers && options.mcpServers.length > 0) {
+      const servers = toMcpServerRecord(options.mcpServers);
+      if (Object.keys(servers).length > 0) {
+        sdkOptions.mcpServers = servers as Options['mcpServers'];
+      }
     }
 
     // Note: Explicitly setting sdkOptions.env causes "spawn node ENOENT" errors

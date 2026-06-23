@@ -75,6 +75,22 @@ export class PgTeamsRepo implements TeamsRepository {
     );
   }
 
+  async setDelegatesTo(teamId: string, delegates: string[] | null): Promise<void> {
+    if (delegates === null) {
+      await this.db.query(
+        `UPDATE teams SET config = config - 'delegates_to' WHERE id = $1`,
+        [teamId],
+      );
+      return;
+    }
+    await this.db.query(
+      `UPDATE teams
+       SET config = jsonb_set(config, '{delegates_to}', $2::jsonb, true)
+       WHERE id = $1`,
+      [teamId, JSON.stringify(delegates)],
+    );
+  }
+
   async deleteTeam(teamId: string): Promise<void> {
     await this.db.query('DELETE FROM teams WHERE id = $1', [teamId]);
   }

@@ -16,9 +16,61 @@
 
 import { spawn, ChildProcess } from 'child_process';
 import { AgentHarness, HarnessOptions, HarnessMessage, HarnessType } from './types.js';
+import { toMcpServerRecord } from './mcp.js';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+
+/**
+ * Fire-and-forget report of one activity step (a tool call / file edit) to the
+ * manager's /activity/record, so the control center can stream "what the agent
+ * is working on" into chat. Wrapped so it can NEVER throw into or delay the
+ * agent's reply path — on any failure it silently no-ops (same policy as the
+ * ollama usage reporter).
+ */
+function reportActivity(kind: string, tool: string | undefined, summary: string, queryId?: string): void {
+  try {
+    if (!summary) return;
+    const managerUrl = (process.env.MANAGER_URL || 'http://127.0.0.1:4100').replace(/\/+$/, '');
+    const payload = {
+      agent: process.env.ID_AGENT_NAME || process.env.ID_AGENT_ALIAS || 'agent',
+      team: process.env.ID_AGENT_TEAM || process.env.ID_TEAM || 'default',
+      kind,
+      tool,
+      summary: summary.slice(0, 240),
+      // The originating dispatch's query id (when known), so the control center
+      // can attribute steps to the exact query even when two dispatches hit the
+      // same agent concurrently. Omitted when unknown — older managers ignore it.
+      queryId: queryId || undefined,
+    };
+    void fetch(`${managerUrl}/activity/record`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(2000),
+    }).catch(() => { /* best-effort; ignore */ });
+  } catch { /* never throw */ }
+}
+
+/** Turn a Claude tool_use block into a short, human-readable activity line. */
+function summarizeTool(name: string, input: any): { kind: string; summary: string } {
+  const s = (k: string): string => (input && typeof input[k] === 'string' ? input[k] : '');
+  const tail = (fp: string): string => { const t = fp.split('/').filter(Boolean); return t.length > 2 ? '…/' + t.slice(-2).join('/') : fp; };
+  switch (name) {
+    case 'Write': return { kind: 'file', summary: `created ${tail(s('file_path'))}` };
+    case 'Edit': case 'MultiEdit': return { kind: 'file', summary: `edited ${tail(s('file_path'))}` };
+    case 'NotebookEdit': return { kind: 'file', summary: `edited ${tail(s('notebook_path'))}` };
+    case 'Read': return { kind: 'read', summary: `read ${tail(s('file_path'))}` };
+    case 'Bash': return { kind: 'run', summary: `ran: ${s('command').slice(0, 90)}` };
+    case 'Grep': return { kind: 'search', summary: `searched "${s('pattern').slice(0, 50)}"` };
+    case 'Glob': return { kind: 'search', summary: `listed ${s('pattern')}` };
+    case 'Task': return { kind: 'delegate', summary: `delegated: ${(s('description') || s('prompt') || 'a subtask').slice(0, 80)}` };
+    case 'WebFetch': return { kind: 'web', summary: `fetched ${s('url').slice(0, 80)}` };
+    case 'WebSearch': return { kind: 'web', summary: `web search: ${s('query').slice(0, 60)}` };
+    case 'TodoWrite': return { kind: 'plan', summary: 'updated its task list' };
+    default: return { kind: 'tool', summary: name };
+  }
+}
 
 export class ClaudeCodeCliHarness implements AgentHarness {
   readonly type: HarnessType = 'claude-code-cli' as HarnessType;
@@ -26,9 +78,14 @@ export class ClaudeCodeCliHarness implements AgentHarness {
   // Track the current running process for cancellation
   private currentProcess: ChildProcess | null = null;
   private cancelled = false;
+  // The query id of the run currently in flight, so streamed activity steps can
+  // be attributed to the originating dispatch. Runs are serial per harness
+  // instance (one currentProcess at a time), so a single field is race-free.
+  private currentQueryId?: string;
 
   async *run(prompt: string, options: HarnessOptions = {}): AsyncGenerator<HarnessMessage> {
     const workingDir = options.workingDirectory || process.cwd();
+    this.currentQueryId = options.queryId;
 
     console.log(`[Claude CLI] Starting harness`);
     console.log(`[Claude CLI] Working directory: ${workingDir}`);
@@ -68,6 +125,28 @@ export class ClaudeCodeCliHarness implements AgentHarness {
       args.push('--allowedTools', options.allowedTools.join(','));
     }
 
+    // Add MCP servers if specified. The claude CLI consumes them from a
+    // .mcp.json-style file via --mcp-config; --strict-mcp-config makes it use
+    // ONLY this file (ignoring any project/user .mcp.json). Written to a temp
+    // file and removed in the finally below.
+    let mcpConfigFile: string | undefined;
+    if (options.mcpServers && options.mcpServers.length > 0) {
+      const mcpServers = toMcpServerRecord(options.mcpServers);
+      if (Object.keys(mcpServers).length > 0) {
+        mcpConfigFile = path.join(os.tmpdir(), `claude-mcp-${process.pid}-${Date.now()}.json`);
+        // MCP env/headers can carry tokens; write owner-only and fail closed on
+        // a pre-existing name ('wx') to avoid clobber/symlink races in shared /tmp.
+        const fd = fs.openSync(mcpConfigFile, 'wx', 0o600);
+        try {
+          fs.writeFileSync(fd, JSON.stringify({ mcpServers }));
+        } finally {
+          fs.closeSync(fd);
+        }
+        args.push('--mcp-config', mcpConfigFile, '--strict-mcp-config');
+        console.log(`[Claude CLI] MCP: ${Object.keys(mcpServers).join(', ')} via ${mcpConfigFile}`);
+      }
+    }
+
     // Build environment - inherit user's env for auth
     const env: Record<string, string> = {
       ...process.env as Record<string, string>,
@@ -105,14 +184,14 @@ export class ClaudeCodeCliHarness implements AgentHarness {
           let jsonResult: any;
 
           if (verbose) {
-            // stream-json: multiple JSON objects, one per line - find the result
+            // stream-json: multiple JSON objects, one per line - take the LAST
+            // result line (a run can legitimately emit more than one).
             const lines = result.stdout.trim().split('\n');
             for (const line of lines) {
               try {
                 const msg = JSON.parse(line);
                 if (msg.type === 'result') {
                   jsonResult = msg;
-                  break;
                 }
               } catch {
                 // Skip non-JSON lines
@@ -133,6 +212,17 @@ export class ClaudeCodeCliHarness implements AgentHarness {
               session_id: jsonResult.session_id,
               duration_ms: jsonResult.duration_ms,
               cost_usd: jsonResult.total_cost_usd
+            };
+          } else {
+            // Verbose stream-json with no parseable {type:'result'} line: salvage
+            // the raw stdout as the reply, exactly as the non-verbose path does on
+            // a JSON parse failure. Without this, a result-line-less but exit-0 run
+            // would yield nothing → a spurious "produced an empty result" failure.
+            yield {
+              type: 'result',
+              subtype: 'success',
+              content: result.stdout.trim(),
+              result: result.stdout.trim()
             };
           }
         } catch (parseErr) {
@@ -161,6 +251,10 @@ export class ClaudeCodeCliHarness implements AgentHarness {
         type: 'error',
         content: err.message
       };
+    } finally {
+      if (mcpConfigFile) {
+        try { fs.rmSync(mcpConfigFile, { force: true }); } catch { /* best-effort */ }
+      }
     }
   }
 
@@ -183,6 +277,9 @@ export class ClaudeCodeCliHarness implements AgentHarness {
                 const inputStr = JSON.stringify(block.input).slice(0, 150);
                 console.log(`[${timestamp}]    Input: ${inputStr}${inputStr.length >= 150 ? '...' : ''}`);
               }
+              // Stream a human-readable step to the control center.
+              const { kind, summary } = summarizeTool(block.name, block.input);
+              reportActivity(kind, block.name, summary, this.currentQueryId);
             }
           }
         }
@@ -195,6 +292,7 @@ export class ClaudeCodeCliHarness implements AgentHarness {
             if (block.type === 'tool_result') {
               const status = block.is_error ? '❌' : '✅';
               console.log(`[${timestamp}] ${status} Tool result for ${block.tool_use_id?.slice(0, 20)}...`);
+              if (block.is_error) reportActivity('error', undefined, 'a tool call failed', this.currentQueryId);
             }
           }
         }
@@ -255,7 +353,7 @@ export class ClaudeCodeCliHarness implements AgentHarness {
 
       // Read prompt from file using shell redirection
       const quotedArgs = newArgs.map(arg => `'${arg.replace(/'/g, "'\\''")}'`).join(' ');
-      const fullCommand = `${claudePath} -p "$(cat ${tmpFile})" ${quotedArgs}; rm ${tmpFile}`;
+      const fullCommand = `${claudePath} -p "$(cat ${tmpFile})" ${quotedArgs}; rm -f ${tmpFile}`;
 
       console.log(`[Claude CLI] Prompt written to temp file: ${tmpFile} (${prompt.length} chars)`);
       console.log(`[Claude CLI] Full command: ${claudePath} -p "$(cat ...)" ${quotedArgs}`);
@@ -276,20 +374,22 @@ export class ClaudeCodeCliHarness implements AgentHarness {
 
       const verbose = process.env.ID_AGENT_VERBOSE === 'true';
 
+      let lineBuf = ''; // accumulate across chunks so a JSON line split by a chunk boundary isn't lost
       proc.stdout?.on('data', (data) => {
         const chunk = data.toString();
         stdout += chunk;
 
-        // In verbose mode, parse and log streaming JSON messages
+        // In verbose mode, parse and log streaming JSON messages (one per line).
         if (verbose) {
-          // Stream-json outputs one JSON object per line
-          const lines = chunk.split('\n').filter((l: string) => l.trim());
-          for (const line of lines) {
+          lineBuf += chunk;
+          const parts = lineBuf.split('\n');
+          lineBuf = parts.pop() || ''; // keep the trailing partial line for the next chunk
+          for (const line of parts) {
+            if (!line.trim()) continue;
             try {
-              const msg = JSON.parse(line);
-              this.logStreamMessage(msg);
+              this.logStreamMessage(JSON.parse(line));
             } catch {
-              // Not valid JSON, might be partial - ignore
+              // Not valid JSON (partial/noise) - ignore
             }
           }
         } else {
@@ -317,6 +417,13 @@ export class ClaudeCodeCliHarness implements AgentHarness {
       proc.on('close', (code) => {
         // Clear process reference
         this.currentProcess = null;
+
+        // Flush any trailing partial line (no terminal newline) so the last
+        // streamed step (often the final tool call) isn't missed.
+        if (verbose && lineBuf.trim()) {
+          try { this.logStreamMessage(JSON.parse(lineBuf)); } catch { /* not JSON */ }
+          lineBuf = '';
+        }
 
         console.log(`[Claude CLI] Process exited with code ${code}`);
         resolve({

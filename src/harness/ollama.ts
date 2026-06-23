@@ -52,6 +52,34 @@ function releaseSlot(): void {
   }
 }
 
+/**
+ * Best-effort, fire-and-forget report of one local-model generation's token
+ * usage to the manager's /usage/record endpoint. Wrapped so it can NEVER throw
+ * into or delay the agent's reply path — on any failure it silently no-ops.
+ */
+function reportOllamaUsage(u: { model: string; input: number | null; output: number | null; genMs: number }): void {
+  try {
+    const input = typeof u.input === 'number' && u.input >= 0 ? u.input : null;
+    const output = typeof u.output === 'number' && u.output >= 0 ? u.output : null;
+    if (input == null && output == null) return; // nothing measured (server ignored include_usage)
+    const managerUrl = (process.env.MANAGER_URL || 'http://127.0.0.1:4100').replace(/\/+$/, '');
+    const tps = output && u.genMs > 0 ? +(output / (u.genMs / 1000)).toFixed(2) : null;
+    const payload = {
+      runtime: 'ollama',
+      model: u.model,
+      agent: process.env.ID_AGENT_NAME || process.env.ID_AGENT_ALIAS || 'local',
+      team: process.env.ID_AGENT_TEAM || process.env.ID_TEAM || 'default',
+      input, output, genMs: u.genMs, tps,
+    };
+    void fetch(`${managerUrl}/usage/record`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(3000),
+    }).catch(() => { /* best-effort; ignore */ });
+  } catch { /* never throw */ }
+}
+
 export class OllamaHarness implements AgentHarness {
   readonly type: HarnessType = 'ollama';
 
@@ -87,6 +115,10 @@ export class OllamaHarness implements AgentHarness {
       stream: true,
       temperature: 0.2,
       max_tokens: MAX_TOKENS,
+      // Ask the OpenAI-compatible endpoint to emit a final usage chunk
+      // ({prompt_tokens, completion_tokens}) so we can report local-model
+      // token throughput to the manager. Harmless on servers that ignore it.
+      stream_options: { include_usage: true },
     });
 
     yield { type: 'system', subtype: 'init', session_id: undefined };
@@ -102,6 +134,10 @@ export class OllamaHarness implements AgentHarness {
     let requestFailed = false;
     let failError = '';
     let aborted = false;
+    // Token-usage accounting for the throughput gauge / 24h-7d averages.
+    let usage: { prompt_tokens?: number; completion_tokens?: number } | null = null;
+    let firstTokenAt = 0; // wall-clock of the first content delta
+    let lastTokenAt = 0;  // wall-clock of the last content delta
 
     try {
       // Combine the user-cancel signal with a hard wall-clock timeout so a
@@ -149,8 +185,14 @@ export class OllamaHarness implements AgentHarness {
           const data = trimmed.startsWith('data: ') ? trimmed.slice(6) : trimmed;
           try {
             const chunk = JSON.parse(data);
+            // Final usage chunk (from stream_options.include_usage); choices is
+            // typically empty here.
+            if (chunk.usage) usage = chunk.usage;
             const delta = chunk.choices?.[0]?.delta?.content;
             if (delta) {
+              const now = Date.now();
+              if (!firstTokenAt) firstTokenAt = now;
+              lastTokenAt = now;
               result += delta;
               yield { type: 'progress', subtype: 'message_delta', content: delta };
             }
@@ -186,6 +228,14 @@ export class OllamaHarness implements AgentHarness {
     }
 
     if (result) {
+      // Fire-and-forget token-usage report (never blocks or breaks the reply).
+      const genMs = firstTokenAt && lastTokenAt ? Math.max(0, lastTokenAt - firstTokenAt) : 0;
+      reportOllamaUsage({
+        model,
+        input: usage?.prompt_tokens ?? null,
+        output: usage?.completion_tokens ?? null,
+        genMs,
+      });
       yield { type: 'result', result };
     } else {
       yield { type: 'error', content: 'Ollama returned an empty response' };

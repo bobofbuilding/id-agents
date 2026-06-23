@@ -227,11 +227,23 @@ export async function startLocalAgent(config: LocalAgentConfig): Promise<{
 
   // Set manager URL for AgentRestServer to use
   process.env.MANAGER_URL = managerUrl;
+  // Identity for best-effort token-usage attribution (read by harnesses that
+  // report local-model usage to the manager's /usage/record endpoint).
+  process.env.ID_AGENT_NAME = name;
+  process.env.ID_AGENT_TEAM = team;
 
   // Enable verbose logging if configured
   if (config.verbose || process.env.ID_AGENT_VERBOSE === 'true') {
     process.env.ID_AGENT_VERBOSE = 'true';
     console.log('📋 Verbose logging enabled - will show tool calls and progress');
+  }
+
+  // Stream live tool/file activity to the manager so the control center can show
+  // "what the agent is working on" inline in chat. This needs the stream-json
+  // parse (verbose) to extract tool steps, so turn it on. Opt out with
+  // ID_AGENT_ACTIVITY=false.
+  if (process.env.ID_AGENT_ACTIVITY !== 'false') {
+    process.env.ID_AGENT_VERBOSE = 'true';
   }
 
   // Catalog seed handoff: the manager passes the YAML-floored catalog object

@@ -9,6 +9,7 @@
 import express from 'express';
 import fetch from 'node-fetch';
 import { createHarness, HarnessType, AgentHarness } from './harness/index.js';
+import { parseMcpServersEnv } from './harness/mcp.js';
 import { withInterAgentSkill } from './inter-agent-skill.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -237,7 +238,10 @@ export class AgentRestServer {
     // Note: do NOT set process.env.AGENT_NAME here (shared process; multiple agents).
 
     this.app = express();
-    this.app.use(express.json());
+    // A dispatch can carry a large accumulated context (history, file contents); the
+    // default 100kb limit rejected those with PayloadTooLargeError → a failed/empty
+    // reply. Match the manager's generous limit (overridable via ID_AGENT_BODY_LIMIT).
+    this.app.use(express.json({ limit: process.env.ID_AGENT_BODY_LIMIT || '50mb' }));
 
     // JSON parse error handler - log details for debugging
     this.app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
@@ -1725,12 +1729,18 @@ ${prompt}`
       const pluginsEnv = process.env.ID_PLUGINS;
       const plugins = pluginsEnv ? JSON.parse(pluginsEnv) : undefined;
 
+      // Read MCP servers from env (set by manager via buildLocalAgentEnv).
+      // ID_MCP_SERVERS is a JSON array of McpServerSpec; parsing is tolerant.
+      const mcpServers = parseMcpServersEnv(process.env.ID_MCP_SERVERS);
+
       for await (const message of this.harness.run(enhancedPrompt, {
         model: this.model,
         allowedTools: this.allowedTools,
         workingDirectory: this.workingDirectory,
         resume: allowSessionResume ? sessionId : undefined,
-        plugins: plugins
+        plugins: plugins,
+        mcpServers: mcpServers,
+        queryId  // thread the dispatch id so live activity steps are attributable
       })) {
         // Capture session ID from system init or result message
         if (message.session_id) {

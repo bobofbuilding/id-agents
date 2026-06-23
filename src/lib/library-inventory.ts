@@ -73,6 +73,38 @@ export interface SkillListEntry {
    * available.
    */
   description: string | null;
+  /**
+   * Tag list parsed from frontmatter `metadata.tags` (catalog filtering).
+   * The agentskills.io spec has no first-class tags field, so tags live
+   * under the `metadata` extension point as a comma-separated string or list.
+   */
+  tags: string[];
+  /** SKILL.md frontmatter `license`, or null. */
+  license: string | null;
+}
+
+/** Input for {@link createLibrarySkill}; mirrors the agentskills.io SKILL.md schema. */
+export interface CreateSkillInput {
+  name: string;
+  description: string;
+  license?: string;
+  compatibility?: string;
+  /** Space-separated tool allow-list → frontmatter `allowed-tools`. */
+  allowedTools?: string;
+  /** Arbitrary string→string map → frontmatter `metadata` (holds tags, category…). */
+  metadata?: Record<string, string>;
+  /** Markdown instructions (body after the frontmatter). */
+  body?: string;
+  /** Permit replacing an existing skill of the same name. Default false. */
+  overwrite?: boolean;
+}
+
+export interface CreateSkillResult {
+  ok: boolean;
+  /** HTTP status the route should answer with. */
+  status: number;
+  error?: string;
+  entry?: SkillListEntry;
 }
 
 export interface SkillDetail extends SkillListEntry {
@@ -147,6 +179,39 @@ export interface TeamDetail extends TeamListEntry {
 export interface TeamListResult {
   libraryRoot: string | null;
   entries: TeamListEntry[];
+}
+
+export interface PluginListEntry {
+  name: string;
+  /** Whether a plugin.json manifest is present. */
+  hasManifest: boolean;
+  /** Manifest version, or null when absent. */
+  version: string | null;
+  /** Manifest description, or null when absent. */
+  description: string | null;
+  /** Absolute filesystem path to the plugin directory. */
+  source_path: string;
+  /** Manifest author name (string or `author.name`), or null. */
+  author?: string | null;
+  /**
+   * Where the plugin comes from — repository / homepage / marketplace URL,
+   * or the manifest `type` (e.g. 'local' → "bundled (local)" for plugins that
+   * ship with the manager). Null when the manifest carries no origin hint.
+   */
+  source?: string | null;
+}
+
+export interface PluginListResult {
+  /** Absolute plugins root (plugins/claude-code), or null when none exists. */
+  pluginsRoot: string | null;
+  entries: PluginListEntry[];
+}
+
+export interface PluginDetail extends PluginListEntry {
+  /** Full plugin.json contents (best-effort), or null. */
+  manifest: Record<string, unknown> | null;
+  /** SKILL.md body if the plugin ships one at its root, else null. */
+  skillBody: string | null;
 }
 
 /**
@@ -276,24 +341,54 @@ function decorateSkillEntry(name: string, dirPath: string, skillFile: string): S
   const raw = readFileIfExists(skillFile);
   const { frontmatter, body } = raw ? parseSkillMd(raw) : { frontmatter: {}, body: '' };
   const fmDesc = stringFieldOrNull(frontmatter, 'description');
+  const metaRaw = frontmatter.metadata;
+  const meta = metaRaw && typeof metaRaw === 'object' && !Array.isArray(metaRaw)
+    ? (metaRaw as Record<string, unknown>)
+    : {};
+  const tags = normalizeTags(meta.tags ?? (frontmatter as Record<string, unknown>).tags);
+  const license = stringFieldOrNull(frontmatter, 'license');
   return {
     name,
     hasSkillMd: fileExists(skillFile),
     source_path: dirPath,
     description: fmDesc ?? readmeFirstParagraph(body),
+    tags,
+    license,
   };
 }
 
+/** Normalize a frontmatter tags value (string "a, b" or list) to a clean array. */
+function normalizeTags(v: unknown): string[] {
+  if (Array.isArray(v)) return v.map((x) => String(x).trim()).filter(Boolean);
+  if (typeof v === 'string') return v.split(',').map((s) => s.trim()).filter(Boolean);
+  return [];
+}
+
 function parseSkillMd(raw: string): { frontmatter: Record<string, unknown>; body: string } {
-  const match = raw.match(/^---\r?\n([\s\S]*?)(?:\r?\n)?---\r?\n([\s\S]*)$/);
-  if (!match) return { frontmatter: {}, body: raw };
+  // Frontmatter is the block between an opening '---' line and the next line
+  // that is EXACTLY '---' (or '...') at column 0. Scanning line-by-line (rather
+  // than a non-greedy regex) avoids mistaking an INDENTED '---' inside a YAML
+  // block scalar — e.g. a markdown horizontal rule in a description — for the
+  // closing fence, which would silently truncate the value.
+  const lines = raw.split('\n');
+  if (lines.length === 0 || lines[0].replace(/\r$/, '') !== '---') {
+    return { frontmatter: {}, body: raw };
+  }
+  let end = -1;
+  for (let i = 1; i < lines.length; i++) {
+    const t = lines[i].replace(/\r$/, '');
+    if (t === '---' || t === '...') { end = i; break; }
+  }
+  if (end === -1) return { frontmatter: {}, body: raw };
+  const fmText = lines.slice(1, end).join('\n');
+  const body = lines.slice(end + 1).join('\n');
   let frontmatter: Record<string, unknown> = {};
   try {
-    frontmatter = (yaml.load(match[1]) as Record<string, unknown>) || {};
+    frontmatter = (yaml.load(fmText) as Record<string, unknown>) || {};
   } catch {
     frontmatter = {};
   }
-  return { frontmatter, body: match[2] };
+  return { frontmatter, body };
 }
 
 function stringFieldOrNull(frontmatter: Record<string, unknown>, key: string): string | null {
@@ -349,6 +444,258 @@ export function listLibrarySkills(libraryRoot: string | null): SkillListResult {
     libraryRoot,
     entries: entries.map(entry => decorateSkillEntry(entry.name, entry.dirPath, entry.skillFile)),
   };
+}
+
+/**
+ * Resolve the plugins root for a given library root. Plugins live alongside
+ * the repo (e.g. `<repo>/plugins/claude-code`), a sibling of `<repo>/configs`
+ * (the usual library root). Resolution order:
+ *   1. ID_PLUGINS_ROOT env when set and existing
+ *   2. <libraryRoot>/../plugins/claude-code
+ *   3. <libraryRoot>/plugins/claude-code (library that nests plugins)
+ *   4. null
+ */
+export function resolvePluginsRoot(libraryRoot: string | null): string | null {
+  const envRoot = process.env.ID_PLUGINS_ROOT;
+  if (envRoot) {
+    const resolved = path.resolve(envRoot);
+    if (dirExists(resolved)) return resolved;
+  }
+  if (!libraryRoot) return null;
+  const sibling = path.resolve(libraryRoot, '..', 'plugins', 'claude-code');
+  if (dirExists(sibling)) return sibling;
+  const nested = path.resolve(libraryRoot, 'plugins', 'claude-code');
+  if (dirExists(nested)) return nested;
+  return null;
+}
+
+function readPluginManifest(pluginDir: string): Record<string, unknown> | null {
+  // Merge the simplified top-level plugin.json with the canonical Claude Code
+  // manifest (.claude-plugin/plugin.json). Curated top-level fields win
+  // (description/version), while the canonical manifest fills in provenance
+  // (author, repository, homepage) the top-level usually omits — e.g.
+  // frontend-design's Anthropic authorship lives only in .claude-plugin.
+  const read = (rel: string): Record<string, unknown> | null => {
+    const raw = readFileIfExists(path.join(pluginDir, rel));
+    if (!raw) return null;
+    try { return JSON.parse(raw) as Record<string, unknown>; } catch { return null; }
+  };
+  const top = read('plugin.json');
+  const canonical = read(path.join('.claude-plugin', 'plugin.json'));
+  if (!top && !canonical) return null;
+  return { ...(canonical ?? {}), ...(top ?? {}) };
+}
+
+/** Best-effort author display from a plugin manifest (string or `author.name`). */
+function manifestAuthor(manifest: Record<string, unknown> | null): string | null {
+  if (!manifest) return null;
+  const a = manifest.author;
+  if (typeof a === 'string') return a.trim() || null;
+  if (a && typeof a === 'object') {
+    const name = (a as Record<string, unknown>).name;
+    if (typeof name === 'string') return name.trim() || null;
+  }
+  return null;
+}
+
+/** Best-effort origin display: repository/homepage/marketplace URL, else the manifest type. */
+function manifestSource(manifest: Record<string, unknown> | null): string | null {
+  if (!manifest) return null;
+  const repo = manifest.repository;
+  if (typeof repo === 'string' && repo.trim()) return repo.trim();
+  if (repo && typeof repo === 'object') {
+    const url = (repo as Record<string, unknown>).url;
+    if (typeof url === 'string' && url.trim()) return url.trim();
+  }
+  for (const k of ['homepage', 'marketplace', 'provider']) {
+    const v = manifest[k];
+    if (typeof v === 'string' && v.trim()) return v.trim();
+  }
+  const type = manifest.type;
+  if (typeof type === 'string' && type.trim()) return type === 'local' ? 'bundled (local)' : type.trim();
+  return null;
+}
+
+function decoratePluginEntry(name: string, dirPath: string): PluginListEntry {
+  const manifest = readPluginManifest(dirPath);
+  return {
+    name,
+    hasManifest: manifest !== null,
+    version: manifest && typeof manifest.version === 'string' ? manifest.version : null,
+    description: manifest && typeof manifest.description === 'string' ? manifest.description : null,
+    source_path: dirPath,
+    author: manifestAuthor(manifest),
+    source: manifestSource(manifest),
+  };
+}
+
+export function listLibraryPlugins(libraryRoot: string | null): PluginListResult {
+  const pluginsRoot = resolvePluginsRoot(libraryRoot);
+  if (!pluginsRoot) return { pluginsRoot: null, entries: [] };
+  const entries = fs.readdirSync(pluginsRoot, { withFileTypes: true })
+    .filter(d => d.isDirectory() && !d.name.startsWith('.'))
+    .map(d => decoratePluginEntry(d.name, path.join(pluginsRoot, d.name)))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  return { pluginsRoot, entries };
+}
+
+export function getLibraryPlugin(libraryRoot: string | null, name: string): PluginDetail | null {
+  const pluginsRoot = resolvePluginsRoot(libraryRoot);
+  if (!pluginsRoot) return null;
+  // `name` comes straight from a route param — reject anything that isn't a
+  // plain directory name, then assert the resolved path stays under the root.
+  if (!/^[A-Za-z0-9._-]+$/.test(name) || name === '.' || name === '..') return null;
+  const dirPath = path.resolve(pluginsRoot, name);
+  if (dirPath !== pluginsRoot && !dirPath.startsWith(pluginsRoot + path.sep)) return null;
+  if (!dirExists(dirPath)) return null;
+  const base = decoratePluginEntry(name, dirPath);
+  return {
+    ...base,
+    manifest: readPluginManifest(dirPath),
+    skillBody: readFileIfExists(path.join(dirPath, 'SKILL.md')),
+  };
+}
+
+/**
+ * agentskills.io `name` rule: 1–64 chars, lowercase alphanumerics and single
+ * hyphens, no leading/trailing/consecutive hyphens. Also functions as the
+ * path-traversal guard since it forbids `/`, `\`, `.` and `..`.
+ */
+const SKILL_NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+/**
+ * Create a new library skill on disk as an agentskills.io-compliant folder
+ * (`<skillsDir>/<name>/SKILL.md`). Validates the frontmatter contract, refuses
+ * path traversal, and (by default) refuses to overwrite an existing skill.
+ * Returns a JSON-friendly result with the HTTP status the route should use.
+ */
+export function createLibrarySkill(libraryRoot: string | null, input: CreateSkillInput): CreateSkillResult {
+  if (!libraryRoot) return { ok: false, status: 409, error: 'no_library_root' };
+
+  const name = typeof input?.name === 'string' ? input.name.trim() : '';
+  if (!name || name.length > 64 || !SKILL_NAME_RE.test(name)) {
+    return { ok: false, status: 400, error: 'invalid_name' };
+  }
+  const description = typeof input?.description === 'string' ? input.description.trim() : '';
+  if (!description || description.length > 1024) {
+    return { ok: false, status: 400, error: 'invalid_description' };
+  }
+  if (input.license != null && (typeof input.license !== 'string' || input.license.length > 200)) {
+    return { ok: false, status: 400, error: 'invalid_license' };
+  }
+  if (input.compatibility != null && (typeof input.compatibility !== 'string' || input.compatibility.length > 500)) {
+    return { ok: false, status: 400, error: 'invalid_compatibility' };
+  }
+  if (input.allowedTools != null && (typeof input.allowedTools !== 'string' || input.allowedTools.length > 500)) {
+    return { ok: false, status: 400, error: 'invalid_allowed_tools' };
+  }
+
+  let metadata: Record<string, string> | undefined;
+  if (input.metadata != null) {
+    if (typeof input.metadata !== 'object' || Array.isArray(input.metadata)) {
+      return { ok: false, status: 400, error: 'invalid_metadata' };
+    }
+    const keys = Object.keys(input.metadata);
+    if (keys.length > 32) return { ok: false, status: 400, error: 'too_much_metadata' };
+    const out: Record<string, string> = {};
+    for (const k of keys) {
+      const v = (input.metadata as Record<string, unknown>)[k];
+      if (typeof k !== 'string' || !k || k.length > 64) return { ok: false, status: 400, error: 'invalid_metadata_key' };
+      if (typeof v !== 'string' || v.length > 512) return { ok: false, status: 400, error: 'invalid_metadata_value' };
+      out[k] = v;
+    }
+    if (Object.keys(out).length) metadata = out;
+  }
+
+  const body = typeof input.body === 'string' ? input.body : '';
+  if (body.length > 100_000) return { ok: false, status: 400, error: 'body_too_large' };
+
+  const skillsDir = getLibraryPaths(libraryRoot).skills;
+  const dirPath = path.resolve(skillsDir, name);
+  // Defense in depth: the resolved skill dir must sit directly under skillsDir.
+  if (path.dirname(dirPath) !== path.resolve(skillsDir)) {
+    return { ok: false, status: 400, error: 'invalid_name' };
+  }
+  // Reject a symlink (or any non-directory) pre-planted at the destination —
+  // path.resolve above does not dereference symlinks, so a symlinked
+  // <skillsDir>/<name> would otherwise let the write escape the library.
+  try {
+    const st = fs.lstatSync(dirPath);
+    if (st.isSymbolicLink() || !st.isDirectory()) {
+      return { ok: false, status: 400, error: 'invalid_name' };
+    }
+  } catch { /* ENOENT: nothing there yet — fine, mkdir creates it below */ }
+  // Verify symlink-resolved containment of the (existing) parent under skillsDir.
+  try {
+    if (fs.realpathSync(path.dirname(dirPath)) !== fs.realpathSync(skillsDir)) {
+      return { ok: false, status: 400, error: 'invalid_name' };
+    }
+  } catch { /* skillsDir not created yet — the dirname string check already held */ }
+  const skillFile = path.join(dirPath, 'SKILL.md');
+  if (fileExists(skillFile) && !input.overwrite) {
+    return { ok: false, status: 409, error: 'already_exists' };
+  }
+
+  // Build frontmatter in spec order, then the markdown body.
+  const fm: Record<string, unknown> = { name, description };
+  if (input.license && input.license.trim()) fm.license = input.license.trim();
+  if (input.compatibility && input.compatibility.trim()) fm.compatibility = input.compatibility.trim();
+  if (input.allowedTools && input.allowedTools.trim()) fm['allowed-tools'] = input.allowedTools.trim();
+  if (metadata) fm.metadata = metadata;
+  const frontmatter = yaml.dump(fm, { sortKeys: false, lineWidth: -1, quotingType: '"' });
+  const content = `---\n${frontmatter}---\n\n${body.trim() ? body.trim() : `# ${name}\n\n${description}`}\n`;
+
+  try {
+    fs.mkdirSync(dirPath, { recursive: true });
+    // O_NOFOLLOW: refuse to write through a symlinked SKILL.md (ELOOP), the one
+    // file-level traversal the directory checks above don't cover on overwrite.
+    const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW;
+    const fd = fs.openSync(skillFile, flags, 0o644);
+    try {
+      fs.writeFileSync(fd, content, { encoding: 'utf-8' });
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch (e) {
+    return { ok: false, status: 500, error: (e as Error)?.message || 'write_failed' };
+  }
+  return { ok: true, status: 201, entry: decorateSkillEntry(name, dirPath, skillFile) };
+}
+
+/**
+ * Delete a library skill folder (<skillsDir>/<name>). Mirrors the create-path
+ * safety: charset-validates the name (broad enough to match any enumerable
+ * skill), refuses symlinks, and verifies real containment under skillsDir
+ * before removing. Requires the dir to actually be a skill (has SKILL.md).
+ */
+export function deleteLibrarySkill(libraryRoot: string | null, name: string): { ok: boolean; status: number; error?: string; removed?: string } {
+  if (!libraryRoot) return { ok: false, status: 409, error: 'no_library_root' };
+  const n = typeof name === 'string' ? name.trim() : '';
+  // Broad enough to match anything enumerateLibrarySkills accepts; the leading
+  // alphanumeric + no '/' means '.'/'..'/traversal can't pass.
+  if (!n || n.length > 64 || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(n)) {
+    return { ok: false, status: 400, error: 'invalid_name' };
+  }
+  const skillsDir = getLibraryPaths(libraryRoot).skills;
+  const dirPath = path.resolve(skillsDir, n);
+  if (path.dirname(dirPath) !== path.resolve(skillsDir)) {
+    return { ok: false, status: 400, error: 'invalid_name' };
+  }
+  let st: fs.Stats;
+  try { st = fs.lstatSync(dirPath); } catch { return { ok: false, status: 404, error: 'not_found' }; }
+  if (st.isSymbolicLink() || !st.isDirectory()) return { ok: false, status: 400, error: 'invalid_name' };
+  if (!fileExists(path.join(dirPath, 'SKILL.md'))) return { ok: false, status: 404, error: 'not_found' };
+  try {
+    if (fs.realpathSync(path.dirname(dirPath)) !== fs.realpathSync(skillsDir)) {
+      return { ok: false, status: 400, error: 'invalid_name' };
+    }
+  } catch { /* skillsDir resolution issue — the string check above already held */ }
+  try {
+    fs.rmSync(dirPath, { recursive: true, force: true });
+  } catch (e) {
+    return { ok: false, status: 500, error: (e as Error)?.message || 'delete_failed' };
+  }
+  return { ok: true, status: 200, removed: n };
 }
 
 export function getLibrarySkill(

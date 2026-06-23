@@ -930,16 +930,33 @@ export function writePersonalityFile(
   runtime: HarnessType | string | undefined,
   body: string,
 ): void {
+  // Append a persistent per-agent instructions sidecar if present. The sidecar
+  // (<workingDir>/.id-instructions.md) is NOT rewritten by deploy/rebuild (only
+  // CLAUDE.md / the AGENTS.md framework block are), so a per-agent directive —
+  // e.g. "act as the team coordinator and delegate to your teammates" — survives
+  // refreshes. Empty/missing sidecar → no change.
+  let full = body;
+  try {
+    const sidecar = path.join(workingDir, INSTRUCTIONS_SIDECAR);
+    if (fs.existsSync(sidecar)) {
+      const txt = fs.readFileSync(sidecar, 'utf-8').trim();
+      if (txt) full = `${body}\n\n${txt}`;
+    }
+  } catch { /* best-effort; never block the personality write */ }
+
   const rp = getRuntimePaths(runtime);
   const personalityPath = path.join(workingDir, rp.personalityFile);
   if (rp.overlayTarget === '.claude') {
     fs.mkdirSync(path.dirname(personalityPath), { recursive: true });
-    fs.writeFileSync(personalityPath, body);
+    fs.writeFileSync(personalityPath, full);
     return;
   }
   // Codex/Cursor: workspace-root AGENTS.md, marker-fenced framework block.
-  upsertMarkedBlock(personalityPath, 'framework', body);
+  upsertMarkedBlock(personalityPath, 'framework', full);
 }
+
+/** Per-agent persistent system-prompt sidecar (appended by writePersonalityFile). */
+export const INSTRUCTIONS_SIDECAR = '.id-instructions.md';
 
 /**
  * For Codex/Cursor runtimes only: append (or replace) the library agent

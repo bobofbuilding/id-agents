@@ -15,10 +15,56 @@
  */
 
 import { spawn, ChildProcess } from 'child_process';
-import { AgentHarness, HarnessOptions, HarnessMessage, HarnessType } from './types.js';
+import { AgentHarness, HarnessOptions, HarnessMessage, HarnessType, McpServerSpec } from './types.js';
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
+
+/** TOML-encode a string scalar. */
+function tomlStr(s: string): string {
+  return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+/** Bare TOML key (no quoting needed). */
+function bareKey(k: string): boolean {
+  return /^[A-Za-z0-9_-]+$/.test(k);
+}
+
+/**
+ * Turn attached MCP servers (Modules view → metadata.mcpServers, delivered via
+ * ID_MCP_SERVERS) into `codex exec -c mcp_servers.*` config overrides. Codex
+ * MERGES these onto ~/.codex/config.toml (so the user's OAuth auth in
+ * ~/.codex/auth.json is preserved — we deliberately do NOT isolate CODEX_HOME),
+ * making the servers' tools available to the model for this invocation.
+ *
+ * Verified: codex 0.130 spawns the stdio server, lists its tools, and calls them.
+ * Note: secret env values (e.g. tokens) end up in the codex process argv — for a
+ * local single-user fleet the value is the operator's own; most attached servers
+ * (filesystem/playwright/context7/…) carry no secret.
+ */
+function codexMcpConfigArgs(servers: McpServerSpec[] | undefined): string[] {
+  if (!servers?.length) return [];
+  const out: string[] = [];
+  for (const s of servers) {
+    if (!s?.name) continue;
+    const base = `mcp_servers.${bareKey(s.name) ? s.name : tomlStr(s.name)}`;
+    if (s.command) {
+      out.push('-c', `${base}.command=${tomlStr(s.command)}`);
+      if (s.args?.length) {
+        out.push('-c', `${base}.args=[${s.args.map(tomlStr).join(', ')}]`);
+      }
+      if (s.env && Object.keys(s.env).length) {
+        const env = Object.entries(s.env)
+          .map(([k, v]) => `${bareKey(k) ? k : tomlStr(k)} = ${tomlStr(String(v))}`)
+          .join(', ');
+        out.push('-c', `${base}.env={ ${env} }`);
+      }
+    } else if (s.url) {
+      // Remote (http/sse) MCP server.
+      out.push('-c', `${base}.url=${tomlStr(s.url)}`);
+    }
+  }
+  return out;
+}
 
 export class CodexHarness implements AgentHarness {
   readonly type: HarnessType = 'codex' as HarnessType;
@@ -62,6 +108,14 @@ export class CodexHarness implements AgentHarness {
 
     // Skip git repo check in case working dir isn't a git repo
     args.push('--skip-git-repo-check');
+
+    // Attach external MCP servers (Modules view) as -c config overrides so codex
+    // can call their tools. Merged onto ~/.codex/config.toml; auth is preserved.
+    const mcpArgs = codexMcpConfigArgs(options.mcpServers);
+    if (mcpArgs.length > 0) {
+      args.push(...mcpArgs);
+      console.log(`[Codex] Attached ${options.mcpServers!.length} MCP server(s) via -c overrides`);
+    }
 
     // Write prompt to temp file to avoid shell escaping issues
     const promptFile = path.join(os.tmpdir(), `codex-prompt-${Date.now()}.txt`);

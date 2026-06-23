@@ -26,6 +26,7 @@ import { registerOnIdChain, createSubnameOnIdChain, setMultiChainAddresses } fro
 import { defaultDeliverFn, redactSshTarget, type DeliverFn } from './lib/ssh-deliver.js';
 import { probeRemoteAgent, defaultHealthProbeFn, type HealthProbeFn } from './lib/remote-heartbeat.js';
 import { filterClaudeEnvVars } from './lib/env-hygiene.js';
+import { LocalModelGate, isLocalModelRuntime } from './lib/local-model-gate.js';
 import { loadMasterKey, deriveKeyAtIndex } from './lib/skillmesh-key-manager.js';
 import { type Db } from './db/db-service.js';
 import type { AgentRow, ScheduleDefinitionRow, TaskRow } from './db/types.js';
@@ -38,12 +39,17 @@ import {
   copyLibraryAgentOverlay,
   appendLibraryPersonaToAgentsMd,
   writePersonalityFile,
+  INSTRUCTIONS_SIDECAR,
 } from './config-parser.js';
 import {
+  createLibrarySkill,
+  deleteLibrarySkill,
   getLibraryAgent,
+  getLibraryPlugin,
   getLibrarySkill,
   getLibraryTeam,
   listLibraryAgents,
+  listLibraryPlugins,
   listLibrarySkills,
   listLibraryTeams,
   resolveDefaultLibraryRoot,
@@ -52,6 +58,7 @@ import {
   installLibraryTeam,
   parseSelector,
 } from './lib/library-install.js';
+import { getLibraryPaths } from './lib/agent-library.js';
 import { PROTOCOL_DEFAULTS } from './protocol-defaults.js';
 import { computeSyncPlan, formatSyncSummary, formatSyncVerbose } from './sync.js';
 import { validateName } from './name-validation.js';
@@ -90,6 +97,7 @@ import {
   getRuntimePaths,
   isRemoteEndpointRuntime,
   isRuntimeId,
+  isSupportedRuntimeSpecifier,
   resolveRuntime,
   runtimeIssueHint,
   validateRuntimePreflight,
@@ -109,8 +117,13 @@ function tokenizeCommand(command: string): string[] {
   const re = /"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|(\S+)/g;
   let match: RegExpExecArray | null;
   while ((match = re.exec(command)) !== null) {
-    const value = match[1] ?? match[2] ?? match[3] ?? '';
-    tokens.push(value.replace(/\\(["'])/g, '$1'));
+    if (match[1] !== undefined || match[2] !== undefined) {
+      // Quoted span: full backslash-unescape (mirrors the qArg producer in idctl,
+      // so backslashes/quotes in content round-trip instead of compounding).
+      tokens.push((match[1] ?? match[2]).replace(/\\(.)/g, '$1'));
+    } else {
+      tokens.push((match[3] ?? '').replace(/\\(["'])/g, '$1'));
+    }
   }
   return tokens;
 }
@@ -255,6 +268,13 @@ function getCatalogEndpoint(catalog: RestAPCatalog, key: 'talk' | 'news' | 'sche
 const restapCatalogCache = new Map<string, { catalog: RestAPCatalog; fetchedAt: number }>();
 const CATALOG_CACHE_TTL = 60000; // 1 minute cache
 
+// Ephemeral in-memory ring of agent activity (tool/file steps), fed by agents'
+// fire-and-forget POST /activity/record and read back via GET /activity. Lost on
+// restart by design — it only matters while a dispatch is live.
+interface ActivityItem { seq: number; at: number; agent: string; team: string; kind: string; tool?: string; summary: string; queryId?: string }
+const ACTIVITY_CAP = 3000;
+const ACTIVITY_RING: { items: ActivityItem[]; seq: number } = { items: [], seq: 0 };
+
 /**
  * Discover REST-AP endpoints from an agent's catalog
  * @param baseEndpoint The agent's base endpoint (e.g., http://localhost:4101)
@@ -371,11 +391,14 @@ export class AgentManagerDb {
    * Stuck-query sweeper timeout, in minutes. Queries whose status is still
    * pending/processing this long after their `created` timestamp are assumed
    * to belong to a crashed agent and are marked 'expired'.
-   * Starting conservatively at 15 minutes — if an agent is legitimately
-   * working on something longer than this, the polling caller should be
-   * treating it as abandoned anyway.
+   * Coordinated/long tasks (a lead delegating to teammates) can legitimately
+   * run for many minutes, so the default is generous (120m); override with
+   * ID_QUERY_EXPIRY_MINUTES. (Crashed queries just linger this long, harmless.)
    */
-  private readonly QUERY_EXPIRY_MINUTES = 15;
+  private readonly QUERY_EXPIRY_MINUTES = (() => {
+    const n = Number(process.env.ID_QUERY_EXPIRY_MINUTES);
+    return Number.isFinite(n) && n > 0 ? n : 120;
+  })();
   private logBuffer: Array<{ ts: number; msg: string }> = [];
   private readonly LOG_BUFFER_SIZE = 500;
   private managementPort: number = 4100;
@@ -434,7 +457,11 @@ export class AgentManagerDb {
     this.loadDefaultConfig();
 
     this.managementApp = express();
-    this.managementApp.use(express.json());
+    // Agent results can be large (git diffs, file contents, long replies). The
+    // default 100kb limit rejected those with PayloadTooLargeError, surfacing as a
+    // "failed" / "Claude Code produced an empty result" in chat. Match the agent
+    // server's generous limit (overridable via ID_MANAGER_BODY_LIMIT).
+    this.managementApp.use(express.json({ limit: process.env.ID_MANAGER_BODY_LIMIT || '50mb' }));
 
     // Ensure teams + manager dirs exist in the mounted workspace
     const teamsDir = `${baseWorkDir}/teams`;
@@ -815,6 +842,34 @@ export class AgentManagerDb {
     }
 
     this.wakeQueryWaiters(teamId, queryId, waiterReply);
+    this.releaseLocalGate(queryId); // #7: free the local-model slot on success
+  }
+
+  /** Append-only JSONL log of local-model token usage (Health page). */
+  private usageLogPath(): string {
+    return path.join(this.baseWorkDir, 'manager', 'token-usage.jsonl');
+  }
+
+  /** Read + parse the usage log, soft-capping its size to stay bounded. */
+  private readUsageRecords(): Array<{ ts: number; runtime: string; model: string; agent: string; team: string; input: number | null; output: number | null; genMs: number | null; tps: number | null }> {
+    const p = this.usageLogPath();
+    if (!existsSync(p)) return [];
+    let raw = '';
+    try { raw = readFileSync(p, 'utf-8'); } catch { return []; }
+    const lines = raw.split('\n').filter(Boolean);
+    // Soft cap: keep the newest 10k records once the file passes 20k lines.
+    const capped = lines.length > 20000 ? lines.slice(lines.length - 10000) : lines;
+    if (capped.length < lines.length) {
+      try { writeFileSync(p, capped.join('\n') + '\n'); } catch { /* best-effort */ }
+    }
+    const out: Array<any> = [];
+    for (const ln of capped) {
+      try {
+        const r = JSON.parse(ln);
+        if (r && typeof r.ts === 'number') out.push(r);
+      } catch { /* skip malformed line */ }
+    }
+    return out;
   }
 
   /**
@@ -872,6 +927,16 @@ export class AgentManagerDb {
         ) {
           delete meta[key];
         }
+      }
+      // MCP server definitions can carry secrets in nested `env` (stdio) and
+      // `headers` (http/sse) — the key-name scan above never sees them. Keep
+      // the server list visible (name/transport/command/url) but drop creds.
+      if (Array.isArray(meta.mcpServers)) {
+        meta.mcpServers = meta.mcpServers.map((srv: any) => {
+          if (!srv || typeof srv !== 'object') return srv;
+          const { env, headers, ...rest } = srv;
+          return rest;
+        });
       }
       out.metadata = meta;
     }
@@ -1364,6 +1429,36 @@ export class AgentManagerDb {
    * Forward a message to an agent's /talk endpoint.
    * Returns the parsed response or an error.
    */
+  // ── Local-model serialization (#7) ───────────────────────────────────
+  // One local-model (Ollama / local Claude) query runs at a time; API-backed
+  // agents (Claude CLI/SDK, Codex, Cursor) are unaffected. Acquire before
+  // dispatch, release when the query reaches a terminal state. The gate
+  // auto-releases after a timeout, so a missed release can never deadlock
+  // dispatch. See lib/local-model-gate.ts.
+  private readonly localModelGate = new LocalModelGate(Number(process.env.LOCAL_MODEL_CONCURRENCY) || 1);
+  private readonly localGateByQuery = new Map<string, string>();
+
+  /** Acquire a local-model slot before dispatching to `runtime`. Returns a token or undefined. */
+  private async acquireLocalGate(runtime?: string | null): Promise<string | undefined> {
+    if (!isLocalModelRuntime(runtime)) return undefined;
+    const token = `lmg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    await this.localModelGate.acquire(token);
+    return token;
+  }
+  /** Bind a token to its queryId so completion releases it; release immediately if no query. */
+  private bindLocalGate(token: string | undefined, queryId?: string): void {
+    if (!token) return;
+    if (queryId) this.localGateByQuery.set(queryId, token);
+    else this.localModelGate.release(token);
+  }
+  /** Release the local-model slot a query held, when it reaches a terminal state. */
+  private releaseLocalGate(queryId: string): void {
+    const token = this.localGateByQuery.get(queryId);
+    if (token === undefined) return;
+    this.localModelGate.release(token);
+    this.localGateByQuery.delete(queryId);
+  }
+
   private async forwardToAgent(targetUrl: string, message: string, from: string, session_id?: string): Promise<{
     ok: true;
     data: any;
@@ -1520,14 +1615,20 @@ export class AgentManagerDb {
 
       this.managerLog(`${shouldWait ? 'Forwarding' : 'Sending async'} message to ${targetDisplayId} at ${targetUrl}`);
 
+      // Serialize local-model dispatch (#7): wait for a slot if this target runs
+      // a local model; API-backed targets pass through immediately.
+      const lmgToken = await this.acquireLocalGate(targetAgent.runtime);
+
       // Forward the message to the agent's /talk endpoint
       const result = await this.forwardToAgent(targetUrl, message, from || 'manager', session_id);
       if (!result.ok) {
+        this.bindLocalGate(lmgToken); // dispatch failed → release the slot now
         console.error(`[Manager] Failed to deliver message to ${targetDisplayId}: ${result.status}`);
         return res.status(result.status).json({ error: result.error });
       }
 
       const queryId = result.data.query_id;
+      this.bindLocalGate(lmgToken, queryId); // released when the query completes/fails
 
       // Store the query so replies can be routed correctly
       if (queryId) {
@@ -1956,6 +2057,21 @@ export class AgentManagerDb {
       res.json(detail);
     });
 
+    // Installable plugins (plugins/claude-code). Read-only inventory, mirrors
+    // the skills routes. Returns an empty list when no plugins root exists.
+    this.managementApp.get('/library/plugins', (_req, res) => {
+      res.json(listLibraryPlugins(this.libraryRoot));
+    });
+
+    this.managementApp.get('/library/plugins/:name', (req, res) => {
+      const detail = getLibraryPlugin(this.libraryRoot, req.params.name);
+      if (!detail) {
+        res.status(404).json({ error: 'not_found', resource: 'library-plugin', name: req.params.name });
+        return;
+      }
+      res.json(detail);
+    });
+
     // POST /library/install — installs a library entry into the manager's
     // library root. Slice 1: only `team:<template>` -> `team:<dest>` is
     // implemented; agent/skill installs return 400 with `unsupported_kind`
@@ -1995,7 +2111,6 @@ export class AgentManagerDb {
         template: fromSel.name,
         dest: toSel.name,
         force,
-        params,
       });
       if (!result.ok) {
         const { ok: _ok, status, ...rest } = result;
@@ -2003,6 +2118,402 @@ export class AgentManagerDb {
         return;
       }
       res.json(result);
+    });
+
+    // Install a library skill onto an agent: persist it to metadata.skills
+    // (so a future rebuild re-deploys it) and copy SKILL.md into the live
+    // workdir for immediate effect. Admin-gated (loopback + X-Id-Admin).
+    this.managementApp.post('/library/skills/install', async (req, res) => {
+      try {
+        if (!this.isAdminRequest(req)) {
+          return res.status(403).json({ error: 'admin_required' });
+        }
+        const { skill, agent: agentRef } = req.body || {};
+        if (!skill || typeof skill !== 'string') {
+          return res.status(400).json({ error: 'Missing skill in request body' });
+        }
+        // Strict skill-name charset — `skill` flows into path.join below, so
+        // reject any traversal / separators before touching the filesystem.
+        if (!/^[a-z0-9][a-z0-9._-]*$/i.test(skill)) {
+          return res.status(400).json({ error: 'invalid skill name' });
+        }
+        if (!agentRef || typeof agentRef !== 'string') {
+          return res.status(400).json({ error: 'Missing agent in request body' });
+        }
+        const { id: teamId, name: teamName } = await this.getTeam(req);
+        const agent = await this.dbQueryAgentById(teamId, agentRef)
+          ?? await this.dbQueryAgentByNameMostRecent(teamId, agentRef);
+        if (!agent) return res.status(404).json({ error: 'Agent not found', name: agentRef });
+
+        // Resolve the skill source from the SAME root the listing uses
+        // (getLibraryPaths(libraryRoot).skills), so "what you can install" ==
+        // "what /library/skills lists"; fall back to the bundled skills/.
+        const skillsRoot = this.libraryRoot
+          ? getLibraryPaths(this.libraryRoot).skills
+          : path.resolve(__dirname, '..', 'skills');
+        if (!existsSync(path.join(skillsRoot, skill, 'SKILL.md'))) {
+          return res.status(404).json({ error: 'not_found', resource: 'library-skill', name: skill });
+        }
+
+        const workingDirectory = agent.working_directory
+          || (agent.metadata as any)?.workingDirectory
+          || path.join(this.baseWorkDir, 'agents', agent.name);
+        const hasWallet = !!(agent.metadata as any)?.ows_wallet || !!(agent.metadata as any)?.wallet;
+        this.deploySkillsToAgent(workingDirectory, [skill], {
+          DISPLAY_NAME: agent.domain || agent.name,
+          TEAM: teamName,
+          ONCHAIN_IDENTITY: agent.domain ? `Your onchain identity is your ENS domain: **${agent.domain}**` : '',
+          ORG_CONTEXT: '',
+        }, { hasWallet, runtime: agent.runtime || undefined, skillsRoot });
+
+        // Persist to metadata.skills (deduped) so the skill survives rebuilds.
+        const cur = (agent.metadata as Record<string, unknown>) || {};
+        const existing = Array.isArray((cur as any).skills) ? ((cur as any).skills as string[]) : [];
+        const skills = existing.includes(skill) ? existing : [...existing, skill];
+        await this.db.agents.updateMetadata(agent.id, { ...cur, skills });
+
+        res.json({ installed: skill, agent: agent.name, skills });
+      } catch (e: any) {
+        res.status(500).json({ error: e?.message || String(e) });
+      }
+    });
+
+    // Create a new library skill as an agentskills.io-compliant folder
+    // (<skillsDir>/<name>/SKILL.md). Admin-gated (loopback + X-Id-Admin).
+    // Validation + filesystem writes live in createLibrarySkill(); it refuses
+    // path traversal and (by default) refuses to overwrite an existing skill.
+    this.managementApp.post('/library/skills/create', (req, res) => {
+      if (!this.isAdminRequest(req)) {
+        return res.status(403).json({ error: 'admin_required' });
+      }
+      const result = createLibrarySkill(this.libraryRoot, req.body || {});
+      if (!result.ok) {
+        return res.status(result.status).json({ error: result.error });
+      }
+      return res.status(result.status).json(result.entry);
+    });
+
+    // Delete a library skill folder. Admin-gated. Validation + symlink/containment
+    // guards live in deleteLibrarySkill(). Does NOT touch agents already carrying
+    // the skill — use /library/skills/uninstall for that.
+    this.managementApp.delete('/library/skills/:name', (req, res) => {
+      if (!this.isAdminRequest(req)) {
+        return res.status(403).json({ error: 'admin_required' });
+      }
+      const result = deleteLibrarySkill(this.libraryRoot, req.params.name);
+      if (!result.ok) {
+        return res.status(result.status).json({ error: result.error });
+      }
+      return res.status(result.status).json({ removed: result.removed });
+    });
+
+    // Uninstall a skill from an agent: drop it from metadata.skills and remove
+    // the deployed SKILL.md from the live workdir. Admin-gated. Inverse of
+    // POST /library/skills/install.
+    this.managementApp.post('/library/skills/uninstall', async (req, res) => {
+      try {
+        if (!this.isAdminRequest(req)) {
+          return res.status(403).json({ error: 'admin_required' });
+        }
+        const { skill, agent: agentRef } = req.body || {};
+        if (!skill || typeof skill !== 'string' || !/^[a-z0-9][a-z0-9._-]*$/i.test(skill)) {
+          return res.status(400).json({ error: 'invalid skill name' });
+        }
+        if (!agentRef || typeof agentRef !== 'string') {
+          return res.status(400).json({ error: 'Missing agent in request body' });
+        }
+        const { id: teamId } = await this.getTeam(req);
+        const agent = await this.dbQueryAgentById(teamId, agentRef)
+          ?? await this.dbQueryAgentByNameMostRecent(teamId, agentRef);
+        if (!agent) return res.status(404).json({ error: 'Agent not found', name: agentRef });
+
+        // Remove the deployed skill dir from both runtime layouts (whichever exists).
+        const workingDirectory = agent.working_directory
+          || (agent.metadata as any)?.workingDirectory
+          || path.join(this.baseWorkDir, 'agents', agent.name);
+        for (const rel of ['.claude/skills', '.agents/skills']) {
+          const p = path.join(workingDirectory, rel, skill);
+          if (existsSync(p)) {
+            try { rmSync(p, { recursive: true, force: true }); } catch { /* best-effort */ }
+          }
+        }
+
+        // Persist metadata.skills without the removed skill.
+        const cur = (agent.metadata as Record<string, unknown>) || {};
+        const existing = Array.isArray((cur as any).skills) ? ((cur as any).skills as string[]) : [];
+        const skills = existing.filter((s) => s !== skill);
+        await this.db.agents.updateMetadata(agent.id, { ...cur, skills });
+
+        res.json({ uninstalled: skill, agent: agent.name, skills });
+      } catch (e: any) {
+        res.status(500).json({ error: e?.message || String(e) });
+      }
+    });
+
+    // ---- Local-model token usage (Ollama) -------------------------------
+    // Agents running local models fire-and-forget POST /usage/record after each
+    // generation; GET /usage aggregates it into 24h/7d summaries + a live
+    // throughput reading for the Health page. Stored as an append-only JSONL log
+    // under <baseWorkDir>/manager — no schema change, and fully decoupled from
+    // the dispatch / query / news lifecycle (a bad report can never affect a reply).
+    this.managementApp.post('/usage/record', (req, res) => {
+      const ip = req.ip || '';
+      const loopback = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
+      if (!loopback) return res.status(403).json({ error: 'loopback_required' });
+      try {
+        const b = req.body || {};
+        const num = (v: unknown): number | null => (typeof v === 'number' && isFinite(v) && v >= 0 ? v : null);
+        const str = (v: unknown, max = 64): string => (typeof v === 'string' ? v.slice(0, max) : '');
+        const rec = {
+          ts: Date.now(),
+          runtime: str(b.runtime) || 'ollama',
+          model: str(b.model, 80),
+          agent: str(b.agent),
+          team: str(b.team),
+          input: num(b.input),
+          output: num(b.output),
+          genMs: num(b.genMs),
+          tps: num(b.tps),
+        };
+        if (rec.input == null && rec.output == null) {
+          return res.status(400).json({ error: 'no_tokens' });
+        }
+        writeFileSync(this.usageLogPath(), JSON.stringify(rec) + '\n', { flag: 'a' });
+        return res.json({ ok: true });
+      } catch (e: any) {
+        return res.status(500).json({ error: e?.message || String(e) });
+      }
+    });
+
+    this.managementApp.get('/usage', (_req, res) => {
+      try {
+        const now = Date.now();
+        const records = this.readUsageRecords();
+        const summarize = (windowMs: number) => {
+          const since = now - windowMs;
+          const rows = records.filter((r) => r.ts >= since);
+          let input = 0, output = 0, genMs = 0;
+          const byAgent = new Map<string, { count: number; output: number; genMs: number }>();
+          for (const r of rows) {
+            input += r.input || 0;
+            output += r.output || 0;
+            genMs += r.genMs || 0;
+            const a = byAgent.get(r.agent) || { count: 0, output: 0, genMs: 0 };
+            a.count++; a.output += r.output || 0; a.genMs += r.genMs || 0;
+            byAgent.set(r.agent, a);
+          }
+          const genSec = genMs / 1000;
+          return {
+            count: rows.length,
+            input, output, total: input + output,
+            avgPerQuery: rows.length ? Math.round((input + output) / rows.length) : 0,
+            avgTps: genSec > 0 ? +(output / genSec).toFixed(1) : 0,
+            agents: [...byAgent.entries()].map(([agent, a]) => ({
+              agent, count: a.count, output: a.output,
+              avgTps: a.genMs > 0 ? +(a.output / (a.genMs / 1000)).toFixed(1) : 0,
+            })).sort((x, y) => y.output - x.output),
+          };
+        };
+        const last = records.length ? records[records.length - 1] : null;
+        return res.json({
+          now,
+          day: summarize(24 * 3600_000),
+          week: summarize(7 * 24 * 3600_000),
+          recent: last ? { tps: last.tps, output: last.output, model: last.model, agent: last.agent, at: last.ts } : null,
+        });
+      } catch (e: any) {
+        return res.status(500).json({ error: e?.message || String(e) });
+      }
+    });
+
+    // ---- Live agent activity (tool/file steps) --------------------------
+    // Agents fire-and-forget POST /activity/record as they work (each tool call
+    // → a human-readable line, esp. file create/modify). Kept in a small
+    // in-memory ring (ephemeral — only useful while a dispatch is live) and read
+    // back via GET /activity?agent=&since= so the chat can stream "what they're
+    // working on" inline. Fully decoupled from the reply path.
+    this.managementApp.post('/activity/record', (req, res) => {
+      const ip = req.ip || '';
+      const loopback = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
+      if (!loopback) return res.status(403).json({ error: 'loopback_required' });
+      try {
+        const b = req.body || {};
+        const str = (v: unknown, max: number): string => (typeof v === 'string' ? v.slice(0, max) : '');
+        const agent = str(b.agent, 80);
+        const summary = str(b.summary, 240);
+        if (!agent || !summary) return res.status(400).json({ error: 'agent_and_summary_required' });
+        const item = {
+          seq: ++ACTIVITY_RING.seq,
+          at: Date.now(),
+          agent,
+          team: str(b.team, 80) || 'default',
+          kind: str(b.kind, 24) || 'tool',
+          tool: str(b.tool, 60) || undefined,
+          summary,
+          // Originating dispatch id (when the agent reports one), so GET /activity
+          // can filter to a single query when two dispatches hit the same agent.
+          queryId: str(b.queryId, 80) || undefined,
+        };
+        ACTIVITY_RING.items.push(item);
+        if (ACTIVITY_RING.items.length > ACTIVITY_CAP) ACTIVITY_RING.items.splice(0, ACTIVITY_RING.items.length - ACTIVITY_CAP);
+        return res.json({ ok: true, seq: item.seq });
+      } catch (e: any) {
+        return res.status(500).json({ error: e?.message || String(e) });
+      }
+    });
+
+    this.managementApp.get('/activity', (req, res) => {
+      try {
+        const since = Math.max(0, Number(req.query.since) || 0);
+        const agent = typeof req.query.agent === 'string' ? req.query.agent : '';
+        const team = typeof req.query.team === 'string' ? req.query.team : '';
+        const queryId = typeof req.query.queryId === 'string' ? req.query.queryId : '';
+        let items = ACTIVITY_RING.items.filter((i) => i.seq > since);
+        if (agent) items = items.filter((i) => i.agent === agent);
+        if (team) items = items.filter((i) => i.team === team);
+        // Exact per-dispatch attribution: when a queryId is given, only steps the
+        // agent tagged with that query match (steps without one are excluded).
+        if (queryId) items = items.filter((i) => i.queryId === queryId);
+        if (items.length > 200) items = items.slice(-200);
+        return res.json({ items, next_seq: ACTIVITY_RING.seq });
+      } catch (e: any) {
+        return res.status(500).json({ error: e?.message || String(e) });
+      }
+    });
+
+    // Attach external MCP servers to an agent (Modules view). Persists a
+    // validated McpServerSpec[] to metadata.mcpServers; takes effect on the
+    // agent's next (re)build, when buildLocalAgentEnv injects ID_MCP_SERVERS.
+    this.managementApp.post('/agents/:id/mcp', async (req, res) => {
+      try {
+        if (!this.isAdminRequest(req)) {
+          return res.status(403).json({ error: 'admin_required' });
+        }
+        const { id: teamId } = await this.getTeam(req);
+        const agent = await this.dbQueryAgentById(teamId, req.params.id)
+          ?? await this.dbQueryAgentByNameMostRecent(teamId, req.params.id);
+        if (!agent) return res.status(404).json({ error: 'Agent not found' });
+
+        const raw = (req.body || {}).servers;
+        if (!Array.isArray(raw)) {
+          return res.status(400).json({ error: 'Missing servers array in request body' });
+        }
+        const servers: any[] = [];
+        for (const s of raw) {
+          if (!s || typeof s.name !== 'string' || !s.name.trim()) {
+            return res.status(400).json({ error: 'Each server needs a non-empty name' });
+          }
+          const transport = s.transport || 'stdio';
+          if (transport === 'stdio') {
+            if (typeof s.command !== 'string' || !s.command.trim()) {
+              return res.status(400).json({ error: `stdio server "${s.name}" needs a command` });
+            }
+          } else if (transport === 'http' || transport === 'sse') {
+            if (typeof s.url !== 'string' || !s.url.trim()) {
+              return res.status(400).json({ error: `${transport} server "${s.name}" needs a url` });
+            }
+          } else {
+            return res.status(400).json({ error: `server "${s.name}" has unknown transport "${transport}"` });
+          }
+          // args must be a string[]; env/headers must be string→string maps.
+          if (s.args !== undefined && (!Array.isArray(s.args) || !s.args.every((a: unknown) => typeof a === 'string'))) {
+            return res.status(400).json({ error: `server "${s.name}" args must be an array of strings` });
+          }
+          const allStringValues = (o: unknown) =>
+            o != null && typeof o === 'object' && Object.values(o as Record<string, unknown>).every((v) => typeof v === 'string');
+          if (s.env !== undefined && !allStringValues(s.env)) {
+            return res.status(400).json({ error: `server "${s.name}" env must be a string map` });
+          }
+          if (s.headers !== undefined && !allStringValues(s.headers)) {
+            return res.status(400).json({ error: `server "${s.name}" headers must be a string map` });
+          }
+          servers.push({
+            name: s.name.trim(),
+            transport,
+            ...(s.command && { command: s.command }),
+            ...(Array.isArray(s.args) && { args: s.args }),
+            ...(s.env && typeof s.env === 'object' && { env: s.env }),
+            ...(s.url && { url: s.url }),
+            ...(s.headers && typeof s.headers === 'object' && { headers: s.headers }),
+          });
+        }
+
+        const cur = (agent.metadata as Record<string, unknown>) || {};
+        await this.db.agents.updateMetadata(agent.id, { ...cur, mcpServers: servers });
+        res.json({ agent: agent.name, mcpServers: servers, needsRebuild: true });
+      } catch (e: any) {
+        res.status(500).json({ error: e?.message || String(e) });
+      }
+    });
+
+    // GET/POST /agents/:id/instructions — a persistent per-agent system-prompt
+    // addendum (e.g. "act as the team coordinator and delegate to teammates").
+    // Stored as a <workingDir>/.id-instructions.md sidecar that writePersonalityFile
+    // appends to CLAUDE.md / the AGENTS.md framework block, so it survives rebuilds.
+    // Admin-gated; takes effect on the agent's next (re)build.
+    this.managementApp.get('/agents/:id/instructions', async (req, res) => {
+      try {
+        const { id: teamId } = await this.getTeam(req);
+        const agent = await this.dbQueryAgentById(teamId, req.params.id) ?? await this.dbQueryAgentByNameMostRecent(teamId, req.params.id);
+        if (!agent) return res.status(404).json({ error: 'Agent not found' });
+        const wd = agent.working_directory;
+        let instructions = '';
+        try { const f = wd ? path.join(wd, INSTRUCTIONS_SIDECAR) : ''; if (f && existsSync(f)) instructions = readFileSync(f, 'utf-8'); } catch { /* none */ }
+        return res.json({ agent: agent.name, instructions });
+      } catch (e: any) {
+        return res.status(500).json({ error: e?.message || String(e) });
+      }
+    });
+
+    this.managementApp.post('/agents/:id/instructions', async (req, res) => {
+      try {
+        if (!this.isAdminRequest(req)) return res.status(403).json({ error: 'admin_required' });
+        const { id: teamId } = await this.getTeam(req);
+        const agent = await this.dbQueryAgentById(teamId, req.params.id) ?? await this.dbQueryAgentByNameMostRecent(teamId, req.params.id);
+        if (!agent) return res.status(404).json({ error: 'Agent not found' });
+        const wd = agent.working_directory;
+        if (!wd) return res.status(400).json({ error: 'agent has no working directory' });
+        const instructions = typeof req.body?.instructions === 'string' ? req.body.instructions.trim() : '';
+        const sidecar = path.join(wd, INSTRUCTIONS_SIDECAR);
+        if (instructions) writeFileSync(sidecar, instructions + '\n');
+        else { try { rmSync(sidecar, { force: true }); } catch { /* */ } }
+        return res.json({ agent: agent.name, instructions, needsRebuild: true });
+      } catch (e: any) {
+        return res.status(500).json({ error: e?.message || String(e) });
+      }
+    });
+
+    // POST /agents/:id/delegates — per-agent cross-team relay override.
+    // Body: { delegates: string[] | "*" | null }. Overrides the team policy for
+    // THIS agent; null removes the override (inherit team). Admin-gated. Takes
+    // effect immediately (checked at delegation time — no rebuild needed).
+    this.managementApp.post('/agents/:id/delegates', async (req, res) => {
+      try {
+        if (!this.isAdminRequest(req)) return res.status(403).json({ error: 'admin_required' });
+        const { id: teamId } = await this.getTeam(req);
+        const agent = await this.dbQueryAgentById(teamId, req.params.id)
+          ?? await this.dbQueryAgentByNameMostRecent(teamId, req.params.id);
+        if (!agent) return res.status(404).json({ error: 'Agent not found' });
+        const body = req.body || {};
+        let delegates: string[] | null;
+        if (body.delegates === null || body.delegates === undefined) {
+          delegates = null;
+        } else if (body.delegates === '*') {
+          delegates = ['*'];
+        } else if (Array.isArray(body.delegates) && body.delegates.every((d: unknown) => typeof d === 'string')) {
+          delegates = body.delegates as string[];
+        } else {
+          return res.status(400).json({ error: 'delegates must be an array of team names, "*", or null' });
+        }
+        const cur = (agent.metadata as Record<string, unknown>) || {};
+        const next = { ...cur };
+        if (delegates === null) delete (next as any).delegates_to;
+        else (next as any).delegates_to = delegates;
+        await this.db.agents.updateMetadata(agent.id, next);
+        res.json({ agent: agent.name, delegates_to: delegates });
+      } catch (e: any) {
+        res.status(500).json({ error: e?.message || String(e) });
+      }
     });
 
     // GET /agents/status - check health of all agents (server-side ping)
@@ -2433,6 +2944,7 @@ export class AgentManagerDb {
               from: from || 'unknown',
               message: message || '',
             });
+            this.releaseLocalGate(in_reply_to); // #7: free the local-model slot on failure
           } else {
             // Single canonical completion lifecycle (queries.complete +
             // delivered event + waiter wakeups). Shared with POST
@@ -3044,6 +3556,47 @@ export class AgentManagerDb {
       }
     });
 
+    // GET /teams/:name/config — relay/delegation policy for a team. Returns
+    // delegates_to: an array of team names ("*" = all), or null = permissive.
+    this.managementApp.get('/teams/:name/config', async (req, res) => {
+      try {
+        const team = await this.db.teams.getTeamByName(req.params.name);
+        if (!team) return res.status(404).json({ error: `Team "${req.params.name}" not found` });
+        const cfg = await this.db.teams.getConfig(team.id).catch(() => ({} as Record<string, unknown>));
+        const raw = cfg.delegates_to;
+        const delegates_to = Array.isArray(raw) ? (raw as string[]) : null;
+        res.json({ name: team.name, delegates_to });
+      } catch (e: any) {
+        res.status(500).json({ error: e?.message || String(e) });
+      }
+    });
+
+    // POST /teams/:name/delegates — set the cross-team relay allow-list.
+    // Body: { delegates: string[] | "*" | null }. "*" → ["*"] (allow all),
+    // [] → block all, null → permissive default. Admin-gated.
+    this.managementApp.post('/teams/:name/delegates', async (req, res) => {
+      try {
+        if (!this.isAdminRequest(req)) return res.status(403).json({ error: 'admin_required' });
+        const team = await this.db.teams.getTeamByName(req.params.name);
+        if (!team) return res.status(404).json({ error: `Team "${req.params.name}" not found` });
+        const body = req.body || {};
+        let delegates: string[] | null;
+        if (body.delegates === null || body.delegates === undefined) {
+          delegates = null;
+        } else if (body.delegates === '*') {
+          delegates = ['*'];
+        } else if (Array.isArray(body.delegates) && body.delegates.every((d: unknown) => typeof d === 'string')) {
+          delegates = body.delegates as string[];
+        } else {
+          return res.status(400).json({ error: 'delegates must be an array of team names, "*", or null' });
+        }
+        await this.db.teams.setDelegatesTo(team.id, delegates);
+        res.json({ name: team.name, delegates_to: delegates });
+      } catch (e: any) {
+        res.status(500).json({ error: e?.message || String(e) });
+      }
+    });
+
     // Delete a team
     this.managementApp.delete('/teams/:name', async (req, res) => {
       const { name } = req.params;
@@ -3131,7 +3684,7 @@ export class AgentManagerDb {
         teamId = team.id;
         teamName = team.name;
 
-        const { name, type: agentType, model, runtime, allowedTools, pluginPath, plugins, skills, metadata: reqMetadata, local, agent, roleBody, heartbeat, openMode, workingDirectory: configWorkDir, verbose, dangerouslySkipPermissions, domain, tokenId, address } = req.body || {};
+        const { name, type: agentType, model, runtime, allowedTools, pluginPath, plugins, skills, metadata: reqMetadata, local, agent, roleBody, heartbeat, openMode, workingDirectory: configWorkDir, verbose, dangerouslySkipPermissions, domain, tokenId, address, start } = req.body || {};
         const agentOverlay = agent;
         if (!name) return res.status(400).json({ error: 'Missing name' });
         const agentNameCheck = validateName(name, 'agent');
@@ -3239,6 +3792,8 @@ export class AgentManagerDb {
           runtime: effectiveRuntime,  // Store runtime for display/querying
           // Store config in metadata for later reference
           ...(reqMetadata?.description && { description: reqMetadata.description }),
+          // Catalog seed (role/expertise/etc.) — surfaced to peers via /catalog.
+          ...(reqMetadata?.catalog && typeof reqMetadata.catalog === 'object' && { catalog: reqMetadata.catalog }),
           plugins: localPlugins, // Use local paths (agent owns its plugins)
           ...(agentOverlay && { agent: agentOverlay }),
           ...(normalizedSkills && { skills: normalizedSkills }),
@@ -3311,6 +3866,21 @@ export class AgentManagerDb {
         if (heartbeat && this.schedulerService) {
           const { definition, agentIds } = heartbeatToSchedule(id, name, heartbeat);
           await this.schedulerService.seedSchedule(definition, agentIds);
+        }
+
+        // Start the local process now when requested (the GUI "Add agent" flow).
+        // Without this, /agents/spawn only creates the row and leaves the CLI to
+        // spawn the worker; with start:true the manager spawns it itself.
+        if (start === true || start === 'true') {
+          await this.spawnLocalAgentProcess(teamId, teamName, {
+            name,
+            id,
+            port: allocatedPort,
+            model: effectiveModel,
+            workingDirectory: hostWorkingDirectory,
+            tokenId: tokenId || undefined,
+            address: address || undefined,
+          });
         }
 
         res.status(201).json({
@@ -3699,6 +4269,33 @@ export class AgentManagerDb {
           status: 'pending',
           message: 'Model updated. Restart the agent to apply the new model.'
         });
+      } catch (e: any) {
+        res.status(500).json({ error: e?.message || String(e) });
+      }
+    });
+
+    // POST /agents/:id/runtime — switch an agent's runtime (harness). Like
+    // /model, this updates the row and requires a rebuild to apply (the new
+    // runtime changes the harness, skills dir, and spawn env).
+    this.managementApp.post('/agents/:id/runtime', async (req, res) => {
+      const { id: teamId } = await this.getTeam(req);
+      const { runtime } = req.body || {};
+      if (!runtime || typeof runtime !== 'string') {
+        return res.status(400).json({ error: 'Missing runtime in request body' });
+      }
+      if (!isSupportedRuntimeSpecifier(runtime)) {
+        return res.status(400).json({ error: `Unknown runtime "${runtime}"` });
+      }
+      const agent = await this.dbQueryAgentById(teamId, req.params.id);
+      if (!agent) return res.status(404).json({ error: 'Agent not found' });
+      if (agent.type !== 'claude') {
+        return res.status(400).json({ error: 'Only local runtime-backed agents have a switchable runtime' });
+      }
+      try {
+        const resolved = resolveRuntime(runtime);
+        await this.db.agents.updateStatus(agent.id, 'pending', { runtime: resolved });
+        console.log(`[Manager] Updated runtime for ${agent.name} to ${resolved} - rebuild required`);
+        res.json({ id: agent.id, name: agent.name, runtime: resolved, status: 'pending', needsRebuild: true, message: 'Runtime updated. Rebuild the agent to apply.' });
       } catch (e: any) {
         res.status(500).json({ error: e?.message || String(e) });
       }
@@ -4952,9 +5549,21 @@ export class AgentManagerDb {
           ownerNameCache.set(agentId, name);
           return name;
         };
+        // Resolve each checkin's linked task → { title, owner, status } so the
+        // response is self-describing (the UI can show WHAT is being supervised
+        // instead of a raw task/checkin id). One task list per request, mapped by id.
+        const allTasks = await this.db.tasks.list({ teamId }).catch(() => [] as TaskRow[]);
+        const taskById = new Map(allTasks.map((t) => [t.id, t]));
+        const linkedTaskOf = async (taskId: string | null): Promise<Record<string, unknown> | null> => {
+          if (!taskId) return null;
+          const t = taskById.get(taskId);
+          if (!t) return { id: taskId, gone: true };
+          return { name: t.name, title: t.title, status: t.status, owner: await resolveOwnerName(t.owner) };
+        };
         const checkins = await Promise.all(
           rows.map(async (row) => buildCheckinResponse(row, {
             ownerName: await resolveOwnerName(row.owner_agent_id),
+            linkedTask: await linkedTaskOf(row.linked_task_id),
           })),
         );
         res.json({ ok: true, checkins });
@@ -5512,10 +6121,12 @@ export class AgentManagerDb {
 
         if (subCmd === 'list') {
           const schedules = await this.listTeamSchedules(teamId);
-          return {
-            ok: true,
-            result: {
-              schedules: schedules.map(({ definition, targets }) => ({
+          // Enrich with the most recent run so the UI can flag missed heartbeats.
+          const enriched = await Promise.all(
+            schedules.map(async ({ definition, targets }) => {
+              const runs = await this.db.schedules.listRuns(definition.id, 1);
+              const last = runs[0];
+              return {
                 id: definition.id,
                 title: definition.title,
                 kind: definition.kind,
@@ -5530,9 +6141,12 @@ export class AgentManagerDb {
                 daysOfWeek: definition.days_of_week,
                 message: definition.message,
                 createdAt: definition.created_at,
-              })),
-            },
-          };
+                lastRunAt: last?.fired_at ?? null,
+                lastStatus: last?.status ?? null,
+              };
+            }),
+          );
+          return { ok: true, result: { schedules: enriched } };
         }
 
         if (subCmd === 'show') {
@@ -6131,26 +6745,59 @@ export class AgentManagerDb {
           return { ok: false, error: `Usage: /${action} <agent-name|agent-id> <message>` };
         }
 
-        // Try to resolve by various identifiers
-        const matches = await this.dbResolveAgents(teamId, agentName);
-
-        if (matches.length === 0) {
-          return { ok: false, error: `Agent "${agentName}" not found` };
+        // Resolve the target agent. "<team>/<agent>" delegates ACROSS teams (#9);
+        // a bare ref resolves within the current team.
+        let a: AgentRow;
+        const slash = agentName.indexOf('/');
+        if (slash > 0 && !agentName.startsWith('http')) {
+          const teamPart = agentName.slice(0, slash);
+          const namePart = agentName.slice(slash + 1);
+          const targetTeam = await this.db.teams.getTeamByName(teamPart);
+          if (!targetTeam) {
+            return { ok: false, error: `Team "${teamPart}" not found (cross-team delegation)` };
+          }
+          // Allow-list: delegation may be restricted by `delegates_to` (array of
+          // team names, or "*"). Unset ⇒ permissive. The SOURCE AGENT's own
+          // policy (metadata.delegates_to) OVERRIDES the team policy when set —
+          // so an individual agent can be granted (or denied) cross-team
+          // delegation independently of its team's default.
+          const srcCfg = await this.db.teams.getConfig(teamId).catch(() => ({} as Record<string, unknown>));
+          const teamPolicy = srcCfg.delegates_to as string[] | string | undefined;
+          let agentPolicy: string[] | string | undefined;
+          if (callerFrom) {
+            const src = await this.dbResolveAgents(teamId, callerFrom).catch(() => [] as AgentRow[]);
+            if (src.length === 1) agentPolicy = (src[0].metadata as any)?.delegates_to;
+          }
+          const policy = agentPolicy !== undefined ? agentPolicy : teamPolicy;
+          const allow = policy === '*' ? ['*'] : (Array.isArray(policy) ? policy : undefined);
+          if (Array.isArray(allow) && !allow.includes('*') && !allow.includes(teamPart)) {
+            const scope = agentPolicy !== undefined ? `agent "${callerFrom}"'s` : "this team's";
+            return { ok: false, error: `Delegation to team "${teamPart}" is blocked by ${scope} delegates_to policy.` };
+          }
+          const found = await this.db.agents.getByName(targetTeam.id, namePart);
+          if (!found) {
+            return { ok: false, error: `Agent "${namePart}" not found in team "${teamPart}"` };
+          }
+          a = found;
+          this.managerLog(`[delegate] ${teamId} → ${teamPart}/${namePart}`);
+        } else {
+          const matches = await this.dbResolveAgents(teamId, agentName);
+          if (matches.length === 0) {
+            return { ok: false, error: `Agent "${agentName}" not found` };
+          }
+          if (matches.length > 1) {
+            const matchList = matches.map(m => {
+              const domain = m.domain || (m.metadata as any)?.idchain_domain;
+              const displayId = domain || m.name || m.id;
+              return `  - ${displayId} (${m.status})`;
+            }).join('\n');
+            return {
+              ok: false,
+              error: `Multiple agents match "${agentName}":\n${matchList}\nUse a specific identifier (e.g., ENS domain or agent_id)`
+            };
+          }
+          a = matches[0];
         }
-
-        if (matches.length > 1) {
-          const matchList = matches.map(a => {
-            const domain = a.domain || (a.metadata as any)?.idchain_domain;
-            const displayId = domain || a.name || a.id;
-            return `  - ${displayId} (${a.status})`;
-          }).join('\n');
-          return {
-            ok: false,
-            error: `Multiple agents match "${agentName}":\n${matchList}\nUse a specific identifier (e.g., ENS domain or agent_id)`
-          };
-        }
-
-        const a = matches[0];
         // Use endpoint if set, otherwise construct from port using localhost
         const baseEndpoint = a.endpoint || `http://localhost:${a.port}`;
 
@@ -6160,6 +6807,8 @@ export class AgentManagerDb {
 
         // Send message to agent's /talk endpoint
         const talkHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
+        // Serialize local-model dispatch (#7).
+        const askGate = await this.acquireLocalGate(a.runtime);
         const talkResp = await fetch(talkUrl, {
           method: 'POST',
           headers: talkHeaders,
@@ -6167,15 +6816,18 @@ export class AgentManagerDb {
         });
 
         if (!talkResp.ok) {
+          this.bindLocalGate(askGate); // dispatch failed → release now
           const err = await talkResp.text();
           return { ok: false, error: `Failed to send message: ${err}` };
         }
 
         const talkResult = await talkResp.json() as any;
+        const askQueryId = talkResult.query_id || talkResult.queryId;
+        this.bindLocalGate(askGate, askQueryId); // released when the query completes/fails
         return {
           ok: true,
           result: {
-            queryId: talkResult.query_id || talkResult.queryId,
+            queryId: askQueryId,
             status: 'processing',
             agent: agentName
           }
@@ -6511,6 +7163,7 @@ export class AgentManagerDb {
 
           await this.db.agents.updateStatus(row.id, 'starting', {
             model: effectiveModel,
+            runtime: effectiveRuntime,
             metadata: updatedMeta,
           });
 
@@ -8848,6 +9501,13 @@ export class AgentManagerDb {
       ? Buffer.from(JSON.stringify(catalogSeed), 'utf8').toString('base64')
       : undefined;
 
+    // External MCP servers attached to this agent (Modules view → metadata).
+    // Serialized as JSON for claude-agent-server to parse into HarnessOptions.
+    const mcpServers = (agentRow?.metadata as any)?.mcpServers;
+    const mcpEnv = Array.isArray(mcpServers) && mcpServers.length > 0
+      ? JSON.stringify(mcpServers)
+      : undefined;
+
     return {
       PATH: process.env.PATH || '',
       HOME: process.env.HOME || '',
@@ -8868,6 +9528,7 @@ export class AgentManagerDb {
       ...(tokenId && { ID_AGENT_TOKEN_ID: tokenId }),
       ...(owsWallet && { OWS_WALLET: owsWallet }),
       ...(catalogEnv && { ID_AGENT_CATALOG: catalogEnv }),
+      ...(mcpEnv && { ID_MCP_SERVERS: mcpEnv }),
       ...(process.env.ANTHROPIC_API_KEY && { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY }),
       ...(process.env.OPENAI_API_KEY && { OPENAI_API_KEY: process.env.OPENAI_API_KEY }),
     };
@@ -8890,17 +9551,23 @@ export class AgentManagerDb {
     workDir: string,
     skillNames: string[],
     vars: Record<string, string>,
-    opts: { hasWallet?: boolean; runtime?: HarnessType | string } = {}
+    opts: { hasWallet?: boolean; runtime?: HarnessType | string; skillsRoot?: string } = {}
   ): void {
     if (skillNames.length === 0) return;
     try {
-      const skillsSource = path.resolve(__dirname, '..', 'skills');
+      const skillsSource = opts.skillsRoot ?? path.resolve(__dirname, '..', 'skills');
       if (!existsSync(skillsSource)) return;
 
       const rp = getRuntimePaths(opts.runtime);
       let deployed = 0;
 
       for (const skillName of skillNames) {
+        // Defense in depth: skill names also arrive from persisted
+        // metadata.skills on rebuild — never let a traversal string reach a join.
+        if (!/^[a-z0-9][a-z0-9._-]*$/i.test(skillName)) {
+          console.warn(`[Deploy] Skipping invalid skill name "${skillName}"`);
+          continue;
+        }
         const skillFile = path.join(skillsSource, skillName, 'SKILL.md');
         if (!existsSync(skillFile)) {
           console.warn(`[Deploy] Skill "${skillName}" not found at ${skillFile}`);
