@@ -126,15 +126,21 @@ export class McpToolHub {
   listTools(): HubTool[] { return this.tools; }
 
   /** Call a tool by its exposed (namespaced) name. Never throws — a failure is
-   *  returned as `{ isError: true, text }` so the loop can feed it back to the model. */
-  async callTool(exposed: string, args: unknown): Promise<{ text: string; isError: boolean }> {
+   *  returned as `{ isError: true, text }` so the loop can feed it back to the
+   *  model. `signal` (the agent's cancel signal) aborts an in-flight call promptly
+   *  instead of waiting out CALL_TIMEOUT_MS. */
+  async callTool(exposed: string, args: unknown, signal?: AbortSignal): Promise<{ text: string; isError: boolean }> {
     const tool = this.byExposed.get(exposed);
     if (!tool) return { text: `Unknown tool "${exposed}"`, isError: true };
     const entry = this.clients.find((c) => c.server === tool.server);
     if (!entry) return { text: `MCP server "${tool.server}" is not connected`, isError: true };
     try {
       const res = await withTimeout(
-        entry.client.callTool({ name: tool.name, arguments: (args && typeof args === 'object') ? args as Record<string, unknown> : {} }),
+        entry.client.callTool(
+          { name: tool.name, arguments: (args && typeof args === 'object') ? args as Record<string, unknown> : {} },
+          undefined,
+          signal ? { signal } : undefined,
+        ),
         CALL_TIMEOUT_MS, `callTool ${exposed}`,
       ) as { content?: unknown; isError?: boolean };
       return { text: flattenContent(res?.content), isError: !!res?.isError };
@@ -153,12 +159,40 @@ export class McpToolHub {
 // Translation (pure functions) — MCP tool schema ⇄ OpenAI/Ollama function tools.
 // ---------------------------------------------------------------------------
 
-/** Make an MCP inputSchema palatable to Ollama's tool-arg parser: drop $-keywords
- *  some model templates reject, and guarantee an object schema with a properties
- *  map (some models choke on parameters that lack `properties`). */
+/** Make an MCP inputSchema palatable to Ollama's tool-arg parser: INLINE internal
+ *  `$ref`s (to `$defs`/`definitions`) so nothing dangles after we drop the defs,
+ *  strip $-keywords some model templates reject, and guarantee an object schema
+ *  with a `properties` map (some models choke on parameters that lack one). */
 function sanitizeSchema(schema: Record<string, unknown> | undefined): Record<string, unknown> {
-  const s: Record<string, unknown> = (schema && typeof schema === 'object') ? { ...schema } : {};
-  delete s.$schema; delete s.$defs; delete s.$id;
+  const root: Record<string, unknown> = (schema && typeof schema === 'object') ? schema : {};
+  const defs: Record<string, unknown> = {
+    ...(root.$defs as Record<string, unknown> | undefined),
+    ...(root.definitions as Record<string, unknown> | undefined),
+  };
+  const resolveRef = (ref: string): unknown => {
+    const m = /^#\/(?:\$defs|definitions)\/(.+)$/.exec(ref);
+    return m ? defs[m[1]] : undefined;
+  };
+  const DROP = new Set(['$schema', '$id', '$defs', 'definitions']);
+  const walk = (node: unknown, seen: Set<string>): unknown => {
+    if (Array.isArray(node)) return node.map((x) => walk(x, seen));
+    if (!node || typeof node !== 'object') return node;
+    const n = node as Record<string, unknown>;
+    if (typeof n.$ref === 'string') {
+      if (seen.has(n.$ref)) return {}; // cycle guard
+      const target = resolveRef(n.$ref);
+      if (target === undefined) return {}; // unresolvable → permissive empty, never dangling
+      const next = new Set(seen); next.add(n.$ref);
+      return walk(target, next);
+    }
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(n)) {
+      if (DROP.has(k)) continue;
+      out[k] = walk(v, seen);
+    }
+    return out;
+  };
+  const s = walk(root, new Set<string>()) as Record<string, unknown>;
   if (!s.type) s.type = 'object';
   if (s.type === 'object' && (s.properties == null || typeof s.properties !== 'object')) s.properties = {};
   return s;

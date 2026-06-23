@@ -89,6 +89,7 @@ export class OllamaHarness implements AgentHarness {
   readonly type: HarnessType = 'ollama';
 
   private abortController: AbortController | null = null;
+  private hub: McpToolHub | null = null; // active MCP tool hub (so cancel() can close it)
 
   async *run(prompt: string, options: HarnessOptions = {}): AsyncGenerator<HarnessMessage> {
     const baseUrl = process.env.OLLAMA_BASE_URL || DEFAULT_BASE_URL;
@@ -149,6 +150,7 @@ export class OllamaHarness implements AgentHarness {
     let requestFailed = false;
     let failError = '';
     let aborted = false;
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined; // hoisted so finally can release it
     // Token-usage accounting for the throughput gauge / 24h-7d averages.
     let usage: { prompt_tokens?: number; completion_tokens?: number } | null = null;
     let firstTokenAt = 0; // wall-clock of the first content delta
@@ -176,7 +178,7 @@ export class OllamaHarness implements AgentHarness {
         return;
       }
 
-      const reader = response.body?.getReader();
+      reader = response.body?.getReader();
       if (!reader) {
         yield { type: 'error', content: 'No response body from Ollama' };
         return;
@@ -229,6 +231,9 @@ export class OllamaHarness implements AgentHarness {
         failError = (err as Error).message || String(err);
       }
     } finally {
+      // Release the stream lock + cancel the underlying body on EVERY exit
+      // (abort, timeout, read error, or consumer abandonment via generator return).
+      try { void reader?.cancel(); } catch { /* reader may already be closed */ }
       releaseSlot();
     }
 
@@ -275,7 +280,11 @@ export class OllamaHarness implements AgentHarness {
   ): AsyncGenerator<HarnessMessage> {
     const url = `${baseUrl}/chat/completions`;
     const headers = { 'Content-Type': 'application/json' };
-    const newSignal = () => AbortSignal.any([this.abortController!.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]);
+    // Snapshot the controller: a between-turn cancel() nulls the shared field, so
+    // closing over it directly would null-deref. cancel() calls abort() first, so
+    // `ac.signal` stays aborted and the next fetch is created already-aborted.
+    const ac = this.abortController!;
+    const newSignal = () => AbortSignal.any([ac.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]);
 
     yield { type: 'system', subtype: 'init', session_id: undefined };
 
@@ -290,6 +299,7 @@ export class OllamaHarness implements AgentHarness {
 
     try {
       hub = await McpToolHub.connect(servers);
+      this.hub = hub; // expose to cancel() so an abort tears down child MCP processes
       let tools = mcpToOpenAiTools(hub.listTools());
       if (options.allowedTools && options.allowedTools.length) {
         const allow = new Set(options.allowedTools);
@@ -338,7 +348,10 @@ export class OllamaHarness implements AgentHarness {
         if (j.usage) { totalIn += j.usage.prompt_tokens || 0; totalOut += j.usage.completion_tokens || 0; }
         const msg = j.choices?.[0]?.message || {};
         const calls = msg.tool_calls || [];
-        if (typeof msg.content === 'string' && msg.content) finalText = msg.content;
+        // Only a turn WITHOUT tool_calls is a real final answer — never let
+        // intermediate "let me check…" narration emitted alongside a tool_call
+        // become the returned result.
+        if (!calls.length && typeof msg.content === 'string' && msg.content) finalText = msg.content;
 
         // Record the assistant turn (incl. tool_calls) so the model keeps context.
         messages.push({ role: 'assistant', content: msg.content || '', ...(calls.length ? { tool_calls: calls } : {}) });
@@ -349,12 +362,27 @@ export class OllamaHarness implements AgentHarness {
           const exposed = call.function?.name || '';
           yield { type: 'tool_use', tool_name: exposed, content: call.function?.arguments || '' };
           console.log(`[Ollama] tool_call: ${exposed}`);
-          const out = await hub.callTool(exposed, parseOpenAiCallArgs(call));
+          const out = await hub.callTool(exposed, parseOpenAiCallArgs(call), ac.signal);
           console.log(`[Ollama] tool result: ${out.text.length} chars${out.isError ? ' (error)' : ''}`);
           messages.push({ role: 'tool', tool_call_id: call.id || exposed, content: out.text });
         }
 
-        if (turn === MAX_TOOL_TURNS - 1) console.warn(`[Ollama] hit MAX_TOOL_TURNS (${MAX_TOOL_TURNS}); returning best-effort answer`);
+        if (turn === MAX_TOOL_TURNS - 1) console.warn(`[Ollama] hit MAX_TOOL_TURNS (${MAX_TOOL_TURNS}); forcing a final answer`);
+      }
+
+      // If we ran out of turns mid-tool-call (no clean final answer yet), give the
+      // model ONE tools-free turn so it answers from the accumulated tool results
+      // instead of returning a placeholder.
+      if (!finalText) {
+        try {
+          const wrap = await fetch(url, { method: 'POST', headers, body: JSON.stringify({ model, messages, stream: false, temperature: 0.2, max_tokens: MAX_TOKENS }), signal: newSignal() });
+          if (wrap.ok) {
+            const wj = (await wrap.json()) as { usage?: { prompt_tokens?: number; completion_tokens?: number }; choices?: Array<{ message?: { content?: string } }> };
+            if (wj.usage) { totalIn += wj.usage.prompt_tokens || 0; totalOut += wj.usage.completion_tokens || 0; }
+            const c = wj.choices?.[0]?.message?.content;
+            if (typeof c === 'string' && c) finalText = c;
+          }
+        } catch { /* keep the sentinel below */ }
       }
 
       reportOllamaUsage({ model, input: totalIn || null, output: totalOut || null, genMs: Date.now() - t0 });
@@ -368,17 +396,25 @@ export class OllamaHarness implements AgentHarness {
       }
     } finally {
       if (hub) await hub.close().catch(() => { /* best-effort */ });
+      this.hub = null;
       releaseSlot();
       this.abortController = null;
     }
   }
 
   cancel(): boolean {
+    const active = this.abortController !== null;
     if (this.abortController) {
       this.abortController.abort();
       this.abortController = null;
-      return true;
     }
-    return false;
+    // Tear down any in-flight MCP tool hub so child server processes don't linger
+    // (the loop's finally also closes it; this makes cancel immediate).
+    if (this.hub) {
+      const h = this.hub;
+      this.hub = null;
+      void h.close().catch(() => { /* best-effort */ });
+    }
+    return active;
   }
 }
