@@ -10,10 +10,15 @@
  * falls back to a single blocking POST otherwise.
  */
 
-import { AgentHarness, HarnessOptions, HarnessMessage, HarnessType } from './types.js';
+import { AgentHarness, HarnessOptions, HarnessMessage, HarnessType, McpServerSpec } from './types.js';
+import { McpToolHub, mcpToOpenAiTools, parseOpenAiCallArgs, modelSupportsTools } from './mcp-client.js';
 
 const DEFAULT_BASE_URL = 'http://127.0.0.1:11434/v1';
 const DEFAULT_MODEL = 'qwen3:4b';
+
+// Max call→execute→continue turns in the MCP tool loop (env OLLAMA_MAX_TOOL_TURNS).
+// Bounds a weak model that can otherwise loop call→call→call forever.
+const MAX_TOOL_TURNS = Number(process.env.OLLAMA_MAX_TOOL_TURNS ?? 8);
 
 // How long to wait for any single Ollama generation (default 10 min).
 // Local models can be slow; this prevents a hung request from blocking the
@@ -95,6 +100,16 @@ export class OllamaHarness implements AgentHarness {
     console.log(`[Ollama] Model: ${model}`);
 
     this.abortController = new AbortController();
+
+    // MCP tool-calling: when servers are attached AND this model supports tools,
+    // run the agentic call→execute→continue loop instead of the plain-text path.
+    const servers = options.mcpServers;
+    if (servers && servers.length) {
+      let toolsOk = false;
+      try { toolsOk = await modelSupportsTools(model, baseUrl); } catch { toolsOk = false; }
+      if (toolsOk) { yield* this.runWithTools(prompt, options, servers, baseUrl, model); return; }
+      console.log(`[Ollama] ${servers.length} MCP server(s) attached, but model "${model}" lacks tool support — plain-text path`);
+    }
 
     // Build system prompt from workingDirectory context if available
     const systemParts: string[] = [];
@@ -242,6 +257,120 @@ export class OllamaHarness implements AgentHarness {
     }
 
     this.abortController = null;
+  }
+
+  /**
+   * MCP tool-calling loop (non-streaming v1). Connects the attached MCP servers,
+   * exposes their tools to the model, and runs call→execute→feed-back until the
+   * model answers without a tool call (or MAX_TOOL_TURNS). One concurrency slot is
+   * held for the WHOLE loop; token usage is summed across turns; the hub is closed
+   * in `finally` so child MCP processes never leak on cancel/timeout.
+   */
+  private async *runWithTools(
+    prompt: string,
+    options: HarnessOptions,
+    servers: McpServerSpec[],
+    baseUrl: string,
+    model: string,
+  ): AsyncGenerator<HarnessMessage> {
+    const url = `${baseUrl}/chat/completions`;
+    const headers = { 'Content-Type': 'application/json' };
+    const newSignal = () => AbortSignal.any([this.abortController!.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]);
+
+    yield { type: 'system', subtype: 'init', session_id: undefined };
+
+    const queuePos = _queue.length;
+    if (queuePos > 0) console.log(`[Ollama] Queued — waiting for slot (${queuePos} ahead, model: ${model})`);
+    await acquireSlot();
+
+    let hub: McpToolHub | null = null;
+    let totalIn = 0;
+    let totalOut = 0;
+    const t0 = Date.now();
+
+    try {
+      hub = await McpToolHub.connect(servers);
+      let tools = mcpToOpenAiTools(hub.listTools());
+      if (options.allowedTools && options.allowedTools.length) {
+        const allow = new Set(options.allowedTools);
+        // Scope: allow by exposed (namespaced) name OR the underlying bare tool name.
+        tools = tools.filter((t) => allow.has(t.function.name) || allow.has(t.function.name.split('__').pop() || ''));
+      }
+      console.log(`[Ollama] Attached ${servers.length} MCP server(s); ${tools.length} tool(s) exposed`);
+
+      const messages: Array<Record<string, unknown>> = [
+        {
+          role: 'system',
+          content:
+            'You can call the provided tools to gather information needed to answer. ' +
+            'Call a tool only when it actually helps; once you have enough to answer, reply in plain text. ' +
+            'Never fabricate tool output — use the values the tools return.' +
+            (options.workingDirectory ? `\nWorking directory: ${options.workingDirectory}` : ''),
+        },
+        { role: 'user', content: prompt },
+      ];
+
+      let finalText = '';
+      let plainFallback = false;
+
+      for (let turn = 0; turn < MAX_TOOL_TURNS; turn++) {
+        const reqBody: Record<string, unknown> = { model, messages, stream: false, temperature: 0.2, max_tokens: MAX_TOKENS };
+        if (tools.length && !plainFallback) reqBody.tools = tools;
+
+        const resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify(reqBody), signal: newSignal() });
+        if (!resp.ok) {
+          const errText = await resp.text().catch(() => `HTTP ${resp.status}`);
+          // A tools-related 4xx on the first turn → retry once WITHOUT tools, so
+          // MCP can never hard-fail the agent (capability detection can be wrong).
+          if (turn === 0 && !plainFallback && tools.length && resp.status >= 400 && resp.status < 500) {
+            console.warn(`[Ollama] tools rejected by model (${resp.status}); falling back to plain text`);
+            plainFallback = true;
+            continue;
+          }
+          yield { type: 'error', content: `Ollama request failed: ${errText}` };
+          return;
+        }
+
+        const j = (await resp.json()) as {
+          usage?: { prompt_tokens?: number; completion_tokens?: number };
+          choices?: Array<{ message?: { content?: string; tool_calls?: Array<{ id?: string; function: { name: string; arguments: string } }> } }>;
+        };
+        if (j.usage) { totalIn += j.usage.prompt_tokens || 0; totalOut += j.usage.completion_tokens || 0; }
+        const msg = j.choices?.[0]?.message || {};
+        const calls = msg.tool_calls || [];
+        if (typeof msg.content === 'string' && msg.content) finalText = msg.content;
+
+        // Record the assistant turn (incl. tool_calls) so the model keeps context.
+        messages.push({ role: 'assistant', content: msg.content || '', ...(calls.length ? { tool_calls: calls } : {}) });
+
+        if (!calls.length) break; // the model produced a final answer
+
+        for (const call of calls) {
+          const exposed = call.function?.name || '';
+          yield { type: 'tool_use', tool_name: exposed, content: call.function?.arguments || '' };
+          console.log(`[Ollama] tool_call: ${exposed}`);
+          const out = await hub.callTool(exposed, parseOpenAiCallArgs(call));
+          console.log(`[Ollama] tool result: ${out.text.length} chars${out.isError ? ' (error)' : ''}`);
+          messages.push({ role: 'tool', tool_call_id: call.id || exposed, content: out.text });
+        }
+
+        if (turn === MAX_TOOL_TURNS - 1) console.warn(`[Ollama] hit MAX_TOOL_TURNS (${MAX_TOOL_TURNS}); returning best-effort answer`);
+      }
+
+      reportOllamaUsage({ model, input: totalIn || null, output: totalOut || null, genMs: Date.now() - t0 });
+      yield { type: 'result', result: finalText || '(the model stopped without a final answer)' };
+    } catch (err: unknown) {
+      const name = (err as Error).name;
+      if (name === 'AbortError' || name === 'TimeoutError') {
+        yield { type: 'error', content: name === 'TimeoutError' ? `Ollama tool run timed out after ${REQUEST_TIMEOUT_MS / 1000}s` : 'Cancelled' };
+      } else {
+        yield { type: 'error', content: `Ollama tool-loop error: ${(err as Error).message || String(err)}` };
+      }
+    } finally {
+      if (hub) await hub.close().catch(() => { /* best-effort */ });
+      releaseSlot();
+      this.abortController = null;
+    }
   }
 
   cancel(): boolean {
