@@ -358,6 +358,44 @@ interface QueryWaiter {
   timeout: NodeJS.Timeout | null;
 }
 
+interface BrainVolunteerContext {
+  bundles: Array<{
+    query?: string;
+    entityIds?: string[];
+    factIds?: number[];
+    textUnitIds?: number[];
+    entities?: Array<{ id?: string; name?: string; type?: string }>;
+    facts?: Array<{ id?: number; entity_id?: string; field?: string; value?: unknown; source?: string }>;
+    textUnits?: Array<{ id?: number; title?: string; content?: string; source_kind?: string; source_id?: string }>;
+  }>;
+  cited?: {
+    entity_ids?: string[];
+    fact_ids?: number[];
+    text_unit_ids?: number[];
+    canonical_source_ids?: string[];
+    source_origins?: Record<string, string[]>;
+  };
+  timelineEventId?: number;
+  context_package_id?: number | null;
+  contextPackageId?: number | null;
+  task_id?: string | null;
+  instructions?: BrainInstruction[];
+}
+
+interface BrainInstruction {
+  source_id: string;
+  memory_id: number;
+  key: string;
+  content: string;
+  scope: {
+    project?: string;
+    task_id?: string;
+    session_id?: string;
+    user_id?: string;
+    turn_id?: string;
+  };
+}
+
 interface ProcessInspection {
   pid: number;
   ppid: number | null;
@@ -377,6 +415,7 @@ export class AgentManagerDb {
   private defaultConfig: DeployConfig['defaults'] | null = null;
   private schedulerService: SchedulerService | null = null;
   private queryWaiters: Map<string, QueryWaiter> = new Map(); // key: query_id
+  private queryBrainContext: Map<string, BrainVolunteerContext> = new Map(); // key: query_id
   // Long-poll waiters for GET /query/:id?wait=<seconds>. Wakes when a daemon-side
   // query write (news.in_reply_to completion, agent-stop cancel) transitions
   // the row. Sweeper-expired rows rely on the request's wait-timeout re-read.
@@ -829,6 +868,38 @@ export class AgentManagerDb {
       .getByQueryIdForTeam(teamId, queryId)
       .catch(() => null);
     if (completedRow && completedRow.status === 'completed') {
+      const brainContext = this.queryBrainContext.get(queryId) || null;
+      const usedSourceIds = Array.isArray((resultPayload as any).used_source_ids)
+        ? (resultPayload as any).used_source_ids.map(String)
+        : Array.isArray((resultPayload as any).usedSourceIds)
+          ? (resultPayload as any).usedSourceIds.map(String)
+          : [];
+      const taskId = typeof (resultPayload as any).task_id === 'string'
+        ? (resultPayload as any).task_id
+        : typeof (resultPayload as any).taskId === 'string'
+          ? (resultPayload as any).taskId
+          : typeof brainContext?.task_id === 'string'
+            ? brainContext.task_id
+            : null;
+      await this.postBrainInstructionFeedback({
+        taskId,
+        queryId,
+        agentId: completedRow.owner_kind === 'manager' ? null : completedRow.agent_id,
+        context: brainContext,
+        payload: resultPayload,
+      });
+      await this.postBrainEvalCapture({
+        queryText: completedRow.prompt || messagePreview || '',
+        route: 'manager.dispatch',
+        agentId: completedRow.owner_kind === 'manager' ? null : completedRow.agent_id,
+        taskId,
+        queryId,
+        context: brainContext,
+        usedSourceIds,
+        volunteeredSourceIds: brainContext?.cited?.canonical_source_ids || [],
+        injectedInstructionIds: (brainContext?.instructions || []).map((item) => item.source_id),
+        latencyMs: completedRow.created ? Math.max(0, occurredAt - Number(completedRow.created)) : null,
+      });
       await emitQueryDelivered(this.db.events, {
         teamId,
         queryId,
@@ -839,6 +910,7 @@ export class AgentManagerDb {
         occurredAt,
         messagePreview,
       });
+      this.queryBrainContext.delete(queryId);
     }
 
     this.wakeQueryWaiters(teamId, queryId, waiterReply);
