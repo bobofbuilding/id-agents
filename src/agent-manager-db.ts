@@ -4373,6 +4373,66 @@ export class AgentManagerDb {
       }
     });
 
+    // POST /agents/:id/team — reassign a local agent to a different team. Ports are
+    // global, so no re-port is needed: we move the agent's team_id (plus its
+    // team-scoped wallet/news/query rows, so deleting the now-empty old team can't
+    // CASCADE them away), then rebuild the process under the target team's ID_TEAM.
+    this.managementApp.post('/agents/:id/team', async (req, res) => {
+      const { id: teamId } = await this.getTeam(req);
+      const target = (req.body || {}).team;
+      if (!target || typeof target !== 'string') {
+        return res.status(400).json({ error: 'Missing team in request body' });
+      }
+      const agent = await this.dbQueryAgentById(teamId, req.params.id)
+        ?? await this.dbQueryAgentByNameMostRecent(teamId, req.params.id);
+      if (!agent) return res.status(404).json({ error: 'Agent not found' });
+      if (agent.type !== 'claude') {
+        return res.status(400).json({ error: 'Only local agents can be reassigned to another team' });
+      }
+      const targetTeam = await this.db.teams.getTeamByName(target);
+      if (!targetTeam) return res.status(404).json({ error: `Team "${target}" not found` });
+      if (targetTeam.id === agent.team_id) {
+        return res.status(400).json({ error: `Agent is already in team "${target}"` });
+      }
+      const collision = await this.db.agents.getByName(targetTeam.id, agent.name);
+      if (collision) {
+        return res.status(409).json({ error: `Team "${target}" already has an agent named "${agent.name}"` });
+      }
+      try {
+        const oldTeamId = agent.team_id;
+        // Essential: move the agent row.
+        await this.db.adapter.query(
+          'UPDATE agents SET team_id = $1 WHERE id = $2 AND team_id = $3',
+          [targetTeam.id, agent.id, oldTeamId],
+        );
+        // Move team-scoped child rows so a later delete of the (now-empty) old team
+        // can't CASCADE them. Best-effort: a missing table/rare PK clash on history
+        // must not abort a move that already updated the agent row.
+        const aux: Array<[string, unknown[]]> = [
+          ['UPDATE wallets SET team_id = $1 WHERE agent_id = $2', [targetTeam.id, agent.id]],
+          ['UPDATE news_items SET team_id = $1 WHERE agent_id = $2 AND team_id = $3', [targetTeam.id, agent.id, oldTeamId]],
+          ['UPDATE queries SET team_id = $1 WHERE agent_id = $2 AND team_id = $3', [targetTeam.id, agent.id, oldTeamId]],
+        ];
+        for (const [sql, params] of aux) {
+          try { await this.db.adapter.query(sql, params); }
+          catch (e: any) { console.warn(`[Manager] move ${agent.name}: aux update skipped (${e?.message || e})`); }
+        }
+        // Rebuild under the new team so its ID_TEAM env reflects the move.
+        const rebuilt = await this.rebuildLocalClaudeAgent(targetTeam.id, targetTeam.name, { ...agent, team_id: targetTeam.id });
+        console.log(`[Manager] Moved agent "${agent.name}" → team "${target}"${rebuilt.success ? ' (rebuilt)' : ' (REBUILD FAILED)'}`);
+        res.json({
+          ok: true,
+          agent: agent.name,
+          team: target,
+          rebuilt: rebuilt.success,
+          ...(rebuilt.success ? {} : { warning: `Moved, but rebuild failed: ${rebuilt.error || 'unknown'}. Rebuild the agent manually.` }),
+          message: `Moved "${agent.name}" to team "${target}"${rebuilt.success ? ' and rebuilt it.' : '.'}`,
+        });
+      } catch (e: any) {
+        res.status(500).json({ error: e?.message || String(e) });
+      }
+    });
+
     // POST /agents/:id/probe — ad-hoc heartbeat probe for remote-endpoint agents
     this.managementApp.post('/agents/:id/probe', async (req, res) => {
       try {
