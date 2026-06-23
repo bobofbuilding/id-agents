@@ -265,11 +265,14 @@ export class OllamaHarness implements AgentHarness {
   }
 
   /**
-   * MCP tool-calling loop (non-streaming v1). Connects the attached MCP servers,
-   * exposes their tools to the model, and runs call→execute→feed-back until the
-   * model answers without a tool call (or MAX_TOOL_TURNS). One concurrency slot is
-   * held for the WHOLE loop; token usage is summed across turns; the hub is closed
-   * in `finally` so child MCP processes never leak on cancel/timeout.
+   * MCP tool-calling loop. Connects the attached MCP servers, exposes their tools
+   * to the model, and runs call→execute→feed-back until the model answers without a
+   * tool call (or MAX_TOOL_TURNS). Each turn STREAMS: assistant text is yielded as
+   * message_delta progress events as it arrives, while tool_call deltas are
+   * assembled per index (name + a growing arguments JSON string) and parsed once the
+   * turn completes. One concurrency slot is held for the WHOLE loop; token usage is
+   * summed across turns; the hub is closed in `finally` so child MCP processes never
+   * leak on cancel/timeout.
    */
   private async *runWithTools(
     prompt: string,
@@ -324,7 +327,10 @@ export class OllamaHarness implements AgentHarness {
       let plainFallback = false;
 
       for (let turn = 0; turn < MAX_TOOL_TURNS; turn++) {
-        const reqBody: Record<string, unknown> = { model, messages, stream: false, temperature: 0.2, max_tokens: MAX_TOKENS };
+        const reqBody: Record<string, unknown> = {
+          model, messages, stream: true, temperature: 0.2, max_tokens: MAX_TOKENS,
+          stream_options: { include_usage: true },
+        };
         if (tools.length && !plainFallback) reqBody.tools = tools;
 
         const resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify(reqBody), signal: newSignal() });
@@ -340,27 +346,65 @@ export class OllamaHarness implements AgentHarness {
           yield { type: 'error', content: `Ollama request failed: ${errText}` };
           return;
         }
+        const reader = resp.body?.getReader();
+        if (!reader) { yield { type: 'error', content: 'No response body from Ollama' }; return; }
 
-        const j = (await resp.json()) as {
-          usage?: { prompt_tokens?: number; completion_tokens?: number };
-          choices?: Array<{ message?: { content?: string; tool_calls?: Array<{ id?: string; function: { name: string; arguments: string } }> } }>;
-        };
-        if (j.usage) { totalIn += j.usage.prompt_tokens || 0; totalOut += j.usage.completion_tokens || 0; }
-        const msg = j.choices?.[0]?.message || {};
-        const calls = msg.tool_calls || [];
+        // Stream the turn: yield assistant text deltas live; assemble tool_call
+        // deltas per index (.function.name + a growing .function.arguments string).
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let turnContent = '';
+        const partial = new Map<number, { id?: string; name: string; args: string }>();
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() ?? '';
+            for (const line of lines) {
+              const trimmed = line.trim();
+              if (!trimmed || trimmed === 'data: [DONE]') continue;
+              const data = trimmed.startsWith('data: ') ? trimmed.slice(6) : trimmed;
+              try {
+                const chunk = JSON.parse(data);
+                if (chunk.usage) { totalIn += chunk.usage.prompt_tokens || 0; totalOut += chunk.usage.completion_tokens || 0; }
+                const delta = chunk.choices?.[0]?.delta;
+                if (delta?.content) {
+                  turnContent += delta.content;
+                  yield { type: 'progress', subtype: 'message_delta', content: delta.content };
+                }
+                if (Array.isArray(delta?.tool_calls)) {
+                  for (const tc of delta.tool_calls) {
+                    const idx = typeof tc.index === 'number' ? tc.index : 0;
+                    let p = partial.get(idx);
+                    if (!p) { p = { id: tc.id, name: '', args: '' }; partial.set(idx, p); }
+                    if (tc.id) p.id = tc.id;
+                    if (tc.function?.name) p.name += tc.function.name;
+                    if (typeof tc.function?.arguments === 'string') p.args += tc.function.arguments;
+                  }
+                }
+              } catch { /* non-JSON keep-alive / partial line — skip */ }
+            }
+          }
+        } finally {
+          try { void reader.cancel(); } catch { /* already closed */ }
+        }
+
+        // Assemble the streamed tool calls (sorted by index → stable order).
+        const calls = [...partial.entries()].sort((a, b) => a[0] - b[0]).map(([, p]) => ({ id: p.id, function: { name: p.name, arguments: p.args } }));
         // Only a turn WITHOUT tool_calls is a real final answer — never let
-        // intermediate "let me check…" narration emitted alongside a tool_call
-        // become the returned result.
-        if (!calls.length && typeof msg.content === 'string' && msg.content) finalText = msg.content;
+        // intermediate "let me check…" narration alongside a tool_call become it.
+        if (!calls.length && turnContent) finalText = turnContent;
 
         // Record the assistant turn (incl. tool_calls) so the model keeps context.
-        messages.push({ role: 'assistant', content: msg.content || '', ...(calls.length ? { tool_calls: calls } : {}) });
+        messages.push({ role: 'assistant', content: turnContent, ...(calls.length ? { tool_calls: calls } : {}) });
 
         if (!calls.length) break; // the model produced a final answer
 
         for (const call of calls) {
-          const exposed = call.function?.name || '';
-          yield { type: 'tool_use', tool_name: exposed, content: call.function?.arguments || '' };
+          const exposed = call.function.name || '';
+          yield { type: 'tool_use', tool_name: exposed, content: call.function.arguments || '' };
           console.log(`[Ollama] tool_call: ${exposed}`);
           const out = await hub.callTool(exposed, parseOpenAiCallArgs(call), ac.signal);
           console.log(`[Ollama] tool result: ${out.text.length} chars${out.isError ? ' (error)' : ''}`);
