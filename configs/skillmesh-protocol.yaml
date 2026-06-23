@@ -9,8 +9,8 @@ team: skillmesh-protocol
 
 defaults:
   local: true
-  runtime: codex
-  model: gpt-5.3-codex
+  runtime: ollama
+  model: qwen3:4b
   skills:
     - identity
     - inter-agent

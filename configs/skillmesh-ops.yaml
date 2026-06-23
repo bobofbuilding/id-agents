@@ -43,8 +43,8 @@ agents:
       Marketplace health — listings, pricing, demand analysis, and inventory
       optimization. Monitors provider activity, flags stale listings, and
       surfaces actionable improvements.
-    runtime: codex
-    model: gpt-5.3-codex
+    runtime: ollama
+    model: qwen3:4b
     catalog:
       role: manager
       expertise:
@@ -73,8 +73,8 @@ agents:
       Skill quality assurance — test case execution, reliability scoring, and
       failure reporting. Runs skills against sample inputs and grades output
       against declared schemas.
-    runtime: codex
-    model: gpt-5.3-codex
+    runtime: ollama
+    model: qwen3:4b
     catalog:
       role: qa
       expertise:
@@ -88,8 +88,8 @@ agents:
     description: >
       Skill ratings, creator reputation, security monitoring, and anomaly
       detection. Assigns quality tiers and flags suspicious token activity.
-    runtime: codex
-    model: gpt-5.3-codex
+    runtime: ollama
+    model: qwen3:4b
     catalog:
       role: auditor
       expertise:

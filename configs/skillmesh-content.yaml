@@ -40,8 +40,8 @@ agents:
     description: >
       Classifies inbound content for safety, compliance, and quality. Returns
       verdict with category labels and confidence scores. Gates rewrite-assistant.
-    runtime: codex
-    model: gpt-5.3-codex
+    runtime: ollama
+    model: qwen3:4b
     catalog:
       role: skill-executor
       expertise:
