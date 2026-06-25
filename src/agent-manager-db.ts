@@ -27,6 +27,7 @@ import { defaultDeliverFn, redactSshTarget, type DeliverFn } from './lib/ssh-del
 import { probeRemoteAgent, defaultHealthProbeFn, type HealthProbeFn } from './lib/remote-heartbeat.js';
 import { filterClaudeEnvVars } from './lib/env-hygiene.js';
 import { LocalModelGate, isLocalModelRuntime } from './lib/local-model-gate.js';
+import { ccCapabilities } from './control-center/manifest.js';
 import { loadMasterKey, deriveKeyAtIndex } from './lib/skillmesh-key-manager.js';
 import { type Db } from './db/db-service.js';
 import type { AgentRow, ScheduleDefinitionRow, TaskRow } from './db/types.js';
@@ -2721,6 +2722,12 @@ export class AgentManagerDb {
       } catch (e: any) {
         return res.status(500).json({ error: e?.message || String(e) });
       }
+    });
+
+    // Control Center capability discovery: lets the GUI feature-detect which CC-only routes this
+    // manager supports (vs stock upstream) and degrade gracefully. See src/control-center/manifest.ts.
+    this.managementApp.get('/capabilities', (_req, res) => {
+      res.json(ccCapabilities());
     });
 
     this.managementApp.get('/usage', (req, res) => {
@@ -9426,6 +9433,15 @@ export class AgentManagerDb {
       const ownerName = ownerAgent?.name || t.owner;
       const teamRow = t.team_id ? await this.db.teams.getTeam(t.team_id).catch(() => null) : null;
       const teamName = teamRow?.name || 'default';
+      // Defer to the manager's native auto check-ins: if an active check-in is already supervising
+      // this task, let it be the single supervisor — don't double-poke. (CC refactor Phase 2: one
+      // supervisor, not three. The sweeper only backstops tasks no check-in is covering.)
+      if (teamRow) {
+        const active = await this.db.checkins
+          .list({ teamId: teamRow.id, linkedTaskId: t.id, status: ['active', 'snoozed'], limit: 1 })
+          .catch(() => [] as CheckinRow[]);
+        if (active.length) continue;
+      }
       const ref = t.uuid ? `#${t.uuid.replace(/-/g, '').slice(0, 8)}` : t.name;
       const mins = Math.round((now - updated) / 60000);
       const msg = `Supervision: task ${ref} ("${t.title}") has been in progress ${mins}m with no completion. If the work is done, mark it done now with \`/task done ${ref}\`. If you're blocked, reply briefly with what's blocking it. If it isn't started, start and finish it.`;
