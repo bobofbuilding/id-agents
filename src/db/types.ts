@@ -68,6 +68,7 @@ export interface QueryRow {
   session_id: string | null;
   owner_kind: InboxOwnerKind;
   owner_id: string;
+  metadata: Record<string, unknown> | null;
 }
 
 /** news_items table row */

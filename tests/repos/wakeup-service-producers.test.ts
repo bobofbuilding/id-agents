@@ -20,9 +20,11 @@ import { SqliteQueriesRepo } from '../../src/db/repos/sqlite/queries-repo.js';
 import {
   emitTaskClaimed,
   emitTaskCompleted,
+  emitQueryDelivered,
   emitQueryExpired,
   TASK_CLAIMED,
   TASK_COMPLETED,
+  QUERY_DELIVERED,
   QUERY_EXPIRED,
 } from '../../src/wakeup-service/event-producer.js';
 
@@ -118,6 +120,31 @@ describe('event-producer: tasks', () => {
     // No title_preview when title is null
     expect((rows[0].data as Record<string, unknown>).title_preview).toBeUndefined();
   });
+
+  it('emitTaskCompleted carries used and volunteered Brain source ids when provided', async () => {
+    const taskUuid = crypto.randomUUID();
+    const occurredAt = 1_777_000_001_500;
+
+    await emitTaskCompleted(events, {
+      teamId,
+      taskUuid,
+      taskName: 'brain-sources',
+      title: 'Brain sources',
+      ownerAgentId: 'agent-coder',
+      actorAgentId: 'agent-coder',
+      occurredAt,
+      usedSourceIds: ['src-1', 'src-2'],
+      volunteeredSourceIds: ['src-3'],
+    });
+
+    const rows = await events.query({ teamId, topics: [TASK_COMPLETED] });
+    expect(rows).toHaveLength(1);
+    expect(rows[0].data).toMatchObject({
+      task_name: 'brain-sources',
+      used_source_ids: ['src-1', 'src-2'],
+      volunteered_source_ids: ['src-3'],
+    });
+  });
 });
 
 describe('event-producer: query sweeper', () => {
@@ -183,5 +210,42 @@ describe('event-producer: query sweeper', () => {
     // Fresh query is unaffected
     const stillPending = await queries.getById(agentId, freshQueryId);
     expect(stillPending?.status).toBe('pending');
+  });
+
+  it('emitQueryDelivered carries task and Brain source metadata when provided', async () => {
+    const queryId = `query_delivered_${crypto.randomUUID()}`;
+    await queries.create(teamId, queryId, agentId, 'prompt', Date.now());
+
+    const occurredAt = 1_777_000_002_500;
+    await emitQueryDelivered(events, {
+      teamId,
+      queryId,
+      agentId,
+      occurredAt,
+      messagePreview: 'done',
+      taskId: 'task:123',
+      usedSourceIds: ['src-1'],
+      volunteeredSourceIds: ['src-2', 'src-3'],
+    });
+
+    const rows = await events.query({ teamId, topics: [QUERY_DELIVERED] });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      team_id: teamId,
+      topic: QUERY_DELIVERED,
+      subject_kind: 'query',
+      subject_id: queryId,
+      actor_agent_id: agentId,
+      occurred_at: occurredAt,
+      data: {
+        query_id: queryId,
+        status: 'delivered',
+        agent: agentId,
+        task_id: 'task:123',
+        used_source_ids: ['src-1'],
+        volunteered_source_ids: ['src-2', 'src-3'],
+        message_preview: 'done',
+      },
+    });
   });
 });

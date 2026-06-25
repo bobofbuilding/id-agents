@@ -169,6 +169,7 @@ describe('wallet opt-in manager integration', () => {
     const agent = await registerRemoteAgent('wallet-command-remote');
     const getOrCreate = vi.fn(() => ({ walletName: 'public-wallet-command-remote', address: '0x3333' }));
     (manager as any).getOrCreateAgentWallet = getOrCreate;
+    (manager as any).checkOwsInstalled = vi.fn(() => true);
 
     const remoteResp = await fetch(`${baseUrl}/remote`, {
       method: 'POST',

@@ -1,0 +1,38 @@
+{
+  "project": "id-agents",
+  "version": "1",
+  "brain_url": "http://127.0.0.1:4200",
+  "notes": "Plan 06 connector spec for id-agents.",
+  "feeds": [
+    {
+      "name": "agents",
+      "type": "event",
+      "source": "id-agents",
+      "event_stream": "http://127.0.0.1:4100/events?limit=50",
+      "script": "./brain-listener.mjs",
+      "managed_by": "io.bittrees.brain-listener",
+      "produces": [
+        "entities",
+        "graph/nodes"
+      ]
+    },
+    {
+      "name": "tasks",
+      "type": "poll",
+      "interval_seconds": 300,
+      "placeholder": true,
+      "produces": [
+        "timeline"
+      ]
+    },
+    {
+      "name": "queries",
+      "type": "poll",
+      "interval_seconds": 300,
+      "placeholder": true,
+      "produces": [
+        "timeline"
+      ]
+    }
+  ]
+}

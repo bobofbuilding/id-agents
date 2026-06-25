@@ -30,40 +30,128 @@ function bareKey(k: string): boolean {
 }
 
 /**
- * Turn attached MCP servers (Modules view → metadata.mcpServers, delivered via
- * ID_MCP_SERVERS) into `codex exec -c mcp_servers.*` config overrides. Codex
- * MERGES these onto ~/.codex/config.toml (so the user's OAuth auth in
- * ~/.codex/auth.json is preserved — we deliberately do NOT isolate CODEX_HOME),
- * making the servers' tools available to the model for this invocation.
+ * Render attached MCP servers (Modules view → metadata.mcpServers, delivered via
+ * ID_MCP_SERVERS) as a TOML `[mcp_servers.*]` block for codex's config.toml.
  *
- * Verified: codex 0.130 spawns the stdio server, lists its tools, and calls them.
- * Note: secret env values (e.g. tokens) end up in the codex process argv — for a
- * local single-user fleet the value is the operator's own; most attached servers
- * (filesystem/playwright/context7/…) carry no secret.
+ * SECURITY: this is written to a 0600 config FILE (see prepareCodexHome), never
+ * passed as `-c …env={…}` on the command line. A codex agent's argv is visible to
+ * any local `ps`, so putting a server's secret env (e.g. GITHUB_PERSONAL_ACCESS_TOKEN)
+ * there leaked the operator's tokens system-wide. Config-file delivery is verified
+ * on codex 0.130 (the spawned stdio server receives its env from the file).
  */
-function codexMcpConfigArgs(servers: McpServerSpec[] | undefined): string[] {
-  if (!servers?.length) return [];
-  const out: string[] = [];
+function renderMcpServersToml(servers: McpServerSpec[] | undefined): string {
+  if (!servers?.length) return '';
+  const blocks: string[] = [];
   for (const s of servers) {
     if (!s?.name) continue;
-    const base = `mcp_servers.${bareKey(s.name) ? s.name : tomlStr(s.name)}`;
+    const key = bareKey(s.name) ? s.name : tomlStr(s.name);
+    const lines: string[] = [`[mcp_servers.${key}]`];
     if (s.command) {
-      out.push('-c', `${base}.command=${tomlStr(s.command)}`);
-      if (s.args?.length) {
-        out.push('-c', `${base}.args=[${s.args.map(tomlStr).join(', ')}]`);
-      }
+      lines.push(`command = ${tomlStr(s.command)}`);
+      if (s.args?.length) lines.push(`args = [${s.args.map(tomlStr).join(', ')}]`);
       if (s.env && Object.keys(s.env).length) {
-        const env = Object.entries(s.env)
-          .map(([k, v]) => `${bareKey(k) ? k : tomlStr(k)} = ${tomlStr(String(v))}`)
-          .join(', ');
-        out.push('-c', `${base}.env={ ${env} }`);
+        lines.push(`[mcp_servers.${key}.env]`);
+        for (const [k, v] of Object.entries(s.env)) {
+          lines.push(`${bareKey(k) ? k : tomlStr(k)} = ${tomlStr(String(v))}`);
+        }
       }
     } else if (s.url) {
-      // Remote (http/sse) MCP server.
-      out.push('-c', `${base}.url=${tomlStr(s.url)}`);
+      lines.push(`url = ${tomlStr(s.url)}`); // remote (http/sse) MCP server
+    } else {
+      continue;
+    }
+    blocks.push(lines.join('\n'));
+  }
+  return blocks.join('\n\n');
+}
+
+/**
+ * Build a per-agent CODEX_HOME so attached MCP servers can be configured via a
+ * PRIVATE config.toml (0600) instead of the command line. Auth and sessions are
+ * SHARED with the operator's real ~/.codex via symlinks, so ChatGPT OAuth login
+ * and `codex exec resume <id>` keep working exactly as before — only config.toml
+ * is per-agent (and is the sole place secret MCP env lives).
+ *
+ * Returns the home dir path, or undefined if it can't be prepared (caller then
+ * falls back to the default home with no MCP servers — never to argv secrets).
+ */
+function prepareCodexHome(servers: McpServerSpec[], agentKey: string): string | undefined {
+  try {
+    const realHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+    const safeKey = (agentKey || 'agent').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 120);
+    const home = path.join(os.homedir(), '.codex-idagents', safeKey);
+    fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+    try { fs.chmodSync(home, 0o700); } catch { /* best effort */ }
+
+    // Mirror every real-home entry EXCEPT config.toml as a symlink → auth.json,
+    // sessions/, caches, skills/, memories/ are all shared with the real codex.
+    let entries: string[] = [];
+    try { entries = fs.readdirSync(realHome); } catch { /* real home not created yet */ }
+    for (const name of entries) {
+      if (name === 'config.toml') continue;
+      const link = path.join(home, name);
+      const target = path.join(realHome, name);
+      try {
+        const st = fs.lstatSync(link);
+        if (st.isSymbolicLink()) {
+          if (fs.readlinkSync(link) === target) continue; // already correct
+          fs.rmSync(link, { force: true });
+        } else {
+          // codex wrote a real file over our symlink (e.g. an OAuth token refresh
+          // of auth.json). Push it back to the shared home, then restore the link
+          // so every agent keeps using one auth source.
+          if (name === 'auth.json') { try { fs.copyFileSync(link, target); } catch { /* best effort */ } }
+          fs.rmSync(link, { recursive: true, force: true });
+        }
+      } catch { /* link absent — create below */ }
+      try { fs.symlinkSync(target, link); } catch { /* ignore individual link failures */ }
+    }
+
+    // Private config = operator's config.toml (trust levels, plugins, …) + the
+    // MCP server tables. 0600 so only this user can read the secret env.
+    let base = '';
+    try { base = fs.readFileSync(path.join(realHome, 'config.toml'), 'utf8'); } catch { /* none yet */ }
+    const mcp = renderMcpServersToml(servers);
+    const cfgPath = path.join(home, 'config.toml');
+    fs.writeFileSync(cfgPath, `${base.trimEnd()}\n\n${mcp}\n`, { mode: 0o600 });
+    try { fs.chmodSync(cfgPath, 0o600); } catch { /* best effort */ }
+    return home;
+  } catch (e) {
+    console.error(`[Codex] prepareCodexHome failed (${(e as Error).message}) — running without attached MCP servers rather than risk leaking secrets on argv`);
+    return undefined;
+  }
+}
+
+// Fail-closed safeguard: a codex agent's argv is world-readable via `ps`, so a
+// credential must NEVER appear there. If a secret-shaped token is found in the
+// args we refuse to spawn (a regression should surface loudly, not leak silently).
+// MCP secrets travel via the 0600 config file (prepareCodexHome); these patterns
+// are specific enough that a normal command line won't trip them.
+const SECRET_ARGV_PATTERNS: RegExp[] = [
+  /gh[pousr]_[A-Za-z0-9]{20,}/,            // GitHub PAT / OAuth / refresh tokens
+  /github_pat_[A-Za-z0-9_]{20,}/,          // GitHub fine-grained PAT
+  /sk-(ant-)?[A-Za-z0-9_-]{20,}/,          // OpenAI / Anthropic API keys
+  /AKIA[0-9A-Z]{16}/,                      // AWS access key id
+  /xox[baprs]-[A-Za-z0-9-]{10,}/,          // Slack tokens
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,    // PEM private keys
+];
+function assertNoSecretsInArgv(args: string[]): void {
+  const joined = args.join(' ');
+  for (const re of SECRET_ARGV_PATTERNS) {
+    if (re.test(joined)) {
+      throw new Error('refusing to spawn codex: a credential-shaped value was found on the command line — MCP secrets must be passed via the isolated config file, not argv');
     }
   }
-  return out;
+}
+/** Redact secret-shaped substrings before logging a command line. */
+function redactForLog(s: string): string {
+  return s
+    .replace(/\b(gh[pousr]_[A-Za-z0-9]{4})[A-Za-z0-9]{16,}/g, '$1…')
+    .replace(/\b(github_pat_[A-Za-z0-9]{4})[A-Za-z0-9_]{16,}/g, '$1…')
+    .replace(/\b(sk-(?:ant-)?[A-Za-z0-9]{4})[A-Za-z0-9_-]{16,}/g, '$1…')
+    .replace(/\bAKIA[0-9A-Z]{16}\b/g, 'AKIA…')
+    .replace(/\b(xox[baprs]-[A-Za-z0-9]{4})[A-Za-z0-9-]{6,}/g, '$1…')
+    .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----/g, '-----BEGIN PRIVATE KEY (redacted)-----');
 }
 
 export class CodexHarness implements AgentHarness {
@@ -79,17 +167,27 @@ export class CodexHarness implements AgentHarness {
     console.log(`[Codex] Working directory: ${workingDir}`);
     if (options.model) console.log(`[Codex] Model: ${options.model}`);
 
-    // Build arguments for codex exec. For this Codex CLI version, flags must
-    // come before the `resume` subcommand.
-    const args: string[] = ['exec'];
+    const skipPermissions = process.env.ID_AGENT_SKIP_PERMISSIONS !== 'false';
+    // A prior thread id (from a previous turn of THIS conversation) → resume it so
+    // context carries over. `codex exec resume <id>` is verified on codex-cli 0.130;
+    // it needs an explicit -m model (it otherwise defaults to a stale model and 400s)
+    // and does NOT accept --cd / --full-auto, so we rely on the spawn cwd and, for the
+    // non-bypass case, the resumed session's own recorded sandbox policy.
+    const resumeId = options.resume && options.resume.trim() ? options.resume.trim() : undefined;
 
-    // Working directory
-    args.push('--cd', workingDir);
+    // Build arguments for codex exec.
+    const args: string[] = ['exec'];
+    if (resumeId) {
+      args.push('resume', resumeId);
+    } else {
+      // Working directory (only on a fresh exec; the resume subcommand has no --cd).
+      args.push('--cd', workingDir);
+    }
 
     // JSON output for parsing
     args.push('--json');
 
-    // Model override
+    // Model override — REQUIRED on resume (see above); harmless on fresh exec.
     if (options.model) {
       args.push('--model', options.model);
     }
@@ -98,23 +196,27 @@ export class CodexHarness implements AgentHarness {
     // agents can act without an interactive shell. The agent's
     // `dangerouslySkipPermissions: false` config opts back into --full-auto
     // (which keeps the workspace-write sandbox and on-request approval policy).
-    const skipPermissions = process.env.ID_AGENT_SKIP_PERMISSIONS !== 'false';
     if (skipPermissions) {
       args.push('--dangerously-bypass-approvals-and-sandbox');
-    } else {
+    } else if (!resumeId) {
       args.push('--full-auto');
     }
-    console.log(`[Codex] Permission mode: ${skipPermissions ? '--dangerously-bypass-approvals-and-sandbox (default)' : '--full-auto (config opt-out)'}`);
+    console.log(`[Codex] Permission mode: ${skipPermissions ? '--dangerously-bypass-approvals-and-sandbox (default)' : (resumeId ? 'resumed session policy (resume has no --full-auto)' : '--full-auto (config opt-out)')}`);
 
     // Skip git repo check in case working dir isn't a git repo
     args.push('--skip-git-repo-check');
 
-    // Attach external MCP servers (Modules view) as -c config overrides so codex
-    // can call their tools. Merged onto ~/.codex/config.toml; auth is preserved.
-    const mcpArgs = codexMcpConfigArgs(options.mcpServers);
-    if (mcpArgs.length > 0) {
-      args.push(...mcpArgs);
-      console.log(`[Codex] Attached ${options.mcpServers!.length} MCP server(s) via -c overrides`);
+    // Attach external MCP servers (Modules view) via a PRIVATE, per-agent config
+    // file — NOT `-c …env={…}` on argv (which is world-readable via `ps` and leaked
+    // the operator's tokens). prepareCodexHome shares auth + sessions with the real
+    // ~/.codex so OAuth and resume are unaffected; only config.toml is per-agent.
+    let codexHome: string | undefined;
+    if (options.mcpServers?.length) {
+      const agentKey = `${process.env.ID_AGENT_TEAM || 'default'}__${process.env.ID_AGENT_NAME || path.basename(workingDir)}`;
+      codexHome = prepareCodexHome(options.mcpServers, agentKey);
+      if (codexHome) {
+        console.log(`[Codex] Attached ${options.mcpServers.length} MCP server(s) via private config (CODEX_HOME=${codexHome})`);
+      }
     }
 
     // Write prompt to temp file to avoid shell escaping issues
@@ -122,21 +224,23 @@ export class CodexHarness implements AgentHarness {
     fs.writeFileSync(promptFile, prompt);
     console.log(`[Codex] Prompt written to temp file: ${promptFile} (${prompt.length} chars)`);
 
-    // The installed Codex CLI does not support `resume` combined with the
-    // non-interactive flags we need here. Run each query as a fresh exec.
-    if (options.resume) {
-      console.log(`[Codex] Ignoring resume session for compatibility: ${options.resume}`);
+    if (resumeId) {
+      console.log(`[Codex] Resuming thread ${resumeId} for conversation continuity`);
     }
 
     // Read prompt from stdin
     args.push('-');
 
-    console.log(`[Codex] Full command: codex ${args.join(' ')}`);
+    // Fail-closed: never spawn with a credential on the command line.
+    assertNoSecretsInArgv(args);
+    console.log(`[Codex] Full command: codex ${redactForLog(args.join(' '))}`);
 
     this.cancelled = false;
 
     // Issue 4: Merge options.env WITH process.env instead of replacing
     const mergedEnv = { ...process.env, ...(options.env || {}) } as NodeJS.ProcessEnv;
+    // Point codex at the per-agent home (private config.toml with the MCP servers).
+    if (codexHome) mergedEnv.CODEX_HOME = codexHome;
 
     const proc = spawn('codex', args, {
       cwd: workingDir,

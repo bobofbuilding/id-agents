@@ -56,6 +56,17 @@ export interface SchedulePayload {
   };
   message: string;
   linkedTasks?: LinkedTaskSummary[];
+  brain_context?: {
+    cited?: {
+      entity_ids?: string[];
+      fact_ids?: number[];
+      text_unit_ids?: number[];
+      canonical_source_ids?: string[];
+      source_origins?: Record<string, string[]>;
+    };
+    timelineEventId?: number;
+    bundles?: unknown[];
+  };
 }
 
 /**

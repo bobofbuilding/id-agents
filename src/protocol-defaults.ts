@@ -55,6 +55,12 @@ the full guidance.
 3. **Work**: Do the work. Write artifacts to \`./output/\`.
 4. **Done**: \`POST $MANAGER_URL/tasks/<name>/done\` with \`{ agent_id: "<your-name>" }\`
    Status flips to \`done\`.
+   If the claim response included \`brain_context\`, include \`used_source_ids\` with any
+   Brain source IDs you relied on.
+   If \`brain_context.instructions\` was present, include \`used_instruction_ids\`,
+   \`ignored_instruction_ids\`, or \`harmful_instruction_ids\` with the relevant
+   \`memory:<id>\` instruction IDs; include \`injected_instruction_ids\` when reporting
+   ignored instructions so Brain can distinguish "not seen" from "not useful".
 5. **Reply**: Include the task name in your response, e.g.
    \`Done. Task: implement-x. Output: ./output/report.md\`
 

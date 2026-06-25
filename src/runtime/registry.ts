@@ -78,14 +78,17 @@ const PROFILES: Record<RuntimeId, RuntimeProfile> = {
     displayName: 'Codex',
     providerName: 'Codex CLI',
     defaultModel: '',  // let Codex CLI pick model based on account; override per-agent in YAML
-    sessionPolicy: 'fresh-per-query',
+    // `codex exec resume <thread_id>` restores prior conversation context (verified
+    // on codex-cli 0.130 — needs an explicit -m model). The harness resumes when a
+    // per-conversation thread id is provided, so chats stay isolated.
+    sessionPolicy: 'resume-by-id',
     deploymentShape: 'local-process',
     auth: {
       mode: 'cli-login',
       provider: 'OpenAI',
     },
     capabilities: {
-      supportsResume: false,
+      supportsResume: true,
       supportsPlugins: true,
       supportsAllowedTools: true,
     },

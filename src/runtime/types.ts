@@ -11,7 +11,7 @@ import type { HarnessType } from '../harness/types.js';
 
 export type RuntimeId = HarnessType;
 
-export type RuntimeSessionPolicy = 'persistent' | 'fresh-per-query' | 'remote-owned';
+export type RuntimeSessionPolicy = 'persistent' | 'fresh-per-query' | 'resume-by-id' | 'remote-owned';
 
 export type DeploymentShape = 'local-process' | 'remote-endpoint';
 

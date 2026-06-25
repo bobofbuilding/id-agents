@@ -33,10 +33,18 @@ async function migrateQueriesTeamQueryPkSqlite(adapter: SqliteAdapter): Promise<
       session_id TEXT,
       owner_kind TEXT NOT NULL DEFAULT 'agent',
       owner_id TEXT NOT NULL DEFAULT '',
+      metadata TEXT,
       PRIMARY KEY (team_id, query_id)
     );
 
-    INSERT INTO queries SELECT * FROM queries_legacy_mgrfk;
+    INSERT INTO queries (
+      team_id, agent_id, query_id, status, prompt, created, completed, result,
+      error, session_id
+    )
+    SELECT
+      team_id, agent_id, query_id, status, prompt, created, completed, result,
+      error, session_id
+    FROM queries_legacy_mgrfk;
 
     DROP TABLE queries_legacy_mgrfk;
   `);
@@ -265,6 +273,7 @@ export async function migrateSqlite(adapter: SqliteAdapter): Promise<void> {
       session_id TEXT,
       owner_kind TEXT NOT NULL DEFAULT 'agent',
       owner_id TEXT NOT NULL DEFAULT '',
+      metadata TEXT,
       PRIMARY KEY (team_id, query_id)
     );
 
@@ -466,6 +475,11 @@ export async function migrateSqlite(adapter: SqliteAdapter): Promise<void> {
   }
   try {
     adapter.exec(`ALTER TABLE queries ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''`);
+  } catch {
+    // Column already exists in upgraded databases.
+  }
+  try {
+    adapter.exec(`ALTER TABLE queries ADD COLUMN metadata TEXT`);
   } catch {
     // Column already exists in upgraded databases.
   }

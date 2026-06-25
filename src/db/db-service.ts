@@ -238,6 +238,7 @@ export interface QueriesRepository {
     sessionId?: string,
     /** Required when `agentId` is null; otherwise derived from non-null `agent_id`. */
     ownership?: { owner_kind: InboxOwnerKind; owner_id: string },
+    metadata?: Record<string, unknown> | null,
   ): Promise<void>;
 
   /** Look up a single query by agent_id and query_id. */

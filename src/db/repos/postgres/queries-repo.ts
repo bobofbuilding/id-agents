@@ -24,7 +24,7 @@ export class PgQueriesRepo implements QueriesRepository {
 
   async getById(agentId: string, queryId: string): Promise<QueryRow | null> {
     const { rows } = await this.db.query<QueryRow>(
-      `SELECT team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id
+      `SELECT team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id, metadata
        FROM queries
        WHERE agent_id = $1 AND query_id = $2`,
       [agentId, queryId],
@@ -34,7 +34,7 @@ export class PgQueriesRepo implements QueriesRepository {
 
   async getByQueryIdForTeam(teamId: string, queryId: string): Promise<QueryRow | null> {
     const { rows } = await this.db.query<QueryRow>(
-      `SELECT team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id
+      `SELECT team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id, metadata
        FROM queries
        WHERE team_id = $1 AND query_id = $2
        LIMIT 1`,
@@ -50,7 +50,7 @@ export class PgQueriesRepo implements QueriesRepository {
       `UPDATE queries
        SET status = 'expired', completed = $1
        WHERE status IN (${placeholders}) AND created < $2
-       RETURNING team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id`,
+       RETURNING team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id, metadata`,
       [Date.now(), cutoffCreated, ...statuses],
     );
     return rows;
@@ -64,13 +64,14 @@ export class PgQueriesRepo implements QueriesRepository {
     created: number,
     sessionId?: string,
     ownership?: { owner_kind: InboxOwnerKind; owner_id: string },
+    metadata?: Record<string, unknown> | null,
   ): Promise<void> {
     const own = resolveQueryOwnership(teamId, agentId, ownership);
     await this.db.query(
-      `INSERT INTO queries (team_id, query_id, agent_id, prompt, status, created, session_id, owner_kind, owner_id)
-       VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8)
+      `INSERT INTO queries (team_id, query_id, agent_id, prompt, status, created, session_id, owner_kind, owner_id, metadata)
+       VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8, $9)
        ON CONFLICT (team_id, query_id) DO NOTHING`,
-      [teamId, queryId, agentId, prompt, created, sessionId || null, own.owner_kind, own.owner_id],
+      [teamId, queryId, agentId, prompt, created, sessionId || null, own.owner_kind, own.owner_id, metadata || null],
     );
   }
 
@@ -84,8 +85,8 @@ export class PgQueriesRepo implements QueriesRepository {
         ? { owner_kind: query.owner_kind, owner_id: query.owner_id }
         : resolveQueryOwnership(teamId, agentId);
     await this.db.query(
-      `INSERT INTO queries (team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+      `INSERT INTO queries (team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id, metadata)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
        ON CONFLICT (team_id, query_id)
        DO UPDATE SET agent_id = EXCLUDED.agent_id,
                      status = EXCLUDED.status,
@@ -94,7 +95,8 @@ export class PgQueriesRepo implements QueriesRepository {
                      error = EXCLUDED.error,
                      session_id = EXCLUDED.session_id,
                      owner_kind = EXCLUDED.owner_kind,
-                     owner_id = EXCLUDED.owner_id`,
+                     owner_id = EXCLUDED.owner_id,
+                     metadata = EXCLUDED.metadata`,
       [
         teamId,
         agentId,
@@ -108,6 +110,7 @@ export class PgQueriesRepo implements QueriesRepository {
         query.session_id || null,
         own.owner_kind,
         own.owner_id,
+        query.metadata || null,
       ],
     );
   }
@@ -149,7 +152,7 @@ export class PgQueriesRepo implements QueriesRepository {
 
   async getPending(agentId: string): Promise<QueryRow[]> {
     const { rows } = await this.db.query<QueryRow>(
-      `SELECT team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id
+      `SELECT team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id, metadata
        FROM queries
        WHERE agent_id = $1 AND status IN ('pending', 'processing')
        ORDER BY created ASC`,
@@ -160,7 +163,7 @@ export class PgQueriesRepo implements QueriesRepository {
 
   async getPendingByOwner(teamId: string, ownerKind: InboxOwnerKind, ownerId: string): Promise<QueryRow[]> {
     const { rows } = await this.db.query<QueryRow>(
-      `SELECT team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id
+      `SELECT team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id, metadata
        FROM queries
        WHERE team_id = $1 AND owner_kind = $2 AND owner_id = $3 AND status IN ('pending', 'processing')
        ORDER BY created ASC`,

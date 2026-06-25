@@ -13,9 +13,9 @@ import {
   unsyncWorkspaceFromConfig,
 } from '../../src/cli/workspace-sync.js';
 
-const FIXTURE_CONFIG = '/Users/nxt3d/projects/id2/public-agents/configs/foundry-demo.yaml';
-const FIXTURE_LIBRARY_ROOT = '/Users/nxt3d/projects/id2/public-agents/configs';
-const FIXTURE_AGENT_ROOT = '/Users/nxt3d/projects/id2/public-agents/configs/agents/foundry-dev';
+const FIXTURE_CONFIG = path.join(process.cwd(), 'configs', 'demos', 'foundry-demo.yaml');
+const FIXTURE_LIBRARY_ROOT = path.join(process.cwd(), 'configs');
+const FIXTURE_AGENT_ROOT = path.join(FIXTURE_LIBRARY_ROOT, 'agents', 'foundry-dev');
 
 function mkTmp(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'id-agents-workspace-sync-'));

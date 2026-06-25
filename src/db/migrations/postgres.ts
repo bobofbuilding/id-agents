@@ -270,12 +270,14 @@ export async function migratePostgres(adapter: DbAdapter): Promise<void> {
       session_id text,
       owner_kind text NOT NULL DEFAULT 'agent',
       owner_id text NOT NULL DEFAULT '',
+      metadata jsonb,
       PRIMARY KEY (team_id, query_id)
     );
   `);
 
   await adapter.query(`ALTER TABLE queries ADD COLUMN IF NOT EXISTS owner_kind text NOT NULL DEFAULT 'agent';`);
   await adapter.query(`ALTER TABLE queries ADD COLUMN IF NOT EXISTS owner_id text NOT NULL DEFAULT '';`);
+  await adapter.query(`ALTER TABLE queries ADD COLUMN IF NOT EXISTS metadata jsonb;`);
   await adapter.query(`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS owner_kind text NOT NULL DEFAULT 'agent';`);
   await adapter.query(`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS owner_id text NOT NULL DEFAULT '';`);
 

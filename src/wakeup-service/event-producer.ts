@@ -45,6 +45,8 @@ export interface TaskCompletedInput {
   ownerAgentId: string | null;
   actorAgentId: string | null;
   occurredAt: number;
+  usedSourceIds?: string[];
+  volunteeredSourceIds?: string[];
 }
 
 export interface QueryDeliveredInput {
@@ -53,6 +55,9 @@ export interface QueryDeliveredInput {
   agentId: string | null;
   occurredAt: number;
   messagePreview?: string | null;
+  taskId?: string | null;
+  usedSourceIds?: string[];
+  volunteeredSourceIds?: string[];
 }
 
 export interface QueryFailedInput {
@@ -108,6 +113,8 @@ export async function emitTaskCompleted(
       status: 'done',
       owner: input.ownerAgentId,
       completed_at: input.occurredAt,
+      ...(input.usedSourceIds?.length ? { used_source_ids: input.usedSourceIds } : {}),
+      ...(input.volunteeredSourceIds?.length ? { volunteered_source_ids: input.volunteeredSourceIds } : {}),
       ...(input.title ? { title_preview: truncate(input.title) } : {}),
     },
   });
@@ -129,6 +136,9 @@ export async function emitQueryDelivered(
       status: 'delivered',
       agent: input.agentId,
       completed_at: input.occurredAt,
+      ...(input.taskId ? { task_id: input.taskId } : {}),
+      ...(input.usedSourceIds?.length ? { used_source_ids: input.usedSourceIds } : {}),
+      ...(input.volunteeredSourceIds?.length ? { volunteered_source_ids: input.volunteeredSourceIds } : {}),
       ...(input.messagePreview
         ? { message_preview: truncate(input.messagePreview) }
         : {}),

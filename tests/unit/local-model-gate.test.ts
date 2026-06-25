@@ -4,7 +4,7 @@ import { LocalModelGate, isLocalModelRuntime } from '../../src/lib/local-model-g
 describe('isLocalModelRuntime', () => {
   it('serializes only local model runtimes', () => {
     expect(isLocalModelRuntime('ollama')).toBe(true);
-    expect(isLocalModelRuntime('claude-code-local')).toBe(true);
+    expect(isLocalModelRuntime('claude-code-local')).toBe(false);
     expect(isLocalModelRuntime('claude-code-cli')).toBe(false);
     expect(isLocalModelRuntime('codex')).toBe(false);
     expect(isLocalModelRuntime('cursor-cli')).toBe(false);

@@ -152,7 +152,15 @@ export class AgentRestServer {
   private app: express.Application;
   private newsItems: NewsItem[] = [];
   private activeQueries: Map<string, ActiveQuery> = new Map();
-  private lastSessionId?: string;  // Persisted session ID for conversation continuity
+  // Conversation continuity is keyed by the CALLER's conversation id (e.g. one per
+  // desktop chat), not a single global pointer — otherwise a message from chat B
+  // would resume chat A's runtime session (cross-chat context creep). Callers that
+  // send no session id share the DEFAULT bucket, preserving the old rolling-context
+  // behavior for heartbeats / scheduled tasks / agent-to-agent talk.
+  private sessionByConversation: Map<string, string> = new Map(); // conversationKey -> runtime sessionId
+  private mintedSessionIds: Set<string> = new Set();              // runtime sessionIds this agent has produced
+  private static readonly DEFAULT_CONVERSATION = '__default__';
+  private static readonly MAX_CONVERSATIONS = 500;                // bound memory for long-lived agents
   private pendingReplyWaiters: Map<string, ReplyWaiter> = new Map(); // queryId -> waiter
   private model: string;
 
@@ -686,13 +694,14 @@ export class AgentRestServer {
 
     // Clear session endpoint - clears conversation context to recover from content filter errors
     this.app.post('/clear', (req, res) => {
-      const oldSession = this.lastSessionId;
-      this.lastSessionId = undefined;
-      console.log(`${logTime()} [Agent] 🔄 Session cleared${oldSession ? ' (was: ' + oldSession.slice(0, 20) + '...)' : ''}`);
+      const had = this.sessionByConversation.size;
+      this.sessionByConversation.clear();
+      this.mintedSessionIds.clear();
+      console.log(`${logTime()} [Agent] 🔄 Sessions cleared (${had} conversation${had === 1 ? '' : 's'})`);
       res.json({
         ok: true,
         message: 'Session cleared - next query will start fresh',
-        had_session: !!oldSession
+        had_session: had > 0
       });
     });
 
@@ -1689,12 +1698,21 @@ What would you like to do with this information?`;
     // Track whether we should send an auto-reply (default: yes if from is set)
     const shouldAutoReply = from && !options?.noAutoReply;
 
-    // Track session ID for continuity (declared outside try for catch block access)
-    // Use provided resume ID, or fall back to the agent's last session for continuity
+    // Track session ID for continuity (declared outside try for catch block access).
+    // The incoming `resume` is the caller's CONVERSATION key (e.g. a desktop chat id),
+    // NOT necessarily a runtime session id. We translate it to the runtime session id
+    // this agent last minted for that conversation, so each chat resumes only its own
+    // thread. A caller that passes back a runtime id we actually minted resumes it
+    // directly (back-compat for agent-to-agent talk / inbox replies). No id ⇒ the
+    // shared default bucket (old rolling-context behavior for heartbeats etc.).
     const allowSessionResume = supportsSessionResume(this.harnessType);
-    let sessionId = allowSessionResume ? (resume || this.lastSessionId) : undefined;
-    if (sessionId && !resume) {
-      console.log(`${logTime()} [Agent] 🔄 Resuming previous session: ${sessionId.slice(0, 20)}...`);
+    const conversationKey = resume || AgentRestServer.DEFAULT_CONVERSATION;
+    const directRuntimeResume = resume && this.mintedSessionIds.has(resume) ? resume : undefined;
+    let sessionId = allowSessionResume
+      ? (directRuntimeResume || this.sessionByConversation.get(conversationKey))
+      : undefined;
+    if (sessionId) {
+      console.log(`${logTime()} [Agent] 🔄 Resuming session for conversation ${conversationKey.slice(0, 24)}: ${sessionId.slice(0, 20)}...`);
     }
 
     try {
@@ -1746,7 +1764,22 @@ ${prompt}`
         if (message.session_id) {
           sessionId = message.session_id;
           if (allowSessionResume) {
-            this.lastSessionId = sessionId;  // Persist for future queries
+            // Remember this runtime session under THIS conversation so the next
+            // turn of the same chat resumes it (and only it).
+            const prior = this.sessionByConversation.get(conversationKey);
+            if (prior && prior !== sessionId) this.mintedSessionIds.delete(prior); // superseded id
+            this.mintedSessionIds.add(sessionId);
+            this.sessionByConversation.set(conversationKey, sessionId);
+            if (this.sessionByConversation.size > AgentRestServer.MAX_CONVERSATIONS) {
+              // Evict the oldest conversation (Map preserves insertion order) and
+              // drop its runtime id from the Set so neither structure grows unbounded.
+              const oldest = this.sessionByConversation.keys().next().value;
+              if (oldest !== undefined && oldest !== conversationKey) {
+                const evicted = this.sessionByConversation.get(oldest);
+                this.sessionByConversation.delete(oldest);
+                if (evicted) this.mintedSessionIds.delete(evicted);
+              }
+            }
           }
         }
 
@@ -1884,11 +1917,13 @@ ${prompt}`
       // Check if this is an API-related error and show helpful message
       const apiHelp = getApiErrorHelp(query.error, this.harnessType);
 
-      // Clear session on content filter errors to allow recovery
-      // The corrupted context is likely causing the filter to trigger
+      // Clear session on content filter errors to allow recovery — but ONLY for the
+      // conversation that hit the filter, so other chats keep their context.
       if (isContentFilterError(query.error)) {
-        console.log(`${logTime()} [Agent] 🔄 Content filter error detected - clearing session to allow recovery`);
-        this.lastSessionId = undefined;
+        console.log(`${logTime()} [Agent] 🔄 Content filter error detected - clearing session for conversation ${conversationKey.slice(0, 24)} to allow recovery`);
+        const failedId = this.sessionByConversation.get(conversationKey);
+        this.sessionByConversation.delete(conversationKey);
+        if (failedId) this.mintedSessionIds.delete(failedId);
       }
 
       // Post to news with helpful message if API error

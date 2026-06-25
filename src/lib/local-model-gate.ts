@@ -34,6 +34,7 @@ export function isLocalModelRuntime(runtime?: string | null): boolean {
 
 export class LocalModelGate {
   private active = 0;
+  private concurrency: number;
   private readonly queue: Array<() => void> = [];
   private readonly holds = new Map<string, ReturnType<typeof setTimeout>>();
 
@@ -42,9 +43,24 @@ export class LocalModelGate {
    * @param maxHoldMs     auto-release safety net (default 16 min, > sweeper)
    */
   constructor(
-    private readonly concurrency = 1,
+    concurrency = 1,
     private readonly maxHoldMs = 16 * 60 * 1000,
-  ) {}
+  ) {
+    this.concurrency = Math.max(1, Math.floor(concurrency) || 1);
+  }
+
+  /** Current max concurrent local-model queries. */
+  getConcurrency(): number {
+    return this.concurrency;
+  }
+
+  /** Change the cap at runtime; raising it immediately admits queued waiters. */
+  setConcurrency(n: number): void {
+    this.concurrency = Math.max(1, Math.floor(n) || 1);
+    while (this.active < this.concurrency && this.queue.length > 0) {
+      this.queue.shift()!();
+    }
+  }
 
   /** Acquire a slot for `key`; resolves when one is free. Idempotent per key. */
   acquire(key: string): Promise<void> {

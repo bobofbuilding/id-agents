@@ -59,7 +59,7 @@ describe('runtime registry', () => {
     expect(usesCliLogin('claude-code-cli')).toBe(true);
     expect(usesCliLogin('claude-agent-sdk')).toBe(false);
 
-    expect(supportsSessionResume('codex')).toBe(false);
+    expect(supportsSessionResume('codex')).toBe(true);
     expect(supportsSessionResume('claude-code-cli')).toBe(true);
   });
 

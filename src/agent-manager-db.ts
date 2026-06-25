@@ -87,8 +87,7 @@ import type { CheckinRow } from './db/types.js';
 import { parseAgentRef, normalizeAlias, buildAmbiguityWarning, type AgentMatch } from './core/agent-identifier.js';
 import { resolveNewsTrigger } from './core/messaging-service.js';
 import type { HarnessType } from './harness/types.js';
-import { SchedulerService, synthesizeForceHeartbeat } from './scheduling/scheduler-service.js';
-import type { DispatchTarget } from './scheduling/schedule-types.js';
+import { SchedulerService } from './scheduling/scheduler-service.js';
 import { heartbeatToSchedule, calendarToSchedule, validateIntervalSeconds, HEARTBEAT_GENERIC_MESSAGE } from './scheduling/schedule-config.js';
 import {
   getAvailableRuntimes,
@@ -107,10 +106,16 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Model alias resolution (canonical source in core/model-aliases.ts;
-// re-exported here for back-compat with existing import sites).
-import { MODEL_ALIASES, resolveModelAlias } from './core/model-aliases.js';
-export { MODEL_ALIASES, resolveModelAlias };
+// Model alias resolution
+const MODEL_ALIASES: Record<string, string> = {
+  'haiku': 'claude-haiku-4-5-20251001',
+  'sonnet': 'claude-sonnet-4-5-20250514',
+  'opus': 'claude-opus-4-5-20250514'
+};
+
+function resolveModelAlias(model: string): string {
+  return MODEL_ALIASES[model.toLowerCase()] || model;
+}
 
 function tokenizeCommand(command: string): string[] {
   const tokens: string[] = [];
@@ -358,44 +363,6 @@ interface QueryWaiter {
   timeout: NodeJS.Timeout | null;
 }
 
-interface BrainVolunteerContext {
-  bundles: Array<{
-    query?: string;
-    entityIds?: string[];
-    factIds?: number[];
-    textUnitIds?: number[];
-    entities?: Array<{ id?: string; name?: string; type?: string }>;
-    facts?: Array<{ id?: number; entity_id?: string; field?: string; value?: unknown; source?: string }>;
-    textUnits?: Array<{ id?: number; title?: string; content?: string; source_kind?: string; source_id?: string }>;
-  }>;
-  cited?: {
-    entity_ids?: string[];
-    fact_ids?: number[];
-    text_unit_ids?: number[];
-    canonical_source_ids?: string[];
-    source_origins?: Record<string, string[]>;
-  };
-  timelineEventId?: number;
-  context_package_id?: number | null;
-  contextPackageId?: number | null;
-  task_id?: string | null;
-  instructions?: BrainInstruction[];
-}
-
-interface BrainInstruction {
-  source_id: string;
-  memory_id: number;
-  key: string;
-  content: string;
-  scope: {
-    project?: string;
-    task_id?: string;
-    session_id?: string;
-    user_id?: string;
-    turn_id?: string;
-  };
-}
-
 interface ProcessInspection {
   pid: number;
   ppid: number | null;
@@ -415,7 +382,6 @@ export class AgentManagerDb {
   private defaultConfig: DeployConfig['defaults'] | null = null;
   private schedulerService: SchedulerService | null = null;
   private queryWaiters: Map<string, QueryWaiter> = new Map(); // key: query_id
-  private queryBrainContext: Map<string, BrainVolunteerContext> = new Map(); // key: query_id
   // Long-poll waiters for GET /query/:id?wait=<seconds>. Wakes when a daemon-side
   // query write (news.in_reply_to completion, agent-stop cancel) transitions
   // the row. Sweeper-expired rows rely on the request's wait-timeout re-read.
@@ -868,19 +834,24 @@ export class AgentManagerDb {
       .getByQueryIdForTeam(teamId, queryId)
       .catch(() => null);
     if (completedRow && completedRow.status === 'completed') {
-      const brainContext = this.queryBrainContext.get(queryId) || null;
+      const brainContext = this.queryBrainContext.get(queryId)
+        || ((completedRow.metadata as any)?.brain_context as BrainVolunteerContext | undefined)
+        || null;
       const usedSourceIds = Array.isArray((resultPayload as any).used_source_ids)
         ? (resultPayload as any).used_source_ids.map(String)
         : Array.isArray((resultPayload as any).usedSourceIds)
           ? (resultPayload as any).usedSourceIds.map(String)
           : [];
+      const metadataTaskId = typeof (brainContext as any)?.task_id === 'string'
+        ? (brainContext as any).task_id
+        : typeof ((completedRow.metadata as any)?.brain_context?.task_id) === 'string'
+          ? (completedRow.metadata as any).brain_context.task_id
+          : null;
       const taskId = typeof (resultPayload as any).task_id === 'string'
         ? (resultPayload as any).task_id
         : typeof (resultPayload as any).taskId === 'string'
           ? (resultPayload as any).taskId
-          : typeof brainContext?.task_id === 'string'
-            ? brainContext.task_id
-            : null;
+          : metadataTaskId;
       await this.postBrainInstructionFeedback({
         taskId,
         queryId,
@@ -896,9 +867,6 @@ export class AgentManagerDb {
         queryId,
         context: brainContext,
         usedSourceIds,
-        volunteeredSourceIds: brainContext?.cited?.canonical_source_ids || [],
-        injectedInstructionIds: (brainContext?.instructions || []).map((item) => item.source_id),
-        latencyMs: completedRow.created ? Math.max(0, occurredAt - Number(completedRow.created)) : null,
       });
       await emitQueryDelivered(this.db.events, {
         teamId,
@@ -910,7 +878,6 @@ export class AgentManagerDb {
         occurredAt,
         messagePreview,
       });
-      this.queryBrainContext.delete(queryId);
     }
 
     this.wakeQueryWaiters(teamId, queryId, waiterReply);
@@ -1559,7 +1526,7 @@ export class AgentManagerDb {
    */
   private async handleMessage(req: express.Request, res: express.Response) {
     try {
-      const { id: teamId } = await this.getTeam(req);
+      const { id: teamId, name: teamName } = await this.getTeam(req);
       const { agent: agentField, to: toField, message, from, session_id, wait, timeout: requestTimeout } = req.body || {};
       const agent = toField || agentField;
 
@@ -1686,13 +1653,27 @@ export class AgentManagerDb {
       }
 
       this.managerLog(`${shouldWait ? 'Forwarding' : 'Sending async'} message to ${targetDisplayId} at ${targetUrl}`);
+      const autoAttach = (req as any)._autoAttach as { task?: TaskRow } | undefined;
+      const taskIdForBrain = autoAttach?.task?.uuid ? `task:${autoAttach.task.uuid}` : null;
+      const brainContext = await this.volunteerBrainContext({
+        taskId: taskIdForBrain,
+        agentId: targetAgent.id,
+        text: String(message),
+        project: teamName,
+        sessionId: session_id || null,
+      });
+      const outgoingMessage = this.withBrainContextAppendix(String(message), brainContext);
+
+      if (shouldWait && from && String(from).toLowerCase() !== 'manager') {
+        this.releaseLocalGateForAgent(String(from));
+      }
 
       // Serialize local-model dispatch (#7): wait for a slot if this target runs
       // a local model; API-backed targets pass through immediately.
       const lmgToken = await this.acquireLocalGate(targetAgent.runtime);
 
       // Forward the message to the agent's /talk endpoint
-      const result = await this.forwardToAgent(targetUrl, message, from || 'manager', session_id);
+      const result = await this.forwardToAgent(targetUrl, outgoingMessage, from || 'manager', session_id);
       if (!result.ok) {
         this.bindLocalGate(lmgToken); // dispatch failed → release the slot now
         console.error(`[Manager] Failed to deliver message to ${targetDisplayId}: ${result.status}`);
@@ -1700,11 +1681,12 @@ export class AgentManagerDb {
       }
 
       const queryId = result.data.query_id;
-      this.bindLocalGate(lmgToken, queryId); // released when the query completes/fails
+      this.bindLocalGate(lmgToken, queryId, targetAgent.name); // released when the query completes/fails
 
       // Store the query so replies can be routed correctly
       if (queryId) {
-        await this.db.queries.create(teamId, queryId, targetAgent.id, message, Date.now());
+        await this.db.queries.create(teamId, queryId, targetAgent.id, outgoingMessage, Date.now());
+        if (brainContext) this.queryBrainContext.set(queryId, brainContext);
       }
 
       // Fire-and-forget: return immediately
@@ -1714,7 +1696,8 @@ export class AgentManagerDb {
           success: true,
           query_id: queryId,
           delivered_to: targetDisplayId,
-          status: 'delivered'
+          status: 'delivered',
+          ...(brainContext ? { brain_context: { cited: brainContext.cited, timelineEventId: brainContext.timelineEventId, context_package_id: brainContext.context_package_id ?? brainContext.contextPackageId, instructions: brainContext.instructions || [] } } : {}),
         });
       }
 
@@ -2129,21 +2112,6 @@ export class AgentManagerDb {
       res.json(detail);
     });
 
-    // Installable plugins (plugins/claude-code). Read-only inventory, mirrors
-    // the skills routes. Returns an empty list when no plugins root exists.
-    this.managementApp.get('/library/plugins', (_req, res) => {
-      res.json(listLibraryPlugins(this.libraryRoot));
-    });
-
-    this.managementApp.get('/library/plugins/:name', (req, res) => {
-      const detail = getLibraryPlugin(this.libraryRoot, req.params.name);
-      if (!detail) {
-        res.status(404).json({ error: 'not_found', resource: 'library-plugin', name: req.params.name });
-        return;
-      }
-      res.json(detail);
-    });
-
     // POST /library/install — installs a library entry into the manager's
     // library root. Slice 1: only `team:<template>` -> `team:<dest>` is
     // implemented; agent/skill installs return 400 with `unsupported_kind`
@@ -2183,6 +2151,7 @@ export class AgentManagerDb {
         template: fromSel.name,
         dest: toSel.name,
         force,
+        params,
       });
       if (!result.ok) {
         const { ok: _ok, status, ...rest } = result;
@@ -2190,6 +2159,21 @@ export class AgentManagerDb {
         return;
       }
       res.json(result);
+    });
+
+    // Installable plugins (plugins/claude-code). Read-only inventory, mirrors
+    // the skills routes. Returns an empty list when no plugins root exists.
+    this.managementApp.get('/library/plugins', (_req, res) => {
+      res.json(listLibraryPlugins(this.libraryRoot));
+    });
+
+    this.managementApp.get('/library/plugins/:name', (req, res) => {
+      const detail = getLibraryPlugin(this.libraryRoot, req.params.name);
+      if (!detail) {
+        res.status(404).json({ error: 'not_found', resource: 'library-plugin', name: req.params.name });
+        return;
+      }
+      res.json(detail);
     });
 
     // Install a library skill onto an agent: persist it to metadata.skills
@@ -4373,77 +4357,6 @@ export class AgentManagerDb {
       }
     });
 
-    // POST /agents/:id/team — reassign a local agent to a different team. Ports are
-    // global, so no re-port is needed: we move the agent's team_id (plus its
-    // team-scoped wallet/news/query rows, so deleting the now-empty old team can't
-    // CASCADE them away), then rebuild the process under the target team's ID_TEAM.
-    this.managementApp.post('/agents/:id/team', async (req, res) => {
-      const { id: teamId } = await this.getTeam(req);
-      const target = (req.body || {}).team;
-      if (!target || typeof target !== 'string') {
-        return res.status(400).json({ error: 'Missing team in request body' });
-      }
-      const agent = await this.dbQueryAgentById(teamId, req.params.id)
-        ?? await this.dbQueryAgentByNameMostRecent(teamId, req.params.id);
-      if (!agent) return res.status(404).json({ error: 'Agent not found' });
-      if (agent.type !== 'claude') {
-        return res.status(400).json({ error: 'Only local agents can be reassigned to another team' });
-      }
-      const targetTeam = await this.db.teams.getTeamByName(target);
-      if (!targetTeam) return res.status(404).json({ error: `Team "${target}" not found` });
-      if (targetTeam.id === agent.team_id) {
-        return res.status(400).json({ error: `Agent is already in team "${target}"` });
-      }
-      const collision = await this.db.agents.getByName(targetTeam.id, agent.name);
-      if (collision) {
-        return res.status(409).json({ error: `Team "${target}" already has an agent named "${agent.name}"` });
-      }
-      try {
-        const oldTeamId = agent.team_id;
-        // Essential: move the agent row. Guard on rowCount (+ deleted_at) so a
-        // concurrent move/delete in the read→write window aborts cleanly instead of
-        // running the aux updates and a destructive, misconfigured rebuild on a row
-        // that did not actually move. Mirrors dbDeleteAgentRow's rowCount check.
-        const moved = await this.db.adapter.query(
-          'UPDATE agents SET team_id = $1 WHERE id = $2 AND team_id = $3 AND deleted_at IS NULL',
-          [targetTeam.id, agent.id, oldTeamId],
-        );
-        if ((moved.rowCount ?? 0) === 0) {
-          return res.status(409).json({ error: 'Agent changed concurrently (moved or removed); move aborted' });
-        }
-        // Re-parent EVERY team-scoped, per-agent table so (a) the agent keeps its
-        // live state under the new team and (b) a later delete of the now-empty old
-        // team can't CASCADE these away. subscriptions (live event relays) and
-        // checkins break on the move alone if left behind. Best-effort: a missing
-        // table/rare clash must not abort a move that already updated the agent row.
-        const aux: Array<[string, unknown[]]> = [
-          ['UPDATE wallets SET team_id = $1 WHERE agent_id = $2', [targetTeam.id, agent.id]],
-          ['UPDATE news_items SET team_id = $1 WHERE agent_id = $2 AND team_id = $3', [targetTeam.id, agent.id, oldTeamId]],
-          ['UPDATE queries SET team_id = $1 WHERE agent_id = $2 AND team_id = $3', [targetTeam.id, agent.id, oldTeamId]],
-          ['UPDATE subscriptions SET team_id = $1 WHERE owner_agent_id = $2 AND team_id = $3', [targetTeam.id, agent.id, oldTeamId]],
-          ['UPDATE event_log SET team_id = $1 WHERE actor_agent_id = $2 AND team_id = $3', [targetTeam.id, agent.id, oldTeamId]],
-          ['UPDATE checkins SET team_id = $1 WHERE (owner_agent_id = $2 OR created_by_agent_id = $2) AND team_id = $3', [targetTeam.id, agent.id, oldTeamId]],
-        ];
-        for (const [sql, params] of aux) {
-          try { await this.db.adapter.query(sql, params); }
-          catch (e: any) { console.warn(`[Manager] move ${agent.name}: aux update skipped (${e?.message || e})`); }
-        }
-        // Rebuild under the new team so its ID_TEAM env reflects the move.
-        const rebuilt = await this.rebuildLocalClaudeAgent(targetTeam.id, targetTeam.name, { ...agent, team_id: targetTeam.id });
-        console.log(`[Manager] Moved agent "${agent.name}" → team "${target}"${rebuilt.success ? ' (rebuilt)' : ' (REBUILD FAILED)'}`);
-        res.json({
-          ok: true,
-          agent: agent.name,
-          team: target,
-          rebuilt: rebuilt.success,
-          ...(rebuilt.success ? {} : { warning: `Moved, but rebuild failed: ${rebuilt.error || 'unknown'}. Rebuild the agent manually.` }),
-          message: `Moved "${agent.name}" to team "${target}"${rebuilt.success ? ' and rebuilt it.' : '.'}`,
-        });
-      } catch (e: any) {
-        res.status(500).json({ error: e?.message || String(e) });
-      }
-    });
-
     // POST /agents/:id/probe — ad-hoc heartbeat probe for remote-endpoint agents
     this.managementApp.post('/agents/:id/probe', async (req, res) => {
       try {
@@ -5104,7 +5017,7 @@ export class AgentManagerDb {
 
     this.managementApp.post('/tasks', async (req, res) => {
       try {
-        let { id: teamId } = await this.getTeam(req);
+        let { id: teamId, name: teamName } = await this.getTeam(req);
         const principal = (req as any).ctx?.principal || 'anon';
         const { title, name: rawName, description, team: teamRef, from } = req.body || {};
 
@@ -5234,7 +5147,7 @@ export class AgentManagerDb {
 
     this.managementApp.post('/tasks/:ref/claim', async (req, res) => {
       try {
-        let { id: teamId } = await this.getTeam(req);
+        let { id: teamId, name: teamName } = await this.getTeam(req);
         const { agent_id, from } = req.body || {};
         const callerRef = agent_id || from;
 
@@ -5256,6 +5169,7 @@ export class AgentManagerDb {
           if (fallback) {
             agent = fallback.agent;
             teamId = fallback.teamId;
+            teamName = (await this.db.teams.getTeam(teamId))?.name || teamName;
           }
         }
         if (!agent) return res.status(404).json({ error: error || `Agent "${callerRef}" not found` });
@@ -5283,7 +5197,21 @@ export class AgentManagerDb {
           ownerAgentId: agent.id,
           occurredAt: Date.now(),
         });
-        res.json({ ok: true, task: await this.buildTaskResult(updated!, teamId) });
+        const taskResult = await this.buildTaskResult(updated!, teamId);
+        const brainContext = await this.volunteerBrainContext({
+          taskId: `task:${updated!.uuid}`,
+          agentId: agent.id,
+          text: [updated!.title, updated!.description].filter(Boolean).join('\n\n'),
+          project: teamName,
+        });
+        if (brainContext) (taskResult as any).brain_context = {
+          cited: brainContext.cited,
+          timelineEventId: brainContext.timelineEventId,
+          context_package_id: brainContext.context_package_id ?? brainContext.contextPackageId,
+          bundles: brainContext.bundles,
+          instructions: brainContext.instructions || [],
+        };
+        res.json({ ok: true, task: taskResult });
       } catch (err: any) {
         console.error('[Manager] Error in POST /tasks/:ref/claim:', err);
         res.status(500).json({ error: err?.message || 'Internal server error' });
@@ -5309,6 +5237,7 @@ export class AgentManagerDb {
             if (fallback) {
               callerAgent = fallback.agent;
               teamId = fallback.teamId;
+              teamName = (await this.db.teams.getTeam(teamId))?.name || teamName;
             }
           }
         }
@@ -5335,6 +5264,54 @@ export class AgentManagerDb {
 
         const updated = await this.db.tasks.getByNameForTeam(task.name, teamId);
         const completedAt = Date.now();
+        const feedbackContext: BrainVolunteerContext | null = {
+          bundles: [],
+          task_id: `task:${updated!.uuid}`,
+          instructions: this.stringArray(req.body?.injected_instruction_ids || req.body?.injectedInstructionIds)
+            .map((sourceId) => ({
+              source_id: sourceId,
+              memory_id: Number(String(sourceId).replace(/^memory:/, '')),
+              key: '',
+              content: '',
+              scope: { project: teamName, task_id: `task:${updated!.uuid}` },
+            }))
+            .filter((item) => Number.isInteger(item.memory_id)),
+        };
+        await this.postBrainInstructionFeedback({
+          taskId: `task:${updated!.uuid}`,
+          agentId: callerAgent?.id ?? updated!.owner ?? null,
+          context: feedbackContext,
+          payload: req.body || {},
+        });
+        const usedSourceIds = Array.isArray(req.body?.used_source_ids)
+          ? req.body.used_source_ids.map(String)
+          : Array.isArray(req.body?.usedSourceIds)
+            ? req.body.usedSourceIds.map(String)
+            : [];
+        const bodyBrainContext = req.body?.brain_context || req.body?.brainContext || null;
+        const volunteeredSourceIds = Array.isArray(req.body?.volunteered_source_ids)
+          ? req.body.volunteered_source_ids.map(String)
+          : Array.isArray(req.body?.volunteeredSourceIds)
+            ? req.body.volunteeredSourceIds.map(String)
+            : Array.isArray(bodyBrainContext?.cited?.canonical_source_ids)
+              ? bodyBrainContext.cited.canonical_source_ids.map(String)
+              : [];
+        if (bodyBrainContext?.cited) {
+          (feedbackContext as any).cited = bodyBrainContext.cited;
+          (feedbackContext as any).timelineEventId = bodyBrainContext.timelineEventId ?? bodyBrainContext.timeline_event_id;
+          (feedbackContext as any).context_package_id = bodyBrainContext.context_package_id ?? bodyBrainContext.contextPackageId;
+        }
+        await this.postBrainEvalCapture({
+          queryText: [updated!.title, updated!.description].filter(Boolean).join('\n\n'),
+          route: 'manager.task_completion',
+          agentId: callerAgent?.id ?? updated!.owner ?? null,
+          taskId: `task:${updated!.uuid}`,
+          context: feedbackContext,
+          usedSourceIds,
+          volunteeredSourceIds,
+          injectedInstructionIds: this.stringArray(req.body?.injected_instruction_ids || req.body?.injectedInstructionIds),
+          latencyMs: updated!.completed_at && updated!.created_at ? Math.max(0, (updated!.completed_at - updated!.created_at) * 1000) : null,
+        });
         await emitTaskCompleted(this.db.events, {
           teamId,
           taskUuid: updated!.uuid,
@@ -5434,7 +5411,6 @@ export class AgentManagerDb {
           limit,
         });
         const earliestAvailableSeq = await this.db.events.earliestSeq(teamId);
-        const latestAvailableSeq = await this.db.events.latestSeq(teamId);
 
         const events = rows.map((row) => ({
           seq: row.seq,
@@ -5449,16 +5425,9 @@ export class AgentManagerDb {
           data: row.data,
         }));
 
-        // next_seq: advance to the last event we returned. With no events, hold
-        // at `since` (normal tailing) — UNLESS the cursor is *ahead* of the log's
-        // tail. That happens when the manager restarted and its event seq reset
-        // below a still-running consumer's cursor: echoing the stale cursor back
-        // would wedge that consumer forever (it polls since=N, we have nothing
-        // past N, it never advances). Detect it and resync the consumer to the
-        // current tail so the live feed recovers on the next poll.
         const nextSeq = events.length > 0
           ? events[events.length - 1].seq
-          : (latestAvailableSeq !== null && since > latestAvailableSeq ? latestAvailableSeq : since);
+          : since;
 
         // replay_truncated: the consumer's cursor predates retained
         // history. `since` is an exclusive cursor, so the consumer next
@@ -6518,77 +6487,7 @@ export class AgentManagerDb {
         // /heartbeat <agent> - show heartbeat status for specific agent
         // /heartbeat enable <agent> - enable heartbeat for agent
         // /heartbeat disable <agent> - disable heartbeat for agent
-        // /heartbeat fire <agent> [--force] - operator-fire a one-off beat
         const subCmd = args[0];
-
-        // /heartbeat fire <agent> [--force]
-        //
-        // Operator-triggered one-off beat. Does NOT advance scheduler
-        // cadence or count against max_runs (slice 1 of
-        // ship-heartbeat-fire). With --force, synthesize a generic
-        // heartbeat schedule for agents that have no config — useful
-        // for testing HEARTBEAT.md wake behavior on a fresh agent.
-        if (subCmd === 'fire') {
-          const agentName = args[1];
-          const force = args.includes('--force');
-          if (!agentName) {
-            return { ok: false, error: 'Usage: /heartbeat fire <agent> [--force]' };
-          }
-          if (!this.schedulerService) {
-            return { ok: false, error: 'Scheduler service is not running' };
-          }
-          const matches = await this.dbResolveAgents(teamId, agentName);
-          if (matches.length === 0) {
-            return { ok: false, error: `Agent "${agentName}" not found` };
-          }
-          if (matches.length > 1) {
-            return { ok: false, error: `Multiple agents match "${agentName}". Be more specific.` };
-          }
-          const agent = matches[0];
-          if (!agent.endpoint && (!agent.port || agent.port === 0)) {
-            return { ok: false, error: `Agent "${agent.name}" has no endpoint to fire against` };
-          }
-
-          // Resolve the agent's heartbeat schedule. When --force is set
-          // and no real schedule exists, synthesize a generic in-memory
-          // definition (never persisted).
-          const schedules = await this.db.schedules.listSchedulesForAgent(agent.id);
-          let hbSchedule = schedules.find(s => s.source_key === `heartbeat:${agent.id}`);
-          if (!hbSchedule) {
-            if (!force) {
-              return {
-                ok: false,
-                error: `Agent "${agent.name}" has no heartbeat schedule. Re-run with --force to fire a synthesized generic beat.`,
-              };
-            }
-            hbSchedule = synthesizeForceHeartbeat(agent.id, agent.name);
-          }
-
-          const target: DispatchTarget = {
-            id: agent.id,
-            name: agent.name,
-            endpoint: agent.endpoint || `http://localhost:${agent.port}`,
-            talkPath: '/talk',
-            schedulePath: '/schedule',
-            status: agent.status,
-          };
-
-          const result = await this.schedulerService.fireManual(hbSchedule, target);
-          if (!result.success) {
-            return { ok: false, error: `Manual fire failed: ${result.error || 'unknown error'}` };
-          }
-          return {
-            ok: true,
-            result: {
-              message: `Fired ${force && !schedules.find(s => s.source_key === `heartbeat:${agent.id}`) ? '(synthesized) ' : ''}heartbeat to ${agent.name}`,
-              agent: agent.name,
-              scheduleId: hbSchedule.id,
-              scheduledKey: result.scheduledKey,
-              manual: true,
-              force,
-            },
-          };
-        }
 
         // Handle enable/disable subcommands
         if (subCmd === 'enable' || subCmd === 'disable') {
@@ -6662,7 +6561,7 @@ export class AgentManagerDb {
                 scheduleActive: hbSchedule?.active ?? false,
                 intervalSeconds: hbSchedule?.interval_seconds || config?.interval || 'no file',
                 runsSent: runCount,
-                maxRuns: hbSchedule?.max_runs ?? config?.maxBeats ?? null,
+                maxRuns: hbSchedule?.max_runs ?? config?.maxBeats ?? 20,
                 expiresAt: hbSchedule?.expires_at ?? null
               }
             }
@@ -6689,7 +6588,7 @@ export class AgentManagerDb {
             scheduleActive: hbSchedule?.active ?? false,
             intervalSeconds: hbSchedule?.interval_seconds || config?.interval || 'no file',
             runsSent: runCount,
-            maxRuns: hbSchedule?.max_runs ?? config?.maxBeats ?? null,
+            maxRuns: hbSchedule?.max_runs ?? config?.maxBeats ?? 20,
             expiresAt: hbSchedule?.expires_at ?? null
           });
         }
@@ -6955,6 +6854,13 @@ export class AgentManagerDb {
         // Discover REST-AP endpoints from the agent's catalog
         const endpoints = await discoverRestAPEndpoints(baseEndpoint);
         const talkUrl = `${baseEndpoint.replace(/\/+$/, '')}${endpoints.talk}`;
+        const brainContext = await this.volunteerBrainContext({
+          agentId: a.id,
+          text: message,
+          project: teamName,
+          sessionId: callerSessionId || null,
+        });
+        const outgoingMessage = this.withBrainContextAppendix(message, brainContext);
 
         // Send message to agent's /talk endpoint
         const talkHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -6963,7 +6869,7 @@ export class AgentManagerDb {
         const talkResp = await fetch(talkUrl, {
           method: 'POST',
           headers: talkHeaders,
-          body: JSON.stringify({ message, from: 'remote' })
+          body: JSON.stringify(callerSessionId ? { message: outgoingMessage, from: 'remote', session_id: callerSessionId } : { message: outgoingMessage, from: 'remote' })
         });
 
         if (!talkResp.ok) {
@@ -6974,13 +6880,25 @@ export class AgentManagerDb {
 
         const talkResult = await talkResp.json() as any;
         const askQueryId = talkResult.query_id || talkResult.queryId;
-        this.bindLocalGate(askGate, askQueryId); // released when the query completes/fails
+        this.bindLocalGate(askGate, askQueryId, a.name); // released when the query completes/fails
+        if (askQueryId) {
+          await this.db.queries.create(
+            teamId,
+            askQueryId,
+            a.id,
+            outgoingMessage,
+            Date.now(),
+            callerSessionId || undefined,
+          );
+          if (brainContext) this.queryBrainContext.set(askQueryId, brainContext);
+        }
         return {
           ok: true,
           result: {
             queryId: askQueryId,
             status: 'processing',
-            agent: agentName
+            agent: agentName,
+            ...(brainContext ? { brain_context: { cited: brainContext.cited, timelineEventId: brainContext.timelineEventId, context_package_id: brainContext.context_package_id ?? brainContext.contextPackageId, instructions: brainContext.instructions || [] } } : {}),
           }
         };
       }
@@ -9675,7 +9593,7 @@ export class AgentManagerDb {
       ID_AGENT_PORT: String(port),
       MANAGER_URL: `http://127.0.0.1:4100`,
       ID_AGENT_SKIP_PERMISSIONS: skipPermissions ? 'true' : 'false',
-      ...(model && { CLAUDE_MODEL: resolveModelAlias(model) }),
+      ...(model && { CLAUDE_MODEL: model }),
       ...(tokenId && { ID_AGENT_TOKEN_ID: tokenId }),
       ...(owsWallet && { OWS_WALLET: owsWallet }),
       ...(catalogEnv && { ID_AGENT_CATALOG: catalogEnv }),

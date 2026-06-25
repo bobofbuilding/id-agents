@@ -22,8 +22,9 @@ import { SqliteNewsRepo } from '../../src/db/repos/sqlite/news-repo.js';
 import { SqliteSchedulesRepo } from '../../src/db/repos/sqlite/schedules-repo.js';
 import { SqliteTasksRepo } from '../../src/db/repos/sqlite/tasks-repo.js';
 
-const FIXTURE_LIBRARY_ROOT = '/Users/nxt3d/projects/id2/public-agents/configs';
-const FIXTURE_AGENT_ROOT = `${FIXTURE_LIBRARY_ROOT}/agents/foundry-dev`;
+const SOURCE_AGENT_ROOT = path.join(process.cwd(), 'configs', 'agents', 'foundry-dev');
+let FIXTURE_LIBRARY_ROOT = '';
+let FIXTURE_AGENT_ROOT = '';
 
 async function createInMemoryDb() {
   const adapter = new SqliteAdapter(':memory:');
@@ -86,6 +87,10 @@ describe('library inventory routes — mounted foundry-dev fixture', () => {
     const port = await findFreePort();
     baseUrl = `http://127.0.0.1:${port}`;
     workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'library-routes-test-'));
+    FIXTURE_LIBRARY_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'library-routes-fixture-root-'));
+    FIXTURE_AGENT_ROOT = path.join(FIXTURE_LIBRARY_ROOT, 'agents', 'foundry-dev');
+    fs.mkdirSync(path.dirname(FIXTURE_AGENT_ROOT), { recursive: true });
+    fs.cpSync(SOURCE_AGENT_ROOT, FIXTURE_AGENT_ROOT, { recursive: true });
     db = await createInMemoryDb();
     manager = new AgentManagerDb(workDir, db as any, {
       libraryRoot: FIXTURE_LIBRARY_ROOT,
@@ -96,6 +101,7 @@ describe('library inventory routes — mounted foundry-dev fixture', () => {
   afterAll(async () => {
     if (manager) await stopManager(manager);
     try { fs.rmSync(workDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    try { fs.rmSync(FIXTURE_LIBRARY_ROOT, { recursive: true, force: true }); } catch { /* ignore */ }
   });
 
   it('GET /library/agents returns the foundry-dev entry with full list contract', async () => {
@@ -127,17 +133,17 @@ describe('library inventory routes — mounted foundry-dev fixture', () => {
     expect(body.name).toBe('foundry-dev');
     expect(body.shape).toBe('claude-native');
     expect(body.source_path).toBe(FIXTURE_AGENT_ROOT);
-    expect(body.memoryFile).toBe(`${FIXTURE_AGENT_ROOT}/CLAUDE.md`);
+    expect(body.memoryFile).toBe(path.join(FIXTURE_AGENT_ROOT, 'CLAUDE.md'));
     expect(body.hasReadme).toBe(true);
     expect(body.hasLicense).toBe(false);
     expect(body.subfolders).toEqual(['skills']);
 
     // Persona body is the raw CLAUDE.md.
-    expect(body.memory).toBe(fs.readFileSync(`${FIXTURE_AGENT_ROOT}/CLAUDE.md`, 'utf-8'));
+    expect(body.memory).toBe(fs.readFileSync(path.join(FIXTURE_AGENT_ROOT, 'CLAUDE.md'), 'utf-8'));
     // README body present and non-empty.
     expect(typeof body.readme).toBe('string');
     expect(body.readme.length).toBeGreaterThan(0);
-    expect(body.readme).toBe(fs.readFileSync(`${FIXTURE_AGENT_ROOT}/README.md`, 'utf-8'));
+    expect(body.readme).toBe(fs.readFileSync(path.join(FIXTURE_AGENT_ROOT, 'README.md'), 'utf-8'));
     // Bundled skills enumerated from the entry's skills/ subdir.
     expect([...body.bundledSkills].sort()).toEqual([
       'foundry-scripting-and-deploy',
@@ -230,11 +236,11 @@ describe('library inventory routes — standalone skills in a tmp library', () =
     expect(body.entries).toEqual([
       {
         name: 'using-foundry',
-        hasSkillMd: true,
-        source_path: path.join(libraryRoot, 'skills', 'using-foundry'),
-        // Slice-2 contract: README-first description. For skills the
-        // frontmatter `description:` is the canonical source.
         description: 'Day-to-day Foundry project work.',
+        hasSkillMd: true,
+        license: 'MIT',
+        source_path: path.join(libraryRoot, 'skills', 'using-foundry'),
+        tags: [],
       },
     ]);
   });
