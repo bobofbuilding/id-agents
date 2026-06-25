@@ -54,6 +54,7 @@ import {
   listLibraryTeams,
   resolveDefaultLibraryRoot,
 } from './lib/library-inventory.js';
+import { inferEntityEdges } from './lib/entity-edge-inference.js';
 import {
   installLibraryTeam,
   parseSelector,
@@ -913,6 +914,9 @@ export class AgentManagerDb {
             : completedRow.agent_id,
         occurredAt,
         messagePreview,
+        taskId,
+        usedSourceIds,
+        volunteeredSourceIds: brainContext?.cited?.canonical_source_ids || [],
       });
     }
 
@@ -1729,6 +1733,20 @@ export class AgentManagerDb {
       instruction_feedback: feedbackPayload,
     });
     await this.postBrain('/instructions/feedback', feedbackPayload);
+    await this.postBrainContextEdges(input.context);
+  }
+
+  private async postBrainContextEdges(context?: BrainVolunteerContext | null): Promise<void> {
+    const entities = (context?.bundles || [])
+      .flatMap((bundle) => bundle.entities || [])
+      .filter((entity): entity is { id: string; name?: string; type?: string } => typeof entity?.id === 'string' && entity.id.length > 0)
+      .map((entity) => ({ id: entity.id, name: entity.name, type: entity.type }));
+    if (entities.length < 2) return;
+    const textUnits = (context?.bundles || []).flatMap((bundle) => bundle.textUnits || []);
+    const texts = (context?.instructions || []).map((instruction) => instruction.content).filter(Boolean);
+    const edges = inferEntityEdges({ entities, textUnits, texts });
+    if (!edges.length) return;
+    await this.postBrain('/entity-edges/bulk', { edges });
   }
 
   private async postBrainEvalCapture(input: {
@@ -1973,7 +1991,16 @@ export class AgentManagerDb {
 
       // Store the query so replies can be routed correctly
       if (queryId) {
-        await this.db.queries.create(teamId, queryId, targetAgent.id, outgoingMessage, Date.now());
+        await this.db.queries.create(
+          teamId,
+          queryId,
+          targetAgent.id,
+          outgoingMessage,
+          Date.now(),
+          undefined,
+          undefined,
+          brainContext ? { brain_context: brainContext } : null,
+        );
         if (brainContext) this.queryBrainContext.set(queryId, brainContext);
       }
 
@@ -5206,7 +5233,13 @@ export class AgentManagerDb {
       const { id: teamId, name: teamName } = await this.getTeam(req);
 
       try {
-        const result = await this.executeRemoteCommand(command.trim(), teamId, teamName, typeof from === 'string' ? from : undefined);
+        const result = await this.executeRemoteCommand(
+          command.trim(),
+          teamId,
+          teamName,
+          typeof from === 'string' ? from : undefined,
+          typeof req.body?.session_id === 'string' ? req.body.session_id : undefined,
+        );
         res.json(result);
       } catch (error: any) {
         res.status(500).json({ error: error.message || 'Command execution failed' });
@@ -5551,8 +5584,21 @@ export class AgentManagerDb {
 
         const updated = await this.db.tasks.getByNameForTeam(task.name, teamId);
         const completedAt = Date.now();
+        const bodyBrainContext = req.body?.brain_context || req.body?.brainContext || null;
+        const usedSourceIds = Array.isArray(req.body?.used_source_ids)
+          ? req.body.used_source_ids.map(String)
+          : Array.isArray(req.body?.usedSourceIds)
+            ? req.body.usedSourceIds.map(String)
+            : [];
+        const volunteeredSourceIds = Array.isArray(req.body?.volunteered_source_ids)
+          ? req.body.volunteered_source_ids.map(String)
+          : Array.isArray(req.body?.volunteeredSourceIds)
+            ? req.body.volunteeredSourceIds.map(String)
+            : Array.isArray(bodyBrainContext?.cited?.canonical_source_ids)
+              ? bodyBrainContext.cited.canonical_source_ids.map(String)
+              : [];
         const feedbackContext: BrainVolunteerContext | null = {
-          bundles: [],
+          bundles: Array.isArray(bodyBrainContext?.bundles) ? bodyBrainContext.bundles : [],
           task_id: `task:${updated!.uuid}`,
           instructions: this.stringArray(req.body?.injected_instruction_ids || req.body?.injectedInstructionIds)
             .map((sourceId) => ({
@@ -5570,19 +5616,6 @@ export class AgentManagerDb {
           context: feedbackContext,
           payload: req.body || {},
         });
-        const usedSourceIds = Array.isArray(req.body?.used_source_ids)
-          ? req.body.used_source_ids.map(String)
-          : Array.isArray(req.body?.usedSourceIds)
-            ? req.body.usedSourceIds.map(String)
-            : [];
-        const bodyBrainContext = req.body?.brain_context || req.body?.brainContext || null;
-        const volunteeredSourceIds = Array.isArray(req.body?.volunteered_source_ids)
-          ? req.body.volunteered_source_ids.map(String)
-          : Array.isArray(req.body?.volunteeredSourceIds)
-            ? req.body.volunteeredSourceIds.map(String)
-            : Array.isArray(bodyBrainContext?.cited?.canonical_source_ids)
-              ? bodyBrainContext.cited.canonical_source_ids.map(String)
-              : [];
         if (bodyBrainContext?.cited) {
           (feedbackContext as any).cited = bodyBrainContext.cited;
           (feedbackContext as any).timelineEventId = bodyBrainContext.timelineEventId ?? bodyBrainContext.timeline_event_id;
@@ -5607,6 +5640,8 @@ export class AgentManagerDb {
           ownerAgentId: updated!.owner ?? null,
           actorAgentId: callerAgent?.id ?? updated!.owner ?? null,
           occurredAt: completedAt,
+          usedSourceIds,
+          volunteeredSourceIds,
         });
         // Auto-close any active/snoozed checkins linked to this task and
         // emit one checkin:closed event per row. Pure consumer of the
@@ -6418,6 +6453,7 @@ export class AgentManagerDb {
     teamId: string,
     teamName: string,
     callerFrom?: string,
+    callerSessionId?: string,
   ): Promise<{ ok: boolean; result?: any; error?: string }> {
     // Remove leading slash if present
     const cmd = command.startsWith('/') ? command.slice(1) : command;
@@ -7077,7 +7113,6 @@ export class AgentManagerDb {
       case 'hey': {
         const agentName = args[0];
         const message = args.slice(1).join(' ');
-        const callerSessionId: string | undefined = undefined;
 
         if (!agentName || !message) {
           return { ok: false, error: `Usage: /${action} <agent-name|agent-id> <message>` };
@@ -7177,6 +7212,8 @@ export class AgentManagerDb {
             outgoingMessage,
             Date.now(),
             callerSessionId || undefined,
+            undefined,
+            brainContext ? { brain_context: brainContext } : null,
           );
           if (brainContext) this.queryBrainContext.set(askQueryId, brainContext);
         }
