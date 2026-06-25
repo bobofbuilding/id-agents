@@ -1,6 +1,6 @@
 ---
 name: brain
-description: Access the SkillMesh knowledge graph and your persistent agent memory. Use to search skills by name/domain/tag, traverse skill relationships, store facts between sessions, and recall past context.
+description: Access the SkillMesh knowledge graph and your persistent agent memory. Use to search skills by name/domain/tag, traverse skill relationships, store facts between sessions, and recall past context. Manage it from the [ID Agents Control Center](https://github.com/bobofbuilding/id-agent-control-center).
 allowed-tools: Bash
 ---
 
