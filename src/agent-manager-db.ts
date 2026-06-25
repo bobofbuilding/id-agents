@@ -363,6 +363,41 @@ interface QueryWaiter {
   timeout: NodeJS.Timeout | null;
 }
 
+interface BrainVolunteerContext {
+  bundles: Array<{
+    query?: string;
+    entities?: Array<{ id?: string; name?: string; type?: string }>;
+    facts?: Array<{ id?: number; entity_id?: string; field?: string; value?: unknown; source?: string }>;
+    textUnits?: Array<{ id?: number; title?: string; content?: string; source_kind?: string; source_id?: string }>;
+  }>;
+  cited?: {
+    entity_ids?: string[];
+    fact_ids?: number[];
+    text_unit_ids?: number[];
+    canonical_source_ids?: string[];
+    source_origins?: Record<string, string[]>;
+  };
+  timelineEventId?: number;
+  context_package_id?: number | null;
+  contextPackageId?: number | null;
+  task_id?: string | null;
+  instructions?: BrainInstruction[];
+}
+
+interface BrainInstruction {
+  source_id: string;
+  memory_id: number;
+  key: string;
+  content: string;
+  scope: {
+    project?: string;
+    task_id?: string;
+    session_id?: string;
+    user_id?: string;
+    turn_id?: string;
+  };
+}
+
 interface ProcessInspection {
   pid: number;
   ppid: number | null;
@@ -382,6 +417,7 @@ export class AgentManagerDb {
   private defaultConfig: DeployConfig['defaults'] | null = null;
   private schedulerService: SchedulerService | null = null;
   private queryWaiters: Map<string, QueryWaiter> = new Map(); // key: query_id
+  private queryBrainContext: Map<string, BrainVolunteerContext> = new Map(); // key: query_id
   // Long-poll waiters for GET /query/:id?wait=<seconds>. Wakes when a daemon-side
   // query write (news.in_reply_to completion, agent-stop cancel) transitions
   // the row. Sweeper-expired rows rely on the request's wait-timeout re-read.
@@ -1475,7 +1511,8 @@ export class AgentManagerDb {
   // auto-releases after a timeout, so a missed release can never deadlock
   // dispatch. See lib/local-model-gate.ts.
   private readonly localModelGate = new LocalModelGate(Number(process.env.LOCAL_MODEL_CONCURRENCY) || 1);
-  private readonly localGateByQuery = new Map<string, string>();
+  private readonly localGateByQuery = new Map<string, { token: string; agent?: string }>();
+  private readonly localGateByAgent = new Map<string, string>();
 
   /** Acquire a local-model slot before dispatching to `runtime`. Returns a token or undefined. */
   private async acquireLocalGate(runtime?: string | null): Promise<string | undefined> {
@@ -1485,17 +1522,22 @@ export class AgentManagerDb {
     return token;
   }
   /** Bind a token to its queryId so completion releases it; release immediately if no query. */
-  private bindLocalGate(token: string | undefined, queryId?: string): void {
+  private bindLocalGate(token: string | undefined, queryId?: string, agent?: string): void {
     if (!token) return;
-    if (queryId) this.localGateByQuery.set(queryId, token);
-    else this.localModelGate.release(token);
+    if (queryId) {
+      this.localGateByQuery.set(queryId, { token, agent });
+      if (agent) this.localGateByAgent.set(agent, queryId);
+    } else {
+      this.localModelGate.release(token);
+    }
   }
   /** Release the local-model slot a query held, when it reaches a terminal state. */
   private releaseLocalGate(queryId: string): void {
-    const token = this.localGateByQuery.get(queryId);
-    if (token === undefined) return;
-    this.localModelGate.release(token);
+    const entry = this.localGateByQuery.get(queryId);
+    if (entry === undefined) return;
+    this.localModelGate.release(entry.token);
     this.localGateByQuery.delete(queryId);
+    if (entry.agent && this.localGateByAgent.get(entry.agent) === queryId) this.localGateByAgent.delete(entry.agent);
   }
 
   private async forwardToAgent(targetUrl: string, message: string, from: string, session_id?: string): Promise<{
@@ -1518,6 +1560,252 @@ export class AgentManagerDb {
 
     const data: any = await talkRes.json();
     return { ok: true, data };
+  }
+
+  private releaseLocalGateForAgent(agent?: string | null): void {
+    if (!agent) return;
+    const qid = this.localGateByAgent.get(agent);
+    if (qid) this.releaseLocalGate(qid);
+  }
+
+  private brainUrl(): string {
+    return (process.env.BRAIN_URL || 'http://127.0.0.1:4200').replace(/\/+$/, '');
+  }
+
+  private brainHeaders(): Record<string, string> {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (process.env.BRAIN_TOKEN) headers.Authorization = `Bearer ${process.env.BRAIN_TOKEN}`;
+    return headers;
+  }
+
+  private async volunteerBrainContext(input: {
+    taskId?: string | null;
+    agentId?: string | null;
+    text: string;
+    project?: string | null;
+    sessionId?: string | null;
+    userId?: string | null;
+  }): Promise<BrainVolunteerContext | null> {
+    if (process.env.BRAIN_CONTEXT_DISABLED === 'true') return null;
+    const dispatchContext = {
+      task_id: input.taskId || undefined,
+      agent_id: input.agentId || undefined,
+      project: input.project || undefined,
+      session_id: input.sessionId || undefined,
+      user_id: input.userId || undefined,
+      text: input.text,
+      risk_level: 'normal',
+      max_sources: 24,
+      max_chars: 24000,
+    };
+    try {
+      await this.validateBrainLearningContract({
+        subject: input.taskId || input.agentId || 'manager.dispatch',
+        dispatch_context: dispatchContext,
+      });
+      const res = await fetch(`${this.brainUrl()}/context/volunteer`, {
+        method: 'POST',
+        headers: this.brainHeaders(),
+        body: JSON.stringify({ ...dispatchContext, limit: 3 }),
+        signal: AbortSignal.timeout(Number(process.env.BRAIN_CONTEXT_TIMEOUT_MS || 1200)),
+      });
+      if (!res.ok) return null;
+      const json = await res.json() as { data?: BrainVolunteerContext };
+      const context = json.data || null;
+      const instructions = await this.fetchBrainInstructions({
+        brainUrl: this.brainUrl(),
+        headers: this.brainHeaders(),
+        project: input.project,
+        taskId: input.taskId,
+        agentId: input.agentId,
+        sessionId: input.sessionId,
+        userId: input.userId,
+      });
+      if (!context && instructions.length === 0) return null;
+      return { ...(context || { bundles: [] }), task_id: input.taskId || undefined, instructions };
+    } catch {
+      return null;
+    }
+  }
+
+  private async postBrain(pathname: string, body: Record<string, unknown>): Promise<void> {
+    if (process.env.BRAIN_CONTEXT_DISABLED === 'true') return;
+    try {
+      await fetch(`${this.brainUrl()}${pathname}`, {
+        method: 'POST',
+        headers: this.brainHeaders(),
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(Number(process.env.BRAIN_CONTEXT_TIMEOUT_MS || 1200)),
+      });
+    } catch {}
+  }
+
+  private async validateBrainLearningContract(body: Record<string, unknown>): Promise<void> {
+    await this.postBrain('/manager/learning-contract/validate', {
+      strict: false,
+      record: true,
+      source: 'id-agents-manager',
+      ...body,
+    });
+  }
+
+  private contextPackageId(context?: BrainVolunteerContext | null): number | null {
+    const value = context?.context_package_id ?? context?.contextPackageId ?? null;
+    if (value == null) return null;
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  private async fetchBrainInstructions(input: {
+    brainUrl: string;
+    headers: Record<string, string>;
+    project?: string | null;
+    taskId?: string | null;
+    agentId?: string | null;
+    sessionId?: string | null;
+    userId?: string | null;
+  }): Promise<BrainInstruction[]> {
+    const params = new URLSearchParams();
+    params.set('tag', 'team-instruction');
+    params.set('limit', String(Number(process.env.BRAIN_INSTRUCTION_LIMIT || 5)));
+    if (input.project) params.set('project', input.project);
+    if (input.taskId) params.set('task_id', input.taskId);
+    if (input.sessionId) params.set('session_id', input.sessionId);
+    if (input.userId) params.set('user_id', input.userId);
+    try {
+      const res = await fetch(`${input.brainUrl}/memory/shared?${params.toString()}`, {
+        method: 'GET',
+        headers: input.headers,
+        signal: AbortSignal.timeout(Number(process.env.BRAIN_CONTEXT_TIMEOUT_MS || 1200)),
+      });
+      if (!res.ok) return [];
+      const json = await res.json() as { memories?: Array<Record<string, unknown>> };
+      return (json.memories || []).filter((memory) => memory.agent_id === 'team-instructions').map((memory) => ({
+        source_id: `memory:${Number(memory.id)}`,
+        memory_id: Number(memory.id),
+        key: String(memory.mem_key || ''),
+        content: String(memory.content || ''),
+        scope: {
+          project: String(memory.project || ''),
+          task_id: String(memory.task_id || ''),
+          session_id: String(memory.session_id || ''),
+          user_id: String(memory.user_id || ''),
+          turn_id: String(memory.turn_id || ''),
+        },
+      })).filter((instruction) => Number.isInteger(instruction.memory_id) && instruction.content.trim().length > 0);
+    } catch {
+      return [];
+    }
+  }
+
+  private stringArray(value: unknown): string[] {
+    return Array.isArray(value) ? value.map(String).filter(Boolean) : [];
+  }
+
+  private async postBrainInstructionFeedback(input: {
+    taskId?: string | null;
+    queryId?: string | null;
+    agentId?: string | null;
+    context?: BrainVolunteerContext | null;
+    payload?: Record<string, unknown> | null;
+  }): Promise<void> {
+    const instructionIds = (input.context?.instructions || []).map((item) => item.source_id);
+    const used = this.stringArray((input.payload as any)?.used_instruction_ids || (input.payload as any)?.usedInstructionIds);
+    const harmful = this.stringArray((input.payload as any)?.harmful_instruction_ids || (input.payload as any)?.harmfulInstructionIds);
+    const explicitIgnored = this.stringArray((input.payload as any)?.ignored_instruction_ids || (input.payload as any)?.ignoredInstructionIds);
+    const ignored = explicitIgnored.length ? explicitIgnored : instructionIds.filter((sourceId) => !used.includes(sourceId) && !harmful.includes(sourceId));
+    if (!used.length && !ignored.length && !harmful.length) return;
+    const feedbackPayload = {
+      task_id: input.taskId || undefined,
+      query_id: input.queryId || undefined,
+      agent_id: input.agentId || undefined,
+      used_instruction_ids: used,
+      ignored_instruction_ids: ignored,
+      harmful_instruction_ids: harmful,
+      metadata: { source: 'id-agents-manager' },
+    };
+    await this.validateBrainLearningContract({
+      subject: input.taskId || input.queryId || 'manager.instructions',
+      instruction_feedback: feedbackPayload,
+    });
+    await this.postBrain('/instructions/feedback', feedbackPayload);
+  }
+
+  private async postBrainEvalCapture(input: {
+    queryText: string;
+    route: string;
+    agentId?: string | null;
+    taskId?: string | null;
+    queryId?: string | null;
+    context?: BrainVolunteerContext | null;
+    usedSourceIds?: string[];
+    volunteeredSourceIds?: string[];
+    injectedInstructionIds?: string[];
+    latencyMs?: number | null;
+  }): Promise<void> {
+    const volunteeredSourceIds = input.volunteeredSourceIds?.length ? input.volunteeredSourceIds : input.context?.cited?.canonical_source_ids || [];
+    const payload = {
+      query_text: input.queryText,
+      route: input.route,
+      agent_id: input.agentId || undefined,
+      task_id: input.taskId || undefined,
+      accepted_ids: input.usedSourceIds || [],
+      volunteered_source_ids: volunteeredSourceIds,
+      context_package_id: this.contextPackageId(input.context),
+      latency_ms: input.latencyMs ?? undefined,
+      metadata: {
+        source: 'id-agents-manager',
+        query_id: input.queryId || undefined,
+        brain_context_timeline_event_id: input.context?.timelineEventId,
+        source_origins: input.context?.cited?.source_origins || {},
+        injected_instruction_ids: input.injectedInstructionIds || [],
+      },
+    };
+    await this.validateBrainLearningContract({
+      subject: input.taskId || input.queryId || 'manager.eval',
+      eval_feedback: payload,
+    });
+    await this.postBrain('/eval/capture', payload);
+    if (volunteeredSourceIds.length && !(input.usedSourceIds || []).length) {
+      await this.postBrain('/context/feedback-missing', {
+        task_id: input.taskId || undefined,
+        query_id: input.queryId || undefined,
+        agent_id: input.agentId || undefined,
+        query_text: input.queryText,
+        route: input.route,
+        brain_context: input.context || undefined,
+        volunteered_source_ids: volunteeredSourceIds,
+      });
+    }
+  }
+
+  private withBrainContextAppendix(message: string, context: BrainVolunteerContext | null): string {
+    if (!context?.bundles?.length && !context?.instructions?.length) return message;
+    const lines = ['Brain context:'];
+    if (context.instructions?.length) {
+      lines.push('Team instructions:');
+      for (const instruction of context.instructions.slice(0, 5)) {
+        lines.push(`- ${instruction.content} [${instruction.source_id}]`);
+      }
+      lines.push('Report instruction usefulness as used_instruction_ids, ignored_instruction_ids, or harmful_instruction_ids.');
+    }
+    for (const bundle of context.bundles.slice(0, 3)) {
+      lines.push(bundle.query ? `- Query: ${bundle.query}` : '- Related context');
+      for (const entity of (bundle.entities || []).slice(0, 3)) {
+        if (entity?.id) lines.push(`  Entity: ${entity.name || entity.id} [entity:${entity.id}]`);
+      }
+      for (const fact of (bundle.facts || []).slice(0, 4)) {
+        if (fact?.id) lines.push(`  Fact: ${fact.entity_id}.${fact.field} = ${JSON.stringify(fact.value)} [fact:${fact.id}]`);
+      }
+      for (const unit of (bundle.textUnits || []).slice(0, 2)) {
+        if (!unit?.id) continue;
+        const excerpt = String(unit.content || '').replace(/\\s+/g, ' ').slice(0, 240);
+        lines.push(`  Source: ${unit.title || unit.source_id || 'text unit'} [text:${unit.id}] ${excerpt}`);
+      }
+    }
+    const canonical = context.cited?.canonical_source_ids || [];
+    if (canonical.length) lines.push(`Cite used Brain sources as used_source_ids: ${canonical.join(', ')}`);
+    return `${message}\n\n${lines.join('\n')}`;
   }
 
   /**
@@ -2151,7 +2439,6 @@ export class AgentManagerDb {
         template: fromSel.name,
         dest: toSel.name,
         force,
-        params,
       });
       if (!result.ok) {
         const { ok: _ok, status, ...rest } = result;
@@ -5220,7 +5507,7 @@ export class AgentManagerDb {
 
     this.managementApp.post('/tasks/:ref/done', async (req, res) => {
       try {
-        let { id: teamId } = await this.getTeam(req);
+        let { id: teamId, name: teamName } = await this.getTeam(req);
         const { agent_id, from } = req.body || {};
         const callerRef = agent_id || from;
 
@@ -6790,6 +7077,7 @@ export class AgentManagerDb {
       case 'hey': {
         const agentName = args[0];
         const message = args.slice(1).join(' ');
+        const callerSessionId: string | undefined = undefined;
 
         if (!agentName || !message) {
           return { ok: false, error: `Usage: /${action} <agent-name|agent-id> <message>` };
@@ -6892,6 +7180,7 @@ export class AgentManagerDb {
           );
           if (brainContext) this.queryBrainContext.set(askQueryId, brainContext);
         }
+        this.bindLocalGate(askGate, askQueryId); // released when the query completes/fails
         return {
           ok: true,
           result: {
