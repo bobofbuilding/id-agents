@@ -16,6 +16,7 @@
 
 import { spawn, ChildProcess } from 'child_process';
 import { AgentHarness, HarnessOptions, HarnessMessage, HarnessType, McpServerSpec } from './types.js';
+import { reportTurnUsage } from './usage-report.js';
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -159,9 +160,11 @@ export class CodexHarness implements AgentHarness {
 
   private currentProcess: ChildProcess | null = null;
   private cancelled = false;
+  private currentQueryId: string | undefined;
 
   async *run(prompt: string, options: HarnessOptions = {}): AsyncGenerator<HarnessMessage> {
     const workingDir = options.workingDirectory || process.cwd();
+    this.currentQueryId = options.queryId;
 
     console.log(`[Codex] Starting harness`);
     console.log(`[Codex] Working directory: ${workingDir}`);
@@ -205,6 +208,16 @@ export class CodexHarness implements AgentHarness {
 
     // Skip git repo check in case working dir isn't a git repo
     args.push('--skip-git-repo-check');
+
+    // Reasoning effort (set per-agent in the Control Center) — fewer reasoning tokens at
+    // lower effort. Non-secret config, so a `-c` override on argv is fine. codex accepts
+    // minimal|low|medium|high; map xhigh→high.
+    const effortRaw = process.env.ID_AGENT_EFFORT;
+    if (effortRaw && /^(minimal|low|medium|high|xhigh)$/.test(effortRaw)) {
+      const eff = effortRaw === 'xhigh' ? 'high' : effortRaw;
+      args.push('-c', `model_reasoning_effort="${eff}"`);
+      console.log(`[Codex] Reasoning effort: ${eff}`);
+    }
 
     // Attach external MCP servers (Modules view) via a PRIVATE, per-agent config
     // file — NOT `-c …env={…}` on argv (which is world-readable via `ps` and leaked
@@ -268,6 +281,7 @@ export class CodexHarness implements AgentHarness {
 
     let lastResult = '';
     let sessionId: string | undefined;
+    let turnStartMs = Date.now();
     let buffer = '';
 
     // Issue 4: Guard stdout/stderr with null checks
@@ -359,6 +373,7 @@ export class CodexHarness implements AgentHarness {
             }
 
             case 'turn.started': {
+              turnStartMs = Date.now();
               yield {
                 type: 'progress',
                 content: 'Processing...',
@@ -534,6 +549,25 @@ export class CodexHarness implements AgentHarness {
             }
 
             case 'turn.completed': {
+              // Per-turn token usage → manager (attributed to this query's task). Codex's
+              // turn.completed carries usage.{input_tokens, cached_input_tokens, output_tokens}.
+              try {
+                const u = event.usage || {};
+                // Codex's input_tokens is the FULL prompt and ALREADY includes the cached
+                // portion; cached_input_tokens is the re-read session history (often millions
+                // of tokens). Count only NEW (non-cached) input so the per-task figure reflects
+                // real spend, not the cached context re-counted every turn.
+                const input = Math.max(0, (Number(u.input_tokens) || 0) - (Number(u.cached_input_tokens) || 0));
+                const output = Number(u.output_tokens) || 0;
+                reportTurnUsage({
+                  runtime: 'codex',
+                  model: options.model || process.env.CODEX_MODEL || 'codex',
+                  input: input || null,
+                  output: output || null,
+                  genMs: Date.now() - turnStartMs,
+                  queryId: this.currentQueryId,
+                });
+              } catch { /* never block the reply */ }
               // Issue 5: Only emit type:result here, on turn.completed
               if (lastResult) {
                 yield {

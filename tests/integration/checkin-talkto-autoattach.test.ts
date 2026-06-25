@@ -453,6 +453,18 @@ describe('/talk-to auto-attach', () => {
         memory_id: 101,
         key: 'instruction:test',
       });
+      const claimEvents = await db.events.query({ teamId, topics: ['task:claimed'] });
+      expect(claimEvents.at(-1)?.data).toMatchObject({
+        volunteered_source_ids: ['memory:101'],
+        brain_context: {
+          cited: {
+            canonical_source_ids: ['memory:101'],
+            source_origins: { 'memory:101': ['team_instruction'] },
+          },
+          timelineEventId: 42,
+          context_package_id: 77,
+        },
+      });
 
       const done = await fetch(`${baseUrl}/tasks/close-deployment-task/done`, {
         method: 'POST',
@@ -497,6 +509,69 @@ describe('/talk-to auto-attach', () => {
       const events = await db.events.query({ teamId, topics: ['task:completed'] });
       expect(events.at(-1)?.data).toMatchObject({
         used_source_ids: ['memory:101'],
+        volunteered_source_ids: ['memory:101'],
+      });
+    } finally {
+      if (previousBrainUrl === undefined) delete process.env.BRAIN_URL;
+      else process.env.BRAIN_URL = previousBrainUrl;
+      if (previousDisabled === undefined) delete process.env.BRAIN_CONTEXT_DISABLED;
+      else process.env.BRAIN_CONTEXT_DISABLED = previousDisabled;
+      await new Promise<void>((r) => brain.close(() => r()));
+    }
+  });
+
+  it('recovers volunteered task sources from durable Brain ledger when claim response context is lost', async () => {
+    const brainPort = await findFreePort();
+    const received = { feedback: [] as any[], validations: [] as any[], evals: [] as any[], missing: [] as any[], edges: [] as any[] };
+    const brain = await startStubBrain(brainPort, received);
+    const previousBrainUrl = process.env.BRAIN_URL;
+    const previousDisabled = process.env.BRAIN_CONTEXT_DISABLED;
+    process.env.BRAIN_URL = `http://127.0.0.1:${brainPort}`;
+    delete process.env.BRAIN_CONTEXT_DISABLED;
+
+    try {
+      const created = await fetch(`${baseUrl}/tasks`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({
+          title: 'Recover claim context task',
+          name: 'recover-claim-context-task',
+          description: 'Completion should not depend on claim response survival',
+          from: 'manager',
+        }),
+      });
+      expect(created.status).toBe(201);
+
+      const claimed = await fetch(`${baseUrl}/tasks/recover-claim-context-task/claim`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({ agent_id: 'coder' }),
+      });
+      expect(claimed.status).toBe(200);
+
+      const claimEvents = await db.events.query({ teamId, topics: ['task:claimed'] });
+      expect(claimEvents.at(-1)?.data).toMatchObject({
+        volunteered_source_ids: ['memory:101'],
+        brain_context: {
+          cited: { canonical_source_ids: ['memory:101'] },
+          timelineEventId: 42,
+        },
+      });
+
+      const done = await fetch(`${baseUrl}/tasks/recover-claim-context-task/done`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({
+          agent_id: 'coder',
+          used_source_ids: ['memory:101'],
+        }),
+      });
+      expect(done.status).toBe(200);
+
+      expect(received.evals).toHaveLength(1);
+      expect(received.evals[0]).toMatchObject({
+        route: 'manager.task_completion',
+        accepted_ids: ['memory:101'],
         volunteered_source_ids: ['memory:101'],
       });
     } finally {
@@ -571,6 +646,77 @@ describe('/talk-to auto-attach', () => {
         used_source_ids: ['memory:101'],
         volunteered_source_ids: ['memory:101'],
       });
+    } finally {
+      if (previousBrainUrl === undefined) delete process.env.BRAIN_URL;
+      else process.env.BRAIN_URL = previousBrainUrl;
+      if (previousDisabled === undefined) delete process.env.BRAIN_CONTEXT_DISABLED;
+      else process.env.BRAIN_CONTEXT_DISABLED = previousDisabled;
+      await new Promise<void>((r) => brain.close(() => r()));
+    }
+  });
+
+  it('records feedback-missing when a dispatched query reply omits used source ids', async () => {
+    const brainPort = await findFreePort();
+    const received = { feedback: [] as any[], validations: [] as any[], evals: [] as any[], missing: [] as any[], edges: [] as any[] };
+    const brain = await startStubBrain(brainPort, received);
+    const previousBrainUrl = process.env.BRAIN_URL;
+    const previousDisabled = process.env.BRAIN_CONTEXT_DISABLED;
+    process.env.BRAIN_URL = `http://127.0.0.1:${brainPort}`;
+    delete process.env.BRAIN_CONTEXT_DISABLED;
+
+    try {
+      const delegated = await fetch(`${baseUrl}/talk-to`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({
+          to: 'coder',
+          from: 'manager',
+          message: 'coder receives Brain context but forgets citations',
+          wait: false,
+          task: { title: 'Brain-backed missing feedback query', name: 'brain-backed-missing-feedback-query' },
+        }),
+      });
+      expect(delegated.status).toBe(200);
+      const delegatedBody = await delegated.json() as { query_id: string; brain_context?: any };
+      expect(delegatedBody.query_id).toMatch(/^query_/);
+      expect(delegatedBody.brain_context?.cited?.canonical_source_ids).toEqual(['memory:101']);
+
+      const reply = await fetch(`${baseUrl}/news`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({
+          from: 'coder',
+          type: 'reply',
+          message: 'Completed without citing what helped.',
+          in_reply_to: delegatedBody.query_id,
+          data: {},
+        }),
+      });
+      expect(reply.status).toBe(201);
+
+      expect(received.validations.some((item) => item.eval_feedback?.route === 'manager.dispatch')).toBe(true);
+      expect(received.evals.some((item) => (
+        item.route === 'manager.dispatch'
+        && item.accepted_ids?.length === 0
+        && item.volunteered_source_ids?.includes('memory:101')
+        && item.context_package_id === 77
+        && item.metadata?.query_id === delegatedBody.query_id
+      ))).toBe(true);
+      expect(received.missing).toHaveLength(1);
+      expect(received.missing[0]).toMatchObject({
+        query_id: delegatedBody.query_id,
+        agent_id: targetId,
+        volunteered_source_ids: ['memory:101'],
+        route: 'manager.dispatch',
+      });
+      expect(received.missing[0].query_text).toContain('coder receives Brain context');
+
+      const queryEvents = await db.events.query({ teamId, topics: ['query:delivered'] });
+      expect(queryEvents.at(-1)?.data).toMatchObject({
+        query_id: delegatedBody.query_id,
+        volunteered_source_ids: ['memory:101'],
+      });
+      expect(queryEvents.at(-1)?.data?.used_source_ids ?? null).toBe(null);
     } finally {
       if (previousBrainUrl === undefined) delete process.env.BRAIN_URL;
       else process.env.BRAIN_URL = previousBrainUrl;

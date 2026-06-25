@@ -17,6 +17,7 @@
 import { spawn, ChildProcess } from 'child_process';
 import { AgentHarness, HarnessOptions, HarnessMessage, HarnessType } from './types.js';
 import { toMcpServerRecord } from './mcp.js';
+import { reportTurnUsage } from './usage-report.js';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -115,6 +116,14 @@ export class ClaudeCodeCliHarness implements AgentHarness {
       args.push('--model', process.env.CLAUDE_CLI_MODEL);
     }
 
+    // Reasoning effort (set per-agent in the Control Center) — fewer reasoning tokens at
+    // lower effort. Claude Code accepts low|medium|high|xhigh (map minimal→low).
+    const effortRaw = process.env.ID_AGENT_EFFORT;
+    if (effortRaw && /^(minimal|low|medium|high|xhigh)$/.test(effortRaw)) {
+      args.push('--effort', effortRaw === 'minimal' ? 'low' : effortRaw);
+      console.log(`[Claude CLI] Reasoning effort: ${effortRaw}`);
+    }
+
     // Add session resume if provided
     if (options.resume) {
       args.push('--resume', options.resume);
@@ -203,6 +212,25 @@ export class ClaudeCodeCliHarness implements AgentHarness {
           }
 
           if (jsonResult) {
+            // Per-turn token usage → manager (attributed to this query's task). Claude Code's
+            // result message carries usage.{input_tokens, output_tokens, cache_*}; sum cache into
+            // input so the displayed "input" reflects everything billed.
+            try {
+              const u = jsonResult.usage || {};
+              // Count only NEW input. Claude's input_tokens is already the non-cached new input;
+              // cache_read/cache_creation are the (cheap, often huge) cached context — including
+              // them made the per-task figure balloon to millions that aren't real spend.
+              const input = Number(u.input_tokens) || 0;
+              const output = Number(u.output_tokens) || 0;
+              reportTurnUsage({
+                runtime: 'claude-code-cli',
+                model: options.model || process.env.CLAUDE_CLI_MODEL || 'claude',
+                input: input || null,
+                output: output || null,
+                genMs: Number(jsonResult.duration_ms) || 0,
+                queryId: this.currentQueryId,
+              });
+            } catch { /* never block the reply */ }
             // Yield the result
             yield {
               type: 'result',

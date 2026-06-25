@@ -427,6 +427,8 @@ export class AgentManagerDb {
   private healthCheckInterval: NodeJS.Timeout | null = null;
   private remoteProbeInterval: NodeJS.Timeout | null = null;
   private querySweeperInterval: NodeJS.Timeout | null = null;
+  private stalledSweepInterval: NodeJS.Timeout | null = null;
+  private stalledNudges = new Map<string, number>(); // taskId → last nudge ts (throttle)
   private retentionService: RetentionService | null = null;
   private checkinService: CheckinService | null = null;
   /**
@@ -930,7 +932,7 @@ export class AgentManagerDb {
   }
 
   /** Read + parse the usage log, soft-capping its size to stay bounded. */
-  private readUsageRecords(): Array<{ ts: number; runtime: string; model: string; agent: string; team: string; input: number | null; output: number | null; genMs: number | null; tps: number | null }> {
+  private readUsageRecords(): Array<{ ts: number; runtime: string; model: string; agent: string; team: string; input: number | null; output: number | null; genMs: number | null; tps: number | null; query_id?: string }> {
     const p = this.usageLogPath();
     if (!existsSync(p)) return [];
     let raw = '';
@@ -949,6 +951,32 @@ export class AgentManagerDb {
       } catch { /* skip malformed line */ }
     }
     return out;
+  }
+
+  private wantsCsv(req: express.Request): boolean {
+    const format = typeof req.query.format === 'string' ? req.query.format.toLowerCase() : '';
+    if (format === 'csv') return true;
+    const accept = String(req.headers.accept || '').toLowerCase();
+    return accept.split(',').some((part) => part.trim().startsWith('text/csv'));
+  }
+
+  private csvCell(value: unknown): string {
+    if (value == null) return '';
+    const text = String(value);
+    return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+  }
+
+  private sendCsv(res: express.Response, filename: string, rows: Array<Record<string, unknown>>): void {
+    const headers = rows.length
+      ? Object.keys(rows[0])
+      : ['empty'];
+    const lines = [
+      headers.map((h) => this.csvCell(h)).join(','),
+      ...rows.map((row) => headers.map((h) => this.csvCell(row[h])).join(',')),
+    ];
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(lines.join('\n') + '\n');
   }
 
   /**
@@ -1704,6 +1732,45 @@ export class AgentManagerDb {
 
   private stringArray(value: unknown): string[] {
     return Array.isArray(value) ? value.map(String).filter(Boolean) : [];
+  }
+
+  private async latestTaskClaimBrainContext(teamId: string, taskUuid: string): Promise<BrainVolunteerContext | null> {
+    if (!taskUuid) return null;
+    const rows = await this.db.events.query({
+      teamId,
+      topics: ['task:claimed'],
+      limit: 200,
+    });
+    const event = rows
+      .slice()
+      .reverse()
+      .find((row) => row.subject_id === taskUuid && row.subject_kind === 'task');
+    const brainContext = event?.data?.brain_context as Record<string, any> | undefined;
+    if (!brainContext || typeof brainContext !== 'object') return null;
+    const cited = brainContext.cited && typeof brainContext.cited === 'object'
+      ? brainContext.cited
+      : undefined;
+    return {
+      bundles: [],
+      cited: cited ? {
+        entity_ids: Array.isArray(cited.entity_ids) ? cited.entity_ids.map(String) : undefined,
+        fact_ids: Array.isArray(cited.fact_ids) ? cited.fact_ids.map(Number).filter(Number.isInteger) : undefined,
+        text_unit_ids: Array.isArray(cited.text_unit_ids) ? cited.text_unit_ids.map(Number).filter(Number.isInteger) : undefined,
+        canonical_source_ids: Array.isArray(cited.canonical_source_ids) ? cited.canonical_source_ids.map(String) : undefined,
+        source_origins: cited.source_origins && typeof cited.source_origins === 'object' ? cited.source_origins as Record<string, string[]> : undefined,
+      } : undefined,
+      timelineEventId: Number.isInteger(brainContext.timelineEventId)
+        ? brainContext.timelineEventId
+        : Number.isInteger(brainContext.timeline_event_id)
+          ? brainContext.timeline_event_id
+          : null,
+      context_package_id: Number.isInteger(brainContext.context_package_id)
+        ? brainContext.context_package_id
+        : Number.isInteger(brainContext.contextPackageId)
+          ? brainContext.contextPackageId
+          : null,
+      task_id: `task:${taskUuid}`,
+    };
   }
 
   private async postBrainInstructionFeedback(input: {
@@ -2644,6 +2711,7 @@ export class AgentManagerDb {
           output: num(b.output),
           genMs: num(b.genMs),
           tps: num(b.tps),
+          query_id: str(b.query_id, 80) || undefined, // attribute the turn to the task this query worked
         };
         if (rec.input == null && rec.output == null) {
           return res.status(400).json({ error: 'no_tokens' });
@@ -2655,7 +2723,7 @@ export class AgentManagerDb {
       }
     });
 
-    this.managementApp.get('/usage', (_req, res) => {
+    this.managementApp.get('/usage', (req, res) => {
       try {
         const now = Date.now();
         const records = this.readUsageRecords();
@@ -2663,34 +2731,187 @@ export class AgentManagerDb {
           const since = now - windowMs;
           const rows = records.filter((r) => r.ts >= since);
           let input = 0, output = 0, genMs = 0;
-          const byAgent = new Map<string, { count: number; output: number; genMs: number }>();
+          // Track input AND output per agent/model so the per-row "total tokens" reconciles
+          // with the window total (input+output) — not output-only.
+          const byAgent = new Map<string, { count: number; input: number; output: number; genMs: number }>();
+          const byModel = new Map<string, { count: number; input: number; output: number; genMs: number }>();
           for (const r of rows) {
             input += r.input || 0;
             output += r.output || 0;
             genMs += r.genMs || 0;
-            const a = byAgent.get(r.agent) || { count: 0, output: 0, genMs: 0 };
-            a.count++; a.output += r.output || 0; a.genMs += r.genMs || 0;
+            const a = byAgent.get(r.agent) || { count: 0, input: 0, output: 0, genMs: 0 };
+            a.count++; a.input += r.input || 0; a.output += r.output || 0; a.genMs += r.genMs || 0;
             byAgent.set(r.agent, a);
+            const mk = r.model || 'unknown';
+            const m = byModel.get(mk) || { count: 0, input: 0, output: 0, genMs: 0 };
+            m.count++; m.input += r.input || 0; m.output += r.output || 0; m.genMs += r.genMs || 0;
+            byModel.set(mk, m);
           }
           const genSec = genMs / 1000;
+          const tps = (out: number, ms: number) => (ms > 0 ? +(out / (ms / 1000)).toFixed(1) : 0);
           return {
             count: rows.length,
             input, output, total: input + output,
             avgPerQuery: rows.length ? Math.round((input + output) / rows.length) : 0,
-            avgTps: genSec > 0 ? +(output / genSec).toFixed(1) : 0,
+            avgTps: tps(output, genMs),
             agents: [...byAgent.entries()].map(([agent, a]) => ({
-              agent, count: a.count, output: a.output,
-              avgTps: a.genMs > 0 ? +(a.output / (a.genMs / 1000)).toFixed(1) : 0,
-            })).sort((x, y) => y.output - x.output),
+              agent, count: a.count, input: a.input, output: a.output, total: a.input + a.output,
+              avgTps: tps(a.output, a.genMs),
+            })).sort((x, y) => y.total - x.total),
+            models: [...byModel.entries()].map(([model, m]) => ({
+              model, count: m.count, input: m.input, output: m.output, total: m.input + m.output,
+              avgTps: tps(m.output, m.genMs),
+            })).sort((x, y) => y.total - x.total),
           };
         };
         const last = records.length ? records[records.length - 1] : null;
-        return res.json({
+        const payload = {
           now,
           day: summarize(24 * 3600_000),
           week: summarize(7 * 24 * 3600_000),
           recent: last ? { tps: last.tps, output: last.output, model: last.model, agent: last.agent, at: last.ts } : null,
-        });
+        };
+        if (this.wantsCsv(req)) {
+          const rows: Array<Record<string, unknown>> = [];
+          const addSummary = (window: 'day' | 'week', summary: typeof payload.day) => {
+            rows.push({
+              window,
+              kind: 'summary',
+              key: 'all',
+              count: summary.count,
+              input: summary.input,
+              output: summary.output,
+              total: summary.total,
+              avg_per_query: summary.avgPerQuery,
+              avg_tps: summary.avgTps,
+              generated_at: now,
+            });
+            for (const agent of summary.agents) {
+              rows.push({
+                window,
+                kind: 'agent',
+                key: agent.agent,
+                count: agent.count,
+                input: agent.input,
+                output: agent.output,
+                total: agent.total,
+                avg_per_query: '',
+                avg_tps: agent.avgTps,
+                generated_at: now,
+              });
+            }
+            for (const model of summary.models) {
+              rows.push({
+                window,
+                kind: 'model',
+                key: model.model,
+                count: model.count,
+                input: model.input,
+                output: model.output,
+                total: model.total,
+                avg_per_query: '',
+                avg_tps: model.avgTps,
+                generated_at: now,
+              });
+            }
+          };
+          addSummary('day', payload.day);
+          addSummary('week', payload.week);
+          if (payload.recent) {
+            rows.push({
+              window: 'recent',
+              kind: 'last_turn',
+              key: payload.recent.agent,
+              count: 1,
+              input: '',
+              output: payload.recent.output ?? '',
+              total: payload.recent.output ?? '',
+              avg_per_query: '',
+              avg_tps: payload.recent.tps ?? '',
+              generated_at: now,
+              model: payload.recent.model,
+              at: payload.recent.at,
+            });
+          }
+          return this.sendCsv(res, 'usage.csv', rows);
+        }
+        return res.json(payload);
+      } catch (e: any) {
+        return res.status(500).json({ error: e?.message || String(e) });
+      }
+    });
+
+    // Per-task token spend: attribute each usage record to the task its query worked.
+    // Cloud harnesses report a query_id → exact attribution; records without one fall back
+    // to time-window matching (same agent, ts inside the query's [created, completed] window).
+    // Keyed by the task's shortId ("#" + dashless-uuid[:8]) so the control center can match cards.
+    this.managementApp.get('/usage/by-task', async (req, res) => {
+      try {
+        const { id: teamId } = await this.getTeam(req);
+        const records = this.readUsageRecords();
+        const { rows } = await this.db.adapter.query<{ query_id: string; agent_id: string | null; created: number; completed: number | null; prompt: string | null; metadata: unknown }>(
+          `SELECT query_id, agent_id, created, completed, prompt, metadata FROM queries WHERE team_id = $1`,
+          [teamId],
+        );
+        // Resolve a task shortId ("#abc12345") for a query: the dispatch prompt always names the
+        // task it's working (WORK_PROMPT / redispatch), so the prompt ref is the primary signal;
+        // fall back to a structured brain_context.task_id (task:<uuid>) when present.
+        const refOfQuery = (prompt: string | null, md: any): string | null => {
+          const m = typeof prompt === 'string' ? prompt.match(/#[0-9a-f]{8}\b/) : null;
+          if (m) return m[0];
+          const tid = md?.brain_context?.task_id ?? md?.task_id;
+          if (typeof tid === 'string' && tid.startsWith('task:')) return `#${tid.slice(5).replace(/-/g, '').slice(0, 8)}`;
+          return null;
+        };
+        // Owner map: a turn's tokens only count toward the task its agent OWNS. Without this, ANY
+        // agent that merely MENTIONS a task ref in its prompt (reports, supervision nudges, dispatch
+        // lists, brain context) had its tokens mis-attributed to that task — e.g. inflated codex turns
+        // from several agents piling onto one ollama-owned task (the 70M+ phantom).
+        const agentNameById = new Map<string, string>();
+        for (const a of await this.db.agents.list(teamId).catch(() => [])) agentNameById.set(a.id, a.name);
+        const ownerOf = new Map<string, string>(); // task ref → owner agent name
+        for (const t of await this.db.tasks.list({ teamId }).catch(() => [])) {
+          if (t.owner && t.uuid) { const nm = agentNameById.get(t.owner); if (nm) ownerOf.set(`#${t.uuid.replace(/-/g, '').slice(0, 8)}`, nm); }
+        }
+        const byQuery = new Map<string, string>(); // query_id → task ref (OWNER's queries only)
+        const windows: Array<{ agent: string; from: number; to: number; ref: string }> = [];
+        for (const r of rows) {
+          let md: any = r.metadata;
+          if (typeof md === 'string') { try { md = JSON.parse(md); } catch { md = null; } }
+          const ref = refOfQuery(r.prompt, md);
+          if (!ref) continue;
+          const qAgent = agentNameById.get(r.agent_id || '') || '';
+          if (ownerOf.get(ref) !== qAgent) continue; // only the task's OWNER's turns count toward it
+          if (r.query_id) byQuery.set(r.query_id, ref);
+          windows.push({ agent: qAgent, from: r.created, to: r.completed ?? Date.now(), ref });
+        }
+        // A single turn's NEW input can't exceed the model's context window; anything far larger is a
+        // stale cache-inflated record from an agent still on the pre-fix harness — drop it.
+        const MAX_TURN_INPUT = 1_000_000;
+        const agg = new Map<string, { input: number; output: number; ms: number; turns: number }>();
+        for (const rec of records) {
+          if ((rec.input || 0) > MAX_TURN_INPUT) continue;
+          let ref = rec.query_id ? byQuery.get(rec.query_id) : undefined;
+          if (!ref) {
+            const w = windows.find((w) => w.agent === rec.agent && rec.ts >= w.from && rec.ts <= w.to + 2000);
+            ref = w?.ref;
+          }
+          if (!ref) continue;
+          const a = agg.get(ref) || { input: 0, output: 0, ms: 0, turns: 0 };
+          a.input += rec.input || 0; a.output += rec.output || 0; a.ms += rec.genMs || 0; a.turns += 1;
+          agg.set(ref, a);
+        }
+        const tasks: Record<string, { tokens: number; input: number; output: number; ms: number; turns: number }> = {};
+        for (const [ref, a] of agg) {
+          tasks[ref] = { tokens: a.input + a.output, input: a.input, output: a.output, ms: a.ms, turns: a.turns };
+        }
+        if (this.wantsCsv(req)) {
+          const csvRows = Object.entries(tasks)
+            .map(([task, a]) => ({ task, tokens: a.tokens, input: a.input, output: a.output, ms: a.ms, turns: a.turns }))
+            .sort((a, b) => b.tokens - a.tokens);
+          return this.sendCsv(res, 'usage-by-task.csv', csvRows);
+        }
+        return res.json({ tasks });
       } catch (e: any) {
         return res.status(500).json({ error: e?.message || String(e) });
       }
@@ -5509,6 +5730,12 @@ export class AgentManagerDb {
         }
 
         const updated = await this.db.tasks.getByNameForTeam(task.name, teamId);
+        const brainContext = await this.volunteerBrainContext({
+          taskId: `task:${updated!.uuid}`,
+          agentId: agent.id,
+          text: [updated!.title, updated!.description].filter(Boolean).join('\n\n'),
+          project: teamName,
+        });
         await emitTaskClaimed(this.db.events, {
           teamId,
           taskUuid: updated!.uuid,
@@ -5516,14 +5743,14 @@ export class AgentManagerDb {
           title: updated!.title,
           ownerAgentId: agent.id,
           occurredAt: Date.now(),
+          volunteeredSourceIds: brainContext?.cited?.canonical_source_ids || [],
+          brainContext: brainContext ? {
+            cited: brainContext.cited,
+            timelineEventId: brainContext.timelineEventId,
+            context_package_id: brainContext.context_package_id ?? brainContext.contextPackageId,
+          } : null,
         });
         const taskResult = await this.buildTaskResult(updated!, teamId);
-        const brainContext = await this.volunteerBrainContext({
-          taskId: `task:${updated!.uuid}`,
-          agentId: agent.id,
-          text: [updated!.title, updated!.description].filter(Boolean).join('\n\n'),
-          project: teamName,
-        });
         if (brainContext) (taskResult as any).brain_context = {
           cited: brainContext.cited,
           timelineEventId: brainContext.timelineEventId,
@@ -5585,6 +5812,8 @@ export class AgentManagerDb {
         const updated = await this.db.tasks.getByNameForTeam(task.name, teamId);
         const completedAt = Date.now();
         const bodyBrainContext = req.body?.brain_context || req.body?.brainContext || null;
+        const claimedBrainContext = bodyBrainContext ? null : await this.latestTaskClaimBrainContext(teamId, updated!.uuid);
+        const effectiveBrainContext = bodyBrainContext || claimedBrainContext;
         const usedSourceIds = Array.isArray(req.body?.used_source_ids)
           ? req.body.used_source_ids.map(String)
           : Array.isArray(req.body?.usedSourceIds)
@@ -5594,11 +5823,11 @@ export class AgentManagerDb {
           ? req.body.volunteered_source_ids.map(String)
           : Array.isArray(req.body?.volunteeredSourceIds)
             ? req.body.volunteeredSourceIds.map(String)
-            : Array.isArray(bodyBrainContext?.cited?.canonical_source_ids)
-              ? bodyBrainContext.cited.canonical_source_ids.map(String)
+            : Array.isArray(effectiveBrainContext?.cited?.canonical_source_ids)
+              ? effectiveBrainContext.cited.canonical_source_ids.map(String)
               : [];
         const feedbackContext: BrainVolunteerContext | null = {
-          bundles: Array.isArray(bodyBrainContext?.bundles) ? bodyBrainContext.bundles : [],
+          bundles: Array.isArray(effectiveBrainContext?.bundles) ? effectiveBrainContext.bundles : [],
           task_id: `task:${updated!.uuid}`,
           instructions: this.stringArray(req.body?.injected_instruction_ids || req.body?.injectedInstructionIds)
             .map((sourceId) => ({
@@ -5616,10 +5845,10 @@ export class AgentManagerDb {
           context: feedbackContext,
           payload: req.body || {},
         });
-        if (bodyBrainContext?.cited) {
-          (feedbackContext as any).cited = bodyBrainContext.cited;
-          (feedbackContext as any).timelineEventId = bodyBrainContext.timelineEventId ?? bodyBrainContext.timeline_event_id;
-          (feedbackContext as any).context_package_id = bodyBrainContext.context_package_id ?? bodyBrainContext.contextPackageId;
+        if (effectiveBrainContext?.cited) {
+          (feedbackContext as any).cited = effectiveBrainContext.cited;
+          (feedbackContext as any).timelineEventId = effectiveBrainContext.timelineEventId ?? effectiveBrainContext.timeline_event_id;
+          (feedbackContext as any).context_package_id = effectiveBrainContext.context_package_id ?? effectiveBrainContext.contextPackageId;
         }
         await this.postBrainEvalCapture({
           queryText: [updated!.title, updated!.description].filter(Boolean).join('\n\n'),
@@ -9166,6 +9395,60 @@ export class AgentManagerDb {
   }
 
   /**
+   * Always-on supervision sweep: re-nudge tasks stuck in 'doing'. Conservative by design —
+   * long stall threshold + long re-nudge throttle + a per-sweep cap — so it never spams the
+   * fleet. Disable with STALL_SWEEP_DISABLED=true. This is the manager-side counterpart to the
+   * control center's auto-pilot, so reconcile runs even when no UI is open.
+   */
+  private startStalledTaskSweeper(): void {
+    if (process.env.STALL_SWEEP_DISABLED === 'true') return;
+    const intervalMs = 5 * 60 * 1000;
+    const run = () => { this.sweepStalledTasks().catch((e) => console.error('[Manager] Stalled-task sweep failed:', e)); };
+    setTimeout(run, 90_000); // let the fleet settle after boot before the first sweep
+    this.stalledSweepInterval = setInterval(run, intervalMs);
+  }
+
+  private async sweepStalledTasks(): Promise<void> {
+    const STALL_MS = Number(process.env.STALL_SWEEP_MS) || 25 * 60 * 1000;     // 'doing' this long with no update
+    const RENUDGE_MS = Number(process.env.STALL_RENUDGE_MS) || 25 * 60 * 1000; // don't re-nudge a task within this
+    const MAX_PER_SWEEP = 6;
+    const now = Date.now();
+    const doing = await this.db.tasks.list({ status: 'doing' }).catch(() => [] as TaskRow[]);
+    let nudged = 0;
+    for (const t of doing) {
+      if (nudged >= MAX_PER_SWEEP) break;
+      if (!t.owner) continue;
+      const updated = t.updated_at || t.created_at || 0;
+      if (now - updated < STALL_MS) continue;
+      if (now - (this.stalledNudges.get(t.id) || 0) < RENUDGE_MS) continue;
+      // Resolve owner id → agent name + the task's team name for the dispatch.
+      const ownerAgent = await this.db.agents.getById(t.owner).catch(() => null);
+      const ownerName = ownerAgent?.name || t.owner;
+      const teamRow = t.team_id ? await this.db.teams.getTeam(t.team_id).catch(() => null) : null;
+      const teamName = teamRow?.name || 'default';
+      const ref = t.uuid ? `#${t.uuid.replace(/-/g, '').slice(0, 8)}` : t.name;
+      const mins = Math.round((now - updated) / 60000);
+      const msg = `Supervision: task ${ref} ("${t.title}") has been in progress ${mins}m with no completion. If the work is done, mark it done now with \`/task done ${ref}\`. If you're blocked, reply briefly with what's blocking it. If it isn't started, start and finish it.`;
+      const quoted = `"${msg.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+      this.stalledNudges.set(t.id, now);
+      try {
+        await fetch(`http://127.0.0.1:${this.managementPort}/remote`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'X-Id-Admin': '1', 'X-Id-Team': teamName },
+          body: JSON.stringify({ command: `/ask ${ownerName} ${quoted}` }),
+          signal: AbortSignal.timeout(20_000),
+        });
+        nudged++;
+      } catch { /* best-effort */ }
+    }
+    // Keep the throttle map from growing without bound.
+    if (this.stalledNudges.size > 2000) {
+      for (const [k, ts] of this.stalledNudges) if (now - ts > 2 * RENUDGE_MS) this.stalledNudges.delete(k);
+    }
+    if (nudged) console.log(`[Manager] Stalled-task sweep: re-nudged ${nudged} owner(s)`);
+  }
+
+  /**
    * Start the event_log retention sweep.
    *
    * Audit #6 (output/security-review-wakeup-service.md): the design promises
@@ -9368,6 +9651,10 @@ export class AgentManagerDb {
 
         // Start stuck-query sweeper (every 5 min, expires >15 min old)
         this.startQuerySweeper();
+
+        // Always-on supervision: re-nudge tasks stuck in 'doing' so reconcile no longer
+        // depends on the control center sitting on the Work board.
+        this.startStalledTaskSweeper();
 
         // Start event_log retention sweep (every 5 min, 7d / 100k-per-team caps)
         this.startEventLogRetentionSweep();
@@ -9896,6 +10183,11 @@ export class AgentManagerDb {
       ? Buffer.from(JSON.stringify(catalogSeed), 'utf8').toString('base64')
       : undefined;
 
+    // Reasoning effort for cloud-subscription runtimes (codex / claude-code-cli) —
+    // lower effort = fewer reasoning tokens. Read by those harnesses; n/a for ollama.
+    const effortRaw = (agentRow?.metadata as any)?.effort;
+    const effort = (typeof effortRaw === 'string' && /^(minimal|low|medium|high|xhigh)$/.test(effortRaw)) ? effortRaw : undefined;
+
     // External MCP servers attached to this agent (Modules view → metadata).
     // Serialized as JSON for claude-agent-server to parse into HarnessOptions.
     const mcpServers = (agentRow?.metadata as any)?.mcpServers;
@@ -9923,6 +10215,7 @@ export class AgentManagerDb {
       ...(tokenId && { ID_AGENT_TOKEN_ID: tokenId }),
       ...(owsWallet && { OWS_WALLET: owsWallet }),
       ...(catalogEnv && { ID_AGENT_CATALOG: catalogEnv }),
+      ...(effort && { ID_AGENT_EFFORT: effort }),
       ...(mcpEnv && { ID_MCP_SERVERS: mcpEnv }),
       ...(process.env.ANTHROPIC_API_KEY && { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY }),
       ...(process.env.OPENAI_API_KEY && { OPENAI_API_KEY: process.env.OPENAI_API_KEY }),

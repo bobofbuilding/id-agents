@@ -35,6 +35,20 @@ export interface TaskClaimedInput {
   title?: string | null;
   ownerAgentId: string;
   occurredAt: number;
+  volunteeredSourceIds?: string[];
+  brainContext?: {
+    cited?: {
+      entity_ids?: string[];
+      fact_ids?: number[];
+      text_unit_ids?: number[];
+      canonical_source_ids?: string[];
+      source_origins?: Record<string, string[]>;
+    };
+    timelineEventId?: number | null;
+    timeline_event_id?: number | null;
+    context_package_id?: number | null;
+    contextPackageId?: number | null;
+  } | null;
 }
 
 export interface TaskCompletedInput {
@@ -91,6 +105,8 @@ export async function emitTaskClaimed(
       task_uuid: input.taskUuid,
       status: 'doing',
       owner: input.ownerAgentId,
+      ...(input.volunteeredSourceIds?.length ? { volunteered_source_ids: input.volunteeredSourceIds } : {}),
+      ...(input.brainContext ? { brain_context: input.brainContext } : {}),
       ...(input.title ? { title_preview: truncate(input.title) } : {}),
     },
   });

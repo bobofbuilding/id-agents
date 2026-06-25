@@ -89,6 +89,44 @@ describe('event-producer: tasks', () => {
     });
   });
 
+  it('emitTaskClaimed carries volunteered source ids and brain context when provided', async () => {
+    const taskUuid = crypto.randomUUID();
+    const occurredAt = 1_777_000_000_500;
+
+    await emitTaskClaimed(events, {
+      teamId,
+      taskUuid,
+      taskName: 'brain-backed-claim',
+      title: 'Brain backed claim',
+      ownerAgentId: 'agent-coder',
+      occurredAt,
+      volunteeredSourceIds: ['memory:101'],
+      brainContext: {
+        cited: {
+          canonical_source_ids: ['memory:101'],
+          source_origins: { 'memory:101': ['team_instruction'] },
+        },
+        timelineEventId: 42,
+        context_package_id: 77,
+      },
+    });
+
+    const rows = await events.query({ teamId, topics: [TASK_CLAIMED] });
+    expect(rows).toHaveLength(1);
+    expect(rows[0].data).toMatchObject({
+      task_name: 'brain-backed-claim',
+      volunteered_source_ids: ['memory:101'],
+      brain_context: {
+        cited: {
+          canonical_source_ids: ['memory:101'],
+          source_origins: { 'memory:101': ['team_instruction'] },
+        },
+        timelineEventId: 42,
+        context_package_id: 77,
+      },
+    });
+  });
+
   it('emitTaskCompleted writes one task:completed row with status=done', async () => {
     const taskUuid = crypto.randomUUID();
     const occurredAt = 1_777_000_001_000;
