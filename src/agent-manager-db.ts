@@ -2734,9 +2734,13 @@ export class AgentManagerDb {
       try {
         const now = Date.now();
         const records = this.readUsageRecords();
+        // A single turn's NEW input can't exceed the model's context window; records far larger
+        // are stale cache-inflated reports from agents still on the pre-fix harness — drop them so
+        // the fleet totals reflect real (non-cached) spend, not the cached context re-counted.
+        const MAX_TURN_INPUT = 1_000_000;
         const summarize = (windowMs: number) => {
           const since = now - windowMs;
-          const rows = records.filter((r) => r.ts >= since);
+          const rows = records.filter((r) => r.ts >= since && (r.input || 0) <= MAX_TURN_INPUT);
           let input = 0, output = 0, genMs = 0;
           // Track input AND output per agent/model so the per-row "total tokens" reconciles
           // with the window total (input+output) — not output-only.
