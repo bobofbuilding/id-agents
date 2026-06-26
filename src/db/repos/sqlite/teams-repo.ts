@@ -82,6 +82,16 @@ export class SqliteTeamsRepo implements TeamsRepository {
     );
   }
 
+  async setOrg(teamId: string, org: Record<string, unknown> | null): Promise<void> {
+    const config = await this.getConfig(teamId);
+    if (org === null) delete config.org;
+    else config.org = org;
+    await this.db.query(
+      `UPDATE teams SET config = ? WHERE id = ?`,
+      [stringifyJson(config), teamId],
+    );
+  }
+
   async setDelegatesTo(teamId: string, delegates: string[] | null): Promise<void> {
     // Read-merge-write: no jsonb_set in SQLite
     const config = await this.getConfig(teamId);

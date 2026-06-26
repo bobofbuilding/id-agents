@@ -32,7 +32,7 @@ import { loadMasterKey, deriveKeyAtIndex } from './lib/skillmesh-key-manager.js'
 import { type Db } from './db/db-service.js';
 import type { AgentRow, QueryRow, ScheduleDefinitionRow, TaskRow } from './db/types.js';
 import fetch from 'node-fetch';
-import type { PluginConfig, DeployConfig, HeartbeatConfig, CalendarSpec, ScheduleDeliveryMode } from './config-parser.js';
+import type { PluginConfig, DeployConfig, HeartbeatConfig, CalendarSpec, ScheduleDeliveryMode, OrgConfig } from './config-parser.js';
 import {
   processConfig,
   copyAgentDirOverlay,
@@ -348,6 +348,7 @@ type AgentMetadata = Record<string, any> & {
   service_type?: string;  // e.g., "REST-AP", "MCP", "A2A"
   service?: string;       // The service URL (e.g., https://idbot.live/{id})
   agent_account?: string;
+  primaryLead?: boolean;
 };
 
 // WebSocket client tracking
@@ -7650,6 +7651,8 @@ export class AgentManagerDb {
           return { ok: false, error: 'No agents defined in config' };
         }
 
+        await this.db.teams.setOrg(syncTeamId, syncOrg ? syncOrg as unknown as Record<string, unknown> : null);
+
         // Get running agents for this team (include automators)
         const runningAgents = await this.db.agents.list(syncTeamId, true);
         // Filter to claude/automator types only — skip interactive agents
@@ -7760,6 +7763,7 @@ export class AgentManagerDb {
             skills: normalizedSkills,
             allowed_tools: spec.allowedTools,
             description: spec.description,
+            ...(spec.lead === true && { primaryLead: true }),
             ...(isAutomator && { isAutomator: true }),
             ...(spec.heartbeat && { heartbeat: true }),
             ...(spec.dangerouslySkipPermissions !== undefined && { dangerouslySkipPermissions: spec.dangerouslySkipPermissions }),
@@ -7872,6 +7876,7 @@ export class AgentManagerDb {
               skills: normalizedSkills,
               allowed_tools: spec.allowedTools,
               description: spec.description,
+              ...(spec.lead === true && { primaryLead: true }),
               ...(isAutomator && { isAutomator: true }),
               ...(spec.heartbeat && { heartbeat: true }),
               ...(spec.openMode !== undefined && { openMode: spec.openMode }),
@@ -8103,6 +8108,8 @@ export class AgentManagerDb {
           return { ok: false, error: 'No agents defined in config' };
         }
 
+        await this.db.teams.setOrg(effectiveTeamId, org ? org as unknown as Record<string, unknown> : null);
+
         for (const agentConfig of agents) {
           const effectiveRuntime = resolveRuntime(agentConfig.runtime) as HarnessType;
           const effectiveModel = agentConfig.model || getDefaultModelForRuntime(effectiveRuntime, this.defaultConfig?.model);
@@ -8193,6 +8200,7 @@ export class AgentManagerDb {
               ...(normalizedSkills && { skills: normalizedSkills }),
               allowed_tools: agentConfig.allowedTools,
               description: agentConfig.description,
+              ...(agentConfig.lead === true && { primaryLead: true }),
               ...(isAutomator && { isAutomator: true }),
               // Flag that heartbeat is enabled
               ...(heartbeatConfig && { heartbeat: true }),
@@ -9425,14 +9433,48 @@ export class AgentManagerDb {
     return !!agent && /running|online|ok/i.test(agent.status || '');
   }
 
+  private isPrimaryLead(agent: AgentRow): boolean {
+    return (agent.metadata as AgentMetadata | null | undefined)?.primaryLead === true;
+  }
+
+  private findConfiguredGroupLead(org: OrgConfig | null | undefined): string | null {
+    if (!org?.groups) return null;
+    const stack = Object.values(org.groups);
+    while (stack.length > 0) {
+      const group = stack.shift();
+      if (!group) continue;
+      if (typeof group.lead === 'string' && group.lead.trim()) return group.lead.trim();
+      if (group.groups) stack.push(...Object.values(group.groups));
+    }
+    return null;
+  }
+
   private async findSupervisionLead(teamId: string): Promise<AgentRow | null> {
+    const agents = await this.db.agents.list(teamId).catch(() => [] as AgentRow[]);
+    const live = agents.filter((agent) => this.isLiveForSupervision(agent));
+
+    const flagged = agents.filter((agent) => this.isPrimaryLead(agent));
+    const liveFlagged = flagged.filter((agent) => this.isLiveForSupervision(agent));
+    if (liveFlagged.length > 1) {
+      console.warn(`[Supervision] Multiple live primary lead agents configured for team ${teamId}; using ${liveFlagged[0].name}`);
+    }
+    if (liveFlagged.length > 0) return liveFlagged[0];
+    if (flagged.length > 1) {
+      console.warn(`[Supervision] Multiple primary lead agents configured for team ${teamId}, but none are live`);
+    }
+
+    const teamConfig = await this.db.teams.getConfig(teamId).catch(() => ({} as Record<string, unknown>));
+    const configuredLead = this.findConfiguredGroupLead(teamConfig.org as OrgConfig | undefined);
+    if (configuredLead) {
+      const groupLead = await this.db.agents.getByName(teamId, configuredLead).catch(() => null);
+      if (this.isLiveForSupervision(groupLead)) return groupLead;
+    }
+
     const explicit = await this.resolveSingleAgentForCommand(teamId, 'lead').catch(
       (): { agent?: AgentRow; error?: string } => ({}),
     );
     if (this.isLiveForSupervision(explicit.agent)) return explicit.agent;
 
-    const agents = await this.db.agents.list(teamId).catch(() => [] as AgentRow[]);
-    const live = agents.filter((agent) => this.isLiveForSupervision(agent));
     return (
       live.find((agent) => /(^|[-_\s])lead$/i.test(agent.name)) ||
       live.find((agent) => /lead/i.test(agent.name)) ||

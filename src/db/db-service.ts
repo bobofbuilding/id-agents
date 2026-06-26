@@ -61,6 +61,9 @@ export interface TeamsRepository {
   /** Set both default_chain_id and default_registry_address in the team config. */
   setDefaultRegistry(teamId: string, chainId: string, registryAddress: string): Promise<void>;
 
+  /** Merge organization chart data into the team config. */
+  setOrg(teamId: string, org: Record<string, unknown> | null): Promise<void>;
+
   /**
    * Set the cross-team delegation allow-list (`delegates_to`). An array of
    * team names (or `["*"]` for all) restricts delegation; `null` removes the

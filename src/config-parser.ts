@@ -66,6 +66,7 @@ export interface AgentCatalog {
 
 export interface AgentSpec {
   name: string;
+  lead?: boolean;                    // Explicit primary supervision lead marker
   agent?: string;                     // Library agent overlay name (resolves to <library-root>/agents/<agent>/)
   type?: 'claude' | 'automator';      // Agent type: 'claude' (default) or 'automator' (team-local planning worker, hidden)
   runtime?: HarnessType | 'codex-cli'; // Runtime harness id, defaults to 'claude-agent-sdk'
@@ -472,6 +473,13 @@ export function validateConfig(config: DeployConfig): ValidationResult {
       errors.push({
         path: `${agentPath}.agent`,
         message: 'agent must be a string'
+      });
+    }
+
+    if (agent.lead !== undefined && typeof agent.lead !== 'boolean') {
+      errors.push({
+        path: `${agentPath}.lead`,
+        message: 'lead must be a boolean'
       });
     }
 

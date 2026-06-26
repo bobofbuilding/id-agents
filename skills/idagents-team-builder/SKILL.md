@@ -128,7 +128,8 @@ defaults:
     - catalog
     - task-discipline
 
-# Optional org chart — drives ORG_CHART.md and inter-agent routing hints.
+# Optional org chart — drives ORG_CHART.md, inter-agent routing hints,
+# and primary-lead fallback resolution.
 org:
   groups:
     leadership:
@@ -143,8 +144,9 @@ org:
 
 # Each agent: required name + workingDirectory. Plus optional fields.
 agents:
-  - name: lead
-    workingDirectory: /absolute/path/to/agents/lead
+  - name: atlas
+    lead: true                         # optional primary lead marker; name can be anything
+    workingDirectory: /absolute/path/to/agents/atlas
     agent: <library-template>          # optional, brings extra skills + rules sidecar
     description: "What this agent does in one sentence."
     model: claude-opus-4-7              # overrides defaults.model
@@ -166,9 +168,10 @@ Two patterns earn their keep. Both work; pick by team size and breadth.
 ### Lead + workers (small teams)
 
 A single lead orchestrates 2-N workers, breaks tasks down, reviews output. Workers implement.
+The lead agent may have any name; set `lead: true` on that agent when the name does not contain `lead`.
 
 ```
-lead         ← claude-opus-4-7, orchestrator
+atlas        ← claude-opus-4-7, orchestrator, lead: true
 ├── dev      ← claude-sonnet-4-6, implementer
 └── scout    ← claude-sonnet-4-6, research
 ```
