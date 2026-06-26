@@ -30,7 +30,7 @@ import { LocalModelGate, isLocalModelRuntime } from './lib/local-model-gate.js';
 import { ccCapabilities } from './control-center/manifest.js';
 import { loadMasterKey, deriveKeyAtIndex } from './lib/skillmesh-key-manager.js';
 import { type Db } from './db/db-service.js';
-import type { AgentRow, ScheduleDefinitionRow, TaskRow } from './db/types.js';
+import type { AgentRow, QueryRow, ScheduleDefinitionRow, TaskRow } from './db/types.js';
 import fetch from 'node-fetch';
 import type { PluginConfig, DeployConfig, HeartbeatConfig, CalendarSpec, ScheduleDeliveryMode } from './config-parser.js';
 import {
@@ -2226,7 +2226,9 @@ export class AgentManagerDb {
     const checkinRow: CheckinRow = {
       id: generateCheckinId(nowMs),
       team_id: teamId,
-      owner_agent_id: fromAgent?.id ?? null,
+      // Auto-attached check-ins supervise the linked task, so the dispatchable
+      // owner must match the task owner even when the sender is the manager.
+      owner_agent_id: targetAgent.id,
       created_by_agent_id: fromAgent?.id ?? null,
       linked_task_id: taskRow.id,
       interval_seconds: intervalSeconds,
@@ -9419,6 +9421,42 @@ export class AgentManagerDb {
     this.stalledSweepInterval = setInterval(run, intervalMs);
   }
 
+  private isLiveForSupervision(agent: AgentRow | null | undefined): agent is AgentRow {
+    return !!agent && /running|online|ok/i.test(agent.status || '');
+  }
+
+  private async findSupervisionLead(teamId: string): Promise<AgentRow | null> {
+    const explicit = await this.resolveSingleAgentForCommand(teamId, 'lead').catch(
+      (): { agent?: AgentRow; error?: string } => ({}),
+    );
+    if (this.isLiveForSupervision(explicit.agent)) return explicit.agent;
+
+    const agents = await this.db.agents.list(teamId).catch(() => [] as AgentRow[]);
+    const live = agents.filter((agent) => this.isLiveForSupervision(agent));
+    return (
+      live.find((agent) => /(^|[-_\s])lead$/i.test(agent.name)) ||
+      live.find((agent) => /lead/i.test(agent.name)) ||
+      live.find((agent) => /manager|coordinator/i.test(agent.name)) ||
+      live[0] ||
+      null
+    );
+  }
+
+  private async sendSupervisionAsk(teamName: string, agentName: string, message: string): Promise<boolean> {
+    const quoted = `"${message.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+    try {
+      await fetch(`http://127.0.0.1:${this.managementPort}/remote`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'X-Id-Admin': '1', 'X-Id-Team': teamName },
+        body: JSON.stringify({ command: `/ask ${agentName} ${quoted}` }),
+        signal: AbortSignal.timeout(20_000),
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private async sweepStalledTasks(): Promise<void> {
     const STALL_MS = Number(process.env.STALL_SWEEP_MS) || 25 * 60 * 1000;     // 'doing' this long with no update
     const RENUDGE_MS = Number(process.env.STALL_RENUDGE_MS) || 25 * 60 * 1000; // don't re-nudge a task within this
@@ -9449,17 +9487,59 @@ export class AgentManagerDb {
       const ref = t.uuid ? `#${t.uuid.replace(/-/g, '').slice(0, 8)}` : t.name;
       const mins = Math.round((now - updated) / 60000);
       const msg = `Supervision: task ${ref} ("${t.title}") has been in progress ${mins}m with no completion. If the work is done, mark it done now with \`/task done ${ref}\`. If you're blocked, reply briefly with what's blocking it. If it isn't started, start and finish it.`;
-      const quoted = `"${msg.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
       this.stalledNudges.set(t.id, now);
-      try {
-        await fetch(`http://127.0.0.1:${this.managementPort}/remote`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json', 'X-Id-Admin': '1', 'X-Id-Team': teamName },
-          body: JSON.stringify({ command: `/ask ${ownerName} ${quoted}` }),
-          signal: AbortSignal.timeout(20_000),
-        });
-        nudged++;
-      } catch { /* best-effort */ }
+      if (await this.sendSupervisionAsk(teamName, ownerName, msg)) nudged++;
+    }
+
+    const todo = nudged < MAX_PER_SWEEP
+      ? await this.db.tasks.list({ status: 'todo' }).catch(() => [] as TaskRow[])
+      : [];
+    for (const t of todo) {
+      if (nudged >= MAX_PER_SWEEP) break;
+      if (t.owner || !t.team_id) continue;
+      const updated = t.updated_at || t.created_at || 0;
+      if (now - updated < STALL_MS) continue;
+      const nudgeKey = `todo:${t.id}`;
+      if (now - (this.stalledNudges.get(nudgeKey) || 0) < RENUDGE_MS) continue;
+
+      const teamRow = await this.db.teams.getTeam(t.team_id).catch(() => null);
+      if (!teamRow) continue;
+      const active = await this.db.checkins
+        .list({ teamId: teamRow.id, linkedTaskId: t.id, status: ['active', 'snoozed'], limit: 1 })
+        .catch(() => [] as CheckinRow[]);
+      if (active.length) continue;
+
+      const lead = await this.findSupervisionLead(teamRow.id);
+      if (!lead) continue;
+      const ref = t.uuid ? `#${t.uuid.replace(/-/g, '').slice(0, 8)}` : t.name;
+      const mins = Math.round((now - updated) / 60000);
+      const msg = `Supervision: unclaimed task ${ref} ("${t.title}") has been waiting ${mins}m with no owner. Please claim it if it is yours, or route it to the right teammate.`;
+      this.stalledNudges.set(nudgeKey, now);
+      if (await this.sendSupervisionAsk(teamRow.name, lead.name, msg)) nudged++;
+    }
+
+    if (nudged < MAX_PER_SWEEP) {
+      const teams = await this.db.teams.listTeams().catch(() => []);
+      for (const team of teams) {
+        if (nudged >= MAX_PER_SWEEP) break;
+        const managerInbox = this.getManagerInboxRef(team.id, team.name);
+        const pending = await this.db.queries
+          .getPendingByOwner(team.id, managerInbox.ownerKind, managerInbox.ownerId)
+          .catch(() => [] as QueryRow[]);
+        for (const q of pending) {
+          if (nudged >= MAX_PER_SWEEP) break;
+          if (now - q.created < STALL_MS) continue;
+          const nudgeKey = `manager-query:${q.query_id}`;
+          if (now - (this.stalledNudges.get(nudgeKey) || 0) < RENUDGE_MS) continue;
+          const lead = await this.findSupervisionLead(team.id);
+          if (!lead) continue;
+          const mins = Math.round((now - q.created) / 60000);
+          const prompt = q.prompt ? ` ("${q.prompt.slice(0, 120)}${q.prompt.length > 120 ? '...' : ''}")` : '';
+          const msg = `Supervision: manager inbox request ${q.query_id}${prompt} has been pending ${mins}m. Please answer it, claim it, or route it to the right teammate.`;
+          this.stalledNudges.set(nudgeKey, now);
+          if (await this.sendSupervisionAsk(team.name, lead.name, msg)) nudged++;
+        }
+      }
     }
     // Keep the throttle map from growing without bound.
     if (this.stalledNudges.size > 2000) {
