@@ -37,6 +37,7 @@ export interface InstallTeamRequest {
   template: string;
   dest: string;
   force?: boolean;
+  params?: Record<string, unknown>;
 }
 
 export interface InstallTeamSuccess {
