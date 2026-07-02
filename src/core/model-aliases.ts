@@ -9,7 +9,9 @@
  */
 export const MODEL_ALIASES: Record<string, string> = {
   'haiku': 'claude-haiku-4-5-20251001',
-  'sonnet': 'claude-sonnet-4-5-20250514',
+  'sonnet': 'claude-sonnet-5',
+  'sonnet-5': 'claude-sonnet-5',
+  'sonnet5': 'claude-sonnet-5',
   'opus': 'claude-opus-4-5-20250514',
   'opus-4-8': 'claude-opus-4-8',
   'opus-4.8': 'claude-opus-4-8',
