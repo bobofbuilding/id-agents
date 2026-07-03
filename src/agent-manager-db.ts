@@ -11812,7 +11812,18 @@ Return this JSON shape:
         // Initialize and start the scheduler service
         this.schedulerService = new SchedulerService(this.db, async (agentId: string) => {
           const agent = await this.db.agents.getById(agentId);
-          if (!agent || !agent.endpoint) return null;
+          if (!agent) return null;
+          if (agent.status !== 'running') {
+            return {
+              id: agent.id,
+              name: agent.name,
+              endpoint: agent.endpoint?.replace(/\/+$/, '') ?? '',
+              talkPath: '/talk',
+              schedulePath: null,
+              status: agent.status,
+            };
+          }
+          if (!agent.endpoint) return null;
           const endpoints = await discoverRestAPEndpoints(agent.endpoint);
           return {
             id: agent.id,

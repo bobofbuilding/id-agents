@@ -17,6 +17,20 @@ import type {
 } from '../../src/db/db-service.js';
 import type { ScheduleDefinitionRow } from '../../src/db/types.js';
 
+const originalBrainContextDisabled = process.env.BRAIN_CONTEXT_DISABLED;
+
+beforeEach(() => {
+  process.env.BRAIN_CONTEXT_DISABLED = 'true';
+});
+
+afterEach(() => {
+  if (originalBrainContextDisabled === undefined) {
+    delete process.env.BRAIN_CONTEXT_DISABLED;
+  } else {
+    process.env.BRAIN_CONTEXT_DISABLED = originalBrainContextDisabled;
+  }
+});
+
 /* ------------------------------------------------------------------ */
 /*  Fixtures                                                           */
 /* ------------------------------------------------------------------ */
@@ -277,6 +291,42 @@ describe('SchedulerService.fireManual', () => {
     expect(sentPayload.schedule.scheduledKey).toMatch(/^interval:\d+$/);
 
     fetchSpy.mockRestore();
+  });
+});
+
+describe('SchedulerService.tick', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('skips stopped targets before recording or dispatching due runs', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1_700_000_301_000);
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response(null, { status: 200 }));
+    const def = makeHeartbeatDef({
+      anchor_at: 1_700_000_000,
+      interval_seconds: 300,
+      max_runs: null,
+    });
+    const schedules = {
+      listActiveDefinitions: vi.fn(async () => [def]),
+      listTargets: vi.fn(async () => ['agent_123']),
+      countRuns: vi.fn(async () => 0),
+      insertRun: vi.fn(async () => true),
+      updateRunStatus: vi.fn(async () => undefined),
+    };
+    const dbStub = { schedules } as unknown as Db;
+    const service = new SchedulerService(dbStub, async () => makeTarget({ status: 'stopped' }));
+
+    await service.tick();
+
+    expect(schedules.listActiveDefinitions).toHaveBeenCalledOnce();
+    expect(schedules.listTargets).toHaveBeenCalledWith(def.id);
+    expect(schedules.countRuns).not.toHaveBeenCalled();
+    expect(schedules.insertRun).not.toHaveBeenCalled();
+    expect(schedules.updateRunStatus).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 });
 

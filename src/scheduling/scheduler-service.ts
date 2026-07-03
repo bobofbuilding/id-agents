@@ -59,6 +59,11 @@ export class SchedulerService {
         const agentIds = await this.db.schedules.listTargets(run.scheduleId);
 
         for (const agentId of agentIds) {
+          const target = await this.resolveAgent(agentId);
+          if (!target || target.status !== 'running') {
+            continue;
+          }
+
           if (def.max_runs != null) {
             const sentCount = await this.db.schedules.countRuns(run.scheduleId, agentId);
             if (sentCount >= def.max_runs) {
@@ -79,12 +84,6 @@ export class SchedulerService {
 
           const inserted = await this.db.schedules.insertRun(runRow);
           if (!inserted) continue;
-
-          const target = await this.resolveAgent(agentId);
-          if (!target) {
-            await this.db.schedules.updateRunStatus(run.scheduleId, agentId, run.scheduledKey, 'skipped', 'Agent not found');
-            continue;
-          }
 
           // Load linked tasks for calendar schedules
           let linkedTasks: LinkedTaskSummary[] | undefined;
