@@ -1878,8 +1878,12 @@ Return this JSON shape:
 
     // Lift metadata.pid to the top level so clients (TUI, health probes)
     // don't have to reach into metadata to batch per-agent RSS lookups.
-    const metaPid = (a.metadata as { pid?: unknown } | undefined)?.pid;
-    const pid = typeof metaPid === 'number' && Number.isFinite(metaPid) && metaPid > 0 ? metaPid : null;
+    const localRunning = a.status === 'running';
+    const metadata = { ...((a.metadata as Record<string, unknown> | null | undefined) ?? {}) };
+    const metaPid = metadata.pid;
+    const metaPidNumber = typeof metaPid === 'number' ? metaPid : Number(metaPid);
+    const pid = localRunning && Number.isFinite(metaPidNumber) && metaPidNumber > 0 ? metaPidNumber : null;
+    if (!localRunning) delete metadata.pid;
 
     // Remote-endpoint agents have no local port or pid; health is derived from probe columns.
     const remoteFields = isRemote ? {
@@ -1918,7 +1922,7 @@ Return this JSON shape:
       type: a.type,
       runtime: runtimeDisplay,
       url,
-      metadata: a.metadata,
+      metadata,
       // Identity fields
       tokenId: a.token_id,
       domain,
@@ -2748,10 +2752,11 @@ Return this JSON shape:
     const drift = detectDefaultCoderRuntimeDrift(coderSpec, coderRow, this.defaultConfig?.model);
     if (!drift) return;
 
-    const nextMetadata = {
+    const nextMetadata: Record<string, unknown> = {
       ...stripDefaultCoderRuntimeMetadata((coderRow.metadata || {}) as Record<string, unknown>),
       runtime: drift.runtime,
     };
+    delete nextMetadata.pid;
     const nextStatus = coderRow.status === 'running' ? 'starting' : 'pending';
 
     console.warn(
@@ -2766,7 +2771,10 @@ Return this JSON shape:
 
     this.providerRuntimeAssignments.delete(coderRow.id);
 
-    if (coderRow.status !== 'running') return;
+    if (coderRow.status !== 'running') {
+      await this.clearAgentPid(coderRow.id);
+      return;
+    }
 
     const refreshed = await this.db.agents.getById(coderRow.id);
     if (!refreshed) return;
@@ -2774,6 +2782,7 @@ Return this JSON shape:
     const spawnResult = await this.rebuildLocalClaudeAgent(defaultTeam.id, defaultTeam.name, refreshed);
     if (!spawnResult.success) {
       await this.db.agents.updateStatus(coderRow.id, 'error').catch(() => {});
+      await this.clearAgentPid(coderRow.id);
       console.error(`[Manager] Failed to resync default/coder at startup: ${spawnResult.error}`);
       return;
     }
@@ -7558,6 +7567,22 @@ Return this JSON shape:
           }
         }
 
+        // wait: optional long-poll hold in seconds for live clients. Without
+        // this, empty event reads return immediately and Electron renderers can
+        // accidentally spin the manager bridge in a tight loop.
+        const waitRaw = req.query.wait;
+        let waitMs = 0;
+        if (waitRaw !== undefined) {
+          const parsed = Number(waitRaw);
+          if (!Number.isFinite(parsed) || parsed < 0) {
+            return res.status(400).json({
+              error: 'invalid_wait',
+              message: '`wait` must be a non-negative number of seconds',
+            });
+          }
+          waitMs = Math.min(parsed, 30) * 1000;
+        }
+
         // tail=1 is a lightweight cursor bootstrap for live clients. It lets
         // dashboards start at the current event tail without replaying every
         // retained event through the UI on launch or tab switches.
@@ -7576,12 +7601,20 @@ Return this JSON shape:
           });
         }
 
-        const rows = await this.db.events.query({
+        const queryRows = () => this.db.events.query({
           teamId,
           sinceSeq: since,
           topics,
           limit,
         });
+        let rows = await queryRows();
+        if (rows.length === 0 && waitMs > 0) {
+          const deadline = Date.now() + waitMs;
+          while (rows.length === 0 && Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, Math.min(500, Math.max(0, deadline - Date.now()))));
+            rows = await queryRows();
+          }
+        }
         const earliestAvailableSeq = await this.db.events.earliestSeq(teamId);
 
         const events = rows.map((row) => ({
@@ -8327,6 +8360,22 @@ Return this JSON shape:
           const all = await this.dbListAgents(teamId);
           const running = all.filter((a) => a.status === 'running');
           return this.probeAgentsViaTalk(teamName, running);
+        }
+        if (sub === 'park-idle') {
+          const confirmed = args.includes('--confirm');
+          const allTeams = args.includes('--all-teams');
+          const includeDefault = args.includes('--include-default');
+          const includeLeads = args.includes('--include-leads');
+          const includeScheduled = args.includes('--include-scheduled');
+          return this.parkIdleAgents({
+            teamId,
+            teamName,
+            confirmed,
+            allTeams,
+            includeDefault,
+            includeLeads,
+            includeScheduled,
+          });
         }
         if (sub === 'rebuild') {
           if (!args.includes('--confirm')) {
@@ -10152,6 +10201,7 @@ Return this JSON shape:
               const killResult = await this.killAgentProcess(agent.port);
               const cancelled = await this.cancelPendingQueriesForAgent(teamId, agent.id);
               await this.db.agents.updateStatus(agent.id, 'stopped');
+              await this.clearAgentPid(agent.id);
               return { ok: true, result: { action: 'stopped', name: agent.name, ...killResult, queriesCancelled: cancelled } };
             }
             case 'rebuild': {
@@ -11856,6 +11906,7 @@ Return this JSON shape:
 
         // Seed well-known teams (idempotent — getOrCreateTeamId is safe to call repeatedly)
         await this.seedWellKnownTeams();
+        await this.clearInactiveAgentPids();
 
         // Rehydrate runtime credential pools and lane cooldowns from team config
         // before any spawned agents select a lane.
@@ -11996,6 +12047,25 @@ Return this JSON shape:
     } catch (err: any) {
       // Non-fatal: log and continue
       console.warn('[Manager] Failed to seed well-known teams:', err?.message);
+    }
+  }
+
+  private async clearInactiveAgentPids(): Promise<void> {
+    try {
+      let cleared = 0;
+      const teams = await this.db.teams.listTeams();
+      for (const team of teams) {
+        const agents = await this.dbListAgents(team.id, true);
+        for (const agent of agents) {
+          const metadata = (agent.metadata as Record<string, unknown> | null | undefined) ?? {};
+          if (agent.status === 'running' || !('pid' in metadata)) continue;
+          await this.clearAgentPid(agent.id);
+          cleared += 1;
+        }
+      }
+      if (cleared > 0) console.log(`[Manager] Cleared ${cleared} stale pid metadata entr${cleared === 1 ? 'y' : 'ies'} for inactive agents`);
+    } catch (err: any) {
+      console.warn('[Manager] Failed to clear inactive agent pid metadata:', err?.message || err);
     }
   }
 
@@ -12643,6 +12713,7 @@ Return this JSON shape:
 
       // Kill any existing process on this port
       await this.killAgentProcess(port);
+      await this.clearAgentPid(id);
       await new Promise(r => setTimeout(r, 500));
 
       // Build command arguments
@@ -12683,6 +12754,7 @@ Return this JSON shape:
       if (!bindResult.ok) {
         if (proc.pid) {
           try { process.kill(proc.pid, 'SIGTERM'); } catch { /* already exited */ }
+          await this.clearAgentPid(id, proc.pid);
         }
         return { success: false, pid: proc.pid, logFile, error: bindResult.error };
       }
@@ -12703,6 +12775,142 @@ Return this JSON shape:
       console.error(`[Manager] Failed to spawn agent ${agentData.name}: ${err.message}`);
       return { success: false, error: err.message };
     }
+  }
+
+  private isLeadLikeAgentName(name: string): boolean {
+    return /(^lead$|[-_]lead$|manager$|coordinator$|counsel$)/i.test(name);
+  }
+
+  private async countOpenOwnedTasks(agentId: string): Promise<number> {
+    const { rows } = await this.db.adapter.query<{ c: string | number }>(
+      `SELECT COUNT(*) AS c
+         FROM tasks
+        WHERE owner = $1
+          AND LOWER(status) NOT IN ('done', 'completed', 'archived', 'cancelled', 'canceled')`,
+      [agentId],
+    );
+    return Number(rows[0]?.c ?? 0) || 0;
+  }
+
+  private async countActiveSchedules(agentId: string): Promise<number> {
+    const { rows } = await this.db.adapter.query<{ c: string | number }>(
+      `SELECT COUNT(*) AS c
+         FROM schedule_targets st
+         JOIN schedule_definitions sd ON sd.id = st.schedule_id
+        WHERE st.agent_id = $1
+          AND sd.active = 1`,
+      [agentId],
+    );
+    return Number(rows[0]?.c ?? 0) || 0;
+  }
+
+  private async countActiveCheckins(agentId: string): Promise<number> {
+    const { rows } = await this.db.adapter.query<{ c: string | number }>(
+      `SELECT COUNT(*) AS c
+         FROM checkins
+        WHERE owner_agent_id = $1
+          AND status IN ('active', 'snoozed')`,
+      [agentId],
+    );
+    return Number(rows[0]?.c ?? 0) || 0;
+  }
+
+  private async parkIdleAgents(opts: {
+    teamId: string;
+    teamName: string;
+    confirmed: boolean;
+    allTeams: boolean;
+    includeDefault: boolean;
+    includeLeads: boolean;
+    includeScheduled: boolean;
+  }): Promise<{ ok: boolean; result: {
+    action: 'agents-park-idle';
+    dryRun: boolean;
+    scope: string;
+    parked: number;
+    skipped: number;
+    failed: number;
+    agents: Array<{ team: string; name: string; status: 'candidate' | 'parked' | 'skipped' | 'failed'; reason: string; pids?: number[] }>;
+  } }> {
+    const teams = opts.allTeams
+      ? await this.db.teams.listTeams()
+      : [{ id: opts.teamId, name: opts.teamName } as { id: string; name: string }];
+    const rows: Array<{ team: string; name: string; status: 'candidate' | 'parked' | 'skipped' | 'failed'; reason: string; pids?: number[] }> = [];
+
+    for (const team of teams) {
+      if (team.name === 'default' && !opts.includeDefault) {
+        rows.push({ team: team.name, name: '*', status: 'skipped', reason: 'default_team_requires_--include-default' });
+        continue;
+      }
+      const agents = await this.dbListAgents(team.id, true);
+      for (const agent of agents) {
+        if (agent.status !== 'running') continue;
+        if (isRemoteEndpointRuntime(agent.runtime)) {
+          rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: 'remote_endpoint_runtime' });
+          continue;
+        }
+        if (agent.type !== 'claude') {
+          rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: 'unsupported_agent_type' });
+          continue;
+        }
+        if (!opts.includeLeads && this.isLeadLikeAgentName(agent.name)) {
+          rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: 'lead_like_requires_--include-leads' });
+          continue;
+        }
+
+        const [openTasks, schedules, checkins] = await Promise.all([
+          this.countOpenOwnedTasks(agent.id),
+          this.countActiveSchedules(agent.id),
+          this.countActiveCheckins(agent.id),
+        ]);
+        if (openTasks > 0) {
+          rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: `owns_${openTasks}_open_task${openTasks === 1 ? '' : 's'}` });
+          continue;
+        }
+        if (!opts.includeScheduled && schedules > 0) {
+          rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: `has_${schedules}_active_schedule${schedules === 1 ? '' : 's'}` });
+          continue;
+        }
+        if (checkins > 0) {
+          rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: `has_${checkins}_active_checkin${checkins === 1 ? '' : 's'}` });
+          continue;
+        }
+
+        if (!opts.confirmed) {
+          rows.push({ team: team.name, name: agent.name, status: 'candidate', reason: 'idle_running_agent' });
+          continue;
+        }
+
+        try {
+          const killResult = await this.killAgentProcess(agent.port);
+          const cancelled = await this.cancelPendingQueriesForAgent(team.id, agent.id);
+          await this.db.agents.updateStatus(agent.id, 'stopped');
+          await this.clearAgentPid(agent.id);
+          rows.push({
+            team: team.name,
+            name: agent.name,
+            status: 'parked',
+            reason: cancelled > 0 ? `idle; cancelled_${cancelled}_queries` : 'idle',
+            pids: killResult.pids,
+          });
+        } catch (err: any) {
+          rows.push({ team: team.name, name: agent.name, status: 'failed', reason: err?.message || String(err) });
+        }
+      }
+    }
+
+    return {
+      ok: true,
+      result: {
+        action: 'agents-park-idle',
+        dryRun: !opts.confirmed,
+        scope: opts.allTeams ? 'all-teams' : opts.teamName,
+        parked: rows.filter((row) => row.status === 'parked').length,
+        skipped: rows.filter((row) => row.status === 'skipped').length,
+        failed: rows.filter((row) => row.status === 'failed').length,
+        agents: rows,
+      },
+    };
   }
 
   /**
@@ -12803,6 +13011,21 @@ Return this JSON shape:
       }
     }
     return { killed: killedPids.length > 0, pids: killedPids };
+  }
+
+  private async clearAgentPid(agentId: string, expectedPid?: number): Promise<void> {
+    try {
+      const row = await this.db.agents.getById(agentId);
+      const metadata = { ...((row?.metadata as Record<string, unknown> | null | undefined) ?? {}) };
+      const currentPid = metadata.pid;
+      const currentPidNumber = typeof currentPid === 'number' ? currentPid : Number(currentPid);
+      if (expectedPid && currentPidNumber !== expectedPid) return;
+      if (!('pid' in metadata)) return;
+      delete metadata.pid;
+      await this.db.agents.updateMetadata(agentId, metadata);
+    } catch {
+      // PID metadata is diagnostic only; lifecycle status is the source of truth.
+    }
   }
 
 }

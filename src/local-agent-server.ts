@@ -342,6 +342,11 @@ export async function startLocalAgent(config: LocalAgentConfig): Promise<{
         if (typeof currentPid === 'number' && currentPid > 0 && currentPid !== process.pid) {
           console.log(`📦 Skipped stopped status for stale PID ${process.pid}; current PID is ${currentPid}`);
         } else {
+          const metadata = { ...((current?.metadata as Record<string, unknown> | null | undefined) ?? {}) };
+          if ('pid' in metadata) {
+            delete metadata.pid;
+            await db.agents.updateMetadata(agentId, metadata);
+          }
           await db.agents.updateStatus(agentId, 'stopped');
         }
       } catch {
