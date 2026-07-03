@@ -375,6 +375,18 @@ export class AgentManagerDb {
    * treating it as abandoned anyway.
    */
   private readonly QUERY_EXPIRY_MINUTES = 15;
+  private readonly configuredTeamLeadNames: Record<string, string[]> = {
+    default: ['lead'],
+    'bittrees-research': ['research-lead'],
+    engineering: ['engineering-lead'],
+    'engineering-team': ['engineering-lead'],
+    legal: ['general-counsel'],
+    'onchain-execution': ['onchain-lead'],
+    'ops-team': ['ops-lead'],
+    research: ['research-lead'],
+    'technology-security': ['security-router'],
+  };
+  private readonly teamLeadDelegationGraceSeconds = 10 * 60;
   private logBuffer: Array<{ ts: number; msg: string }> = [];
   private readonly LOG_BUFFER_SIZE = 500;
   private managementPort: number = 4100;
@@ -397,6 +409,140 @@ export class AgentManagerDb {
     if (this.logBuffer.length > this.LOG_BUFFER_SIZE) {
       this.logBuffer.shift();
     }
+  }
+
+  private isConfiguredTeamLead(teamName: string, owner: AgentRow | null | undefined): boolean {
+    if (!owner) return false;
+    const configured = this.configuredTeamLeadNames[teamName] || [];
+    if (configured.includes(owner.name)) return true;
+    const role = String((owner.metadata as any)?.role || (owner.metadata as any)?.catalog?.role || '').toLowerCase();
+    return /\b(lead|coordinator|router)\b/.test(role) && /\b(lead|counsel|router)\b/.test(owner.name);
+  }
+
+  private taskRefsFromCompletionPayload(payload: Record<string, unknown> | undefined): string[] {
+    if (!payload) return [];
+    const raw = payload.delegated_task_names
+      ?? payload.delegatedTaskNames
+      ?? payload.child_task_names
+      ?? payload.childTaskNames
+      ?? payload.child_tasks
+      ?? payload.childTasks;
+    if (!Array.isArray(raw)) return [];
+    return raw.map((item) => String(item).trim()).filter(Boolean);
+  }
+
+  private taskCompletionDelegationExemption(payload?: Record<string, unknown>): boolean {
+    if (!payload) return false;
+    const noDelegationReason = typeof payload.no_delegation_reason === 'string' && payload.no_delegation_reason.trim()
+      ? payload.no_delegation_reason.trim()
+      : typeof payload.noDelegationReason === 'string' && payload.noDelegationReason.trim()
+        ? payload.noDelegationReason.trim()
+        : null;
+    return Boolean(noDelegationReason || payload.advisory_query === true || payload.advisoryQuery === true);
+  }
+
+  private async validateTeamLeadDelegationBeforeDone(params: {
+    teamId: string;
+    teamName: string;
+    task: TaskRow;
+    payload?: Record<string, unknown>;
+  }): Promise<string | null> {
+    const owner = params.task.owner
+      ? await this.db.agents.getById(params.task.owner).catch(() => null)
+      : null;
+    if (!this.isConfiguredTeamLead(params.teamName, owner)) return null;
+    if (this.taskCompletionDelegationExemption(params.payload)) return null;
+
+    const childRefs = this.taskRefsFromCompletionPayload(params.payload);
+    if (childRefs.length === 0) {
+      return 'Team lead objectives require delegated_task_names (or child_task_names) naming at least one completed member-owned child task before completion';
+    }
+
+    for (const childRef of childRefs) {
+      const { task: childTask, error } = await this.resolveTaskRef(childRef, params.teamId);
+      if (!childTask) {
+        return `Delegated child task "${childRef}" not found in ${params.teamName} team${error ? `: ${error}` : ''}`;
+      }
+      if (childTask.id === params.task.id) {
+        return `Delegated child task "${childRef}" cannot be the parent team-lead objective`;
+      }
+      if (childTask.team_id && childTask.team_id !== params.teamId) {
+        return `Delegated child task "${childRef}" is not in the ${params.teamName} team`;
+      }
+      if (!childTask.owner) {
+        return `Delegated child task "${childRef}" must be claimed by a ${params.teamName} member`;
+      }
+      if (owner && childTask.owner === owner.id) {
+        return `Delegated child task "${childRef}" must be owned by a ${params.teamName} member, not ${owner.name}`;
+      }
+      if (childTask.status !== 'done') {
+        return `Delegated child task "${childRef}" must be done before the team-lead objective can be completed`;
+      }
+    }
+
+    return null;
+  }
+
+  private taskMatchesParentRef(candidate: TaskRow, parent: TaskRow): boolean {
+    const shortId = parent.uuid ? parent.uuid.replace(/-/g, '').slice(0, 8).toLowerCase() : '';
+    const text = `${candidate.name}\n${candidate.title}\n${candidate.description || ''}`.toLowerCase();
+    return Boolean(
+      text.includes(parent.name.toLowerCase())
+      || (shortId && text.includes(shortId))
+      || (parent.uuid && text.includes(parent.uuid.toLowerCase()))
+    );
+  }
+
+  private async findDelegatedChildTasks(task: TaskRow, teamId: string, owner: AgentRow | null): Promise<TaskRow[]> {
+    const allTasks = await this.db.tasks.list({ teamId });
+    return allTasks.filter((candidate) => {
+      if (candidate.id === task.id || !candidate.owner || candidate.owner === owner?.id) return false;
+      if (candidate.team_id && candidate.team_id !== teamId) return false;
+      if (candidate.created_at < task.created_at) return false;
+      if (candidate.status !== 'done' && candidate.status !== 'doing' && candidate.status !== 'todo') return false;
+      return candidate.created_by === owner?.id || this.taskMatchesParentRef(candidate, task);
+    });
+  }
+
+  private async buildDelegationAudit(
+    task: TaskRow,
+    teamId: string,
+    teamName: string | null,
+    owner: AgentRow | null,
+  ): Promise<Record<string, unknown> | null> {
+    if (!teamName || !this.isConfiguredTeamLead(teamName, owner)) return null;
+    if (task.status !== 'doing') return null;
+    const now = Math.floor(Date.now() / 1000);
+    const ageSeconds = Math.max(0, now - task.updated_at);
+    const childTasks = await this.findDelegatedChildTasks(task, teamId, owner);
+    const childTaskRefs = childTasks.map((child) => child.uuid ? `#${child.uuid.replace(/-/g, '').slice(0, 8)}` : child.name);
+    if (childTaskRefs.length > 0) {
+      return {
+        status: 'ok',
+        ownerRole: 'team-lead',
+        ageSeconds,
+        graceSeconds: this.teamLeadDelegationGraceSeconds,
+        childTaskRefs,
+      };
+    }
+    if (ageSeconds < this.teamLeadDelegationGraceSeconds) {
+      return {
+        status: 'pending-delegation',
+        ownerRole: 'team-lead',
+        reason: `Lead-owned doing task is within the ${Math.round(this.teamLeadDelegationGraceSeconds / 60)} minute delegation grace window`,
+        ageSeconds,
+        graceSeconds: this.teamLeadDelegationGraceSeconds,
+        childTaskRefs,
+      };
+    }
+    return {
+      status: 'needs-delegation',
+      ownerRole: 'team-lead',
+      reason: `Lead-owned doing task has no detected member-owned child tasks after ${Math.round(this.teamLeadDelegationGraceSeconds / 60)} minutes`,
+      ageSeconds,
+      graceSeconds: this.teamLeadDelegationGraceSeconds,
+      childTaskRefs,
+    };
   }
 
   constructor(
@@ -4486,7 +4632,7 @@ export class AgentManagerDb {
 
     this.managementApp.post('/tasks/:ref/done', async (req, res) => {
       try {
-        let { id: teamId } = await this.getTeam(req);
+        let { id: teamId, name: teamName } = await this.getTeam(req);
         const { agent_id, from } = req.body || {};
         const callerRef = agent_id || from;
 
@@ -4503,6 +4649,7 @@ export class AgentManagerDb {
             if (fallback) {
               callerAgent = fallback.agent;
               teamId = fallback.teamId;
+              teamName = (await this.db.teams.getTeam(teamId))?.name || teamName;
             }
           }
         }
@@ -4518,6 +4665,16 @@ export class AgentManagerDb {
         // If caller identifies themselves, enforce ownership
         if (callerAgent && task.owner !== callerAgent.id) {
           return res.status(403).json({ error: `Agent "${callerRef}" is not the owner of task "${task.name}"` });
+        }
+
+        const delegationError = await this.validateTeamLeadDelegationBeforeDone({
+          teamId,
+          teamName,
+          task,
+          payload: req.body || {},
+        });
+        if (delegationError) {
+          return res.status(409).json({ error: delegationError });
         }
 
         const now = Math.floor(Date.now() / 1000);
@@ -5172,8 +5329,9 @@ export class AgentManagerDb {
 
   private async buildTaskResult(task: TaskRow, teamId: string): Promise<Record<string, unknown>> {
     let ownerName: string | null = null;
+    let ownerAgent: AgentRow | null = null;
     if (task.owner) {
-      const ownerAgent = await this.db.agents.getById(task.owner);
+      ownerAgent = await this.db.agents.getById(task.owner);
       if (ownerAgent) {
         ownerName = (ownerAgent.metadata as any)?.alias || ownerAgent.name;
       }
@@ -5187,6 +5345,8 @@ export class AgentManagerDb {
 
     const links = await this.db.tasks.listEventLinksForTask(task.id);
     const shortId = task.uuid ? `#${task.uuid.replace(/-/g, '').slice(0, 8)}` : null;
+    const taskTeamId = task.team_id || teamId;
+    const delegationAudit = await this.buildDelegationAudit(task, taskTeamId, teamName, ownerAgent);
 
     return {
       name: task.name,
@@ -5201,6 +5361,7 @@ export class AgentManagerDb {
       createdAt: task.created_at,
       updatedAt: task.updated_at,
       completedAt: task.completed_at,
+      ...(delegationAudit ? { delegationAudit } : {}),
     };
   }
 

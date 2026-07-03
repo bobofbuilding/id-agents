@@ -98,9 +98,10 @@ async function insertAgent(
   teamId: string,
   name: string,
   endpoint: string | null,
+  metadataOverrides: Record<string, unknown> = {},
 ): Promise<string> {
   const id = `agent_${crypto.randomUUID()}`;
-  const metadata = JSON.stringify({ local: true, mesh_member: true });
+  const metadata = JSON.stringify({ local: true, mesh_member: true, ...metadataOverrides });
   await db.adapter.query(
     `INSERT INTO agents (team_id, id, name, type, model, port, endpoint, status, created_at, runtime, metadata)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -307,5 +308,165 @@ describe('/talk-to auto-attach', () => {
 
     expect(await db.tasks.list({ teamId })).toHaveLength(0);
     expect(await db.checkins.list({ teamId })).toHaveLength(0);
+  });
+
+  it('audits team-lead delegation using only newer member-owned child tasks', async () => {
+    const opsTeamId = await db.teams.getOrCreateTeamId('ops-team');
+    const leadId = await insertAgent(db, opsTeamId, 'ops-lead', null, { catalog: { role: 'lead' } });
+    const memberId = await insertAgent(db, opsTeamId, 'ops-runner', null);
+    const now = Math.floor(Date.now() / 1000);
+
+    await db.tasks.create({
+      id: 'task_fresh_parent',
+      name: 'fresh-lead-objective',
+      uuid: '44444444-4444-4444-8444-444444444444',
+      team_id: opsTeamId,
+      title: 'Fresh lead objective',
+      description: 'Parent objective still inside the delegation grace window',
+      status: 'doing',
+      created_by: leadId,
+      owner: leadId,
+      created_at: now - 120,
+      updated_at: now - 120,
+      completed_at: null,
+    });
+
+    const freshAudit = await fetch(`${baseUrl}/tasks/fresh-lead-objective`, {
+      headers: adminHeaders('ops-team'),
+    });
+    expect(freshAudit.status).toBe(200);
+    const freshAuditBody = await freshAudit.json() as { task: { delegationAudit?: { status?: string; childTaskRefs?: string[] } } };
+    expect(freshAuditBody.task.delegationAudit?.status).toBe('pending-delegation');
+    expect(freshAuditBody.task.delegationAudit?.childTaskRefs).toEqual([]);
+
+    await db.tasks.create({
+      id: 'task_old_child',
+      name: 'old-child-work',
+      uuid: '11111111-1111-4111-8111-111111111111',
+      team_id: opsTeamId,
+      title: 'Old child work',
+      description: 'Mentions new lead objective but predates it',
+      status: 'done',
+      created_by: leadId,
+      owner: memberId,
+      created_at: now - 1_200,
+      updated_at: now - 1_150,
+      completed_at: now - 1_150,
+    });
+    await db.tasks.create({
+      id: 'task_new_parent',
+      name: 'new-lead-objective',
+      uuid: '22222222-2222-4222-8222-222222222222',
+      team_id: opsTeamId,
+      title: 'New lead objective',
+      description: 'Parent objective that still needs delegation',
+      status: 'doing',
+      created_by: leadId,
+      owner: leadId,
+      created_at: now - 900,
+      updated_at: now - 900,
+      completed_at: null,
+    });
+
+    const staleAudit = await fetch(`${baseUrl}/tasks/new-lead-objective`, {
+      headers: adminHeaders('ops-team'),
+    });
+    expect(staleAudit.status).toBe(200);
+    const staleAuditBody = await staleAudit.json() as { task: { delegationAudit?: { status?: string; childTaskRefs?: string[] } } };
+    expect(staleAuditBody.task.delegationAudit?.status).toBe('needs-delegation');
+    expect(staleAuditBody.task.delegationAudit?.childTaskRefs).toEqual([]);
+
+    await db.tasks.create({
+      id: 'task_new_child',
+      name: 'new-child-work',
+      uuid: '33333333-3333-4333-8333-333333333333',
+      team_id: opsTeamId,
+      title: 'New child work',
+      description: 'Real child for new-lead-objective',
+      status: 'done',
+      created_by: leadId,
+      owner: memberId,
+      created_at: now - 800,
+      updated_at: now - 700,
+      completed_at: now - 700,
+    });
+
+    const delegatedAudit = await fetch(`${baseUrl}/tasks/new-lead-objective`, {
+      headers: adminHeaders('ops-team'),
+    });
+    expect(delegatedAudit.status).toBe(200);
+    const delegatedAuditBody = await delegatedAudit.json() as { task: { delegationAudit?: { status?: string; childTaskRefs?: string[] } } };
+    expect(delegatedAuditBody.task.delegationAudit?.status).toBe('ok');
+    expect(delegatedAuditBody.task.delegationAudit?.childTaskRefs).toEqual(['#33333333']);
+  });
+
+  it('blocks team-lead completion until completed member child tasks are named', async () => {
+    const opsTeamId = await db.teams.getOrCreateTeamId('ops-team');
+    const leadId = await insertAgent(db, opsTeamId, 'ops-lead', null, { catalog: { role: 'lead' } });
+    const memberId = await insertAgent(db, opsTeamId, 'ops-runner', null);
+    const now = Math.floor(Date.now() / 1000);
+
+    await db.tasks.create({
+      id: 'task_guard_parent',
+      name: 'guarded-lead-objective',
+      uuid: '55555555-5555-4555-8555-555555555555',
+      team_id: opsTeamId,
+      title: 'Guarded lead objective',
+      description: 'Parent objective requiring explicit child evidence',
+      status: 'doing',
+      created_by: leadId,
+      owner: leadId,
+      created_at: now - 900,
+      updated_at: now - 900,
+      completed_at: null,
+    });
+
+    const rejected = await fetch(`${baseUrl}/tasks/guarded-lead-objective/done`, {
+      method: 'POST',
+      headers: adminHeaders('ops-team'),
+      body: JSON.stringify({ agent_id: 'ops-lead' }),
+    });
+    expect(rejected.status).toBe(409);
+    const rejectedBody = await rejected.json() as { error: string };
+    expect(rejectedBody.error).toContain('delegated_task_names');
+
+    await db.tasks.create({
+      id: 'task_incomplete_child',
+      name: 'incomplete-child-work',
+      uuid: '66666666-6666-4666-8666-666666666666',
+      team_id: opsTeamId,
+      title: 'Incomplete child work',
+      description: 'Child must be done before parent closes',
+      status: 'doing',
+      created_by: leadId,
+      owner: memberId,
+      created_at: now - 800,
+      updated_at: now - 700,
+      completed_at: null,
+    });
+
+    const rejectedIncomplete = await fetch(`${baseUrl}/tasks/guarded-lead-objective/done`, {
+      method: 'POST',
+      headers: adminHeaders('ops-team'),
+      body: JSON.stringify({ agent_id: 'ops-lead', delegated_task_names: ['incomplete-child-work'] }),
+    });
+    expect(rejectedIncomplete.status).toBe(409);
+    const rejectedIncompleteBody = await rejectedIncomplete.json() as { error: string };
+    expect(rejectedIncompleteBody.error).toContain('must be done');
+
+    await db.tasks.updateFields('task_incomplete_child', {
+      status: 'done',
+      completed_at: now - 600,
+      updated_at: now - 600,
+    });
+
+    const completed = await fetch(`${baseUrl}/tasks/guarded-lead-objective/done`, {
+      method: 'POST',
+      headers: adminHeaders('ops-team'),
+      body: JSON.stringify({ agent_id: 'ops-lead', delegated_task_names: ['incomplete-child-work'] }),
+    });
+    expect(completed.status).toBe(200);
+    const completedTask = await db.tasks.getByNameForTeam('guarded-lead-objective', opsTeamId);
+    expect(completedTask?.status).toBe('done');
   });
 });
