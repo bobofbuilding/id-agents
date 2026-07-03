@@ -88,6 +88,7 @@ import {
   emitTaskCompleted,
   emitTaskRefreshed,
   emitTaskTriaged,
+  recordCheckinClosed,
   recordCheckinCreated,
 } from './wakeup-service/event-producer.js';
 import { RetentionService } from './wakeup-service/retention.js';
@@ -1113,6 +1114,154 @@ export class AgentManagerDb {
     return {
       message: this.leadDelegationBacklogMessage(params.teamName, params.owner, blockers),
       blockers: this.leadDelegationBlockerRefs(blockers),
+    };
+  }
+
+  private async leadDelegationTaskSummary(
+    task: TaskRow,
+    teamId: string,
+    teamName: string,
+    owner: AgentRow,
+  ): Promise<Record<string, unknown>> {
+    const audit = await this.buildDelegationAudit(task, teamId, teamName, owner);
+    return {
+      ref: this.taskShortRef(task),
+      name: task.name,
+      title: task.title,
+      status: task.status,
+      owner: owner.name,
+      createdAt: task.created_at,
+      updatedAt: task.updated_at,
+      delegationStatus: audit?.status ?? null,
+      ageSeconds: audit?.ageSeconds ?? null,
+    };
+  }
+
+  private async closeCheckinsForLeadBacklogRequeue(
+    teamId: string,
+    task: TaskRow,
+    actorAgentId: string | null,
+    nowMs: number,
+  ): Promise<number> {
+    const linked = await this.db.checkins.list({
+      teamId,
+      linkedTaskId: task.id,
+      status: ['active', 'snoozed'],
+      limit: 1000,
+    }).catch(() => [] as CheckinRow[]);
+    let closed = 0;
+    for (const row of linked) {
+      const transitioned = await this.db.checkins.close(
+        row.id,
+        teamId,
+        nowMs,
+        'lead_delegation_backlog_requeued',
+      );
+      if (!transitioned) continue;
+      closed += 1;
+      await recordCheckinClosed(this.db.events, this.db.checkins, {
+        teamId,
+        checkinId: row.id,
+        ownerAgentId: row.owner_agent_id,
+        linkedTaskId: row.linked_task_id,
+        reason: 'lead_delegation_backlog_requeued',
+        actorAgentId,
+        taskStatus: 'todo',
+        occurredAt: nowMs,
+      });
+    }
+    return closed;
+  }
+
+  private async leadDelegationBacklogReport(params: {
+    teams: Array<{ id: string; name: string }>;
+    ownerRef?: string;
+    apply: boolean;
+    keepActive: number;
+  }): Promise<Record<string, unknown>> {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const nowMs = Date.now();
+    const resultTeams: Array<Record<string, unknown>> = [];
+    const totals = { teams: 0, leads: 0, blockers: 0, kept: 0, requeued: 0, checkinsClosed: 0 };
+
+    for (const teamRow of params.teams) {
+      const leads = params.ownerRef
+        ? [await this.resolveSingleAgentForCommand(teamRow.id, params.ownerRef).then((r) => r.agent ?? null)]
+        : (await this.db.agents.list(teamRow.id).catch(() => [] as AgentRow[]))
+          .filter((agent) => this.isConfiguredTeamLead(teamRow.name, agent));
+      const resolvedLeads = leads.filter((agent): agent is AgentRow => Boolean(agent));
+      if (params.ownerRef && resolvedLeads.length === 0) {
+        resultTeams.push({
+          team: teamRow.name,
+          error: `Agent "${params.ownerRef}" not found`,
+          leads: [],
+        });
+        continue;
+      }
+
+      const leadRows: Array<Record<string, unknown>> = [];
+      for (const lead of resolvedLeads) {
+        if (!this.isConfiguredTeamLead(teamRow.name, lead)) continue;
+        const blockers = await this.findLeadDelegationBlockers(teamRow.id, teamRow.name, lead);
+        blockers.sort((a, b) => (a.created_at - b.created_at) || (a.updated_at - b.updated_at) || a.name.localeCompare(b.name));
+        const kept = blockers.slice(0, params.keepActive);
+        const toRequeue = blockers.slice(params.keepActive);
+        const requeued: Array<Record<string, unknown>> = [];
+        let checkinsClosed = 0;
+
+        for (const task of toRequeue) {
+          const before = await this.leadDelegationTaskSummary(task, teamRow.id, teamRow.name, lead);
+          if (params.apply) {
+            await this.db.tasks.updateFields(task.id, {
+              owner: null,
+              status: 'todo',
+              completed_at: null,
+              updated_at: nowSec,
+            });
+            checkinsClosed += await this.closeCheckinsForLeadBacklogRequeue(teamRow.id, task, lead.id, nowMs);
+            await emitTaskTriaged(this.db.events, {
+              teamId: teamRow.id,
+              taskUuid: task.uuid,
+              taskName: task.name,
+              title: task.title,
+              ownerAgentId: lead.id,
+              actorAgentId: lead.id,
+              occurredAt: nowMs,
+              reason: 'lead_delegation_backlog_requeued',
+              stalledMinutes: Math.max(0, Math.round((nowSec - task.updated_at) / 60)),
+            });
+          }
+          requeued.push(before);
+        }
+
+        if (blockers.length > 0 || params.ownerRef) {
+          leadRows.push({
+            owner: lead.name,
+            blockerCount: blockers.length,
+            kept: await Promise.all(kept.map((task) => this.leadDelegationTaskSummary(task, teamRow.id, teamRow.name, lead))),
+            requeued,
+            checkinsClosed,
+          });
+        }
+        totals.leads += blockers.length > 0 ? 1 : 0;
+        totals.blockers += blockers.length;
+        totals.kept += kept.length;
+        totals.requeued += toRequeue.length;
+        totals.checkinsClosed += checkinsClosed;
+      }
+
+      if (leadRows.length > 0) {
+        totals.teams += 1;
+        resultTeams.push({ team: teamRow.name, leads: leadRows });
+      }
+    }
+
+    return {
+      ok: true,
+      dryRun: !params.apply,
+      keepActive: params.keepActive,
+      totals,
+      teams: resultTeams,
     };
   }
 
@@ -11064,6 +11213,56 @@ Return this JSON shape:
           }
 
           return { ok: true, result: { tasks: results } };
+        }
+
+        if (subCmd === 'lead-backlog' || subCmd === 'lead-delegation-backlog') {
+          // /task lead-backlog [--team <team>|--all] [--owner <lead>] [--keep-active N] [--apply]
+          const rawArgs = args.slice(1);
+          let targetTeamName: string | undefined;
+          let allTeams = false;
+          let ownerRef: string | undefined;
+          let apply = false;
+          let keepActive = 1;
+
+          for (let i = 0; i < rawArgs.length; i++) {
+            const token = rawArgs[i];
+            if (token === '--all') { allTeams = true; continue; }
+            if (token === '--team') { targetTeamName = rawArgs[++i]; continue; }
+            if (token === '--owner') { ownerRef = rawArgs[++i]; continue; }
+            if (token === '--apply') { apply = true; continue; }
+            if (token === '--dry-run') { apply = false; continue; }
+            if (token === '--keep-active') {
+              const parsed = Number(rawArgs[++i]);
+              if (!Number.isInteger(parsed) || parsed < 0 || parsed > 20) {
+                return { ok: false, error: '--keep-active must be an integer between 0 and 20' };
+              }
+              keepActive = parsed;
+              continue;
+            }
+          }
+
+          if (allTeams && targetTeamName) {
+            return { ok: false, error: 'Use either --all or --team <team>, not both' };
+          }
+
+          let teams: Array<{ id: string; name: string }>;
+          if (allTeams) {
+            teams = (await this.db.teams.listTeams()).map((team) => ({ id: team.id, name: team.name }));
+          } else if (targetTeamName) {
+            const targetTeam = await this.db.teams.getTeamByName(targetTeamName);
+            if (!targetTeam) return { ok: false, error: `Team "${targetTeamName}" not found` };
+            teams = [{ id: targetTeam.id, name: targetTeam.name }];
+          } else {
+            teams = [{ id: teamId, name: teamName }];
+          }
+
+          const report = await this.leadDelegationBacklogReport({
+            teams,
+            ownerRef,
+            apply,
+            keepActive,
+          });
+          return { ok: true, result: report };
         }
 
         if (subCmd === 'assign') {

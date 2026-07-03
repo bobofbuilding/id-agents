@@ -36,6 +36,7 @@ import { SqliteEventsRepo } from '../../src/db/repos/sqlite/events-repo.js';
 import { SqliteSubscriptionsRepo } from '../../src/db/repos/sqlite/subscriptions-repo.js';
 import { SqliteCheckinsRepo } from '../../src/db/repos/sqlite/checkins-repo.js';
 import { SqliteRuntimeLaneCooldownsRepo } from '../../src/db/repos/sqlite/runtime-lane-cooldowns-repo.js';
+import type { CheckinRow } from '../../src/db/types.js';
 
 const TEAM = 'checkin-autoattach-test';
 
@@ -244,6 +245,30 @@ function validBriefFields() {
     out_of_scope: ['optional recommendations'],
     backlog_policy: 'Non-required recommendations become backlog candidates.',
     bittrees_relevance: 'medium: improves validator routing reliability for Bittrees contributor work.',
+  };
+}
+
+function buildCheckinRow(overrides: Partial<CheckinRow> & Pick<CheckinRow, 'id' | 'team_id' | 'owner_agent_id' | 'linked_task_id'>): CheckinRow {
+  const now = Date.now();
+  return {
+    created_by_agent_id: overrides.owner_agent_id,
+    interval_seconds: 600,
+    priority: 'normal',
+    status: 'active',
+    close_when: { task_terminal: true },
+    max_iterations: null,
+    iteration_count: 0,
+    next_fire_at: now + 600_000,
+    snooze_until: null,
+    ttl_expires_at: null,
+    last_fire_at: null,
+    last_event_seq: null,
+    note: null,
+    created_at: now,
+    updated_at: now,
+    closed_at: null,
+    closed_reason: null,
+    ...overrides,
   };
 }
 
@@ -869,6 +894,110 @@ describe('/talk-to auto-attach', () => {
     expect(cliBlockedBody.result?.warning).toContain('lead_delegation_backlog');
     expect(cliBlockedBody.result?.task?.status).toBe('todo');
     expect(cliBlockedBody.result?.task?.ownerName).toBeNull();
+  });
+
+  it('reports and requeues existing lead-owned delegation backlog with linked checkin cleanup', async () => {
+    const engTeamId = await db.teams.getOrCreateTeamId('engineering-team');
+    const leadId = await getOrInsertAgent(db, engTeamId, 'engineering-lead', null);
+    const now = Math.floor(Date.now() / 1000);
+    const parents = [
+      { id: 'task_backlog_a', name: 'backlog-parent-a', uuid: '77777777-7777-4777-8777-777777777777', created_at: now - 1_200 },
+      { id: 'task_backlog_b', name: 'backlog-parent-b', uuid: '88888888-8888-4888-8888-888888888888', created_at: now - 1_100 },
+      { id: 'task_backlog_c', name: 'backlog-parent-c', uuid: '99999999-9999-4999-8999-999999999999', created_at: now - 1_000 },
+    ];
+
+    for (const parent of parents) {
+      await db.tasks.create({
+        id: parent.id,
+        name: parent.name,
+        uuid: parent.uuid,
+        team_id: engTeamId,
+        title: parent.name,
+        description: 'Lead-owned parent objective without delegated child tasks',
+        status: 'doing',
+        created_by: leadId,
+        owner: leadId,
+        created_at: parent.created_at,
+        updated_at: parent.created_at,
+        completed_at: null,
+      });
+    }
+    await db.checkins.create(buildCheckinRow({
+      id: 'chk_backlog_b',
+      team_id: engTeamId,
+      owner_agent_id: leadId,
+      linked_task_id: 'task_backlog_b',
+    }));
+    await db.checkins.create(buildCheckinRow({
+      id: 'chk_backlog_c',
+      team_id: engTeamId,
+      owner_agent_id: leadId,
+      linked_task_id: 'task_backlog_c',
+    }));
+
+    const dryRun = await fetch(`${baseUrl}/remote`, {
+      method: 'POST',
+      headers: adminHeaders('engineering-team'),
+      body: JSON.stringify({
+        from: 'manager',
+        command: '/task lead-backlog --team engineering-team --keep-active 1',
+      }),
+    });
+    expect(dryRun.status).toBe(200);
+    const dryBody = await dryRun.json() as {
+      ok: boolean;
+      result?: {
+        dryRun?: boolean;
+        totals?: { blockers?: number; kept?: number; requeued?: number; checkinsClosed?: number };
+      };
+    };
+    expect(dryBody.ok).toBe(true);
+    expect(dryBody.result?.dryRun).toBe(true);
+    expect(dryBody.result?.totals).toMatchObject({ blockers: 3, kept: 1, requeued: 2, checkinsClosed: 0 });
+    expect((await db.tasks.getByNameForTeam('backlog-parent-b', engTeamId))?.status).toBe('doing');
+    expect((await db.checkins.get('chk_backlog_b', engTeamId))?.status).toBe('active');
+
+    const apply = await fetch(`${baseUrl}/remote`, {
+      method: 'POST',
+      headers: adminHeaders('engineering-team'),
+      body: JSON.stringify({
+        from: 'manager',
+        command: '/task lead-backlog --team engineering-team --keep-active 1 --apply',
+      }),
+    });
+    expect(apply.status).toBe(200);
+    const applyBody = await apply.json() as {
+      ok: boolean;
+      result?: {
+        dryRun?: boolean;
+        totals?: { blockers?: number; kept?: number; requeued?: number; checkinsClosed?: number };
+      };
+    };
+    expect(applyBody.ok).toBe(true);
+    expect(applyBody.result?.dryRun).toBe(false);
+    expect(applyBody.result?.totals).toMatchObject({ blockers: 3, kept: 1, requeued: 2, checkinsClosed: 2 });
+
+    const kept = await db.tasks.getByNameForTeam('backlog-parent-a', engTeamId);
+    const requeuedB = await db.tasks.getByNameForTeam('backlog-parent-b', engTeamId);
+    const requeuedC = await db.tasks.getByNameForTeam('backlog-parent-c', engTeamId);
+    expect(kept?.status).toBe('doing');
+    expect(kept?.owner).toBe(leadId);
+    expect(requeuedB?.status).toBe('todo');
+    expect(requeuedB?.owner).toBeNull();
+    expect(requeuedC?.status).toBe('todo');
+    expect(requeuedC?.owner).toBeNull();
+
+    const checkinB = await db.checkins.get('chk_backlog_b', engTeamId);
+    const checkinC = await db.checkins.get('chk_backlog_c', engTeamId);
+    expect(checkinB?.status).toBe('closed');
+    expect(checkinB?.closed_reason).toBe('lead_delegation_backlog_requeued');
+    expect(checkinC?.status).toBe('closed');
+    expect(checkinC?.closed_reason).toBe('lead_delegation_backlog_requeued');
+
+    const triageEvents = await db.events.query({ teamId: engTeamId, topics: ['task:triaged'] });
+    expect(triageEvents.filter((event) => event.data?.reason === 'lead_delegation_backlog_requeued')).toHaveLength(2);
+    const checkinEvents = await db.events.query({ teamId: engTeamId, topics: ['checkin:closed'] });
+    expect(checkinEvents.filter((event) => event.data?.reason === 'lead_delegation_backlog_requeued')).toHaveLength(2);
   });
 
   it('rejects duplicate validator children for the same parent and purpose', async () => {
