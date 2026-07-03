@@ -8290,8 +8290,10 @@ export class AgentManagerDb {
             const isOnline = resp.ok;
             this.healthStatus.set(key, { status: isOnline ? 'online' : 'offline', lastCheck: Date.now() });
 
-            // Update DB status if it changed
-            if (isOnline && agent.status === 'offline') {
+            // Update DB status if it changed. A stale local-agent shutdown can
+            // leave a replacement process labeled "stopped"; a successful
+            // local /health probe is authoritative for local-process liveness.
+            if (isOnline && agent.status !== 'running') {
               await this.db.agents.updateStatus(agent.id, 'running');
             } else if (!isOnline && agent.status === 'running') {
               await this.db.agents.updateStatus(agent.id, 'offline');

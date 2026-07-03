@@ -301,4 +301,55 @@ describe('Phase 7: heartbeat mode separation', () => {
       await db.close();
     }
   }, 20000);
+
+  // ─── Test 4: local heartbeat repairs stale stopped status ──────────────────
+
+  it('4. runHealthChecks promotes a reachable stopped local agent back to running', async () => {
+    const db = await createInMemoryDb();
+    const port = await findFreePort();
+    const { createServer } = await import('http');
+    const healthServer = createServer((req, res) => {
+      if (req.url === '/health') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'ok' }));
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+
+    await new Promise<void>((resolve) => healthServer.listen(0, '127.0.0.1', () => resolve()));
+    const addr = healthServer.address();
+    if (!addr || typeof addr === 'string') throw new Error('health server did not bind to a TCP port');
+    const agentPort = addr.port;
+
+    const manager = new AgentManagerDb(workDir, db as any);
+    await manager.start(port);
+
+    try {
+      const teamId = await db.teams.getOrCreateTeamId('idchain');
+      await db.agents.create({
+        team_id: teamId,
+        id: 'stale-stopped-local-id',
+        name: 'stale-stopped-local',
+        type: 'claude',
+        model: 'claude-code-cli',
+        status: 'stopped',
+        created_at: Date.now(),
+        runtime: 'claude-code-cli',
+        port: agentPort,
+        endpoint: `http://127.0.0.1:${agentPort}`,
+        metadata: { pid: 12345 },
+      });
+
+      await (manager as any).runHealthChecks();
+
+      const updated = await db.agents.getById('stale-stopped-local-id');
+      expect(updated?.status).toBe('running');
+    } finally {
+      await new Promise<void>((res) => healthServer.close(() => res()));
+      await new Promise<void>((res) => (manager as any).httpServer?.close(() => res()));
+      await db.close();
+    }
+  }, 20000);
 });

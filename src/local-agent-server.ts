@@ -324,7 +324,13 @@ export async function startLocalAgent(config: LocalAgentConfig): Promise<{
           console.log(`📋 Cancelled ${queryIds.length} pending queries`);
         }
 
-        await db.agents.updateStatus(agentId, 'stopped');
+        const current = await db.agents.getById(agentId);
+        const currentPid = (current?.metadata as { pid?: unknown } | null | undefined)?.pid;
+        if (typeof currentPid === 'number' && currentPid > 0 && currentPid !== process.pid) {
+          console.log(`📦 Skipped stopped status for stale PID ${process.pid}; current PID is ${currentPid}`);
+        } else {
+          await db.agents.updateStatus(agentId, 'stopped');
+        }
       } catch {
         // Ignore errors
       }
