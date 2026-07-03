@@ -14,6 +14,7 @@ import { SqliteQueriesRepo } from '../../src/db/repos/sqlite/queries-repo.js';
 import { SqliteNewsRepo } from '../../src/db/repos/sqlite/news-repo.js';
 import { SqliteSchedulesRepo } from '../../src/db/repos/sqlite/schedules-repo.js';
 import { SqliteTasksRepo } from '../../src/db/repos/sqlite/tasks-repo.js';
+import type { AgentRow } from '../../src/db/types.js';
 
 async function createInMemoryDb() {
   const adapter = new SqliteAdapter(':memory:');
@@ -35,6 +36,37 @@ async function makeManager() {
   const db = await createInMemoryDb();
   const manager = new AgentManagerDb(workDir, db as any);
   return { manager, db, workDir };
+}
+
+function agentRow(overrides: Partial<AgentRow> = {}): AgentRow {
+  return {
+    team_id: 'team-1',
+    id: 'agent-1',
+    name: 'coder',
+    type: 'claude',
+    model: 'sonnet',
+    port: 4243,
+    endpoint: 'http://127.0.0.1:4243',
+    working_directory: null,
+    status: 'running',
+    created_at: 1,
+    registry: null,
+    metadata: { pid: 12345, runtime: 'codex' },
+    deleted_at: null,
+    runtime: 'codex',
+    token_id: null,
+    domain: null,
+    api_key: null,
+    customer_domain: null,
+    public_endpoint_url: null,
+    internal_endpoint_url: null,
+    ssh_target: null,
+    last_seen: null,
+    last_probed_at: null,
+    last_error: null,
+    consecutive_failures: 0,
+    ...overrides,
+  };
 }
 
 describe('AgentManagerDb killAgentProcess guards', () => {
@@ -166,5 +198,19 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     await Promise.all([first, second]);
 
     expect(starts).toEqual(['coder-first', 'coder-second']);
+  });
+
+  it('does not expose stale PID metadata for stopped local agents', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const stopped = (manager as any).agentToResponse(agentRow({ status: 'stopped' }));
+    expect(stopped.pid).toBeNull();
+    expect(stopped.metadata).not.toHaveProperty('pid');
+
+    const running = (manager as any).agentToResponse(agentRow({ status: 'running' }));
+    expect(running.pid).toBe(12345);
+    expect(running.metadata.pid).toBe(12345);
   });
 });

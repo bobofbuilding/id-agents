@@ -35,6 +35,7 @@ import { SqliteSchedulesRepo } from '../../src/db/repos/sqlite/schedules-repo.js
 import { SqliteTasksRepo } from '../../src/db/repos/sqlite/tasks-repo.js';
 import { SqliteEventsRepo } from '../../src/db/repos/sqlite/events-repo.js';
 import { SqliteSubscriptionsRepo } from '../../src/db/repos/sqlite/subscriptions-repo.js';
+import { SqliteRuntimeLaneCooldownsRepo } from '../../src/db/repos/sqlite/runtime-lane-cooldowns-repo.js';
 
 const TEAM = 'wakeup-events-read-test';
 
@@ -51,6 +52,7 @@ async function createInMemoryDb() {
     tasks: new SqliteTasksRepo(adapter),
     events: new SqliteEventsRepo(adapter),
     subscriptions: new SqliteSubscriptionsRepo(adapter),
+    runtimeLaneCooldowns: new SqliteRuntimeLaneCooldownsRepo(adapter),
     async close() { await adapter.close(); },
   };
 }
@@ -218,6 +220,48 @@ describe('GET /events — wakeup-service catch-up read', () => {
     expect(body.next_seq).toBe(0);
   });
 
+  it('honors wait by holding an empty read instead of returning immediately', async () => {
+    const waitTeam = `wakeup-events-wait-empty-${Date.now()}`;
+    await db.teams.getOrCreateTeamId(waitTeam);
+
+    const started = Date.now();
+    const { status, body } = await getEvents(baseUrl, waitTeam, { since: 0, wait: 0.2 });
+    const elapsed = Date.now() - started;
+
+    expect(status).toBe(200);
+    expect(body.events).toEqual([]);
+    expect(body.next_seq).toBe(0);
+    expect(elapsed).toBeGreaterThanOrEqual(150);
+  });
+
+  it('returns before the wait deadline when a matching event arrives', async () => {
+    const waitTeam = `wakeup-events-wait-hit-${Date.now()}`;
+    const waitTeamId = await db.teams.getOrCreateTeamId(waitTeam);
+
+    const started = Date.now();
+    const read = getEvents(baseUrl, waitTeam, { since: 0, wait: 2 });
+    setTimeout(() => {
+      void db.events.insert({
+        team_id: waitTeamId,
+        topic: 'task:created',
+        actor_agent_id: 'cto',
+        subject_kind: 'task',
+        subject_id: 'wait-hit',
+        occurred_at: Date.now(),
+        data: { name: 'wait-hit' },
+      });
+    }, 100);
+
+    const { status, body } = await read;
+    const elapsed = Date.now() - started;
+
+    expect(status).toBe(200);
+    expect(body.events).toHaveLength(1);
+    expect(body.events[0].subject?.id).toBe('wait-hit');
+    expect(body.next_seq).toBe(body.events[0].seq);
+    expect(elapsed).toBeLessThan(1800);
+  });
+
   it('filters by an exact topic when the CSV contains a concrete topic', async () => {
     const { status, body } = await getEvents(baseUrl, TEAM, {
       since: 0,
@@ -293,6 +337,11 @@ describe('GET /events — wakeup-service catch-up read', () => {
     expect(limitZero.status).toBe(400);
     const limitBody = (await limitZero.json()) as { error: string };
     expect(limitBody.error).toBe('invalid_limit');
+
+    const waitBad = await fetch(`${baseUrl}/events?wait=abc`, { headers: teamHeaders(TEAM) });
+    expect(waitBad.status).toBe(400);
+    const waitBody = (await waitBad.json()) as { error: string };
+    expect(waitBody.error).toBe('invalid_wait');
   });
 
   it('isolates events per team — X-Id-Team header scopes the read', async () => {
