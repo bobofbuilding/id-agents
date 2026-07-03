@@ -648,4 +648,108 @@ describe('AgentManagerDb killAgentProcess guards', () => {
       else process.env.ID_PENDING_QUERY_EXPIRY_MINUTES = savedEnv.pending;
     }
   });
+
+  it('expires duplicate active managed task asks while preserving one active task ask', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-supervised',
+        name: 'supervised-lead',
+        port: 4114,
+        status: 'running',
+      }),
+    });
+    const now = Date.now();
+    await db.queries.upsert(teamId, 'agent-supervised', {
+      query_id: 'older-pending-supervision',
+      status: 'pending',
+      prompt: 'Supervision: task #abc12345 ("Profile workflow needs") has been in progress 73m with no completion (probe 1/3).',
+      created: now,
+      owner_kind: 'agent',
+      owner_id: 'agent-supervised',
+    });
+    await db.queries.upsert(teamId, 'agent-supervised', {
+      query_id: 'active-processing-supervision',
+      status: 'processing',
+      prompt: 'Supervision: task #abc12345 ("Profile workflow needs") has been in progress 79m with no completion (probe 1/3).',
+      created: now + 1000,
+      owner_kind: 'agent',
+      owner_id: 'agent-supervised',
+    });
+    await db.queries.upsert(teamId, 'agent-supervised', {
+      query_id: 'other-task-supervision',
+      status: 'pending',
+      prompt: 'Supervision: task #def67890 ("Different task") has been in progress 79m with no completion (probe 1/3).',
+      created: now + 2000,
+      owner_kind: 'agent',
+      owner_id: 'agent-supervised',
+    });
+    await db.queries.upsert(teamId, 'agent-supervised', {
+      query_id: 'older-task-delegation',
+      status: 'pending',
+      prompt: 'TASK DELEGATION from primary lead: You are assigned task #ghi99999 (Design the workflow), part of parent #jkl11111.',
+      created: now + 3000,
+      owner_kind: 'agent',
+      owner_id: 'agent-supervised',
+    });
+    await db.queries.upsert(teamId, 'agent-supervised', {
+      query_id: 'newer-task-delegation',
+      status: 'pending',
+      prompt: 'TASK DELEGATION from primary lead: You are assigned task #ghi99999 (Design the workflow), part of parent #jkl11111.',
+      created: now + 4000,
+      owner_kind: 'agent',
+      owner_id: 'agent-supervised',
+    });
+
+    const result = await (manager as any).sweepStaleQueries();
+
+    expect(result.duplicateTaskAsk).toBe(2);
+    expect(result.total).toBe(2);
+    expect((await db.queries.getByQueryIdForTeam(teamId, 'older-pending-supervision'))?.status).toBe('expired');
+    expect((await db.queries.getByQueryIdForTeam(teamId, 'active-processing-supervision'))?.status).toBe('processing');
+    expect((await db.queries.getByQueryIdForTeam(teamId, 'other-task-supervision'))?.status).toBe('pending');
+    expect((await db.queries.getByQueryIdForTeam(teamId, 'older-task-delegation'))?.status).toBe('pending');
+    expect((await db.queries.getByQueryIdForTeam(teamId, 'newer-task-delegation'))?.status).toBe('expired');
+  });
+
+  it('dedupes active task delegation /ask prompts before dispatching', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-task-delegate',
+        name: 'task-delegate-lead',
+        port: 4115,
+        status: 'running',
+        endpoint: 'http://127.0.0.1:9',
+      }),
+    });
+    await db.queries.upsert(teamId, 'agent-task-delegate', {
+      query_id: 'existing-task-delegation',
+      status: 'pending',
+      prompt: 'TASK DELEGATION from primary lead: You are assigned task #abc12345 (Design the model), part of parent #def67890.',
+      created: Date.now(),
+      owner_kind: 'agent',
+      owner_id: 'agent-task-delegate',
+    });
+
+    const result = await (manager as any).executeRemoteCommand(
+      '/ask task-delegate-lead TASK DELEGATION from primary lead: You are assigned task #abc12345 (Design the model), part of parent #def67890.',
+      teamId,
+      'default',
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.result?.queryId).toBe('existing-task-delegation');
+    expect(result.result?.deduped).toBe(true);
+  });
 });

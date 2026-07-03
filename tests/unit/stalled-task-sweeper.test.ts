@@ -95,6 +95,8 @@ function fakeDb(overrides: Record<string, any> = {}): any {
       ...overrides.checkins,
     },
     queries: {
+      expireStale: vi.fn(async () => []),
+      getPending: vi.fn(async () => []),
       getPendingByOwner: vi.fn(async () => []),
       ...overrides.queries,
     },
@@ -240,6 +242,120 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('does not stack lead delegation probes while a prior task supervision ask is active', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const lead = agent({
+      id: 'lead-1',
+      name: 'ops-lead',
+      metadata: { catalog: { role: 'lead' } },
+    });
+    const leadTask = task({
+      id: 'lead-task-1',
+      name: 'coordinate-release-work',
+      uuid: '87654321-4321-4321-8321-123456789abc',
+      title: 'Coordinate release work',
+      owner: 'lead-1',
+      created_by: 'lead-1',
+      created_at: nowSec - 11 * 60,
+      updated_at: nowSec - 11 * 60,
+    });
+    const db = fakeDb({
+      teams: {
+        getTeam: vi.fn(async () => team({ name: 'ops-team' })),
+      },
+      agents: {
+        getById: vi.fn(async () => lead),
+        list: vi.fn(async () => [lead, agent()]),
+      },
+      tasks: {
+        list: vi.fn(async ({ status, teamId }: { status?: string; teamId?: string } = {}) => {
+          if (status === 'doing') return [leadTask];
+          if (teamId === TEAM_ID) return [leadTask];
+          return [];
+        }),
+        updateFields: vi.fn(async () => {}),
+      },
+      queries: {
+        getPending: vi.fn(async () => [{
+          team_id: TEAM_ID,
+          agent_id: 'lead-1',
+          query_id: 'active-delegation-probe',
+          status: 'pending',
+          prompt: 'Supervision: team-lead task #87654321 ("Coordinate release work") has no detected member-owned child tasks after 11m (delegation probe 1/3).',
+          created: NOW_MS - 60_000,
+          completed: null,
+          result: null,
+          error: null,
+          session_id: null,
+          owner_kind: 'agent',
+          owner_id: 'lead-1',
+          metadata: null,
+        }]),
+        getPendingByOwner: vi.fn(async () => []),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.sweepStalledTasks();
+
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
+    expect(db.events.insert).not.toHaveBeenCalled();
+  });
+
+  it('does not stack lead delegation kickoffs while a prior kickoff ask is active', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const lead = agent({
+      id: 'lead-1',
+      name: 'ops-lead',
+      metadata: { catalog: { role: 'lead' } },
+    });
+    const leadTask = task({
+      id: 'lead-task-1',
+      name: 'coordinate-release-work',
+      uuid: '87654321-4321-4321-8321-123456789abc',
+      title: 'Coordinate release work',
+      owner: 'lead-1',
+      created_by: 'lead-1',
+      created_at: nowSec - 11 * 60,
+      updated_at: nowSec - 11 * 60,
+    });
+    const db = fakeDb({
+      agents: {
+        list: vi.fn(async () => [lead, agent()]),
+      },
+      tasks: {
+        list: vi.fn(async ({ teamId }: { teamId?: string } = {}) => teamId === TEAM_ID ? [leadTask] : []),
+        updateFields: vi.fn(async () => {}),
+      },
+      queries: {
+        getPending: vi.fn(async () => [{
+          team_id: TEAM_ID,
+          agent_id: 'lead-1',
+          query_id: 'active-kickoff',
+          status: 'pending',
+          prompt: 'Lead delegation kickoff: task #87654321 ("Coordinate release work") is assigned to you as the team coordinator.',
+          created: NOW_MS - 60_000,
+          completed: null,
+          result: null,
+          error: null,
+          session_id: null,
+          owner_kind: 'agent',
+          owner_id: 'lead-1',
+          metadata: null,
+        }]),
+        getPendingByOwner: vi.fn(async () => []),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.promptLeadForDelegationKickoff(TEAM_ID, 'ops-team', leadTask, lead);
+
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
+    expect(db.events.insert).not.toHaveBeenCalled();
+  });
+
   it('triages a stalled task to the lead when the owner is unavailable', async () => {
     const unavailableOwner = agent({ status: 'stopped' });
     const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
@@ -271,6 +387,43 @@ describe('stalled task sweeper', () => {
         stalled_minutes: 60,
       }),
     }));
+  });
+
+  it('does not stack unavailable-owner triage probes while a prior task supervision ask is active', async () => {
+    const unavailableOwner = agent({ status: 'stopped' });
+    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
+    const db = fakeDb({
+      agents: {
+        getById: vi.fn(async () => unavailableOwner),
+        getByName: vi.fn(async () => lead),
+        list: vi.fn(async () => [unavailableOwner, lead]),
+      },
+      queries: {
+        getPending: vi.fn(async () => [{
+          team_id: TEAM_ID,
+          agent_id: 'lead-1',
+          query_id: 'active-owner-unavailable-probe',
+          status: 'processing',
+          prompt: 'Supervision: task #12345678 ("Stalled work") has been in progress 60m, but owner worker is stopped (triage probe 1/3).',
+          created: NOW_MS - 60_000,
+          completed: null,
+          result: null,
+          error: null,
+          session_id: null,
+          owner_kind: 'agent',
+          owner_id: 'lead-1',
+          metadata: null,
+        }]),
+        getPendingByOwner: vi.fn(async () => []),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.sweepStalledTasks();
+
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
+    expect(db.events.insert).not.toHaveBeenCalled();
   });
 
   it('parks stopped lead-owned work that missed delegation instead of nudging another lead', async () => {

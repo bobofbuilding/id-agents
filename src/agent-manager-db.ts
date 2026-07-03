@@ -415,6 +415,7 @@ interface QueryWaiter {
 interface StaleQuerySweepResult {
   pending: number;
   processing: number;
+  duplicateTaskAsk: number;
   total: number;
 }
 
@@ -1298,11 +1299,12 @@ export class AgentManagerDb {
     if (this.stalledNudges.has(key)) return;
     const children = await this.findDelegatedChildTasks(task, teamId, owner);
     if (children.length) return;
-    this.markStalledProbe(key, Date.now());
     const members = (await this.db.agents.list(teamId).catch(() => [] as AgentRow[]))
       .filter((agent) => agent.id !== owner.id && this.isLiveForSupervision(agent))
       .map((agent) => agent.name);
     const ref = this.taskShortRef(task);
+    if (await this.hasActiveSupervisionAskForMarker(teamId, owner, ref)) return;
+    this.markStalledProbe(key, Date.now());
     const memberHint = members.length ? ` Available teammates: ${members.join(', ')}.` : '';
     const message = `Lead delegation kickoff: task ${ref} ("${task.title}") is assigned to you as the team coordinator. Do not do the whole task yourself. Immediately decompose it into member-owned child tasks with \`/task create ... --owner <teammate> --parent-task ${ref}\`, then close this parent only after child tasks are done using \`/task done ${ref} --delegated-task-names "child-a,child-b"\`. If this is truly advisory, close it with \`--no-delegation-reason\` and a failure/summary note.${memberHint}`;
     if (await this.sendSupervisionAsk(teamName, owner.name, message)) {
@@ -9396,6 +9398,18 @@ Return this JSON shape:
           a = matches[0];
         }
         await this.sweepStaleQueriesIfDue(0);
+        const duplicateTaskAsk = await this.findActiveDuplicateTaskAsk(teamId, a, message);
+        if (duplicateTaskAsk) {
+          return {
+            ok: true,
+            result: {
+              queryId: duplicateTaskAsk.query_id,
+              status: duplicateTaskAsk.status,
+              agent: agentName,
+              deduped: true,
+            },
+          };
+        }
         const maxActiveQueries = this.getMaxActiveQueriesPerAgent();
         if (maxActiveQueries > 0) {
           const activeQueries = await this.countActiveQueries(a.id);
@@ -11800,6 +11814,113 @@ Return this JSON shape:
     }
   }
 
+  private supervisionPromptMatchesMarker(prompt: string | null | undefined, marker: string): boolean {
+    const text = String(prompt ?? '').trim().toLowerCase();
+    const normalizedMarker = marker.trim().toLowerCase();
+    if (!text || !normalizedMarker || !text.includes(normalizedMarker)) return false;
+    return text.startsWith('supervision:')
+      || text.startsWith('lead delegation kickoff:');
+  }
+
+  private activeTaskAskMarker(prompt: string | null | undefined): string | null {
+    const text = String(prompt ?? '').trim();
+    const lower = text.toLowerCase();
+    const managedTaskAsk = lower.startsWith('task delegation')
+      || lower.startsWith('supervision:')
+      || lower.startsWith('lead delegation kickoff:');
+    if (!managedTaskAsk) return null;
+    return text.match(/#[a-z0-9][a-z0-9_-]{3,}/i)?.[0]?.toLowerCase() ?? null;
+  }
+
+  private supervisionPromptMarker(prompt: string | null | undefined): string | null {
+    const text = String(prompt ?? '').trim();
+    if (!this.supervisionPromptMatchesMarker(text, 'task') && !this.supervisionPromptMatchesMarker(text, 'request')) {
+      return null;
+    }
+    const match = text.match(/\b(?:task|request)\s+(#[a-z0-9_-]+|query_[a-z0-9_]+)/i);
+    return match?.[1]?.toLowerCase() ?? null;
+  }
+
+  private async hasActiveSupervisionAskForMarker(
+    teamId: string,
+    recipient: AgentRow | null | undefined,
+    marker: string,
+  ): Promise<boolean> {
+    if (!recipient?.id) return false;
+    await this.sweepStaleQueriesIfDue();
+    const active = await this.db.queries.getPending(recipient.id).catch(() => [] as QueryRow[]);
+    return active.some((row) =>
+      row.team_id === teamId
+      && (row.status === 'pending' || row.status === 'processing')
+      && this.supervisionPromptMatchesMarker(row.prompt, marker),
+    );
+  }
+
+  private async findActiveDuplicateTaskAsk(
+    teamId: string,
+    recipient: AgentRow,
+    message: string,
+  ): Promise<QueryRow | null> {
+    const marker = this.activeTaskAskMarker(message);
+    if (!marker) return null;
+    await this.sweepStaleQueriesIfDue();
+    const active = await this.db.queries.getPending(recipient.id).catch(() => [] as QueryRow[]);
+    return active.find((row) =>
+      row.team_id === teamId
+      && (row.status === 'pending' || row.status === 'processing')
+      && this.activeTaskAskMarker(row.prompt) === marker,
+    ) ?? null;
+  }
+
+  private async expireDuplicateActiveTaskAsks(nowMs: number): Promise<QueryRow[]> {
+    const rows = await this.db.adapter.query<QueryRow>(
+      `SELECT team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id, metadata
+       FROM queries
+       WHERE status IN ('pending', 'processing')
+         AND (
+           LOWER(prompt) LIKE 'supervision:%'
+           OR LOWER(prompt) LIKE 'lead delegation kickoff:%'
+           OR LOWER(prompt) LIKE 'task delegation%'
+         )
+       ORDER BY team_id ASC, owner_kind ASC, owner_id ASC, created ASC, query_id ASC`,
+    ).then((r) => r.rows).catch(() => [] as QueryRow[]);
+    const grouped = new Map<string, QueryRow[]>();
+    for (const row of rows) {
+      const marker = this.activeTaskAskMarker(row.prompt) ?? this.supervisionPromptMarker(row.prompt);
+      if (!marker) continue;
+      const key = `${row.team_id}\u0001${row.owner_kind}\u0001${row.owner_id}\u0001${marker}`;
+      const list = grouped.get(key) ?? [];
+      list.push(row);
+      grouped.set(key, list);
+    }
+
+    const duplicateIds: string[] = [];
+    for (const list of grouped.values()) {
+      if (list.length <= 1) continue;
+      const sorted = [...list].sort((a, b) => {
+        const aRank = a.status === 'processing' ? 0 : 1;
+        const bRank = b.status === 'processing' ? 0 : 1;
+        return (aRank - bRank) || (a.created - b.created) || a.query_id.localeCompare(b.query_id);
+      });
+      for (const row of sorted.slice(1)) duplicateIds.push(row.query_id);
+    }
+    if (!duplicateIds.length) return [];
+
+    const dialect = this.db.adapter.dialect;
+    const completedParam = dialect === 'postgres' ? '$1' : '?';
+    const placeholders = duplicateIds
+      .map((_, i) => dialect === 'postgres' ? `$${i + 2}` : '?')
+      .join(', ');
+    const result = await this.db.adapter.query<QueryRow>(
+      `UPDATE queries
+       SET status = 'expired', completed = ${completedParam}
+       WHERE status IN ('pending', 'processing') AND query_id IN (${placeholders})
+       RETURNING team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id, metadata`,
+      [nowMs, ...duplicateIds],
+    );
+    return result.rows;
+  }
+
   private taskShortRef(task: TaskRow): string {
     return task.uuid ? `#${task.uuid.replace(/-/g, '').slice(0, 8)}` : task.name;
   }
@@ -11958,6 +12079,7 @@ Return this JSON shape:
         const canRun = this.canRunStalledProbe(nudgeKey, now, RENUDGE_MS, MAX_PROBES);
         const canEscalate = !canRun && this.canEscalateStalledProbe(nudgeKey, MAX_PROBES);
         if (canRun || canEscalate) {
+          if (await this.hasActiveSupervisionAskForMarker(teamRow.id, ownerAgent, ref)) continue;
           const attempt = canRun ? this.markStalledProbe(nudgeKey, now) : MAX_PROBES;
           const msg = await this.buildLeadDelegationNudge(
             t,
@@ -12057,6 +12179,7 @@ Return this JSON shape:
             }
             const lead = await this.findSupervisionLead(teamRow.id);
             if (lead) {
+              if (await this.hasActiveSupervisionAskForMarker(teamRow.id, lead, ref)) continue;
               this.markStalledProbeEscalated(nudgeKey, now);
               const msg = `Supervision: task ${ref} ("${t.title}") is still in progress after ${MAX_PROBES} stalled owner probes over ${mins}m. Please triage it: close it if finished, unblock it, reassign it, or split it into a new tracked task.`;
               if (await this.sendSupervisionAsk(teamRow.name, lead.name, msg)) {
@@ -12067,6 +12190,7 @@ Return this JSON shape:
           }
           continue;
         }
+        if (await this.hasActiveSupervisionAskForMarker(teamRow.id, ownerAgent, ref)) continue;
         const attempt = this.markStalledProbe(nudgeKey, now);
         const msg = `Supervision: task ${ref} ("${t.title}") has been in progress ${mins}m with no completion (probe ${attempt}/${MAX_PROBES}). If the work is done, mark it done now with \`/task done ${ref}\`. If you're blocked, reply briefly with what's blocking it. If it isn't started, start and finish it.`;
         if (await this.sendSupervisionAsk(teamName, ownerName, msg)) {
@@ -12080,6 +12204,7 @@ Return this JSON shape:
       if (!lead) continue;
       const nudgeKey = `task:${t.id}:owner-unavailable`;
       if (!this.canRunStalledProbe(nudgeKey, now, RENUDGE_MS, MAX_PROBES)) continue;
+      if (await this.hasActiveSupervisionAskForMarker(teamRow.id, lead, ref)) continue;
       const attempt = this.markStalledProbe(nudgeKey, now);
       const msg = `Supervision: task ${ref} ("${t.title}") has been in progress ${mins}m, but ${unavailable} (triage probe ${attempt}/${MAX_PROBES}). Please triage it: claim it, reassign it, or route it to the right teammate.`;
       if (await this.sendSupervisionAsk(teamRow.name, lead.name, msg)) {
@@ -12110,6 +12235,7 @@ Return this JSON shape:
       if (!lead) continue;
       const ref = this.taskShortRef(t);
       const mins = Math.round((now - updated) / 60000);
+      if (await this.hasActiveSupervisionAskForMarker(teamRow.id, lead, ref)) continue;
       const attempt = this.markStalledProbe(nudgeKey, now);
       const msg = `Supervision: unclaimed task ${ref} ("${t.title}") has been waiting ${mins}m with no owner (triage probe ${attempt}/${MAX_PROBES}). Please claim it if it is yours, or route it to the right teammate.`;
       if (await this.sendSupervisionAsk(teamRow.name, lead.name, msg)) {
@@ -12133,6 +12259,7 @@ Return this JSON shape:
           if (!this.canRunStalledProbe(nudgeKey, now, RENUDGE_MS, MAX_PROBES)) continue;
           const lead = await this.findSupervisionLead(team.id);
           if (!lead) continue;
+          if (await this.hasActiveSupervisionAskForMarker(team.id, lead, q.query_id)) continue;
           const mins = Math.round((now - q.created) / 60000);
           const prompt = q.prompt ? ` ("${q.prompt.slice(0, 120)}${q.prompt.length > 120 ? '...' : ''}")` : '';
           const attempt = this.markStalledProbe(nudgeKey, now);
@@ -12169,7 +12296,7 @@ Return this JSON shape:
     const now = Date.now();
     if (this.querySweepInFlight) return this.querySweepInFlight;
     if (this.lastQuerySweepAt > 0 && now - this.lastQuerySweepAt < minIntervalMs) {
-      return { pending: 0, processing: 0, total: 0 };
+      return { pending: 0, processing: 0, duplicateTaskAsk: 0, total: 0 };
     }
     return this.sweepStaleQueries();
   }
@@ -12189,8 +12316,9 @@ Return this JSON shape:
       this.db.queries.expireStale(pendingCutoff, ['pending']),
       this.db.queries.expireStale(processingCutoff, ['processing']),
     ]);
+    const expiredDuplicateTaskAsks = await this.expireDuplicateActiveTaskAsks(now);
     this.lastQuerySweepAt = now;
-    const expired = [...expiredPending, ...expiredProcessing];
+    const expired = [...expiredPending, ...expiredProcessing, ...expiredDuplicateTaskAsks];
     const count = expired.length;
     if (count > 0) {
       const occurredAt = now;
@@ -12205,13 +12333,18 @@ Return this JSON shape:
         });
       }
       this.managerLog(
-        `Expired ${count} stale queries (pending>${this.PENDING_QUERY_EXPIRY_MINUTES}m, processing>${this.PROCESSING_QUERY_EXPIRY_MINUTES}m)`,
+        `Expired ${count} stale/duplicate queries (pending>${this.PENDING_QUERY_EXPIRY_MINUTES}m, processing>${this.PROCESSING_QUERY_EXPIRY_MINUTES}m, duplicate-task-asks=${expiredDuplicateTaskAsks.length})`,
       );
       console.log(
-        `[Manager] Query sweeper expired ${count} stale queries (pending>${this.PENDING_QUERY_EXPIRY_MINUTES}m, processing>${this.PROCESSING_QUERY_EXPIRY_MINUTES}m)`,
+        `[Manager] Query sweeper expired ${count} stale/duplicate queries (pending>${this.PENDING_QUERY_EXPIRY_MINUTES}m, processing>${this.PROCESSING_QUERY_EXPIRY_MINUTES}m, duplicate-task-asks=${expiredDuplicateTaskAsks.length})`,
       );
     }
-    return { pending: expiredPending.length, processing: expiredProcessing.length, total: count };
+    return {
+      pending: expiredPending.length,
+      processing: expiredProcessing.length,
+      duplicateTaskAsk: expiredDuplicateTaskAsks.length,
+      total: count,
+    };
   }
 
   /**
