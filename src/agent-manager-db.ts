@@ -7558,6 +7558,24 @@ Return this JSON shape:
           }
         }
 
+        // tail=1 is a lightweight cursor bootstrap for live clients. It lets
+        // dashboards start at the current event tail without replaying every
+        // retained event through the UI on launch or tab switches.
+        const tailRaw = req.query.tail;
+        const tail = tailRaw === '1' || tailRaw === 'true';
+        if (tail) {
+          const [earliestAvailableSeq, latestSeq] = await Promise.all([
+            this.db.events.earliestSeq(teamId),
+            this.db.events.latestSeq(teamId),
+          ]);
+          return res.json({
+            events: [],
+            next_seq: latestSeq ?? since,
+            replay_truncated: false,
+            earliest_available_seq: earliestAvailableSeq,
+          });
+        }
+
         const rows = await this.db.events.query({
           teamId,
           sinceSeq: since,
