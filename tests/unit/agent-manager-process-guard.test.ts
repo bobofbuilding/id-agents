@@ -504,4 +504,51 @@ describe('AgentManagerDb killAgentProcess guards', () => {
       else process.env.ID_PROCESSING_QUERY_EXPIRY_MINUTES = savedEnv.processing;
     }
   });
+
+  it('rejects /ask before dispatch when the target agent queue is saturated', async () => {
+    const saved = process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
+    process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT = '2';
+    try {
+      const { manager, db, workDir } = await makeManager();
+      dbs.push(db);
+      workDirs.push(workDir);
+
+      const teamId = await db.teams.getOrCreateTeamId('default');
+      await db.agents.create({
+        ...agentRow({
+          team_id: teamId,
+          id: 'agent-busy',
+          name: 'busy-lead',
+          port: 4112,
+          status: 'running',
+        }),
+      });
+      await db.queries.upsert(teamId, 'agent-busy', {
+        query_id: 'busy-pending',
+        status: 'pending',
+        prompt: 'queued work',
+        created: Date.now(),
+        owner_kind: 'agent',
+        owner_id: 'agent-busy',
+      });
+      await db.queries.upsert(teamId, 'agent-busy', {
+        query_id: 'busy-processing',
+        status: 'processing',
+        prompt: 'current work',
+        created: Date.now(),
+        owner_kind: 'agent',
+        owner_id: 'agent-busy',
+      });
+      const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+      const result = await (manager as any).executeRemoteCommand('/ask busy-lead do one more thing', teamId, 'default');
+
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain('already has 2 active queries');
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      if (saved === undefined) delete process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
+      else process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT = saved;
+    }
+  });
 });

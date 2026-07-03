@@ -136,6 +136,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DEFAULT_MAX_DOING_TASKS = 30;
 const DEFAULT_STALLED_TASK_MAX_PROBES = 3;
+const DEFAULT_MAX_ACTIVE_QUERIES_PER_AGENT = 8;
 
 interface StalledProbeState {
   lastAt: number;
@@ -610,6 +611,13 @@ export class AgentManagerDb {
     const raw = process.env.STALL_MAX_PROBES;
     const parsed = raw ? Number(raw) : DEFAULT_STALLED_TASK_MAX_PROBES;
     return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : DEFAULT_STALLED_TASK_MAX_PROBES;
+  }
+
+  private getMaxActiveQueriesPerAgent(): number {
+    const raw = process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
+    if (raw === '0') return 0;
+    const parsed = raw ? Number(raw) : DEFAULT_MAX_ACTIVE_QUERIES_PER_AGENT;
+    return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : DEFAULT_MAX_ACTIVE_QUERIES_PER_AGENT;
   }
 
   private canRunStalledProbe(key: string, nowMs: number, renudgeMs: number, maxProbes: number): boolean {
@@ -9376,6 +9384,16 @@ Return this JSON shape:
             };
           }
           a = matches[0];
+        }
+        const maxActiveQueries = this.getMaxActiveQueriesPerAgent();
+        if (maxActiveQueries > 0) {
+          const activeQueries = await this.countActiveQueries(a.id);
+          if (activeQueries >= maxActiveQueries) {
+            return {
+              ok: false,
+              error: `Agent "${a.name}" already has ${activeQueries} active ${activeQueries === 1 ? 'query' : 'queries'} (limit ${maxActiveQueries}). Wait for current work to finish or expire before dispatching more.`,
+            };
+          }
         }
         // Use endpoint if set, otherwise construct from port using localhost
         const baseEndpoint = a.endpoint || `http://localhost:${a.port}`;
