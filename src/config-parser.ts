@@ -152,12 +152,24 @@ export interface OrgConfig {
   tags?: Record<string, string[]>;
 }
 
+export interface RuntimeCredentialLaneConfig {
+  id: string;
+  runtime?: HarnessType;
+  kind: 'subscription' | 'metered-api';
+  env?: Record<string, string>;
+}
+
+export interface RuntimeCredentialPoolConfig {
+  lanes: RuntimeCredentialLaneConfig[];
+}
+
 export interface DeployConfig {
   version: string;
   team?: string;
   parameters?: ConfigParameter[];
   onchain?: OnchainConfig;              // Onchain registration settings
   org?: OrgConfig;                      // Organization chart
+  runtimeCredentialPool?: RuntimeCredentialPoolConfig; // Runtime auth lanes for subscription/metered failover
   calendar?: CalendarSpec[];            // Team calendar schedules
   defaults?: {
     runtime?: HarnessType;              // Default harness for all agents
@@ -187,6 +199,7 @@ export interface TeamConfig {
   name?: string;
   team?: string;
   parameters?: ConfigParameter[];
+  runtimeCredentialPool?: RuntimeCredentialPoolConfig;
   agents: AgentSpec[];
 }
 
@@ -443,6 +456,49 @@ export function validateConfig(config: DeployConfig): ValidationResult {
         }
       }
     });
+  }
+
+  if (config.runtimeCredentialPool !== undefined) {
+    const lanes = config.runtimeCredentialPool?.lanes;
+    if (!Array.isArray(lanes) || lanes.length === 0) {
+      errors.push({ path: 'runtimeCredentialPool.lanes', message: 'runtimeCredentialPool.lanes must be a non-empty array' });
+    } else {
+      const subscriptionLanesByRuntime = new Map<string, number>();
+      for (const lane of lanes) {
+        if (!lane || typeof lane !== 'object' || lane.kind !== 'subscription') continue;
+        const runtime = resolveRuntime(typeof lane.runtime === 'string' && isValidHarnessType(lane.runtime)
+          ? lane.runtime
+          : config.defaults?.runtime || getDefaultRuntime());
+        subscriptionLanesByRuntime.set(runtime, (subscriptionLanesByRuntime.get(runtime) || 0) + 1);
+      }
+      if (subscriptionLanesByRuntime.size === 0) {
+        errors.push({ path: 'runtimeCredentialPool.lanes', message: 'runtimeCredentialPool.lanes must include at least two subscription lanes' });
+      }
+      for (const [runtime, count] of subscriptionLanesByRuntime.entries()) {
+        if (count < 2) {
+          errors.push({ path: 'runtimeCredentialPool.lanes', message: `runtimeCredentialPool.lanes must include at least two subscription lanes for ${runtime}` });
+        }
+      }
+      lanes.forEach((lane, index) => {
+        const lanePath = `runtimeCredentialPool.lanes[${index}]`;
+        if (!lane || typeof lane !== 'object') {
+          errors.push({ path: lanePath, message: 'lane must be an object' });
+          return;
+        }
+        if (typeof lane.id !== 'string' || !lane.id.trim()) {
+          errors.push({ path: `${lanePath}.id`, message: 'lane id is required' });
+        }
+        if (lane.runtime !== undefined && !isValidHarnessType(lane.runtime)) {
+          errors.push({ path: `${lanePath}.runtime`, message: `runtime must be one of: ${getAvailableHarnesses().join(', ')}` });
+        }
+        if (lane.kind !== 'subscription' && lane.kind !== 'metered-api') {
+          errors.push({ path: `${lanePath}.kind`, message: 'kind must be subscription or metered-api' });
+        }
+        if (lane.env !== undefined && (typeof lane.env !== 'object' || lane.env === null || Array.isArray(lane.env))) {
+          errors.push({ path: `${lanePath}.env`, message: 'env must be an object' });
+        }
+      });
+    }
   }
 
   // Validate each agent
@@ -1249,7 +1305,7 @@ export function processConfig(
   filePath: string,
   workspacePath: string = '/workspace',
   args: string[] = []
-): { agents: AgentSpec[]; calendar: CalendarSpec[]; teamContext: string | null; teamName: string | null; errors: ValidationError[]; parameters?: ConfigParameter[]; onchain?: OnchainConfig; org?: OrgConfig } {
+): { agents: AgentSpec[]; calendar: CalendarSpec[]; teamContext: string | null; teamName: string | null; errors: ValidationError[]; parameters?: ConfigParameter[]; onchain?: OnchainConfig; org?: OrgConfig; runtimeCredentialPool?: RuntimeCredentialPoolConfig } {
   // Get parameters first (for error messages)
   const parameters = getConfigParameters(filePath);
 
@@ -1328,5 +1384,5 @@ export function processConfig(
     ? loadTeamContext(resolvedConfig.team, workspacePath)
     : null;
 
-  return { agents, calendar: resolvedConfig.calendar || [], teamContext, teamName: resolvedConfig.team || null, errors: [], parameters, onchain: resolvedConfig.onchain, org: resolvedConfig.org };
+  return { agents, calendar: resolvedConfig.calendar || [], teamContext, teamName: resolvedConfig.team || null, errors: [], parameters, onchain: resolvedConfig.onchain, org: resolvedConfig.org, runtimeCredentialPool: resolvedConfig.runtimeCredentialPool };
 }

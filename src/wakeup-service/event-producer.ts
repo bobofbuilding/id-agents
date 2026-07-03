@@ -14,9 +14,12 @@
 
 import type { CheckinsRepository, EventsRepository } from '../db/db-service.js';
 import type { CheckinPriority } from '../db/types.js';
+import type { LearningLoopCapture } from '../core/learning-loop-capture.js';
 
 export const TASK_CLAIMED = 'task:claimed';
 export const TASK_COMPLETED = 'task:completed';
+export const TASK_REFRESHED = 'task:refreshed';
+export const TASK_TRIAGED = 'task:triaged';
 export const QUERY_DELIVERED = 'query:delivered';
 export const QUERY_FAILED = 'query:failed';
 export const QUERY_EXPIRED = 'query:expired';
@@ -61,6 +64,20 @@ export interface TaskCompletedInput {
   occurredAt: number;
   usedSourceIds?: string[];
   volunteeredSourceIds?: string[];
+  learningLoop?: LearningLoopCapture | null;
+  failureNote?: string | null;
+}
+
+export interface TaskSupervisionInput {
+  teamId: string;
+  taskUuid: string;
+  taskName: string;
+  title?: string | null;
+  ownerAgentId: string | null;
+  actorAgentId: string | null;
+  occurredAt: number;
+  reason: string;
+  stalledMinutes: number;
 }
 
 export interface QueryDeliveredInput {
@@ -72,6 +89,7 @@ export interface QueryDeliveredInput {
   taskId?: string | null;
   usedSourceIds?: string[];
   volunteeredSourceIds?: string[];
+  learningLoop?: LearningLoopCapture | null;
 }
 
 export interface QueryFailedInput {
@@ -131,6 +149,45 @@ export async function emitTaskCompleted(
       completed_at: input.occurredAt,
       ...(input.usedSourceIds?.length ? { used_source_ids: input.usedSourceIds } : {}),
       ...(input.volunteeredSourceIds?.length ? { volunteered_source_ids: input.volunteeredSourceIds } : {}),
+      ...(input.learningLoop ? { learning_loop: input.learningLoop } : {}),
+      ...(input.failureNote ? { failure_note: truncate(input.failureNote) } : {}),
+      ...(input.title ? { title_preview: truncate(input.title) } : {}),
+    },
+  });
+}
+
+export async function emitTaskRefreshed(
+  events: EventsRepository,
+  input: TaskSupervisionInput,
+): Promise<{ seq: number }> {
+  return emitTaskSupervisionEvent(events, TASK_REFRESHED, input);
+}
+
+export async function emitTaskTriaged(
+  events: EventsRepository,
+  input: TaskSupervisionInput,
+): Promise<{ seq: number }> {
+  return emitTaskSupervisionEvent(events, TASK_TRIAGED, input);
+}
+
+async function emitTaskSupervisionEvent(
+  events: EventsRepository,
+  topic: typeof TASK_REFRESHED | typeof TASK_TRIAGED,
+  input: TaskSupervisionInput,
+): Promise<{ seq: number }> {
+  return events.insert({
+    team_id: input.teamId,
+    topic,
+    actor_agent_id: input.actorAgentId,
+    subject_kind: 'task',
+    subject_id: input.taskUuid,
+    occurred_at: input.occurredAt,
+    data: {
+      task_name: input.taskName,
+      task_uuid: input.taskUuid,
+      owner: input.ownerAgentId,
+      reason: input.reason,
+      stalled_minutes: input.stalledMinutes,
       ...(input.title ? { title_preview: truncate(input.title) } : {}),
     },
   });
@@ -155,6 +212,7 @@ export async function emitQueryDelivered(
       ...(input.taskId ? { task_id: input.taskId } : {}),
       ...(input.usedSourceIds?.length ? { used_source_ids: input.usedSourceIds } : {}),
       ...(input.volunteeredSourceIds?.length ? { volunteered_source_ids: input.volunteeredSourceIds } : {}),
+      ...(input.learningLoop ? { learning_loop: input.learningLoop } : {}),
       ...(input.messagePreview
         ? { message_preview: truncate(input.messagePreview) }
         : {}),

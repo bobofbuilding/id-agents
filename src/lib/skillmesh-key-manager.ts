@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 /**
- * SkillMesh HD key derivation for id-agents.
+ * Optional SkillMesh provider HD key derivation for id-agents.
  *
- * Each new agent gets a unique Ethereum key derived from the skill-master
- * private key at path m/44'/60'/0'/0/<index>.
+ * This helper is intentionally inert unless the SkillMesh provider/plugin is
+ * attached or explicitly enabled. Neutral agents do not receive these keys.
  *
  * Master key resolution order:
  *   1. SKILLMESH_MASTER_KEY env var (preferred)

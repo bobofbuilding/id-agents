@@ -5,8 +5,6 @@ import { Footer } from './components/Footer.js';
 import { HelpView, HELP_VIEW_CHROME_ROWS } from './components/HelpView.js';
 import { TeamsPanel } from './components/TeamsPanel.js';
 import { AgentsTable } from './components/AgentsTable.js';
-import { NewsView } from './components/NewsView.js';
-import { NewsDetail } from './components/NewsDetail.js';
 import { StatusStrip } from './components/StatusStrip.js';
 import { TasksTable } from './components/TasksTable.js';
 import { TaskDetail } from './components/TaskDetail.js';
@@ -36,9 +34,8 @@ import {
   parseCommandLine,
 } from './commands/registry.js';
 import { ManagerError, NetworkError } from './api/manager.js';
-import type { Agent, NewsItem, Schedule, Task, Team } from './api/types.js';
+import type { Agent, Schedule, Task, Team } from './api/types.js';
 import {
-  fetchAgentNews,
   fetchAgentsAllTeams,
   fetchAgentsLatestNewsTs,
   fetchLibraryAgent,
@@ -76,8 +73,6 @@ import type { CommandResultRenderer } from './commands/registry.js';
 type View =
   | 'agents'
   | 'agent-detail'
-  | 'news'
-  | 'news-detail'
   | 'tasks'
   | 'task-detail'
   | 'calendar'
@@ -96,13 +91,11 @@ type View =
 
 const AGENTS_POLL_MS = 2000;
 const TEAMS_POLL_MS = 15000;
-const NEWS_POLL_MS = 3000;
 const TASKS_POLL_MS = 5000;
 const SCHEDULES_POLL_MS = 5000;
 const LIBRARY_POLL_MS = 5000;
 const NEWS_COOLDOWN_TICK_MS = 10_000;
 const AGENTS_CHROME_ROWS = 11;
-const NEWS_CHROME_ROWS = 6;
 const DETAIL_CHROME_ROWS = 6;
 const TASKS_CHROME_ROWS = 10;
 // Calendar: no TeamsPanel, no StatusStrip — only the bordered list box
@@ -120,6 +113,9 @@ const LIBRARY_CHROME_ROWS = 8;
 const DETAIL_CONTENT_WIDTH = 76;
 const MIN_VISIBLE = 3;
 const SELF_AGENT = 'tui';
+const DEFAULT_DASHBOARD_TEAM = 'default';
+const DEFAULT_TEAM_LEAD = 'lead';
+const DEFAULT_SPEAK_COMMAND_BUFFER = `/ask ${DEFAULT_TEAM_LEAD} `;
 const FLASH_MS = 1500;
 const TERMINAL_CONTENT_WIDTH = 76;
 const TEAM_MUTATING_COMMANDS: ReadonlySet<string> = new Set(['team', 'deploy', 'sync']);
@@ -130,7 +126,34 @@ const AGENT_TARGETED_COMMANDS: ReadonlySet<string> = new Set([
   'meta', 'output', 'cancel', 'delete',
   'ask', 'hey', 'agent',
 ]);
-const NEWS_MESSAGE_WIDTH = TERMINAL_CONTENT_WIDTH - 8 - 1 - 17 - 4;
+
+export function initialCommandBuffer(input: string): string {
+  return input === '/' ? DEFAULT_SPEAK_COMMAND_BUFFER : input;
+}
+
+export function resolveAgentTargetTeam(
+  commandName: string,
+  targetName: string,
+  allAgents: Agent[],
+): { teamName?: string; error?: string } {
+  const matches = allAgents.filter(
+    (a) => a.name === targetName || a.name.startsWith(`${targetName}.`),
+  );
+  if (targetName === DEFAULT_TEAM_LEAD) {
+    const defaultLead = matches.find((m) => m.teamName === DEFAULT_DASHBOARD_TEAM);
+    if (defaultLead) return { teamName: DEFAULT_DASHBOARD_TEAM };
+  }
+  const distinctTeams = Array.from(new Set(matches.map((m) => m.teamName)));
+  if (distinctTeams.length === 1) {
+    return { teamName: distinctTeams[0] };
+  }
+  if (distinctTeams.length > 1) {
+    return {
+      error: `${commandName}: agent "${targetName}" exists in multiple teams (${distinctTeams.join(', ')}). Switch to the team you want first.`,
+    };
+  }
+  return { error: `${commandName}: agent "${targetName}" not found in any team.` };
+}
 
 interface AppProps {
   staticMode?: boolean;
@@ -219,8 +242,6 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
   const [selectedTeam, setSelectedTeam] = useState<string | null>(null);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [windowStart, setWindowStart] = useState(0);
-  const [newsSelectedIndex, setNewsSelectedIndex] = useState(0);
-  const [newsWindowStart, setNewsWindowStart] = useState(0);
   const [taskSelectedIndex, setTaskSelectedIndex] = useState(0);
   const [taskWindowStart, setTaskWindowStart] = useState(0);
   const [schedSelectedIndex, setSchedSelectedIndex] = useState(0);
@@ -289,12 +310,11 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
   } | null>(null);
   const backgroundPaused = showHelp || showQuitConfirm;
 
-  // Cooldown tick runs on news AND agents so the news-freshness dot in
-  // the agents table colours against the same 10s epoch rather than a
-  // free-running clock. Bucketed colour thresholds mean re-renders only
-  // fire when an item crosses a 60/300/900s band.
+  // Cooldown tick drives the news-freshness dot in the agents table.
+  // Bucketed colour thresholds mean re-renders only fire when an item
+  // crosses a 60/300/900s band.
   useEffect(() => {
-    const needsTick = !backgroundPaused && (view === 'news' || view === 'agents');
+    const needsTick = !backgroundPaused && view === 'agents';
     if (!needsTick || staticMode) return;
     setCooldownEpoch(Date.now());
     const id = setInterval(() => setCooldownEpoch(Date.now()), NEWS_COOLDOWN_TICK_MS);
@@ -443,6 +463,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
     const s = new Set<string>();
     for (const a of allAgents) {
       const isRemote = a.deploymentShape === 'remote-endpoint' ||
+        a.runtime === 'public-agent-remote' ||
         a.metadata?.runtime === 'public-agent-remote';
       if (!isRemote) s.add(a.id);
     }
@@ -462,7 +483,6 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
 
   const rows = stdout?.rows ?? 30;
   const agentsWindowSize = Math.max(MIN_VISIBLE, rows - AGENTS_CHROME_ROWS);
-  const newsWindowSize = Math.max(MIN_VISIBLE, rows - NEWS_CHROME_ROWS);
   const detailWindowSize = Math.max(MIN_VISIBLE, rows - DETAIL_CHROME_ROWS);
   const helpWindowSize = helpWindowSizeForRows(rows);
   const tasksWindowSize = Math.max(MIN_VISIBLE, rows - TASKS_CHROME_ROWS);
@@ -649,50 +669,9 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
   const selectedAgentId: string | null = selectedAgent?.id ?? null;
   const selectedAgentTeam: string | null = selectedAgent?.teamName ?? null;
 
-  const newsFetcher = useCallback(
-    (signal: AbortSignal): Promise<NewsItem[]> => {
-      if (!selectedAgentName) return Promise.resolve([]);
-      return fetchAgentNews(manager, SELF_AGENT, selectedAgentName, signal, selectedAgentTeam ?? undefined);
-    },
-    [manager, selectedAgentName, selectedAgentTeam],
-  );
-
-  const newsPoll = usePolling<NewsItem[]>(
-    newsFetcher,
-    NEWS_POLL_MS,
-    staticMode || (view !== 'news' && view !== 'news-detail'),
-    [manager, selectedAgentName ?? '', selectedAgentTeam ?? '', view],
-  );
-  const newsItems = newsPoll.data ?? [];
-  const sortedNewsItems = useMemo(
-    () => [...newsItems].sort((a, b) => b.timestamp - a.timestamp),
-    [newsItems],
-  );
-  const newsTotal = sortedNewsItems.length;
-  const selectedNewsItem: NewsItem | null = sortedNewsItems[newsSelectedIndex] ?? null;
-
-  const [detailScroll, setDetailScroll] = useState(0);
   const [taskDetailScroll, setTaskDetailScroll] = useState(0);
   const [hbDetailScroll, setHbDetailScroll] = useState(0);
   const [agentDetailScroll, setAgentDetailScroll] = useState(0);
-
-  useEffect(() => {
-    if (newsTotal === 0) {
-      if (newsSelectedIndex !== 0) setNewsSelectedIndex(0);
-      if (newsWindowStart !== 0) setNewsWindowStart(0);
-      return;
-    }
-    const clampedSel = Math.min(newsSelectedIndex, newsTotal - 1);
-    if (clampedSel !== newsSelectedIndex) setNewsSelectedIndex(clampedSel);
-    const maxStart = Math.max(0, newsTotal - newsWindowSize);
-    let nextStart = newsWindowStart;
-    if (clampedSel < nextStart) nextStart = clampedSel;
-    if (clampedSel >= nextStart + newsWindowSize)
-      nextStart = clampedSel - newsWindowSize + 1;
-    if (nextStart > maxStart) nextStart = maxStart;
-    if (nextStart < 0) nextStart = 0;
-    if (nextStart !== newsWindowStart) setNewsWindowStart(nextStart);
-  }, [newsTotal, newsSelectedIndex, newsWindowStart, newsWindowSize]);
 
   const teamOptions: Array<string | null> = useMemo(
     () => [null, ...teams.map((t) => t.name)],
@@ -718,14 +697,6 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
       setSelectedIndex((idx) => clamp(idx + delta, 0, total - 1));
     },
     [total],
-  );
-
-  const moveNewsSel = useCallback(
-    (delta: number) => {
-      if (newsTotal === 0) return;
-      setNewsSelectedIndex((idx) => clamp(idx + delta, 0, newsTotal - 1));
-    },
-    [newsTotal],
   );
 
   const moveTaskSel = useCallback(
@@ -786,9 +757,6 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
 
   const openAgentDetail = useCallback(() => {
     if (!selectedAgent) return;
-    const isRemote = selectedAgent.deploymentShape === 'remote-endpoint' ||
-      selectedAgent.metadata?.runtime === 'public-agent-remote';
-    if (!isRemote) return; // local agents drill into news instead
     setAgentDetailScroll(0);
     setView('agent-detail');
   }, [selectedAgent]);
@@ -803,19 +771,6 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
     },
     [],
   );
-
-  const openNews = useCallback(() => {
-    if (!selectedAgentName) return;
-    setNewsSelectedIndex(0);
-    setNewsWindowStart(0);
-    setView('news');
-  }, [selectedAgentName]);
-
-  const openNewsDetail = useCallback(() => {
-    if (!selectedNewsItem) return;
-    setDetailScroll(0);
-    setView('news-detail');
-  }, [selectedNewsItem]);
 
   const openTaskDetail = useCallback(() => {
     if (tasksTotal === 0) return;
@@ -837,17 +792,6 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
   const backToAgents = useCallback(() => {
     setView('agents');
   }, []);
-
-  const backToNews = useCallback(() => {
-    setView('news');
-  }, []);
-
-  const moveDetailScroll = useCallback(
-    (delta: number) => {
-      setDetailScroll((off) => Math.max(0, off + delta));
-    },
-    [],
-  );
 
   // ---------------------------------------------------------------- Library
   // Read-only browser fed by slice-7 manager /library/* endpoints. No
@@ -1272,29 +1216,16 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         && parsed.args[0] !== '*'
         && !parsed.args[0]!.startsWith('-');
       if (AGENT_TARGETED_COMMANDS.has(parsed.name) && firstArgLooksLikeAgent) {
-        const targetName = parsed.args[0];
-        // Match exact names AND ENS-style prefix shorthands (`cli` should
-        // match `cli.agent-28.xid.eth`). Mirrors the daemon's lenient name
-        // resolution so the operator can use the short form everywhere.
-        const matches = allAgents.filter(
-          (a) => a.name === targetName || a.name.startsWith(`${targetName}.`),
-        );
-        const distinctTeams = Array.from(new Set(matches.map((m) => m.teamName)));
-        if (distinctTeams.length === 1) {
-          resolvedTeam = distinctTeams[0];
-        } else if (distinctTeams.length > 1) {
+        const targetName = parsed.args[0]!;
+        const target = resolveAgentTargetTeam(parsed.name, targetName, allAgents);
+        if (target.error) {
           setCommandError({
             kind: 'manager',
-            message: `${parsed.name}: agent "${targetName}" exists in multiple teams (${distinctTeams.join(', ')}). Switch to the team you want first.`,
-          });
-          return;
-        } else {
-          setCommandError({
-            kind: 'manager',
-            message: `${parsed.name}: agent "${targetName}" not found in any team.`,
+            message: target.error,
           });
           return;
         }
+        resolvedTeam = target.teamName;
       }
       if (!resolvedTeam) {
         resolvedTeam = teams.find((t) => t.name !== 'public')?.name;
@@ -1439,7 +1370,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         // under "Views". Reuses the same dispatch/openers the per-view
         // input blocks already call so behavior is identical.
         if (
-          input === 'a' || input === 't' || input === 'n' ||
+          input === 'a' || input === 't' ||
           input === 'c' || input === 'h' || input === 'l' || input === 's' ||
           input === 'm'
         ) {
@@ -1447,7 +1378,6 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           setHelpScroll(0);
           if (input === 'a') return setView('agents');
           if (input === 't') return setView('tasks');
-          if (input === 'n') return setView('news');
           if (input === 'c') return openCalendar();
           if (input === 'h') return openHeartbeats();
           if (input === 'l') return openLibraryAgents();
@@ -1462,7 +1392,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           setShowHelp(false);
           setHelpScroll(0);
           setCommandMode(true);
-          setCommandBuffer(input);
+          setCommandBuffer(initialCommandBuffer(input));
           setCommandHistoryIndex(null);
           return;
         }
@@ -1637,7 +1567,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         }
         if (input === ':' || input === '/') {
           setCommandMode(true);
-          setCommandBuffer(input);
+          setCommandBuffer(initialCommandBuffer(input));
           setCommandHistoryIndex(null);
           return;
         }
@@ -1684,7 +1614,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
       }
       if (input === ':' || input === '/') {
         setCommandMode(true);
-        setCommandBuffer(input);
+        setCommandBuffer(initialCommandBuffer(input));
         setCommandHistoryIndex(null);
         return;
       }
@@ -1704,10 +1634,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         if (input === 's') return openLibrarySkills();
         if (input === 'm') return openLibraryTeams();
         if (key.rightArrow) {
-          // Remote agents get the detail panel; local agents get news
-          const isRemote = selectedAgent?.deploymentShape === 'remote-endpoint' ||
-            selectedAgent?.metadata?.runtime === 'public-agent-remote';
-          return isRemote ? openAgentDetail() : openNews();
+          return openAgentDetail();
         }
         if (key.tab) return cycleTeam(key.shift ? -1 : 1);
         if (key.upArrow) return moveAgentsSel(-1);
@@ -2013,26 +1940,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
         return;
       }
 
-      if (view === 'news') {
-        if (key.rightArrow) return openNewsDetail();
-        if (key.leftArrow || key.escape) return backToAgents();
-        if (key.upArrow) return moveNewsSel(-1);
-        if (key.downArrow) return moveNewsSel(1);
-        if (key.pageUp) return moveNewsSel(-newsWindowSize);
-        if (key.pageDown) return moveNewsSel(newsWindowSize);
-        if (isHomeKey(input)) return setNewsSelectedIndex(0);
-        if (isEndKey(input)) return setNewsSelectedIndex(Math.max(0, newsTotal - 1));
-        return;
-      }
-
-      // news-detail view
-      if (key.leftArrow || key.escape) return backToNews();
-      if (key.upArrow) return moveDetailScroll(-1);
-      if (key.downArrow) return moveDetailScroll(1);
-      if (key.pageUp) return moveDetailScroll(-detailWindowSize);
-      if (key.pageDown) return moveDetailScroll(detailWindowSize);
-      if (isHomeKey(input)) return setDetailScroll(0);
-      if (isEndKey(input)) return setDetailScroll(Number.MAX_SAFE_INTEGER);
+      if (key.leftArrow || key.escape) return backToAgents();
     },
     { isActive: process.stdin.isTTY === true },
   );
@@ -2212,6 +2120,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           />
           <TasksTable
             tasks={visibleTasks}
+            scopeLabel={selectedTeam === null ? 'fleet aggregate' : selectedTeam}
             ageByName={ageByTaskName}
             selectedIndex={taskSelectedIndex}
             windowStart={taskWindowStart}
@@ -2359,31 +2268,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
           scrollOffset={libTeamDetailScroll}
           installState={libTeamInstallState}
         />
-      ) : view === 'news' ? (
-        <NewsView
-          agentName={selectedAgentName}
-          items={sortedNewsItems}
-          loading={newsPoll.lastUpdated === 0 && !newsPoll.error}
-          error={newsPoll.error}
-          windowStart={newsWindowStart}
-          windowSize={newsWindowSize}
-          selectedIndex={newsSelectedIndex}
-          messageWidth={NEWS_MESSAGE_WIDTH}
-          cooldownEpoch={cooldownEpoch}
-        />
-      ) : (
-        <NewsDetail
-          agentName={selectedAgentName}
-          item={selectedNewsItem}
-          positionLabel={
-            selectedNewsItem && newsTotal > 0
-              ? `item ${newsSelectedIndex + 1} of ${newsTotal}`
-              : ''
-          }
-          windowSize={detailWindowSize}
-          scrollOffset={detailScroll}
-        />
-      )}
+      ) : null}
       {flashMessage ? (
         <Box paddingX={1}>
           <Text color="green" wrap="truncate-end">{flashMessage}</Text>

@@ -221,7 +221,7 @@ export async function startLocalAgent(config: LocalAgentConfig): Promise<{
 
   // For Claude CLI runtimes, prefer the local Claude session over ambient API keys.
   // Codex still supports OPENAI_API_KEY and should inherit it when present.
-  if (usesCliLogin(runtime) && runtime !== 'codex') {
+  if (usesCliLogin(runtime) && runtime !== 'codex' && process.env.ID_AGENT_CLAUDE_BARE !== '1') {
     delete process.env.ANTHROPIC_API_KEY;
   }
 
@@ -231,6 +231,7 @@ export async function startLocalAgent(config: LocalAgentConfig): Promise<{
   // report local-model usage to the manager's /usage/record endpoint).
   process.env.ID_AGENT_NAME = name;
   process.env.ID_AGENT_TEAM = team;
+  process.env.ID_AGENT_ID = agentId;
 
   // Enable verbose logging if configured
   if (config.verbose || process.env.ID_AGENT_VERBOSE === 'true') {
@@ -336,7 +337,13 @@ export async function startLocalAgent(config: LocalAgentConfig): Promise<{
           console.log(`📋 Cancelled ${queryIds.length} pending queries`);
         }
 
-        await db.agents.updateStatus(agentId, 'stopped');
+        const current = await db.agents.getById(agentId);
+        const currentPid = (current?.metadata as { pid?: unknown } | null | undefined)?.pid;
+        if (typeof currentPid === 'number' && currentPid > 0 && currentPid !== process.pid) {
+          console.log(`📦 Skipped stopped status for stale PID ${process.pid}; current PID is ${currentPid}`);
+        } else {
+          await db.agents.updateStatus(agentId, 'stopped');
+        }
       } catch {
         // Ignore errors
       }

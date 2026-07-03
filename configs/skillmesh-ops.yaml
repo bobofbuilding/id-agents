@@ -15,6 +15,7 @@ defaults:
     - identity
     - inter-agent
     - catalog
+    - task-discipline
   plugins:
     - name: skillmesh
       path: ../workspace/projects/skillmesh/agents/plugins/skillmesh
@@ -27,6 +28,15 @@ agents:
       marketplace ops, research, content, and protocol monitoring. Assigns work,
       tracks blockers, and ensures agents and skills stay in sync with on-chain
       state. Orchestrates multi-agent workflows and escalates to the human operator.
+      For non-trivial objectives, creates and claims its own lead task, creates
+      member-owned child tasks for delegated work, dispatches independent child
+      tasks in parallel, and includes delegated_task_names when marking the lead
+      task done. Returns substantial accomplishment packets through default/coder
+      and default/researcher validation before default/lead treats the work as final.
+    skills:
+      - team-coordinator
+      - brain
+      - idagents-team-builder
     catalog:
       role: lead
       expertise:

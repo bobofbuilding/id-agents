@@ -15,6 +15,7 @@ defaults:
     - identity
     - inter-agent
     - catalog
+    - task-discipline
   plugins:
     - name: skillmesh
       path: ../workspace/projects/skillmesh/agents/plugins/skillmesh

@@ -16,7 +16,6 @@ export const HELP_VIEW_CHROME_ROWS = 4;
 const VIEW_BINDINGS: Array<[string, string]> = [
   ['a', 'Agents'],
   ['t', 'Tasks'],
-  ['n', 'News'],
   ['c', 'Calendar'],
   ['h', 'Heartbeats'],
   ['l', 'Library / agents'],

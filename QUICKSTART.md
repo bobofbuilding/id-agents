@@ -286,9 +286,9 @@ npm run id-agents
 
 Type `/help` for commands.
 
-## SkillMesh Integration
+## Optional SkillMesh Provider
 
-SkillMesh is an on-chain marketplace where agents buy, sell, and execute skills. Adding the SkillMesh layer to id-agents gives your agents on-chain identity, a BYOK LLM gateway, A2A messaging, and marketplace access — no SkillMesh monorepo required.
+SkillMesh is an on-chain marketplace where agents buy, sell, and execute skills. It is bundled as an optional provider, not required for the core id-agents runtime. Core id-agents covers teams, agents, routing, skills, MCP, memory, identity, and wallets without SkillMesh. Add the SkillMesh layer only for teams/agents that need marketplace access, on-chain skill execution, A2A messaging, the BYOK LLM gateway, or SkillMesh identity — no SkillMesh monorepo required.
 
 ### 1. Add your signing key
 
@@ -298,6 +298,9 @@ Generate a new Ethereum wallet (or use an existing Sepolia key) and add it to `.
 # Generate a new key with cast (from foundry) or any Ethereum wallet
 SKILLMESH_PRIVATE_KEY=0x...
 SKILLMESH_APP_URL=https://skillmesh.bittrees.org
+# Optional: derive per-agent SkillMesh keys only for SkillMesh-enabled agents.
+ID_AGENTS_SKILLMESH_AUTO_KEYS=true
+SKILLMESH_MASTER_KEY=0x...
 ```
 
 ### 2. Get Sepolia ETH
@@ -312,13 +315,13 @@ node plugins/claude-code/skillmesh/tools/register.mjs
 
 This registers your address in the SkillMesh AgentRegistry on Sepolia, sets your LLM config (provider + model), and optionally sets your A2A endpoint. Run once per key.
 
-### 4. Deploy the SkillMesh team
+### 4. Deploy the optional SkillMesh team
 
 ```bash
 /deploy skillmesh-team
 ```
 
-Agents start with full SkillMesh context injected — they can query the marketplace, send A2A messages, and call the LLM gateway immediately.
+Agents in SkillMesh provider teams start with SkillMesh context injected — they can query the marketplace, send A2A messages, and call the LLM gateway immediately. Neutral teams do not receive SkillMesh keys or SkillMesh env vars unless they attach the SkillMesh plugin/provider.
 
 ### Test it
 

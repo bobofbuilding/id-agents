@@ -35,6 +35,7 @@ import { SqliteTasksRepo } from '../../src/db/repos/sqlite/tasks-repo.js';
 import { SqliteEventsRepo } from '../../src/db/repos/sqlite/events-repo.js';
 import { SqliteSubscriptionsRepo } from '../../src/db/repos/sqlite/subscriptions-repo.js';
 import { SqliteCheckinsRepo } from '../../src/db/repos/sqlite/checkins-repo.js';
+import { SqliteRuntimeLaneCooldownsRepo } from '../../src/db/repos/sqlite/runtime-lane-cooldowns-repo.js';
 
 const TEAM = 'checkin-autoattach-test';
 
@@ -52,6 +53,7 @@ async function createInMemoryDb() {
     events: new SqliteEventsRepo(adapter),
     subscriptions: new SqliteSubscriptionsRepo(adapter),
     checkins: new SqliteCheckinsRepo(adapter),
+    runtimeLaneCooldowns: new SqliteRuntimeLaneCooldownsRepo(adapter),
     async close() { await adapter.close(); },
   };
 }
@@ -222,6 +224,29 @@ function adminHeaders(team: string): Record<string, string> {
   return { 'Content-Type': 'application/json', 'X-Id-Team': team, 'X-Id-Admin': '1' };
 }
 
+function validBriefFields() {
+  return {
+    goal_id: 'goal_mqxibu5r_2k2my',
+    expected_output: 'implementation patch and tests',
+    acceptance_criteria: ['validates malformed intake', 'preserves completion failure closure'],
+    validation_path: { required_default_validators: ['coder', 'researcher'] },
+    out_of_scope: ['optional recommendations'],
+    backlog_policy: 'Non-required recommendations become backlog candidates.',
+    bittrees_relevance: 'medium: improves validator routing reliability for Bittrees contributor work.',
+  };
+}
+
+async function withBriefValidationMode<T>(mode: 'off' | 'warn' | 'enforce', fn: () => Promise<T>): Promise<T> {
+  const previous = process.env.ID_TASK_BRIEF_VALIDATION;
+  process.env.ID_TASK_BRIEF_VALIDATION = mode;
+  try {
+    return await fn();
+  } finally {
+    if (previous === undefined) delete process.env.ID_TASK_BRIEF_VALIDATION;
+    else process.env.ID_TASK_BRIEF_VALIDATION = previous;
+  }
+}
+
 describe('/talk-to auto-attach', () => {
   let manager: AgentManagerDb;
   let db: Awaited<ReturnType<typeof createInMemoryDb>>;
@@ -272,7 +297,7 @@ describe('/talk-to auto-attach', () => {
         from: 'manager',
         message: 'build the foo widget',
         wait: false,
-        task: { title: 'Build foo widget', name: 'build-foo' },
+        task: { title: 'Build foo widget', name: 'build-foo', ...validBriefFields() },
       }),
     });
     expect(res.status).toBe(200);
@@ -289,11 +314,11 @@ describe('/talk-to auto-attach', () => {
       team_id: teamId,
     });
 
-    // Checkin: owner = dispatcher, linked_task = the new task, default 10m.
+    // Checkin: linked to the new task with the current manager-selected owner and default 10m cadence.
     const checkins = await db.checkins.list({ teamId });
     expect(checkins).toHaveLength(1);
     expect(checkins[0]).toMatchObject({
-      owner_agent_id: dispatcherId,
+      owner_agent_id: targetId,
       created_by_agent_id: dispatcherId,
       linked_task_id: tasks[0].id,
       interval_seconds: 600,
@@ -319,7 +344,7 @@ describe('/talk-to auto-attach', () => {
         from: 'manager',
         message: 'no need to watch this one',
         wait: false,
-        task: { title: 'Quick fix' },
+        task: { title: 'Quick fix', ...validBriefFields() },
         no_checkin: true,
       }),
     });
@@ -345,7 +370,7 @@ describe('/talk-to auto-attach', () => {
         from: 'manager',
         message: 'longer cadence please',
         wait: false,
-        task: { title: 'Long-running migration' },
+        task: { title: 'Long-running migration', ...validBriefFields() },
         checkin: '30m',
       }),
     });
@@ -366,7 +391,7 @@ describe('/talk-to auto-attach', () => {
         from: 'manager',
         message: 'cap follow-ups',
         wait: false,
-        task: { title: 'Bounded check' },
+        task: { title: 'Bounded check', ...validBriefFields() },
         checkin: '5m',
         checkin_iters: 3,
       }),
@@ -401,6 +426,65 @@ describe('/talk-to auto-attach', () => {
     expect(await db.checkins.list({ teamId })).toHaveLength(0);
   });
 
+  it('rejects trigger:true auto-attach before task/checkin creation when the brief is malformed', async () => {
+    await withBriefValidationMode('warn', async () => {
+      const res = await fetch(`${baseUrl}/talk-to`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({
+          to: 'coder',
+          from: 'manager',
+          message: 'execute a malformed delegated task',
+          wait: false,
+          trigger: true,
+          task: { title: 'Malformed delegated task', name: 'malformed-delegated-task' },
+        }),
+      });
+      expect(res.status).toBe(422);
+      const body = await res.json() as { error: string; brief_validation?: { dispatch_ready: boolean; missing: string[] } };
+      expect(body.error).toBe('task_brief_not_dispatch_ready');
+      expect(body.brief_validation?.dispatch_ready).toBe(false);
+      expect(body.brief_validation?.missing).toEqual(expect.arrayContaining([
+        'goal_id',
+        'expected_output',
+        'acceptance_criteria',
+        'validation_path',
+        'out_of_scope',
+        'backlog_policy',
+      ]));
+
+      expect(await db.tasks.list({ teamId })).toHaveLength(0);
+      expect(await db.checkins.list({ teamId })).toHaveLength(0);
+    });
+  });
+
+  it('allows trigger:true auto-attach when the brief is dispatch-ready', async () => {
+    await withBriefValidationMode('warn', async () => {
+      const res = await fetch(`${baseUrl}/talk-to`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({
+          to: 'coder',
+          from: 'manager',
+          message: 'execute a validated delegated task',
+          wait: false,
+          trigger: true,
+          task: {
+            title: 'Validated delegated task',
+            name: 'validated-delegated-task',
+            ...validBriefFields(),
+          },
+        }),
+      });
+      expect(res.status).toBe(200);
+      const tasks = await db.tasks.list({ teamId });
+      expect(tasks).toHaveLength(1);
+      expect(tasks[0]).toMatchObject({ name: 'validated-delegated-task', status: 'doing', owner: targetId });
+      expect(tasks[0].description).toContain('Goal ID: goal_mqxibu5r_2k2my');
+      expect(await db.checkins.list({ teamId })).toHaveLength(1);
+    });
+  });
+
   it('does not create any rows when /talk-to has no `task` field (legacy path unchanged)', async () => {
     const res = await fetch(`${baseUrl}/talk-to`, {
       method: 'POST',
@@ -416,6 +500,449 @@ describe('/talk-to auto-attach', () => {
 
     expect(await db.tasks.list({ teamId })).toHaveLength(0);
     expect(await db.checkins.list({ teamId })).toHaveLength(0);
+  });
+
+  it('enforces task brief validation on POST /tasks and triages malformed legacy claims', async () => {
+    await withBriefValidationMode('enforce', async () => {
+      const rejected = await fetch(`${baseUrl}/tasks`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({
+          title: 'Malformed task',
+          name: 'malformed-task',
+          description: 'Missing required brief metadata',
+          from: 'manager',
+        }),
+      });
+      expect(rejected.status).toBe(422);
+      expect(await db.tasks.list({ teamId })).toHaveLength(0);
+
+      const accepted = await fetch(`${baseUrl}/tasks`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({
+          title: 'Ready task',
+          name: 'ready-task',
+          description: 'Has structured brief fields',
+          from: 'manager',
+          ...validBriefFields(),
+        }),
+      });
+      expect(accepted.status).toBe(201);
+      const body = await accepted.json() as { brief_validation?: { ok: boolean } };
+      expect(body.brief_validation?.ok).toBe(true);
+
+      const now = Math.floor(Date.now() / 1000);
+      await db.tasks.create({
+        id: `task_${Date.now()}_legacy`,
+        name: 'legacy-malformed-task',
+        uuid: crypto.randomUUID(),
+        team_id: teamId,
+        title: 'Legacy malformed task',
+        description: 'Old row without a full brief',
+        status: 'todo',
+        created_by: null,
+        owner: null,
+        created_at: now,
+        updated_at: now,
+        completed_at: null,
+      });
+
+      const claim = await fetch(`${baseUrl}/tasks/legacy-malformed-task/claim`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({ agent_id: 'coder' }),
+      });
+      expect(claim.status).toBe(409);
+      const claimBody = await claim.json() as { error: string; brief_validation?: { dispatch_ready: boolean } };
+      expect(claimBody.error).toBe('task_brief_not_dispatch_ready');
+      expect(claimBody.brief_validation?.dispatch_ready).toBe(false);
+    });
+  });
+
+  it('requires acceptance coverage or an explicit failure note before successful done in enforce mode', async () => {
+    await withBriefValidationMode('enforce', async () => {
+      const created = await fetch(`${baseUrl}/tasks`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({
+          title: 'Completion packet task',
+          name: 'completion-packet-task',
+          from: 'manager',
+          ...validBriefFields(),
+        }),
+      });
+      expect(created.status).toBe(201);
+
+      const claimed = await fetch(`${baseUrl}/tasks/completion-packet-task/claim`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({ agent_id: 'coder' }),
+      });
+      expect(claimed.status).toBe(200);
+
+      const rejected = await fetch(`${baseUrl}/tasks/completion-packet-task/done`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({ agent_id: 'coder' }),
+      });
+      expect(rejected.status).toBe(422);
+      const rejectedBody = await rejected.json() as { error: string };
+      expect(rejectedBody.error).toBe('task_completion_packet_required');
+      const stillDoing = await db.tasks.getByNameForTeam('completion-packet-task', teamId);
+      expect(stillDoing?.status).toBe('doing');
+
+      const done = await fetch(`${baseUrl}/tasks/completion-packet-task/done`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({
+          agent_id: 'coder',
+          failure_note: 'closed with explicit failure note for validation',
+        }),
+      });
+      expect(done.status).toBe(200);
+      const finished = await db.tasks.getByNameForTeam('completion-packet-task', teamId);
+      expect(finished?.status).toBe('done');
+
+      const coverageCreated = await fetch(`${baseUrl}/tasks`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({
+          title: 'Coverage completion packet task',
+          name: 'coverage-completion-packet-task',
+          from: 'manager',
+          ...validBriefFields(),
+        }),
+      });
+      expect(coverageCreated.status).toBe(201);
+
+      const coverageClaimed = await fetch(`${baseUrl}/tasks/coverage-completion-packet-task/claim`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({ agent_id: 'coder' }),
+      });
+      expect(coverageClaimed.status).toBe(200);
+
+      const coverageDone = await fetch(`${baseUrl}/tasks/coverage-completion-packet-task/done`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({
+          agent_id: 'coder',
+          acceptance_coverage: ['validated done success via acceptance coverage'],
+        }),
+      });
+      expect(coverageDone.status).toBe(200);
+      const coverageFinished = await db.tasks.getByNameForTeam('coverage-completion-packet-task', teamId);
+      expect(coverageFinished?.status).toBe('done');
+    });
+  });
+
+  it('allows configured team leads to complete advisory tasks with no_delegation_reason', async () => {
+    const engTeamId = await db.teams.getOrCreateTeamId('engineering-team');
+    const leadId = await insertAgent(db, engTeamId, 'engineering-lead', null);
+    const memberId = await insertAgent(db, engTeamId, 'implementation-engineer', null);
+
+    const created = await fetch(`${baseUrl}/tasks`, {
+      method: 'POST',
+      headers: adminHeaders('engineering-team'),
+      body: JSON.stringify({
+        title: 'Advisory manager query',
+        name: 'advisory-manager-query',
+        from: 'engineering-lead',
+        ...validBriefFields(),
+      }),
+    });
+    expect(created.status).toBe(201);
+
+    const claimed = await fetch(`${baseUrl}/tasks/advisory-manager-query/claim`, {
+      method: 'POST',
+      headers: adminHeaders('engineering-team'),
+      body: JSON.stringify({ agent_id: 'engineering-lead' }),
+    });
+    expect(claimed.status).toBe(200);
+
+    const rejected = await fetch(`${baseUrl}/tasks/advisory-manager-query/done`, {
+      method: 'POST',
+      headers: adminHeaders('engineering-team'),
+      body: JSON.stringify({
+        agent_id: 'engineering-lead',
+        failure_note: 'advisory query produced no child implementation tasks',
+      }),
+    });
+    expect(rejected.status).toBe(409);
+    const rejectedBody = await rejected.json() as { error: string };
+    expect(rejectedBody.error).toContain('delegated_task_names');
+
+    const done = await fetch(`${baseUrl}/tasks/advisory-manager-query/done`, {
+      method: 'POST',
+      headers: adminHeaders('engineering-team'),
+      body: JSON.stringify({
+        agent_id: 'engineering-lead',
+        failure_note: 'advisory query produced no child implementation tasks',
+        no_delegation_reason: 'advisory_query: manager asked for guardrail analysis, not delegated child execution',
+      }),
+    });
+    expect(done.status).toBe(200);
+    const finished = await db.tasks.getByNameForTeam('advisory-manager-query', engTeamId);
+    expect(finished?.status).toBe('done');
+
+    const now = Math.floor(Date.now() / 1000);
+    await db.tasks.create({
+      id: 'task_fresh_parent',
+      name: 'fresh-lead-objective',
+      uuid: '44444444-4444-4444-8444-444444444444',
+      team_id: engTeamId,
+      title: 'Fresh lead objective',
+      description: 'Parent objective still inside the delegation grace window',
+      status: 'doing',
+      created_by: leadId,
+      owner: leadId,
+      created_at: now - 120,
+      updated_at: now - 120,
+      completed_at: null,
+    });
+    const freshAudit = await fetch(`${baseUrl}/tasks/fresh-lead-objective`, {
+      headers: adminHeaders('engineering-team'),
+    });
+    expect(freshAudit.status).toBe(200);
+    const freshAuditBody = await freshAudit.json() as { task: { delegationAudit?: { status?: string; childTaskRefs?: string[] } } };
+    expect(freshAuditBody.task.delegationAudit?.status).toBe('pending-delegation');
+    expect(freshAuditBody.task.delegationAudit?.childTaskRefs).toEqual([]);
+
+    await db.tasks.create({
+      id: 'task_old_child',
+      name: 'old-child-work',
+      uuid: '11111111-1111-4111-8111-111111111111',
+      team_id: engTeamId,
+      title: 'Old child work',
+      description: 'Mentions new lead objective but predates it',
+      status: 'done',
+      created_by: leadId,
+      owner: memberId,
+      created_at: now - 1_200,
+      updated_at: now - 1_150,
+      completed_at: now - 1_150,
+    });
+    await db.tasks.create({
+      id: 'task_new_parent',
+      name: 'new-lead-objective',
+      uuid: '22222222-2222-4222-8222-222222222222',
+      team_id: engTeamId,
+      title: 'New lead objective',
+      description: 'Parent objective that still needs delegation',
+      status: 'doing',
+      created_by: leadId,
+      owner: leadId,
+      created_at: now - 900,
+      updated_at: now - 900,
+      completed_at: null,
+    });
+
+    const staleAudit = await fetch(`${baseUrl}/tasks/new-lead-objective`, {
+      headers: adminHeaders('engineering-team'),
+    });
+    expect(staleAudit.status).toBe(200);
+    const staleAuditBody = await staleAudit.json() as { task: { delegationAudit?: { status?: string; childTaskRefs?: string[] } } };
+    expect(staleAuditBody.task.delegationAudit?.status).toBe('needs-delegation');
+    expect(staleAuditBody.task.delegationAudit?.childTaskRefs).toEqual([]);
+
+    await db.tasks.create({
+      id: 'task_new_child',
+      name: 'new-child-work',
+      uuid: '33333333-3333-4333-8333-333333333333',
+      team_id: engTeamId,
+      title: 'New child work',
+      description: 'Real child for new-lead-objective',
+      status: 'done',
+      created_by: leadId,
+      owner: memberId,
+      created_at: now - 800,
+      updated_at: now - 700,
+      completed_at: now - 700,
+    });
+
+    const delegatedAudit = await fetch(`${baseUrl}/tasks/new-lead-objective`, {
+      headers: adminHeaders('engineering-team'),
+    });
+    expect(delegatedAudit.status).toBe(200);
+    const delegatedAuditBody = await delegatedAudit.json() as { task: { delegationAudit?: { status?: string; childTaskRefs?: string[] } } };
+    expect(delegatedAuditBody.task.delegationAudit?.status).toBe('ok');
+    expect(delegatedAuditBody.task.delegationAudit?.childTaskRefs).toEqual(['#33333333']);
+  });
+
+  it('rejects duplicate validator children for the same parent and purpose', async () => {
+    const first = await fetch(`${baseUrl}/tasks`, {
+      method: 'POST',
+      headers: adminHeaders(TEAM),
+      body: JSON.stringify({
+        title: 'Validate parent alpha coder',
+        name: 'validate-parent-alpha-coder',
+        from: 'manager',
+        parent_task: 'parent-alpha',
+        validation_purpose: 'coder technical validation',
+        ...validBriefFields(),
+      }),
+    });
+    expect(first.status).toBe(201);
+
+    const duplicate = await fetch(`${baseUrl}/tasks`, {
+      method: 'POST',
+      headers: adminHeaders(TEAM),
+      body: JSON.stringify({
+        title: 'Review parent alpha coder again',
+        name: 'review-parent-alpha-coder-again',
+        from: 'manager',
+        parent_task: 'parent-alpha',
+        validation_purpose: 'coder technical validation',
+        ...validBriefFields(),
+      }),
+    });
+    expect(duplicate.status).toBe(409);
+    const duplicateBody = await duplicate.json() as { error: string; existing_task?: string };
+    expect(duplicateBody.error).toBe('duplicate_validator_child_task');
+    expect(duplicateBody.existing_task).toBe('validate-parent-alpha-coder');
+  });
+
+  it('blocks validators from creating validator tasks and routes low-relevance live dispatch to backlog', async () => {
+    const recursive = await fetch(`${baseUrl}/tasks`, {
+      method: 'POST',
+      headers: adminHeaders(TEAM),
+      body: JSON.stringify({
+        title: 'Validate parent beta coder',
+        name: 'validate-parent-beta-coder',
+        from: 'coder',
+        parent_task: 'parent-beta',
+        validation_purpose: 'coder technical validation',
+        ...validBriefFields(),
+      }),
+    });
+    expect(recursive.status).toBe(409);
+    const recursiveBody = await recursive.json() as { error: string };
+    expect(recursiveBody.error).toBe('validator_task_recursion_blocked');
+
+    const lowRelevance = await fetch(`${baseUrl}/talk-to`, {
+      method: 'POST',
+      headers: adminHeaders(TEAM),
+      body: JSON.stringify({
+        to: 'coder',
+        from: 'manager',
+        message: 'do generic validator tuning now',
+        wait: false,
+        task: {
+          title: 'Generic validator tuning',
+          name: 'generic-validator-tuning',
+          ...validBriefFields(),
+          bittrees_relevance: 'low/backlog: generic validator tuning without direct Bittrees contributor relevance.',
+        },
+      }),
+    });
+    expect(lowRelevance.status).toBe(422);
+    const lowBody = await lowRelevance.json() as { error: string; brief_validation?: { reason_codes?: string[] } };
+    expect(lowBody.error).toBe('task_brief_not_dispatch_ready');
+    expect(lowBody.brief_validation?.reason_codes).toContain('low_bittrees_relevance_live_dispatch');
+    expect(await db.tasks.getByNameForTeam('generic-validator-tuning', teamId)).toBeNull();
+  });
+
+  it('keeps /remote task CLI validation behavior aligned with REST task intake', async () => {
+    await withBriefValidationMode('enforce', async () => {
+      const malformedCreate = await fetch(`${baseUrl}/remote`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({
+          from: 'manager',
+          command: '/task create "CLI malformed task" --name cli-malformed-task --owner coder',
+        }),
+      });
+      expect(malformedCreate.status).toBe(200);
+      const malformedCreateBody = await malformedCreate.json() as { ok: boolean; error?: string; result?: { brief_validation?: { dispatch_ready: boolean } } };
+      expect(malformedCreateBody.ok).toBe(false);
+      expect(malformedCreateBody.error).toBe('task_brief_not_dispatch_ready');
+      expect(malformedCreateBody.result?.brief_validation?.dispatch_ready).toBe(false);
+
+      const validCreate = await fetch(`${baseUrl}/remote`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({
+          from: 'manager',
+          command: '/task create "CLI ready task" --name cli-ready-task --goal goal_mqxibu5r_2k2my --expected-output "implementation patch and tests" --acceptance "covers CLI create" --validation-path "coder and researcher" --out-of-scope "optional recommendations" --backlog-policy "Non-required recommendations become backlog candidates." --bittrees-relevance "medium: improves validator routing reliability for Bittrees contributor work."',
+        }),
+      });
+      expect(validCreate.status).toBe(200);
+      const validCreateBody = await validCreate.json() as { ok: boolean; result?: { brief_validation?: { ok: boolean } } };
+      expect(validCreateBody.ok).toBe(true);
+      expect(validCreateBody.result?.brief_validation?.ok).toBe(true);
+
+      const now = Math.floor(Date.now() / 1000);
+      await db.tasks.create({
+        id: `task_${Date.now()}_cli_legacy`,
+        name: 'cli-legacy-malformed-task',
+        uuid: crypto.randomUUID(),
+        team_id: teamId,
+        title: 'CLI legacy malformed task',
+        description: 'Old CLI row without a full brief',
+        status: 'todo',
+        created_by: null,
+        owner: null,
+        created_at: now,
+        updated_at: now,
+        completed_at: null,
+      });
+
+      const malformedClaim = await fetch(`${baseUrl}/remote`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({
+          from: 'coder',
+          command: '/task claim cli-legacy-malformed-task',
+        }),
+      });
+      expect(malformedClaim.status).toBe(200);
+      const malformedClaimBody = await malformedClaim.json() as { ok: boolean; error?: string; result?: { brief_validation?: { dispatch_ready: boolean } } };
+      expect(malformedClaimBody.ok).toBe(false);
+      expect(malformedClaimBody.error).toBe('task_brief_not_dispatch_ready');
+      expect(malformedClaimBody.result?.brief_validation?.dispatch_ready).toBe(false);
+
+      const claim = await fetch(`${baseUrl}/remote`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({
+          from: 'coder',
+          command: '/task claim cli-ready-task',
+        }),
+      });
+      expect(claim.status).toBe(200);
+      const claimBody = await claim.json() as { ok: boolean };
+      expect(claimBody.ok).toBe(true);
+
+      const rejectedDone = await fetch(`${baseUrl}/remote`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({
+          from: 'coder',
+          command: '/task done cli-ready-task',
+        }),
+      });
+      expect(rejectedDone.status).toBe(200);
+      const rejectedDoneBody = await rejectedDone.json() as { ok: boolean; error?: string; result?: { completion_validation?: { ok: boolean } } };
+      expect(rejectedDoneBody.ok).toBe(false);
+      expect(rejectedDoneBody.error).toBe('task_completion_packet_required');
+      expect(rejectedDoneBody.result?.completion_validation?.ok).toBe(false);
+
+      const done = await fetch(`${baseUrl}/remote`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({
+          from: 'coder',
+          command: '/task done cli-ready-task --failure-note "closed with explicit CLI failure note"',
+        }),
+      });
+      expect(done.status).toBe(200);
+      const doneBody = await done.json() as { ok: boolean; result?: { completion_validation?: { ok: boolean } } };
+      expect(doneBody.ok).toBe(true);
+      expect(doneBody.result?.completion_validation?.ok).toBe(true);
+      const finished = await db.tasks.getByNameForTeam('cli-ready-task', teamId);
+      expect(finished?.status).toBe('done');
+    });
   });
 
   it('injects Brain team instructions on task claim and reports completion feedback', async () => {
@@ -475,6 +1002,18 @@ describe('/talk-to auto-attach', () => {
           used_instruction_ids: ['memory:101'],
           used_source_ids: ['memory:101'],
           brain_context: claimBody.task.brain_context,
+          learning_loop: {
+            gap_type: 'source_recovery',
+            save_back_decision: 'save',
+            source_recovery: {
+              required_source_ids: ['memory:101'],
+              available_source_ids: ['memory:101'],
+              recovery_state: 'recovered',
+            },
+            backlog_rule: {
+              candidate_refs: ['backlog:deployment-followup'],
+            },
+          },
         }),
       });
       expect(done.status).toBe(200);
@@ -489,6 +1028,7 @@ describe('/talk-to auto-attach', () => {
       expect(received.validations.some((item) => item.dispatch_context?.task_id && item.dispatch_context?.agent_id === targetId)).toBe(true);
       expect(received.validations.some((item) => item.instruction_feedback?.used_instruction_ids?.includes('memory:101'))).toBe(true);
       expect(received.validations.some((item) => item.eval_feedback?.accepted_ids?.includes('memory:101'))).toBe(true);
+      expect(received.validations.some((item) => item.learned_artifact?.gap?.gap_type === 'source_recovery')).toBe(true);
       expect(received.evals).toHaveLength(1);
       expect(received.evals[0]).toMatchObject({
         route: 'manager.task_completion',
@@ -498,6 +1038,13 @@ describe('/talk-to auto-attach', () => {
         context_package_id: 77,
         metadata: {
           source_origins: { 'memory:101': ['team_instruction'] },
+          learning_loop: {
+            schema: 'brain.learning_loop_capture.v1',
+            gap: { gap_type: 'source_recovery' },
+            owner: { owner_team: TEAM, owner_agent_id: targetId },
+            source_recovery: { recovery_state: 'recovered' },
+            backlog_rule: { candidate_refs: ['backlog:deployment-followup'] },
+          },
         },
       });
       expect(received.missing).toHaveLength(0);
@@ -510,6 +1057,12 @@ describe('/talk-to auto-attach', () => {
       expect(events.at(-1)?.data).toMatchObject({
         used_source_ids: ['memory:101'],
         volunteered_source_ids: ['memory:101'],
+        learning_loop: {
+          schema: 'brain.learning_loop_capture.v1',
+          gap: { gap_type: 'source_recovery' },
+          owner: { owner_team: TEAM },
+          save_back: { decision: 'save' },
+        },
       });
     } finally {
       if (previousBrainUrl === undefined) delete process.env.BRAIN_URL;
@@ -601,7 +1154,7 @@ describe('/talk-to auto-attach', () => {
           from: 'manager',
           message: 'coder uses Brain evidence and reports what helped',
           wait: false,
-          task: { title: 'Brain-backed query', name: 'brain-backed-query' },
+          task: { title: 'Brain-backed query', name: 'brain-backed-query', ...validBriefFields() },
         }),
       });
       expect(delegated.status).toBe(200);
@@ -620,6 +1173,16 @@ describe('/talk-to auto-attach', () => {
           data: {
             used_source_ids: ['memory:101'],
             used_instruction_ids: ['memory:101'],
+            learning_loop: {
+              gap_type: 'validation_feedback_missing',
+              save_back_decision: 'record-backlog',
+              backlog_rule: {
+                candidate_refs: ['backlog:brain-backed-query'],
+              },
+              source_recovery: {
+                missing_source_ids: ['memory:404'],
+              },
+            },
           },
         }),
       });
@@ -631,9 +1194,12 @@ describe('/talk-to auto-attach', () => {
         && item.volunteered_source_ids?.includes('memory:101')
         && item.context_package_id === 77
         && item.metadata?.source_origins?.['memory:101']?.includes('team_instruction')
+        && item.metadata?.learning_loop?.gap?.gap_type === 'validation_feedback_missing'
+        && item.metadata?.learning_loop?.backlog_rule?.candidate_refs?.includes('backlog:brain-backed-query')
       ))).toBe(true);
       expect(received.validations.some((item) => item.eval_feedback?.route === 'manager.dispatch')).toBe(true);
       expect(received.validations.some((item) => item.instruction_feedback?.used_instruction_ids?.includes('memory:101'))).toBe(true);
+      expect(received.validations.some((item) => item.learned_artifact?.subject?.ref === `query:${delegatedBody.query_id}`)).toBe(true);
       expect(received.missing).toHaveLength(0);
       expect(received.edges.filter((edge) => edge.from === 'agent:coder' && edge.to === 'skill:brain')).toEqual([
         { from: 'agent:coder', to: 'skill:brain', kind: 'mentions' },
@@ -645,6 +1211,21 @@ describe('/talk-to auto-attach', () => {
         query_id: delegatedBody.query_id,
         used_source_ids: ['memory:101'],
         volunteered_source_ids: ['memory:101'],
+        learning_loop: {
+          schema: 'brain.learning_loop_capture.v1',
+          gap: { gap_type: 'validation_feedback_missing' },
+          save_back: { decision: 'record-backlog' },
+          source_recovery: {
+            missing_source_ids: ['memory:404'],
+            recovery_state: 'partial',
+          },
+        },
+      });
+      const completedQuery = await db.queries.getByQueryIdForTeam(teamId, delegatedBody.query_id);
+      expect((completedQuery?.result as any)?.learning_loop).toMatchObject({
+        schema: 'brain.learning_loop_capture.v1',
+        subject: { ref: `query:${delegatedBody.query_id}` },
+        gap: { gap_type: 'validation_feedback_missing' },
       });
     } finally {
       if (previousBrainUrl === undefined) delete process.env.BRAIN_URL;
@@ -673,7 +1254,7 @@ describe('/talk-to auto-attach', () => {
           from: 'manager',
           message: 'coder receives Brain context but forgets citations',
           wait: false,
-          task: { title: 'Brain-backed missing feedback query', name: 'brain-backed-missing-feedback-query' },
+          task: { title: 'Brain-backed missing feedback query', name: 'brain-backed-missing-feedback-query', ...validBriefFields() },
         }),
       });
       expect(delegated.status).toBe(200);

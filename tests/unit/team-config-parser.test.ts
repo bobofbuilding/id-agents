@@ -6,6 +6,7 @@ import os from 'os';
 import path from 'path';
 
 import {
+  parseConfig,
   parseCatalogMarkdown,
   parseTeamConfig,
   processConfig,
@@ -132,6 +133,115 @@ agents:
     });
     expect(result.valid).toBe(true);
     expect(result.errors).toEqual([]);
+  });
+
+  it('parses and round-trips runtimeCredentialPool lanes unchanged', () => {
+    tmpDir = mkTmp();
+    const configPath = path.join(tmpDir, 'team.yaml');
+    fs.writeFileSync(configPath, `version: "1"
+team: credential-pool-demo
+
+runtimeCredentialPool:
+  lanes:
+    - id: claude-sub-a
+      runtime: claude-code-cli
+      kind: subscription
+    - id: claude-sub-b
+      runtime: claude-code-cli
+      kind: subscription
+    - id: claude-metered
+      runtime: claude-code-cli
+      kind: metered-api
+      env:
+        ANTHROPIC_API_KEY: test-metered-key
+
+agents:
+  - name: lead
+    runtime: claude-code-cli
+`);
+
+    const parsed = parseConfig(configPath);
+    expect(parsed.runtimeCredentialPool?.lanes).toEqual([
+      { id: 'claude-sub-a', runtime: 'claude-code-cli', kind: 'subscription' },
+      { id: 'claude-sub-b', runtime: 'claude-code-cli', kind: 'subscription' },
+      { id: 'claude-metered', runtime: 'claude-code-cli', kind: 'metered-api', env: { ANTHROPIC_API_KEY: 'test-metered-key' } },
+    ]);
+
+    const out = processConfig(configPath);
+    expect(out.errors).toEqual([]);
+    expect(out.runtimeCredentialPool?.lanes).toEqual(parsed.runtimeCredentialPool?.lanes);
+  });
+
+  it('validates runtimeCredentialPool lane shape', () => {
+    const result = validateConfig({
+      version: '1',
+      runtimeCredentialPool: {
+        lanes: [
+          { id: 'ok', runtime: 'claude-code-cli', kind: 'subscription' },
+          { runtime: 'claude-code-cli', kind: 'subscription' } as any,
+          { id: 'bad-runtime', runtime: 'not-a-runtime' as any, kind: 'subscription' },
+          { id: 'bad-kind', runtime: 'claude-code-cli', kind: 'free-tier' as any },
+          { id: 'bad-env', runtime: 'claude-code-cli', kind: 'metered-api', env: 'ANTHROPIC_API_KEY=x' as any },
+        ],
+      },
+      agents: [{ name: 'lead' }],
+    });
+
+    expect(result.valid).toBe(false);
+    expect(result.errors.map((err) => err.path)).toEqual(expect.arrayContaining([
+      'runtimeCredentialPool.lanes[1].id',
+      'runtimeCredentialPool.lanes[2].runtime',
+      'runtimeCredentialPool.lanes[3].kind',
+      'runtimeCredentialPool.lanes[4].env',
+    ]));
+
+    const empty = validateConfig({
+      version: '1',
+      runtimeCredentialPool: { lanes: [] },
+      agents: [{ name: 'lead' }],
+    });
+    expect(empty.valid).toBe(false);
+    expect(empty.errors).toContainEqual({
+      path: 'runtimeCredentialPool.lanes',
+      message: 'runtimeCredentialPool.lanes must be a non-empty array',
+    });
+
+    const oneSubscriptionLane = validateConfig({
+      version: '1',
+      runtimeCredentialPool: {
+        lanes: [
+          { id: 'sub-a', runtime: 'claude-code-cli', kind: 'subscription' },
+          { id: 'metered', runtime: 'claude-code-cli', kind: 'metered-api' },
+        ],
+      },
+      agents: [{ name: 'lead' }],
+    });
+    expect(oneSubscriptionLane.valid).toBe(false);
+    expect(oneSubscriptionLane.errors).toContainEqual({
+      path: 'runtimeCredentialPool.lanes',
+      message: 'runtimeCredentialPool.lanes must include at least two subscription lanes for claude-code-cli',
+    });
+
+    const mixedRuntimeSingleSubscriptions = validateConfig({
+      version: '1',
+      runtimeCredentialPool: {
+        lanes: [
+          { id: 'claude-sub-a', runtime: 'claude-code-cli', kind: 'subscription' },
+          { id: 'codex-sub-a', runtime: 'codex', kind: 'subscription' },
+          { id: 'claude-metered', runtime: 'claude-code-cli', kind: 'metered-api' },
+        ],
+      },
+      agents: [{ name: 'lead' }],
+    });
+    expect(mixedRuntimeSingleSubscriptions.valid).toBe(false);
+    expect(mixedRuntimeSingleSubscriptions.errors).toContainEqual({
+      path: 'runtimeCredentialPool.lanes',
+      message: 'runtimeCredentialPool.lanes must include at least two subscription lanes for claude-code-cli',
+    });
+    expect(mixedRuntimeSingleSubscriptions.errors).toContainEqual({
+      path: 'runtimeCredentialPool.lanes',
+      message: 'runtimeCredentialPool.lanes must include at least two subscription lanes for codex',
+    });
   });
 
   it('accepts an agent entry with only peer `skills:` (no `agent:`)', () => {

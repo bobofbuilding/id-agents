@@ -18,6 +18,7 @@ import { spawn, ChildProcess } from 'child_process';
 import { AgentHarness, HarnessOptions, HarnessMessage, HarnessType } from './types.js';
 import { toMcpServerRecord } from './mcp.js';
 import { reportTurnUsage } from './usage-report.js';
+import { detectClaudeCliRateLimit } from './rate-limit.js';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -103,6 +104,7 @@ export class ClaudeCodeCliHarness implements AgentHarness {
     const skipPermissions = process.env.ID_AGENT_SKIP_PERMISSIONS !== 'false';
     const args: string[] = [
       '-p', prompt,
+      ...(process.env.ID_AGENT_CLAUDE_BARE === '1' ? ['--bare'] : []),
       ...(skipPermissions ? ['--dangerously-skip-permissions'] : []),
       '--output-format', verbose ? 'stream-json' : 'json',
       ...(verbose ? ['--verbose'] : [])
@@ -122,6 +124,15 @@ export class ClaudeCodeCliHarness implements AgentHarness {
     if (effortRaw && /^(minimal|low|medium|high|xhigh)$/.test(effortRaw)) {
       args.push('--effort', effortRaw === 'minimal' ? 'low' : effortRaw);
       console.log(`[Claude CLI] Reasoning effort: ${effortRaw}`);
+    }
+
+    // Output speed (set per-agent in the Control Center). The installed Claude
+    // CLI exposes /fast as an interactive toggle, but `claude --help` currently
+    // shows no launch-time --fast flag or speed env var. Do not invent one; log
+    // this so operators know the requested setting could not be applied.
+    const speedRaw = process.env.ID_AGENT_SPEED;
+    if (speedRaw === 'fast') {
+      console.log('[Claude CLI] TODO: speed=fast requested, but no Claude CLI launch-time fast flag is available; /fast is interactive only.');
     }
 
     // Add session resume if provided
@@ -266,11 +277,13 @@ export class ClaudeCodeCliHarness implements AgentHarness {
 
       // Check for errors
       if (result.exitCode !== 0) {
+        const rateLimit = detectClaudeCliRateLimit(result);
         const errorMsg = result.stderr || `Claude CLI exited with code ${result.exitCode}`;
         console.error(`[Claude CLI] Error: ${errorMsg}`);
         yield {
           type: 'error',
-          content: errorMsg
+          content: rateLimit?.message || errorMsg,
+          ...(rateLimit ? { rateLimit } : {})
         };
       }
     } catch (err: any) {

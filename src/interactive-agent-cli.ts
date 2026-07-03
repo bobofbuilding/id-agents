@@ -73,6 +73,59 @@ function playAlertSound() {
   }
 }
 
+function listListeningPidsOnPort(port: number): string[] {
+  if (!Number.isInteger(port) || port <= 0) return [];
+
+  try {
+    const lsofOutput = execFileSync('lsof', [`-tiTCP:${port}`, '-sTCP:LISTEN'], {
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+    return lsofOutput.split('\n').map(pid => pid.trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function isManagerProcessPid(pid: number): boolean {
+  if (pid === process.pid) return true;
+  try {
+    const commandLine = execFileSync('ps', ['-o', 'command=', '-p', String(pid)], {
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim().toLowerCase();
+    return commandLine.includes('start-agent-manager.js') || commandLine.includes('start-agent-manager.ts');
+  } catch {
+    return false;
+  }
+}
+
+function killListeningPidsOnPort(
+  port: number,
+  options: { signal?: 'SIGTERM' | 'SIGKILL'; skipManager?: boolean } = {},
+): string[] {
+  const signal = options.signal || 'SIGTERM';
+  const skipManager = options.skipManager ?? true;
+  const killed: string[] = [];
+
+  for (const pid of listListeningPidsOnPort(port)) {
+    const numericPid = parseInt(pid, 10);
+    if (!Number.isInteger(numericPid) || numericPid <= 0) continue;
+    if (skipManager && isManagerProcessPid(numericPid)) {
+      console.warn(`[CLI] Skipping manager PID ${numericPid} on port ${port}`);
+      continue;
+    }
+    try {
+      process.kill(numericPid, signal);
+      killed.push(pid);
+    } catch {
+      // Process may have already exited
+    }
+  }
+
+  return killed;
+}
+
 // Help menu items - single source of truth (alphabetically organized)
 const HELP_ITEMS: Array<{ cmd: string; desc: string; indent?: boolean }> = [
   { cmd: '/agent <name> rebuild', desc: 'Rebuild a single agent' },
@@ -858,22 +911,10 @@ async function startLocalAgentProcess(agentData: any): Promise<{ success: boolea
 
     // Kill any existing process on this port before starting
     if (agentPort) {
-      try {
-        const lsofOutput = execFileSync('lsof', ['-ti', `:${agentPort}`], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
-        if (lsofOutput) {
-          const pids = lsofOutput.split('\n').filter(Boolean);
-          for (const pid of pids) {
-            try {
-              process.kill(parseInt(pid), 'SIGTERM');
-            } catch {
-              // Process may have already exited
-            }
-          }
-          // Wait a moment for the process to exit
-          await new Promise(resolve => setTimeout(resolve, 1000));
-        }
-      } catch {
-        // No process on port, that's fine
+      const killedPids = killListeningPidsOnPort(agentPort);
+      if (killedPids.length > 0) {
+        // Wait a moment for the process to exit
+        await new Promise(resolve => setTimeout(resolve, 1000));
       }
     }
 
@@ -970,7 +1011,7 @@ async function regenerateTeamConfigIfMissing(teamName: string, force: boolean = 
           name: a.alias || a.name,
         };
         if (md.description) entry.description = md.description;
-        const runtime = md.runtime || (a as any).runtime;
+        const runtime = (a as any).runtime || md.runtime;
         if (runtime) entry.runtime = runtime;
         if (a.model) entry.model = a.model;
         if (a.workingDirectory) entry.workingDirectory = a.workingDirectory;
@@ -1347,15 +1388,10 @@ async function handleLine(line: string) {
 
           // Step 2: Stop the manager
           console.log(`${colors.gray}   Stopping manager on port ${MANAGER_PORT}...${colors.reset}`);
-          try {
-            const managerPids = execFileSync('lsof', ['-ti', `:${MANAGER_PORT}`], { encoding: 'utf8' }).trim();
-            for (const pid of managerPids.split('\n').filter(Boolean)) {
-              if (pid !== String(myPid)) {
-                try { process.kill(parseInt(pid), 'SIGTERM'); } catch {}
-              }
+          for (const pid of listListeningPidsOnPort(MANAGER_PORT)) {
+            if (pid !== String(myPid)) {
+              try { process.kill(parseInt(pid), 'SIGTERM'); } catch {}
             }
-          } catch {
-            // Nothing on port
           }
 
           // Wait for processes to die
@@ -1746,14 +1782,9 @@ async function handleLine(line: string) {
           if (agentType === 'local') {
             // Stop existing process
             if (agent.port) {
-              try {
-                const pids = execFileSync('lsof', ['-ti', `:${agent.port}`], { encoding: 'utf8' }).trim();
-                for (const pid of pids.split('\n').filter(Boolean)) {
-                  try { process.kill(parseInt(pid), 'SIGTERM'); } catch {}
-                }
+              const killedPids = killListeningPidsOnPort(agent.port);
+              if (killedPids.length > 0) {
                 await new Promise(resolve => setTimeout(resolve, 500));
-              } catch {
-                // No process on port
               }
             }
 
@@ -1820,26 +1851,13 @@ async function handleLine(line: string) {
             skipped++;
             continue;
           } else if (agentType === 'local' && agent.port) {
-            try {
-              const lsofOutput = execFileSync('lsof', ['-ti', `:${agent.port}`], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
-              if (lsofOutput) {
-                const pids = lsofOutput.split('\n').filter(Boolean);
-                for (const pid of pids) {
-                  try { process.kill(parseInt(pid), 'SIGTERM'); } catch {}
-                }
-                console.log(`${colors.green}✅ ${agent.name}${colors.reset} ${colors.gray}(stopped PID ${pids.join(', ')})${colors.reset}`);
-                success++;
-              } else {
-                console.log(`${colors.yellow}⚠️  ${agent.name}: not running${colors.reset}`);
-                skipped++;
-              }
-            } catch (err: any) {
-              if (err.status === 1) {
-                console.log(`${colors.yellow}⚠️  ${agent.name}: not running${colors.reset}`);
-                skipped++;
-              } else {
-                throw err;
-              }
+            const killedPids = killListeningPidsOnPort(agent.port);
+            if (killedPids.length > 0) {
+              console.log(`${colors.green}✅ ${agent.name}${colors.reset} ${colors.gray}(stopped PID ${killedPids.join(', ')})${colors.reset}`);
+              success++;
+            } else {
+              console.log(`${colors.yellow}⚠️  ${agent.name}: not running${colors.reset}`);
+              skipped++;
             }
             continue;
           }
@@ -1976,24 +1994,11 @@ async function handleLine(line: string) {
           const port = agentData.port;
           if (!port) throw new Error('Agent has no port assigned');
 
-          try {
-            const lsofOutput = execFileSync('lsof', ['-ti', `:${port}`], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
-            if (lsofOutput) {
-              const pids = lsofOutput.split('\n').filter(Boolean);
-              for (const pid of pids) {
-                try { process.kill(parseInt(pid), 'SIGTERM'); } catch {}
-              }
-              console.log(`\n${colors.green}✅ Stopped${colors.reset} ${target} (killed PID ${pids.join(', ')})\n`);
-            } else {
-              console.log(`\n${colors.yellow}⚠️  No process found on port ${port}${colors.reset}\n`);
-            }
-          } catch (err: any) {
-            if (err.status === 1) {
-              // No process on port
-              console.log(`\n${colors.yellow}⚠️  Agent "${target}" is not running (no process on port ${port})${colors.reset}\n`);
-            } else {
-              throw err;
-            }
+          const killedPids = killListeningPidsOnPort(port);
+          if (killedPids.length > 0) {
+            console.log(`\n${colors.green}✅ Stopped${colors.reset} ${target} (killed PID ${killedPids.join(', ')})\n`);
+          } else {
+            console.log(`\n${colors.yellow}⚠️  No process found on port ${port}${colors.reset}\n`);
           }
         } else if (agentType === 'virtual' || agentType === 'interactive') {
           console.log(`\n${colors.yellow}⚠️  "${target}" is a ${agentType} agent - nothing to stop${colors.reset}\n`);
@@ -4285,17 +4290,9 @@ async function deleteAgent(agentNameOrId: string) {
 
     // Kill local agent process before deleting from manager
     if (agent.port) {
-      try {
-        const lsofOutput = execFileSync('lsof', ['-ti', `:${agent.port}`], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
-        if (lsofOutput) {
-          const pids = lsofOutput.split('\n').filter(Boolean);
-          for (const pid of pids) {
-            try { process.kill(parseInt(pid), 'SIGTERM'); } catch {}
-          }
-          console.log(`${colors.green}✅ Stopped agent process${colors.reset} (killed PID ${pids.join(', ')} on port ${agent.port})`);
-        }
-      } catch {
-        // No process on port — already stopped
+      const killedPids = killListeningPidsOnPort(agent.port);
+      if (killedPids.length > 0) {
+        console.log(`${colors.green}✅ Stopped agent process${colors.reset} (killed PID ${killedPids.join(', ')} on port ${agent.port})`);
       }
     }
 
@@ -4965,15 +4962,10 @@ async function deployFromConfig(filePath: string, args: string[] = []) {
 
           // Check if port is already in use and warn
           if (result.port) {
-            try {
-              const lsofOutput = execFileSync('lsof', ['-ti', `:${result.port}`], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
-              if (lsofOutput) {
-                const pids = lsofOutput.split('\n').filter(Boolean);
-                console.log(`${colors.yellow}   ⚠️  Warning: Port ${result.port} is in use by PID ${pids.join(', ')}${colors.reset}`);
-                console.log(`${colors.yellow}      Run: kill ${pids.join(' ')}  (to free the port)${colors.reset}`);
-              }
-            } catch {
-              // No process on port, that's fine
+            const pids = listListeningPidsOnPort(result.port);
+            if (pids.length > 0) {
+              console.log(`${colors.yellow}   ⚠️  Warning: Port ${result.port} is in use by PID ${pids.join(', ')}${colors.reset}`);
+              console.log(`${colors.yellow}      Run: kill ${pids.join(' ')}  (to free the port)${colors.reset}`);
             }
           }
 

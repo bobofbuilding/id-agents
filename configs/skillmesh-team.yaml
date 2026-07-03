@@ -42,6 +42,7 @@ defaults:
     - inter-agent
     - catalog
     - brain
+    - task-discipline
   plugins:
     - name: skillmesh
       path: ../workspace/projects/skillmesh/agents/plugins/skillmesh
@@ -54,7 +55,7 @@ agents:
   #   claude-code-cli → codex/gpt-5.3-codex → codex/gpt-5.4 (higher capacity)
   #   codex/gpt-5.3-codex → codex/gpt-5.4 → codex/gpt-5.5 (highest)
   # To switch a live agent: POST /remote {"command":"/model <agent> <model>"}
-  # task-master auto-detects probe failures and can trigger /model switches.
+  # ops-team task-master auto-detects probe failures and can trigger /model switches.
   # ─────────────────────────────────────────────────────────────────────────
 
   # ── Team Lead ──────────────────────────────────────────────────────────────
@@ -64,6 +65,14 @@ agents:
       marketplace ops, research, content, and protocol monitoring. Assigns work,
       tracks blockers, and ensures agents and skills stay in sync with on-chain
       state. Orchestrates multi-agent workflows and escalates to the human operator.
+      For non-trivial objectives, creates and claims its own lead task, creates
+      member-owned child tasks for delegated work, dispatches independent child
+      tasks in parallel, and includes delegated_task_names when marking the lead
+      task done. Returns substantial accomplishment packets through default/coder
+      and default/researcher validation before default/lead treats the work as final.
+    skills:
+      - team-coordinator
+      - idagents-team-builder
     catalog:
       role: lead
       expertise:
@@ -146,7 +155,11 @@ agents:
     description: >
       Research Stack lead — coordinates market parsing, entity extraction, summary
       formatting, and alert routing for analysts and crypto ops teams. Delegates
-      to market-parser, alert-router, and summary tools.
+      to market-parser, alert-router, and summary tools. Returns substantial
+      accomplishment packets through default/coder and default/researcher validation
+      before default/lead treats the work as final.
+    skills:
+      - team-coordinator
     catalog:
       role: analyst
       expertise:
@@ -235,7 +248,11 @@ agents:
     description: >
       Content Ops Stack — moderates inbound content for safety and compliance,
       rewrites drafts for tone and clarity, generates structured metadata (title,
-      tags, SEO signals), and formats output for distribution channels.
+      tags, SEO signals), and formats output for distribution channels. Returns
+      substantial accomplishment packets through default/coder and default/researcher
+      validation before default/lead treats the work as final.
+    skills:
+      - team-coordinator
     catalog:
       role: content-lead
       expertise:
@@ -276,11 +293,15 @@ agents:
   # ── Protocol Monitor (source: protocol-monitor.yaml) ──────────────────────
   - name: protocol-monitor
     description: >
-      Protocol Monitoring Stack — watches on-chain event streams, classifies
+      Protocol Monitoring Stack lead — watches on-chain event streams, classifies
       anomalies against baselines, summarizes incidents with timeline and
-      recommendations, and dispatches alerts to operator endpoints.
+      recommendations, and dispatches alerts to operator endpoints. Returns
+      substantial accomplishment packets through default/coder and default/researcher
+      validation before default/lead treats the work as final.
     runtime: ollama
     model: qwen3:4b
+    skills:
+      - team-coordinator
     catalog:
       role: monitor
       expertise:
@@ -611,22 +632,6 @@ agents:
         - the-graph
         - subgraph-querying
         - on-chain-forensics
-      costTier: medium
-
-  # ── Task Master (ops supervisor) ──────────────────────────────────────────
-  - name: task-master
-    description: >
-      Ops supervisor — runs on a 1-hour heartbeat to audit the task board, close
-      stale doing tasks with no assignee, dispatch unclaimed todos to the right
-      agents, probe the full fleet for offline agents and restart them, and send
-      a structured ops digest to skillmesh-ops-lead. Single point of fleet hygiene.
-    catalog:
-      role: supervisor
-      expertise:
-        - task-management
-        - fleet-health
-        - ops-automation
-        - agent-orchestration
       costTier: medium
 
   # ── Self-Improvement Loop ──────────────────────────────────────────────────

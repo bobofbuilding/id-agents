@@ -29,7 +29,9 @@ agents:
       sub-questions, delegates each to the right specialist (web-researcher,
       analyst, fact-checker, writer) via the inter-agent skill, then synthesizes
       their replies into one well-sourced answer. Handles trivial questions
-      directly and delegates everything substantial.
+      directly and delegates everything substantial. Returns substantial
+      accomplishment packets through default/coder and default/researcher
+      validation before default/lead treats the work as final.
     # Per-agent skills MERGE with the defaults above.
     skills:
       - team-coordinator

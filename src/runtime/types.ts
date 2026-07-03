@@ -27,6 +27,37 @@ export interface RuntimeCapabilities {
   supportsAllowedTools: boolean;
 }
 
+export type RuntimeInterfaceProtocol = 'rest-ap';
+export type RuntimeAdapterContract = 'id-agents-harness-v1';
+
+export interface RuntimeInterfaceProfile {
+  /** Stable contract version external runtimes can target. */
+  version: string;
+  /** Wire protocol exposed to callers and peer agents. */
+  protocol: RuntimeInterfaceProtocol;
+  protocolVersion: string;
+  /** Internal adapter boundary used by local-process runtimes. */
+  adapterContract: RuntimeAdapterContract;
+  runtime: RuntimeId;
+  providerName: string;
+  sessionPolicy: RuntimeSessionPolicy;
+  deploymentShape: DeploymentShape;
+  requiredEndpoints: {
+    discovery: string;
+    talk: string;
+    news: string;
+    newsPost: string;
+    catalog: string;
+  };
+  driver: {
+    interface: 'AgentHarness';
+    input: 'prompt:string + HarnessOptions';
+    output: 'AsyncGenerator<HarnessMessage>';
+    eventTypes: Array<'system' | 'tool_use' | 'result' | 'error' | 'progress' | 'thinking'>;
+  };
+  capabilities: RuntimeCapabilities;
+}
+
 export interface RuntimeProfile {
   id: RuntimeId;
   canonicalId: RuntimeId;

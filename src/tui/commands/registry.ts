@@ -469,6 +469,8 @@ const REGISTRY: Record<string, CommandSpec> = {
       argCompleter: agentNameSlot0,
     },
   ),
+  ask: remote('ask', 'Ask an agent: `/ask <agent> <message>`', 'safe', { argCompleter: agentNameSlot0 }),
+  hey: remote('hey', 'Ask an agent: `/hey <agent> <message>`', 'safe', { argCompleter: agentNameSlot0 }),
   cancel: remote('cancel', "Cancel an agent's running query: `/cancel <agent>`", 'powerful', {
     shouldRetype: () => true,
     confirmPreview: (args) =>

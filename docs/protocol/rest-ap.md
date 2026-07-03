@@ -91,6 +91,71 @@ REST-AP allows hosts to advertise extra endpoints in the catalog beyond the requ
 
 This is not part of the minimum REST-AP contract. It is a host-specific extension that should be explicitly advertised in `/.well-known/restap.json`.
 
+## **Runtime-Agnostic Agent Interface**
+
+REST-AP callers must not need to know whether an agent is backed by Claude, Codex, Cursor, Ollama, a remote public-agent service, or a future runtime. The wire contract is the REST-AP surface:
+
+* `GET /.well-known/restap.json` for discovery.
+* `POST /talk` with `{ "message": string }` and optional runtime-neutral metadata such as `session_id` and `from`.
+* `GET /news` for passive polling of completions and progress.
+* `POST /news` for passive reply or notification delivery.
+* `PATCH /catalog` where supported, for updating self-description metadata.
+
+Provider/runtime details are informational. A client may display them, but must not branch on names like "Claude" or "Codex" to decide how to talk to the agent. The catalog advertises `runtime_interface` so other AI runtimes can target the same contract:
+
+```json
+{
+  "runtime_interface": {
+    "version": "id-agents-runtime-v1",
+    "protocol": "rest-ap",
+    "protocolVersion": "1.0",
+    "adapterContract": "id-agents-harness-v1",
+    "runtime": "codex",
+    "providerName": "Codex CLI",
+    "sessionPolicy": "resume-by-id",
+    "deploymentShape": "local-process",
+    "requiredEndpoints": {
+      "discovery": "/.well-known/restap.json",
+      "talk": "/talk",
+      "news": "/news",
+      "newsPost": "/news",
+      "catalog": "/catalog"
+    },
+    "driver": {
+      "interface": "AgentHarness",
+      "input": "prompt:string + HarnessOptions",
+      "output": "AsyncGenerator<HarnessMessage>",
+      "eventTypes": ["system", "tool_use", "result", "error", "progress", "thinking"]
+    }
+  }
+}
+```
+
+### **Adding a New Runtime**
+
+A new local runtime only needs to implement the internal harness adapter:
+
+```ts
+interface AgentHarness {
+  readonly type: HarnessType;
+  run(prompt: string, options: HarnessOptions): AsyncGenerator<HarnessMessage>;
+  cancel?(): boolean;
+}
+```
+
+The harness may call any model provider or local binary, but it must normalize output to `HarnessMessage` events and let the REST-AP server own HTTP behavior, news storage, catalog discovery, task IDs, and session isolation. That separation keeps model/provider quirks out of the public protocol.
+
+Remote runtimes do not need a local harness. They can expose the REST-AP endpoints directly and publish `runtime_interface.deploymentShape: "remote-endpoint"` in discovery.
+
+### **Compatibility Rules**
+
+* Treat `message` as the only required `/talk` input.
+* Treat `query_id` as the portable tracking handle.
+* Treat `items[].data.result.result` as the portable final text location for completed news items.
+* Treat `session_id` as optional and governed by `runtime_interface.sessionPolicy`.
+* Keep provider auth, tool flags, CLI sessions, and model names behind the runtime adapter.
+* Do not encode runtime names into protocol clients, manager routing, task lifecycle, or catalog parsing.
+
 ## **The Catalog Document**
 
 The catalog describes what a hosted agent can do. REST-AP requires **two complementary documents**:

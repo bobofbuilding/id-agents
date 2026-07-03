@@ -92,11 +92,31 @@ export class SqliteTeamsRepo implements TeamsRepository {
     );
   }
 
+  async setRuntimeCredentialPool(teamId: string, pool: Record<string, unknown> | null): Promise<void> {
+    const config = await this.getConfig(teamId);
+    if (pool === null) delete config.runtimeCredentialPool;
+    else config.runtimeCredentialPool = pool;
+    await this.db.query(
+      `UPDATE teams SET config = ? WHERE id = ?`,
+      [stringifyJson(config), teamId],
+    );
+  }
+
   async setDelegatesTo(teamId: string, delegates: string[] | null): Promise<void> {
     // Read-merge-write: no jsonb_set in SQLite
     const config = await this.getConfig(teamId);
     if (delegates === null) delete config.delegates_to;
     else config.delegates_to = delegates;
+    await this.db.query(
+      `UPDATE teams SET config = ? WHERE id = ?`,
+      [stringifyJson(config), teamId],
+    );
+  }
+
+  async setValidatorRecommendationLoop(teamId: string, loop: Record<string, unknown> | null): Promise<void> {
+    const config = await this.getConfig(teamId);
+    if (loop === null) delete config.validatorRecommendationLoop;
+    else config.validatorRecommendationLoop = loop;
     await this.db.query(
       `UPDATE teams SET config = ? WHERE id = ?`,
       [stringifyJson(config), teamId],

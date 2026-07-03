@@ -4,8 +4,6 @@ import { Box, Text } from 'ink';
 export type FooterView =
   | 'agents'
   | 'agent-detail'
-  | 'news'
-  | 'news-detail'
   | 'tasks'
   | 'task-detail'
   | 'calendar'
@@ -38,8 +36,6 @@ const HAS_BACK: Record<FooterView, boolean> = {
   heartbeats: false,
   'task-detail': true,
   'heartbeat-detail': true,
-  news: true,
-  'news-detail': true,
   'library-agents': true,
   'library-agent-detail': true,
   'library-skills': true,

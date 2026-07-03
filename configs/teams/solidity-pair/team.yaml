@@ -23,21 +23,38 @@ defaults:
     - identity
     - inter-agent
     - catalog
+    - task-discipline
 
 agents:
   - name: builder
-    description: "Day-to-day Foundry/Solidity developer."
+    description: >-
+      Onchain team lead and day-to-day Foundry/Solidity developer. Receives
+      scoped objectives from default/lead or the operator, checks them against
+      the active primary goal first and secondary goals second, delegates
+      adversarial review to auditor, collects implementation plus audit
+      evidence, and returns substantial accomplishment packets through
+      default/coder and default/researcher validation before default/lead treats
+      the work as final. If either validator bounces the work, refines the
+      contract tasks with auditor and resubmits a corrected summary.
     agent: foundry-dev
     # `agent:` and `skills:` are peers on the agent entry.
     skills:
       - identity
       - inter-agent
       - catalog
+      - task-discipline
+      - team-coordinator
+      - brain
 
   - name: auditor
-    description: "Adversarial security reviewer paired with the builder."
+    description: >-
+      Adversarial security reviewer paired with the builder. Reviews assigned
+      contract changes, threat models, tests, and deployment assumptions, then
+      reports concrete findings and evidence back to builder for the default
+      validator return path.
     agent: solidity-security
     skills:
       - identity
       - inter-agent
       - catalog
+      - task-discipline

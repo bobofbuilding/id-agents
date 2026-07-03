@@ -5,6 +5,7 @@ import { TaskRow, TaskRowHeader } from './TaskRow.js';
 
 interface TasksTableProps {
   tasks: Task[];
+  scopeLabel: string;
   ageByName: ReadonlyMap<string, string>;
   selectedIndex: number;
   windowStart: number;
@@ -14,7 +15,7 @@ interface TasksTableProps {
 }
 
 export function TasksTable(props: TasksTableProps): React.ReactElement {
-  const { tasks, ageByName, selectedIndex, windowStart, windowSize, loading, error } = props;
+  const { tasks, scopeLabel, ageByName, selectedIndex, windowStart, windowSize, loading, error } = props;
   const total = tasks.length;
   const windowEnd = Math.min(total, windowStart + windowSize);
   const visible = tasks.slice(windowStart, windowEnd);
@@ -24,7 +25,7 @@ export function TasksTable(props: TasksTableProps): React.ReactElement {
   return (
     <Box flexDirection="column" borderStyle="round" paddingX={1}>
       <Box justifyContent="space-between">
-        <Text bold>Tasks ({total})</Text>
+        <Text bold>Tasks ({total} {scopeLabel})</Text>
         <Text dimColor>
           {loading && total === 0 ? 'loading…' : null}
           {error ? `error: ${error.message}` : null}

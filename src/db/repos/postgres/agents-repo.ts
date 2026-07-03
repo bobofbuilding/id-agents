@@ -358,6 +358,20 @@ export class PgAgentsRepo implements AgentsRepository {
     );
   }
 
+  async moveToTeam(agentId: string, teamId: string, status?: string): Promise<void> {
+    if (status !== undefined) {
+      await this.db.query(
+        `UPDATE agents SET team_id = $2, status = $3 WHERE id = $1`,
+        [agentId, teamId, status],
+      );
+      return;
+    }
+    await this.db.query(
+      `UPDATE agents SET team_id = $2 WHERE id = $1`,
+      [agentId, teamId],
+    );
+  }
+
   async updateStatus(
     agentId: string,
     status: string,

@@ -54,9 +54,55 @@ describe('TUI command registry tiers', () => {
     expect(command('teams').resultRenderer).toBe('table');
     expect(command('list').resultRenderer).toBe('table');
 
+    expect(command('ask').resultRenderer).toBeUndefined();
+    expect(command('hey').resultRenderer).toBeUndefined();
     expect(command('meta').resultRenderer).toBeUndefined();
     expect(command('configs').resultRenderer).toBeUndefined();
     expect(command('output').resultRenderer).toBe('table');
+  });
+
+  it('routes :ask and :hey through /remote and completes agent names', async () => {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), init: init ?? {} });
+      return new Response(JSON.stringify({ ok: true, result: { queryId: 'q1' } }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    try {
+      await command('ask').run({
+        manager: 'http://127.0.0.1:0',
+        executor: 'tui',
+        signal: new AbortController().signal,
+        args: ['lead', 'status?'],
+        teamName: 'default',
+      });
+      await command('hey').run({
+        manager: 'http://127.0.0.1:0',
+        executor: 'tui',
+        signal: new AbortController().signal,
+        args: ['lead', 'status?'],
+        teamName: 'default',
+      });
+
+      expect(calls.map((c) => JSON.parse(String(c.init.body)))).toEqual([
+        { agent: 'tui', command: '/ask lead status?' },
+        { agent: 'tui', command: '/hey lead status?' },
+      ]);
+      expect(calls.map((c) => (c.init.headers as Record<string, string>)['x-id-team'])).toEqual([
+        'default',
+        'default',
+      ]);
+      expect(completeBuffer('/ask le', {
+        agentNames: ['lead', 'researcher'],
+        teamNames: ['default'],
+      })).toBe('/ask lead ');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 
   it('selects table rendering only for :agents team lifecycle fan-out', () => {

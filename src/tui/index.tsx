@@ -38,7 +38,7 @@ if (process.stdout.isTTY) {
     const transformed =
       eraseReplaced !== s ? eraseReplaced.replace(/\n/g, '\x1b[K\n') : eraseReplaced;
     // Defensive: append ESC[J on transformed writes so any edge case that
-    // escapes the fixed-height padding in AgentsTable / NewsView (e.g. an
+    // escapes the fixed-height padding in fixed-height tables (e.g. an
     // off-by-one after a terminal resize, or content that briefly overflows
     // during transition) can't leave residual rows below the new content.
     const out = transformed !== s ? transformed + '\x1b[K\x1b[J' : transformed;

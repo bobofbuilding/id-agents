@@ -3,6 +3,19 @@ export interface AgentMetadata {
   description?: string;
   heartbeat?: boolean;
   pid?: number;
+  skills?: string[];
+  plugins?: Array<{ name?: string; path?: string } | string>;
+  mcpServers?: Array<{
+    name?: string;
+    transport?: string;
+    command?: string;
+    url?: string;
+  }>;
+  delegates?: string[];
+  instructions?: string;
+  provider_wallet_address?: string;
+  providerWalletAddress?: string;
+  providers?: Record<string, unknown>;
   skillmesh_address?: string;
   skillmesh_key_index?: number;
   skillmesh_key_path?: string;
@@ -18,6 +31,7 @@ export interface Agent {
   health: string;
   model?: string;
   type?: string;
+  runtime?: string;
   url?: string;
   workingDirectory?: string;
   createdAt: number;

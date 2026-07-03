@@ -49,6 +49,24 @@ export async function migratePostgres(adapter: DbAdapter): Promise<void> {
     );
   `);
 
+  await adapter.query(`
+    CREATE TABLE IF NOT EXISTS runtime_lane_cooldowns (
+      lane_id text PRIMARY KEY,
+      runtime text NOT NULL,
+      kind text NOT NULL,
+      cooling_until_ms bigint NOT NULL,
+      observed_at_ms bigint NOT NULL,
+      reason text NOT NULL,
+      team_id text,
+      agent_id text,
+      agent_name text,
+      query_id text,
+      reset_text text,
+      message text
+    );
+  `);
+  await adapter.query(`CREATE INDEX IF NOT EXISTS runtime_lane_cooldowns_until_idx ON runtime_lane_cooldowns(cooling_until_ms);`);
+
   // 4) Ensure port range columns exist (partial installs)
   await adapter.query(`ALTER TABLE teams ADD COLUMN IF NOT EXISTS port_start integer NOT NULL DEFAULT 4101;`);
   await adapter.query(`ALTER TABLE teams ADD COLUMN IF NOT EXISTS port_end integer NOT NULL DEFAULT 4125;`);

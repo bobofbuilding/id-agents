@@ -212,6 +212,22 @@ export async function migrateSqlite(adapter: SqliteAdapter): Promise<void> {
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS runtime_lane_cooldowns (
+      lane_id TEXT PRIMARY KEY,
+      runtime TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      cooling_until_ms INTEGER NOT NULL,
+      observed_at_ms INTEGER NOT NULL,
+      reason TEXT NOT NULL,
+      team_id TEXT,
+      agent_id TEXT,
+      agent_name TEXT,
+      query_id TEXT,
+      reset_text TEXT,
+      message TEXT
+    );
+    CREATE INDEX IF NOT EXISTS runtime_lane_cooldowns_until_idx ON runtime_lane_cooldowns(cooling_until_ms);
+
     CREATE TABLE IF NOT EXISTS agents (
       id TEXT PRIMARY KEY,
       team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,

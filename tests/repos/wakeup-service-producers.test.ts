@@ -173,6 +173,63 @@ describe('event-producer: tasks', () => {
       occurredAt,
       usedSourceIds: ['src-1', 'src-2'],
       volunteeredSourceIds: ['src-3'],
+      learningLoop: {
+        schema: 'brain.learning_loop_capture.v1',
+        subject: { kind: 'task', ref: `task:${taskUuid}`, route: 'manager.task_completion' },
+        gap: { gap_type: 'source_recovery', severity: 'medium', required_for_acceptance: false },
+        owner: { owner_team: 'default', owner_agent_id: 'agent-coder' },
+        validation_path: {
+          required: true,
+          default_validators: ['coder', 'researcher'],
+          specialists: [],
+          relay_target: 'owning_team_lead',
+          final_relay: 'default_validator_pair',
+        },
+        save_back: {
+          decision: 'save',
+          expected: true,
+          mode: 'apply_after_validation',
+          target_type: 'fact',
+          target_ref: 'fact:1',
+          operation: 'save',
+        },
+        source_recovery: {
+          required_source_ids: ['src-1'],
+          available_source_ids: ['src-1', 'src-2', 'src-3'],
+          missing_source_ids: [],
+          recovery_state: 'recovered',
+          evidence_refs: [],
+        },
+        backlog_rule: {
+          current_scope_only: true,
+          optional_improvements: 'record_as_backlog_candidate',
+          backlog_allowed: true,
+          optional_items_block_acceptance: false,
+          candidate_refs: [],
+        },
+        evidence: {
+          used_source_ids: ['src-1', 'src-2'],
+          volunteered_source_ids: ['src-3'],
+          used_instruction_ids: [],
+          ignored_instruction_ids: [],
+          harmful_instruction_ids: [],
+          artifact_refs: [],
+        },
+        outcome_telemetry: {
+          detection_type: 'manual_review',
+          owner_lane: 'default',
+          branch_chosen: 'save_back',
+          validation_result: 'approved',
+          final_state: 'saved_back',
+          metric_flags: {
+            reused_existing_record: false,
+            created_new_record: true,
+            rejected_output: false,
+            converted_to_backlog: false,
+          },
+          recorded_at: '2026-06-28T00:00:00.000Z',
+        },
+      },
     });
 
     const rows = await events.query({ teamId, topics: [TASK_COMPLETED] });
@@ -181,6 +238,10 @@ describe('event-producer: tasks', () => {
       task_name: 'brain-sources',
       used_source_ids: ['src-1', 'src-2'],
       volunteered_source_ids: ['src-3'],
+      learning_loop: {
+        gap: { gap_type: 'source_recovery' },
+        save_back: { decision: 'save' },
+      },
     });
   });
 });
@@ -264,6 +325,63 @@ describe('event-producer: query sweeper', () => {
       taskId: 'task:123',
       usedSourceIds: ['src-1'],
       volunteeredSourceIds: ['src-2', 'src-3'],
+      learningLoop: {
+        schema: 'brain.learning_loop_capture.v1',
+        subject: { kind: 'query', ref: `query:${queryId}`, route: 'manager.dispatch' },
+        gap: { gap_type: 'validation_feedback_missing', severity: 'medium', required_for_acceptance: false },
+        owner: { owner_team: 'default', owner_agent_id: agentId },
+        validation_path: {
+          required: true,
+          default_validators: ['coder', 'researcher'],
+          specialists: [],
+          relay_target: 'owning_team_lead',
+          final_relay: 'default_validator_pair',
+        },
+        save_back: {
+          decision: 'record-backlog',
+          expected: false,
+          mode: 'advisory_only',
+          target_type: 'none',
+          target_ref: null,
+          operation: 'record-backlog',
+        },
+        source_recovery: {
+          required_source_ids: [],
+          available_source_ids: ['src-1', 'src-2', 'src-3'],
+          missing_source_ids: [],
+          recovery_state: 'not_needed',
+          evidence_refs: [],
+        },
+        backlog_rule: {
+          current_scope_only: true,
+          optional_improvements: 'record_as_backlog_candidate',
+          backlog_allowed: true,
+          optional_items_block_acceptance: false,
+          candidate_refs: ['backlog:1'],
+        },
+        evidence: {
+          used_source_ids: ['src-1'],
+          volunteered_source_ids: ['src-2', 'src-3'],
+          used_instruction_ids: [],
+          ignored_instruction_ids: [],
+          harmful_instruction_ids: [],
+          artifact_refs: [],
+        },
+        outcome_telemetry: {
+          detection_type: 'manual_review',
+          owner_lane: 'default',
+          branch_chosen: 'backlog_only',
+          validation_result: 'not_required',
+          final_state: 'backlog_recorded',
+          metric_flags: {
+            reused_existing_record: false,
+            created_new_record: false,
+            rejected_output: false,
+            converted_to_backlog: true,
+          },
+          recorded_at: '2026-06-28T00:00:00.000Z',
+        },
+      },
     });
 
     const rows = await events.query({ teamId, topics: [QUERY_DELIVERED] });
@@ -282,6 +400,10 @@ describe('event-producer: query sweeper', () => {
         task_id: 'task:123',
         used_source_ids: ['src-1'],
         volunteered_source_ids: ['src-2', 'src-3'],
+        learning_loop: {
+          gap: { gap_type: 'validation_feedback_missing' },
+          save_back: { decision: 'record-backlog' },
+        },
         message_preview: 'done',
       },
     });

@@ -3,9 +3,11 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  getAvailableRuntimes,
   getDefaultModelForRuntime,
   getDefaultRuntime,
   getRuntimeDisplayName,
+  getRuntimeInterfaceProfile,
   getRuntimeProfile,
   getRuntimeProviderName,
   resolveRuntime,
@@ -57,10 +59,47 @@ describe('runtime registry', () => {
   it('tracks auth and session behavior by runtime', () => {
     expect(usesCliLogin('codex')).toBe(true);
     expect(usesCliLogin('claude-code-cli')).toBe(true);
+    expect(usesCliLogin('grok')).toBe(true);
+    expect(usesCliLogin('antigravity')).toBe(true);
+    expect(usesCliLogin('copilot')).toBe(true);
+    expect(usesCliLogin('kiro-cli')).toBe(true);
     expect(usesCliLogin('claude-agent-sdk')).toBe(false);
 
     expect(supportsSessionResume('codex')).toBe(true);
     expect(supportsSessionResume('claude-code-cli')).toBe(true);
+    expect(supportsSessionResume('grok')).toBe(true);
+    expect(supportsSessionResume('antigravity')).toBe(true);
+    expect(supportsSessionResume('copilot')).toBe(false);
+    expect(supportsSessionResume('kiro-cli')).toBe(true);
+  });
+
+  it('exposes one runtime-neutral interface contract for every runtime', () => {
+    for (const runtime of getAvailableRuntimes()) {
+      const profile = getRuntimeProfile(runtime);
+      const contract = getRuntimeInterfaceProfile(runtime);
+
+      expect(contract.version).toBe('id-agents-runtime-v1');
+      expect(contract.protocol).toBe('rest-ap');
+      expect(contract.protocolVersion).toBe('1.0');
+      expect(contract.adapterContract).toBe('id-agents-harness-v1');
+      expect(contract.runtime).toBe(profile.id);
+      expect(contract.sessionPolicy).toBe(profile.sessionPolicy);
+      expect(contract.deploymentShape).toBe(profile.deploymentShape);
+      expect(contract.capabilities).toEqual(profile.capabilities);
+      expect(contract.requiredEndpoints).toMatchObject({
+        discovery: '/.well-known/restap.json',
+        talk: '/talk',
+        news: '/news',
+        newsPost: '/news',
+        catalog: '/catalog',
+      });
+      expect(contract.driver).toMatchObject({
+        interface: 'AgentHarness',
+        input: 'prompt:string + HarnessOptions',
+        output: 'AsyncGenerator<HarnessMessage>',
+      });
+      expect(contract.driver.eventTypes).toEqual(['system', 'tool_use', 'result', 'error', 'progress', 'thinking']);
+    }
   });
 
   it('flags incompatible runtime/model combinations', () => {
@@ -119,6 +158,70 @@ describe('runtime registry', () => {
     expect(validateRuntimeModelCompatibility('cursor-cli', 'claude-opus-4-20250514')).toEqual([]);
   });
 
+  it('exposes the GitHub Copilot runtime profile', () => {
+    const profile = getRuntimeProfile('copilot');
+    expect(profile.id).toBe('copilot');
+    expect(profile.canonicalId).toBe('copilot');
+    expect(profile.displayName).toBe('GitHub Copilot');
+    expect(profile.auth.mode).toBe('cli-login');
+    expect(profile.capabilities.supportsResume).toBe(false);
+    expect(getDefaultModelForRuntime('copilot')).toBe('default');
+  });
+
+  it('accepts provider-owned model strings for copilot', () => {
+    expect(validateRuntimeModelCompatibility('copilot', 'default')).toEqual([]);
+    expect(validateRuntimeModelCompatibility('copilot', 'gpt-5.4')).toEqual([]);
+    expect(validateRuntimeModelCompatibility('copilot', 'claude-sonnet-4-6')).toEqual([]);
+  });
+
+  it('exposes the Grok Build runtime profile', () => {
+    const profile = getRuntimeProfile('grok');
+    expect(profile.id).toBe('grok');
+    expect(profile.canonicalId).toBe('grok');
+    expect(profile.displayName).toBe('Grok Build');
+    expect(profile.auth.mode).toBe('cli-login');
+    expect(profile.capabilities.supportsResume).toBe(true);
+    expect(getDefaultModelForRuntime('grok')).toBe('grok-composer-2.5-fast');
+  });
+
+  it('accepts provider-owned model strings for grok', () => {
+    expect(validateRuntimeModelCompatibility('grok', 'grok-composer-2.5-fast')).toEqual([]);
+    expect(validateRuntimeModelCompatibility('grok', 'grok-build')).toEqual([]);
+    expect(validateRuntimeModelCompatibility('grok', 'claude-sonnet-4-6')).toEqual([]);
+  });
+
+  it('exposes the Google Antigravity runtime profile', () => {
+    const profile = getRuntimeProfile('antigravity');
+    expect(profile.id).toBe('antigravity');
+    expect(profile.canonicalId).toBe('antigravity');
+    expect(profile.displayName).toBe('Google Antigravity');
+    expect(profile.auth.mode).toBe('cli-login');
+    expect(profile.capabilities.supportsResume).toBe(true);
+    expect(getDefaultModelForRuntime('antigravity')).toBe('Gemini 3.5 Flash (Medium)');
+  });
+
+  it('accepts provider-owned model strings for antigravity', () => {
+    expect(validateRuntimeModelCompatibility('antigravity', 'Gemini 3.5 Flash (Medium)')).toEqual([]);
+    expect(validateRuntimeModelCompatibility('antigravity', 'Claude Sonnet 4.6 (Thinking)')).toEqual([]);
+    expect(validateRuntimeModelCompatibility('antigravity', 'GPT-OSS 120B (Medium)')).toEqual([]);
+  });
+
+  it('exposes the Kiro runtime profile', () => {
+    const profile = getRuntimeProfile('kiro-cli');
+    expect(profile.id).toBe('kiro-cli');
+    expect(profile.canonicalId).toBe('kiro-cli');
+    expect(profile.displayName).toBe('Kiro');
+    expect(profile.auth.mode).toBe('cli-login');
+    expect(profile.capabilities.supportsResume).toBe(true);
+    expect(getDefaultModelForRuntime('kiro-cli')).toBe('auto');
+  });
+
+  it('accepts provider-owned model strings for kiro-cli', () => {
+    expect(validateRuntimeModelCompatibility('kiro-cli', 'auto')).toEqual([]);
+    expect(validateRuntimeModelCompatibility('kiro-cli', 'claude-sonnet-4.5')).toEqual([]);
+    expect(validateRuntimeModelCompatibility('kiro-cli', 'qwen3-coder-next')).toEqual([]);
+  });
+
   it('exposes the ollama runtime profile', () => {
     const profile = getRuntimeProfile('ollama');
     expect(profile.id).toBe('ollama');
@@ -133,5 +236,13 @@ describe('runtime registry', () => {
     expect(validateRuntimeModelCompatibility('ollama', 'qwen3:4b')).toEqual([]);
     expect(validateRuntimeModelCompatibility('ollama', 'gpt-5')).toEqual([]);
     expect(validateRuntimeModelCompatibility('ollama', 'claude-opus-4-20250514')).toEqual([]);
+  });
+
+  it('maps provider lane specifiers to the generic provider-api harness', () => {
+    expect(resolveRuntime('provider:openrouter')).toBe('provider-api');
+    expect(getRuntimeDisplayName('provider:NVIDIABuild-Autogen-73')).toBe('API Provider');
+    expect(getRuntimeProviderName('provider:openrouter')).toBe('OpenAI-compatible API');
+    expect(validateRuntimeModelCompatibility('provider:openrouter', 'anthropic/claude-sonnet-4.6')).toEqual([]);
+    expect(validateRuntimeModelCompatibility('provider:openrouter', 'qwen/qwen3.5-397b-a17b')).toEqual([]);
   });
 });

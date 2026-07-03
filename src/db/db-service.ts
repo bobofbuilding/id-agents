@@ -64,12 +64,18 @@ export interface TeamsRepository {
   /** Merge organization chart data into the team config. */
   setOrg(teamId: string, org: Record<string, unknown> | null): Promise<void>;
 
+  /** Store or remove the team's runtime credential pool declaration. */
+  setRuntimeCredentialPool(teamId: string, pool: Record<string, unknown> | null): Promise<void>;
+
   /**
    * Set the cross-team delegation allow-list (`delegates_to`). An array of
    * team names (or `["*"]` for all) restricts delegation; `null` removes the
    * key, restoring the permissive default.
    */
   setDelegatesTo(teamId: string, delegates: string[] | null): Promise<void>;
+
+  /** Store or remove the team's event-driven validator recommendation loop config. */
+  setValidatorRecommendationLoop(teamId: string, config: Record<string, unknown> | null): Promise<void>;
 
   /** Permanently delete a team row. */
   deleteTeam(teamId: string): Promise<void>;
@@ -184,6 +190,9 @@ export interface AgentsRepository {
 
   /** Replace the full metadata JSON for an agent. */
   updateMetadata(agentId: string, metadata: Record<string, unknown>): Promise<void>;
+
+  /** Move an agent row to another existing team, optionally changing status. */
+  moveToTeam(agentId: string, teamId: string, status?: string): Promise<void>;
 
   /**
    * Update agent status, with optional extra column updates
@@ -498,6 +507,7 @@ export interface TasksRepository {
     status?: 'todo' | 'doing' | 'done';
     owner?: string;
     teamId?: string | null;
+    limit?: number;
   }): Promise<TaskRow[]>;
 
   /** Update one or more mutable fields on a task. */
@@ -517,9 +527,16 @@ export interface TasksRepository {
   /**
    * Atomically claim an unowned todo task.
    * Sets owner, status='doing', and updated_at.
+   * When maxDoingForTeam is supplied, the claim only succeeds if the task's
+   * team currently has fewer than that many doing tasks.
    * Returns true if the claim succeeded, false if already owned or not todo.
    */
-  claim(taskId: string, ownerId: string, updatedAt: number): Promise<boolean>;
+  claim(
+    taskId: string,
+    ownerId: string,
+    updatedAt: number,
+    options?: { maxDoingForTeam?: number },
+  ): Promise<boolean>;
 
   /** Delete a task by id (task_event_links cascade). */
   delete(taskId: string): Promise<void>;
@@ -694,6 +711,31 @@ export interface CheckinsRepository {
 }
 
 // ---------------------------------------------------------------------------
+// RuntimeLaneCooldownsRepository
+// ---------------------------------------------------------------------------
+
+export interface RuntimeLaneCooldownRecord {
+  lane_id: string;
+  runtime: string;
+  kind: string;
+  cooling_until_ms: number;
+  observed_at_ms: number;
+  reason: string;
+  team_id: string | null;
+  agent_id: string | null;
+  agent_name: string | null;
+  query_id: string | null;
+  reset_text: string | null;
+  message: string | null;
+}
+
+export interface RuntimeLaneCooldownsRepository {
+  upsert(cooldown: RuntimeLaneCooldownRecord): Promise<void>;
+  listActive(nowMs: number): Promise<RuntimeLaneCooldownRecord[]>;
+  pruneExpired(nowMs: number): Promise<number>;
+}
+
+// ---------------------------------------------------------------------------
 // Db — composite service
 // ---------------------------------------------------------------------------
 
@@ -719,6 +761,7 @@ export interface Db {
   events: EventsRepository;
   subscriptions: SubscriptionsRepository;
   checkins: CheckinsRepository;
+  runtimeLaneCooldowns: RuntimeLaneCooldownsRepository;
 
   /** Close the database connection / file handle. */
   close(): Promise<void>;

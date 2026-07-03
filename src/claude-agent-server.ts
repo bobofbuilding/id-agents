@@ -9,6 +9,7 @@
 import express from 'express';
 import fetch from 'node-fetch';
 import { createHarness, HarnessType, AgentHarness } from './harness/index.js';
+import type { RuntimeRateLimitSignal } from './harness/rate-limit.js';
 import { parseMcpServersEnv } from './harness/mcp.js';
 import { withInterAgentSkill } from './inter-agent-skill.js';
 import path from 'path';
@@ -21,6 +22,7 @@ import {
   getRuntimeAuthProvider,
   getDefaultModelForRuntime,
   getRuntimeDisplayName,
+  getRuntimeInterfaceProfile,
   getRuntimeProviderName,
   resolveRuntime,
   supportsSessionResume,
@@ -523,6 +525,7 @@ export class AgentRestServer {
       res.json({
         restap_version: '1.0',
         agent: agentInfo,
+        runtime_interface: getRuntimeInterfaceProfile(this.harnessType),
         provider: {
           name: getRuntimeProviderName(this.harnessType),
           version: '1.0'
@@ -1703,16 +1706,22 @@ What would you like to do with this information?`;
     // NOT necessarily a runtime session id. We translate it to the runtime session id
     // this agent last minted for that conversation, so each chat resumes only its own
     // thread. A caller that passes back a runtime id we actually minted resumes it
-    // directly (back-compat for agent-to-agent talk / inbox replies). No id ⇒ the
-    // shared default bucket (old rolling-context behavior for heartbeats etc.).
+    // directly (back-compat for agent-to-agent talk / inbox replies). Manager-owned
+    // dispatches without an explicit session id are fresh by default; otherwise
+    // unrelated task/schedule traffic builds one giant hidden runtime session.
     const allowSessionResume = supportsSessionResume(this.harnessType);
-    const conversationKey = resume || AgentRestServer.DEFAULT_CONVERSATION;
-    const directRuntimeResume = resume && this.mintedSessionIds.has(resume) ? resume : undefined;
+    const resumeKey = typeof resume === 'string' && resume.trim() ? resume.trim() : undefined;
+    const managerOwnedDispatch = from === 'manager' || from === 'remote' || options?.noAutoReply === true;
+    const disableImplicitDefault = process.env.ID_AGENT_DISABLE_IMPLICIT_DEFAULT_SESSION === '1';
+    const useImplicitDefault = !resumeKey && !managerOwnedDispatch && !disableImplicitDefault;
+    const conversationKey = resumeKey || (useImplicitDefault ? AgentRestServer.DEFAULT_CONVERSATION : undefined);
+    const directRuntimeResume = resumeKey && this.mintedSessionIds.has(resumeKey) ? resumeKey : undefined;
     let sessionId = allowSessionResume
-      ? (directRuntimeResume || this.sessionByConversation.get(conversationKey))
+      ? (directRuntimeResume || (conversationKey ? this.sessionByConversation.get(conversationKey) : undefined))
       : undefined;
     if (sessionId) {
-      console.log(`${logTime()} [Agent] 🔄 Resuming session for conversation ${conversationKey.slice(0, 24)}: ${sessionId.slice(0, 20)}...`);
+      const label = conversationKey ? conversationKey.slice(0, 24) : 'explicit-runtime-session';
+      console.log(`${logTime()} [Agent] 🔄 Resuming session for conversation ${label}: ${sessionId.slice(0, 20)}...`);
     }
 
     try {
@@ -1763,7 +1772,7 @@ ${prompt}`
         // Capture session ID from system init or result message
         if (message.session_id) {
           sessionId = message.session_id;
-          if (allowSessionResume) {
+          if (allowSessionResume && conversationKey) {
             // Remember this runtime session under THIS conversation so the next
             // turn of the same chat resumes it (and only it).
             const prior = this.sessionByConversation.get(conversationKey);
@@ -1824,6 +1833,11 @@ ${prompt}`
         if (message.type === 'error' && message.content) {
           const errorContent = message.content;
           const apiHelp = getApiErrorHelp(errorContent, this.harnessType);
+          const rateLimit = (message as any).rateLimit as RuntimeRateLimitSignal | undefined;
+
+          if (rateLimit?.isRateLimit) {
+            this.notifyRuntimeRateLimit(rateLimit, queryId).catch(() => {});
+          }
 
           if (apiHelp.isApiError) {
             console.error(`\n${apiHelp.helpMessage}\n`);
@@ -1919,7 +1933,7 @@ ${prompt}`
 
       // Clear session on content filter errors to allow recovery — but ONLY for the
       // conversation that hit the filter, so other chats keep their context.
-      if (isContentFilterError(query.error)) {
+      if (isContentFilterError(query.error) && conversationKey) {
         console.log(`${logTime()} [Agent] 🔄 Content filter error detected - clearing session for conversation ${conversationKey.slice(0, 24)} to allow recovery`);
         const failedId = this.sessionByConversation.get(conversationKey);
         this.sessionByConversation.delete(conversationKey);
@@ -2038,6 +2052,28 @@ ${prompt}`
     } catch {
       // Ignore broadcast failures - this is best-effort for /watch
     }
+  }
+
+  private async notifyRuntimeRateLimit(rateLimit: RuntimeRateLimitSignal, queryId?: string): Promise<void> {
+    const managerUrl = process.env.MANAGER_URL;
+    if (!managerUrl) return;
+
+    await fetch(`${managerUrl.replace(/\/+$/, '')}/runtime/rate-limit`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Id-Team': process.env.ID_TEAM || '',
+      },
+      body: JSON.stringify({
+        agent_id: process.env.ID_AGENT_ID || this.dbAgentId,
+        agent_name: process.env.ID_AGENT_NAME || this.agentName || this.getDisplayId(),
+        runtime: this.harnessType,
+        lane_id: process.env.ID_RUNTIME_LANE_ID,
+        query_id: queryId,
+        rateLimit,
+      }),
+      signal: AbortSignal.timeout(2000),
+    });
   }
 
   async start(port: number = 4101): Promise<void> {

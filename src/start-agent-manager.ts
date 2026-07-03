@@ -6,6 +6,7 @@
  */
 
 import 'dotenv/config';
+import path from 'node:path';
 import { AgentManagerDb } from './agent-manager-db.js';
 import { createDb, migrateDb } from './db.js';
 import { AgentRestServer } from './agent-rest-server.js';
@@ -63,7 +64,7 @@ async function main() {
 
 async function startManagerAgent() {
   const managementPort = parseInt(process.env.AGENT_MANAGER_PORT || '4100');
-  const workingDir = process.env.AGENT_MANAGER_WORKDIR || '/workspace';
+  const workingDir = path.resolve(process.env.AGENT_MANAGER_WORKDIR || path.join(process.cwd(), 'workspace'));
 
   // Initialize DB (required for persistence)
   const db = await createDb();

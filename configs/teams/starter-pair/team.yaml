@@ -22,11 +22,25 @@ defaults:
     - identity
     - inter-agent
     - catalog
+    - task-discipline
 
 agents:
   - name: lead
-    description: "Plans the work, splits it into tasks, reviews the result."
+    description: >-
+      Team lead. Receives scoped objectives from default/lead or the operator,
+      checks them against the active primary goal first and secondary goals
+      second, splits the remaining work into tasks for dev, tracks completion,
+      and returns substantial accomplishment packets through default/coder and
+      default/researcher validation before default/lead treats the work as
+      final. If either validator bounces the work, refines the tasks with dev
+      and resubmits a corrected summary.
     model: claude-opus-4-7
+    skills:
+      - team-coordinator
+      - brain
 
   - name: dev
-    description: "Implements features against the lead's plan."
+    description: >-
+      Implements assigned tasks against the lead's plan, reports concise
+      completion evidence and blockers back to lead, and does not bypass the
+      default-team validator return path for substantial work.

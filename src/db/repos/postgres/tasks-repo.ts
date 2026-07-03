@@ -67,6 +67,7 @@ export class PgTasksRepo implements TasksRepository {
     status?: 'todo' | 'doing' | 'done';
     owner?: string;
     teamId?: string | null;
+    limit?: number;
   }): Promise<TaskRow[]> {
     const clauses: string[] = [];
     const params: unknown[] = [];
@@ -89,9 +90,13 @@ export class PgTasksRepo implements TasksRepository {
       }
     }
 
+    const limit = filters?.limit && Number.isFinite(filters.limit)
+      ? Math.max(1, Math.min(500, Math.floor(filters.limit)))
+      : 0;
     const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+    if (limit) params.push(limit);
     const r = await this.db.query<TaskRow>(
-      `SELECT * FROM tasks ${where} ORDER BY updated_at DESC`,
+      `SELECT * FROM tasks ${where} ORDER BY updated_at DESC${limit ? ` LIMIT $${idx++}` : ''}`,
       params,
     );
     return r.rows;
@@ -130,7 +135,32 @@ export class PgTasksRepo implements TasksRepository {
     );
   }
 
-  async claim(taskId: string, ownerId: string, updatedAt: number): Promise<boolean> {
+  async claim(
+    taskId: string,
+    ownerId: string,
+    updatedAt: number,
+    options?: { maxDoingForTeam?: number },
+  ): Promise<boolean> {
+    const limit = options?.maxDoingForTeam;
+    if (limit !== undefined) {
+      const r = await this.db.query(
+        `UPDATE tasks AS target
+         SET owner = $2, status = 'doing', updated_at = $3
+         WHERE target.id = $1 AND target.owner IS NULL AND target.status = 'todo'
+           AND (
+             SELECT COUNT(*)
+             FROM tasks active
+             WHERE active.status = 'doing'
+               AND (
+                 active.team_id = target.team_id
+                 OR (active.team_id IS NULL AND target.team_id IS NULL)
+               )
+           ) < $4`,
+        [taskId, ownerId, updatedAt, limit],
+      );
+      return r.rowCount > 0;
+    }
+
     const r = await this.db.query(
       `UPDATE tasks
        SET owner = $2, status = 'doing', updated_at = $3

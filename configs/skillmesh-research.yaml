@@ -15,6 +15,7 @@ defaults:
     - identity
     - inter-agent
     - catalog
+    - task-discipline
   plugins:
     - name: skillmesh
       path: ../workspace/projects/skillmesh/agents/plugins/skillmesh
@@ -25,7 +26,12 @@ agents:
     description: >
       Research Stack lead — coordinates market parsing, entity extraction, summary
       formatting, and alert routing for analysts and crypto ops teams. Delegates
-      to market-parser, alert-router, and summary tools.
+      to market-parser, alert-router, and summary tools. Returns substantial
+      accomplishment packets through default/coder and default/researcher validation
+      before default/lead treats the work as final.
+    skills:
+      - team-coordinator
+      - brain
     catalog:
       role: analyst
       expertise:

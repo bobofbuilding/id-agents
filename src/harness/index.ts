@@ -12,7 +12,12 @@ import { ClaudeAgentSdkHarness } from './claude-agent-sdk.js';
 import { ClaudeCodeCliHarness } from './claude-code-cli.js';
 import { CodexHarness } from './codex.js';
 import { CursorCliHarness } from './cursor-cli.js';
+import { GrokHarness } from './grok.js';
+import { AntigravityHarness } from './antigravity.js';
+import { CopilotCliHarness } from './copilot-cli.js';
+import { KiroCliHarness } from './kiro-cli.js';
 import { OllamaHarness } from './ollama.js';
+import { ProviderApiHarness } from './provider-api.js';
 import { getAvailableRuntimes, isRuntimeId } from '../runtime/registry.js';
 
 // Export all types
@@ -21,7 +26,13 @@ export { ClaudeAgentSdkHarness } from './claude-agent-sdk.js';
 export { ClaudeCodeCliHarness } from './claude-code-cli.js';
 export { CodexHarness } from './codex.js';
 export { CursorCliHarness } from './cursor-cli.js';
+export { GrokHarness } from './grok.js';
+export { AntigravityHarness } from './antigravity.js';
+export { CopilotCliHarness } from './copilot-cli.js';
+export { KiroCliHarness } from './kiro-cli.js';
 export { OllamaHarness } from './ollama.js';
+export { ProviderApiHarness } from './provider-api.js';
+export * from './rate-limit.js';
 
 /**
  * Create a harness instance by type.
@@ -41,10 +52,20 @@ export function createHarness(type: HarnessType = 'claude-agent-sdk'): AgentHarn
       return new CodexHarness();
     case 'cursor-cli':
       return new CursorCliHarness();
+    case 'grok':
+      return new GrokHarness();
+    case 'antigravity':
+      return new AntigravityHarness();
+    case 'copilot':
+      return new CopilotCliHarness();
+    case 'kiro-cli':
+      return new KiroCliHarness();
     case 'ollama':
       return new OllamaHarness();
+    case 'provider-api':
+      return new ProviderApiHarness();
     default:
-      throw new Error(`Unknown harness type: ${type}. Valid types: claude-agent-sdk, claude-code-cli, codex, cursor-cli, ollama`);
+      throw new Error(`Unknown harness type: ${type}. Valid types: claude-agent-sdk, claude-code-cli, codex, cursor-cli, grok, antigravity, copilot, kiro-cli, ollama, provider-api`);
   }
 }
 

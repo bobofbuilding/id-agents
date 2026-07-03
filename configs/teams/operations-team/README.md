@@ -9,14 +9,19 @@ and maintenance** — with a dedicated **git‑manager** that keeps the control 
 - **ops-lead** ⭑ — the coordinator. Triages ops requests, delegates to the specialists,
   reports one clear status, and escalates anything risky (production pushes, mainnet,
   deletes) to you. *(skills: defaults + `team-coordinator`, `brain`)*
-- **git-manager** — owns the git repos under your **projects root**
-  (`id-agents/workspace/projects/` — brain, chat, the `bittrees-*` apps, the control
-  center, etc.). It runs `git status`, commits meaningful changes with clear messages,
-  keeps branches tidy, and keeps the working tree clean so the **Projects page's scan
-  shows accurate, current state** (branch, ahead/behind, dirty files, last commit).
+- **task-master** — task-board and fleet-hygiene supervisor. Audits stale work, routes
+  unclaimed todos, probes offline agents, and reports a structured digest to ops-lead.
+  *(skills: defaults + `brain`)*
+- **git-manager** — owns git hygiene and push coordination for the git repos under
+  your **projects root** (`id-agents/workspace/projects/` — brain, chat, the
+  `bittrees-*` apps, the control center, etc.). It runs `git status`, preserves
+  untracked/local-only files, commits meaningful changes with clear messages, keeps
+  branches tidy, and keeps the working tree clean so the **Projects page's scan shows
+  accurate, current state** (branch, ahead/behind, dirty files, last commit).
   *(skills: defaults + `brain`)*
 - **deployer** — build / CI / release: builds + tests, cuts versioned releases and tags,
-  deploys (with a confirm before any production deploy), rolls back on failure.
+  deploys (with a confirm before any production deploy), rolls back on failure, and
+  hands staging, committing, merging to `main`, and pushing back to git-manager.
 - **monitor** — reliability: health probes, log tails, incident flags with next steps.
 - **maintainer** — routine upkeep: dependency updates, cleanup, scheduled chores, small
   scripts — proposed as commits for the git‑manager to land.
@@ -32,9 +37,15 @@ page scans is real and current. Ask it things like:
 
 ### Guardrails (baked into the git‑manager)
 
-- **Commits freely; pushes carefully.** It pushes only when you ask or to a non‑production
-  branch, **never force‑pushes**, and **never pushes a branch that auto‑deploys to
-  production** (e.g. `chat`/chirpy → `main`) without your confirmation.
+- **Commits freely; pushes carefully.** It pushes only when you ask or to a
+  non‑production branch. When a push should land on `main`, it fetches first, merges or
+  rebases without discarding local work, resolves conflicts explicitly, verifies
+  status/tests as appropriate, and then pushes normally.
+- **No destructive git cleanup.** It never force-pushes, never runs hard resets or
+  untracked-file cleanup, and never deletes local-only files just to make a branch look
+  clean.
+- **Production branches need confirmation.** It never pushes a branch that auto‑deploys
+  to production (e.g. `chat`/chirpy → `main`) without your confirmation.
 - Treats repos you flag as read‑only (e.g. upstream `id-agents`) as **off‑limits for
   writes**.
 

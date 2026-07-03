@@ -37,6 +37,7 @@ async function createPostgresDb(adapter: DbAdapter): Promise<Db> {
   const { PgEventsRepo } = await import('./repos/postgres/events-repo.js');
   const { PgSubscriptionsRepo } = await import('./repos/postgres/subscriptions-repo.js');
   const { PgCheckinsRepo } = await import('./repos/postgres/checkins-repo.js');
+  const { PgRuntimeLaneCooldownsRepo } = await import('./repos/postgres/runtime-lane-cooldowns-repo.js');
   return {
     adapter,
     teams: new PgTeamsRepo(adapter),
@@ -48,6 +49,7 @@ async function createPostgresDb(adapter: DbAdapter): Promise<Db> {
     events: new PgEventsRepo(adapter),
     subscriptions: new PgSubscriptionsRepo(adapter),
     checkins: new PgCheckinsRepo(adapter),
+    runtimeLaneCooldowns: new PgRuntimeLaneCooldownsRepo(adapter),
     async close() { await adapter.close(); },
   };
 }
@@ -62,6 +64,7 @@ async function createSqliteDb(adapter: SqliteAdapter): Promise<Db> {
   const { SqliteEventsRepo } = await import('./repos/sqlite/events-repo.js');
   const { SqliteSubscriptionsRepo } = await import('./repos/sqlite/subscriptions-repo.js');
   const { SqliteCheckinsRepo } = await import('./repos/sqlite/checkins-repo.js');
+  const { SqliteRuntimeLaneCooldownsRepo } = await import('./repos/sqlite/runtime-lane-cooldowns-repo.js');
   return {
     adapter,
     teams: new SqliteTeamsRepo(adapter),
@@ -73,6 +76,7 @@ async function createSqliteDb(adapter: SqliteAdapter): Promise<Db> {
     events: new SqliteEventsRepo(adapter),
     subscriptions: new SqliteSubscriptionsRepo(adapter),
     checkins: new SqliteCheckinsRepo(adapter),
+    runtimeLaneCooldowns: new SqliteRuntimeLaneCooldownsRepo(adapter),
     async close() { await adapter.close(); },
   };
 }

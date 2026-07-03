@@ -3,6 +3,21 @@
   "version": "1.0.0",
   "description": "SkillMesh integration — on-chain agent identity, LLM gateway, A2A messaging, and marketplace access",
   "type": "local",
+  "core": false,
+  "provider": {
+    "id": "skillmesh",
+    "optional": true,
+    "capabilities": [
+      "marketplace",
+      "onchain-skill-execution",
+      "a2a-messaging",
+      "byok-llm-gateway",
+      "skillmesh-identity"
+    ],
+    "requires": [
+      "SKILLMESH_PRIVATE_KEY"
+    ]
+  },
   "homepage": "https://skillmesh.bittrees.org",
   "entrypoint": "SKILL.md",
   "scripts": []

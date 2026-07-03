@@ -60,7 +60,14 @@ lifecycle below: create → claim → do → done.
 2. Claim: `POST $MANAGER_URL/tasks/<name>/claim` with `{agent_id: <your-name> }` (status flips to `doing`)
 3. Do the work. Write artifacts to `./output/` in your working directory.
 4. Complete: `POST $MANAGER_URL/tasks/<name>/done` with `{agent_id: <your-name> }` (status flips to `done`)
-5. Reply to the requester: include the task name, e.g. `Done. Task: implement-x. Output: ./output/report.md`
+5. Reply to the requester or team lead with a completion packet:
+   - `Task:` the assigned task name, verbatim
+   - `Summary:` what changed or what you learned
+   - `Evidence:` files, commands, tests, citations, or output paths
+   - `Goal fit:` how the result supports the active primary goal first, then any secondary goal
+   - `Blocked/risks:` anything unresolved, uncertain, or needing validator review
+
+Example: `Done. Task: implement-x. Summary: added the guarded write path. Evidence: src/foo.ts, npm test. Goal fit: supports the current reliability goal. Blocked/risks: needs validator review for rollout wording.`
 
 ## If work fails
 
@@ -74,7 +81,7 @@ Avoid reserved command verbs (delete, deploy, sync, etc.) which will be rejected
 
 ## Why this matters
 
-A verifier agent walking the task stream can see every unit of work, every artifact, every completion or failure, but only if every agent uses the system. Your discipline is what makes the team auditable.
+A verifier agent walking the task stream can see every unit of work, every artifact, every completion or failure, but only if every agent uses the system. Your discipline is what makes the team auditable. Your completion packet is also what lets a team lead refine your work into an accomplishment packet for default/coder and default/researcher validation before default/lead treats substantial work as final.
 
 ## Orphan cleanup notes
 

@@ -91,6 +91,22 @@ export class PgTeamsRepo implements TeamsRepository {
     );
   }
 
+  async setRuntimeCredentialPool(teamId: string, pool: Record<string, unknown> | null): Promise<void> {
+    if (pool === null) {
+      await this.db.query(
+        `UPDATE teams SET config = config - 'runtimeCredentialPool' WHERE id = $1`,
+        [teamId],
+      );
+      return;
+    }
+    await this.db.query(
+      `UPDATE teams
+       SET config = jsonb_set(config, '{runtimeCredentialPool}', $2::jsonb, true)
+       WHERE id = $1`,
+      [teamId, JSON.stringify(pool)],
+    );
+  }
+
   async setDelegatesTo(teamId: string, delegates: string[] | null): Promise<void> {
     if (delegates === null) {
       await this.db.query(
@@ -104,6 +120,22 @@ export class PgTeamsRepo implements TeamsRepository {
        SET config = jsonb_set(config, '{delegates_to}', $2::jsonb, true)
        WHERE id = $1`,
       [teamId, JSON.stringify(delegates)],
+    );
+  }
+
+  async setValidatorRecommendationLoop(teamId: string, loop: Record<string, unknown> | null): Promise<void> {
+    if (loop === null) {
+      await this.db.query(
+        `UPDATE teams SET config = config - 'validatorRecommendationLoop' WHERE id = $1`,
+        [teamId],
+      );
+      return;
+    }
+    await this.db.query(
+      `UPDATE teams
+       SET config = jsonb_set(config, '{validatorRecommendationLoop}', $2::jsonb, true)
+       WHERE id = $1`,
+      [teamId, JSON.stringify(loop)],
     );
   }
 

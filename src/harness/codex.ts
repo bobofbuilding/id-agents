@@ -219,6 +219,15 @@ export class CodexHarness implements AgentHarness {
       console.log(`[Codex] Reasoning effort: ${eff}`);
     }
 
+    // Output speed (set per-agent in the Control Center). `codex --help`
+    // currently shows no launch-time --fast flag or speed config key. Do not
+    // invent one; log this so operators know the requested setting could not be
+    // applied.
+    const speedRaw = process.env.ID_AGENT_SPEED;
+    if (speedRaw === 'fast') {
+      console.log('[Codex] TODO: speed=fast requested, but no Codex launch-time fast flag or speed config key is available.');
+    }
+
     // Attach external MCP servers (Modules view) via a PRIVATE, per-agent config
     // file — NOT `-c …env={…}` on argv (which is world-readable via `ps` and leaked
     // the operator's tokens). prepareCodexHome shares auth + sessions with the real

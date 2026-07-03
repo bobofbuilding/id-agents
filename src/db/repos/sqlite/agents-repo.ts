@@ -422,6 +422,20 @@ export class SqliteAgentsRepo implements AgentsRepository {
     );
   }
 
+  async moveToTeam(agentId: string, teamId: string, status?: string): Promise<void> {
+    if (status !== undefined) {
+      await this.db.query(
+        `UPDATE agents SET team_id = ?, status = ? WHERE id = ?`,
+        [teamId, status, agentId],
+      );
+      return;
+    }
+    await this.db.query(
+      `UPDATE agents SET team_id = ? WHERE id = ?`,
+      [teamId, agentId],
+    );
+  }
+
   async updateStatus(
     agentId: string,
     status: string,

@@ -20,6 +20,7 @@ interface AgentsTableProps {
 
 function isRemoteAgent(a: Agent): boolean {
   return a.deploymentShape === 'remote-endpoint' ||
+    a.runtime === 'public-agent-remote' ||
     a.metadata?.runtime === 'public-agent-remote';
 }
 

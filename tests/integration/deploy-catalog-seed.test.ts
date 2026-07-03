@@ -33,6 +33,7 @@ import { SqliteTasksRepo } from '../../src/db/repos/sqlite/tasks-repo.js';
 import { SqliteEventsRepo } from '../../src/db/repos/sqlite/events-repo.js';
 import { SqliteSubscriptionsRepo } from '../../src/db/repos/sqlite/subscriptions-repo.js';
 import { SqliteCheckinsRepo } from '../../src/db/repos/sqlite/checkins-repo.js';
+import { SqliteRuntimeLaneCooldownsRepo } from '../../src/db/repos/sqlite/runtime-lane-cooldowns-repo.js';
 
 async function createInMemoryDb() {
   const adapter = new SqliteAdapter(':memory:');
@@ -48,6 +49,7 @@ async function createInMemoryDb() {
     events: new SqliteEventsRepo(adapter),
     subscriptions: new SqliteSubscriptionsRepo(adapter),
     checkins: new SqliteCheckinsRepo(adapter),
+    runtimeLaneCooldowns: new SqliteRuntimeLaneCooldownsRepo(adapter),
     async close() { await adapter.close(); },
   };
 }
@@ -183,10 +185,7 @@ describe('catalog seed deploy integration', () => {
   });
 
   afterEach(async () => {
-    await new Promise<void>((resolve) => {
-      (manager as any).httpServer?.close(() => resolve());
-      setTimeout(resolve, 500);
-    });
+    await manager.shutdown();
     await db.close();
     try { fs.rmSync(workDir, { recursive: true, force: true }); } catch { /* ignore */ }
     try { fs.rmSync(configDir, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -368,7 +367,7 @@ agents:
     // This is the spawn-site change at src/agent-manager-db.ts buildLocalAgentEnv:
     // metadata.catalog must be encoded into ID_AGENT_CATALOG so the spawned
     // local-agent-server can seed in-memory /catalog state before binding.
-    const env = (manager as any).buildLocalAgentEnv(TEST_TEAM, 24999, jrRow);
+    const env = (manager as any).buildLocalAgentEnv(teamId, TEST_TEAM, 24999, jrRow);
     expect(env.ID_AGENT_CATALOG).toBeTruthy();
     const decoded = JSON.parse(Buffer.from(env.ID_AGENT_CATALOG, 'base64').toString('utf8'));
     expect(decoded.role).toBe('junior-developer');
@@ -380,7 +379,7 @@ agents:
     // No catalog on row → no ID_AGENT_CATALOG. Confirms the var is only set
     // when there's something to seed (no empty-string footgun).
     const bareRow = { ...jrRow, metadata: {} as any };
-    const bareEnv = (manager as any).buildLocalAgentEnv(TEST_TEAM, 24999, bareRow);
+    const bareEnv = (manager as any).buildLocalAgentEnv(teamId, TEST_TEAM, 24999, bareRow);
     expect(bareEnv.ID_AGENT_CATALOG).toBeUndefined();
   });
 
@@ -401,6 +400,7 @@ agents:
 
     for (const [configuredModel, expectedModel] of cases) {
       const env = (manager as any).buildLocalAgentEnv(
+        teamId,
         TEST_TEAM,
         24999,
         jrRow,

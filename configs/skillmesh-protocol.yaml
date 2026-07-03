@@ -15,6 +15,7 @@ defaults:
     - identity
     - inter-agent
     - catalog
+    - task-discipline
   plugins:
     - name: skillmesh
       path: ../workspace/projects/skillmesh/agents/plugins/skillmesh
@@ -25,7 +26,12 @@ agents:
     description: >
       Protocol Monitoring Stack lead — watches on-chain event streams, classifies
       anomalies against baselines, summarizes incidents with timeline and
-      recommendations, and dispatches alerts to operator endpoints.
+      recommendations, and dispatches alerts to operator endpoints. Returns
+      substantial accomplishment packets through default/coder and default/researcher
+      validation before default/lead treats the work as final.
+    skills:
+      - team-coordinator
+      - brain
     catalog:
       role: monitor
       expertise:

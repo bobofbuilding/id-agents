@@ -32,7 +32,7 @@ import { loadMasterKey, deriveKeyAtIndex } from './lib/skillmesh-key-manager.js'
 import { type Db } from './db/db-service.js';
 import type { AgentRow, QueryRow, ScheduleDefinitionRow, TaskRow } from './db/types.js';
 import fetch from 'node-fetch';
-import type { PluginConfig, DeployConfig, HeartbeatConfig, CalendarSpec, ScheduleDeliveryMode, OrgConfig } from './config-parser.js';
+import type { PluginConfig, DeployConfig, HeartbeatConfig, CalendarSpec, ScheduleDeliveryMode, OrgConfig, RuntimeCredentialPoolConfig } from './config-parser.js';
 import {
   processConfig,
   copyAgentDirOverlay,
@@ -65,11 +65,29 @@ import { PROTOCOL_DEFAULTS } from './protocol-defaults.js';
 import { computeSyncPlan, formatSyncSummary, formatSyncVerbose } from './sync.js';
 import { validateName } from './name-validation.js';
 import {
+  detectDefaultCoderRuntimeDrift,
+  stripDefaultCoderRuntimeMetadata,
+} from './default-coder-drift.js';
+import {
+  appendTaskBriefFieldsToDescription,
+  getBittreesContributorPriority,
+  getTaskBriefValidationMode,
+  shouldBlockTaskBrief,
+  shouldBlockTaskCompletion,
+  validateTaskBrief,
+  validateTaskCompletionPacket,
+  type TaskBriefValidationInput,
+  type TaskBriefValidationResult,
+  type TaskCompletionValidationResult,
+} from './task-brief-validation.js';
+import {
   emitQueryDelivered,
   emitQueryExpired,
   emitQueryFailed,
   emitTaskClaimed,
   emitTaskCompleted,
+  emitTaskRefreshed,
+  emitTaskTriaged,
   recordCheckinCreated,
 } from './wakeup-service/event-producer.js';
 import { RetentionService } from './wakeup-service/retention.js';
@@ -88,6 +106,11 @@ import { closeLinkedCheckinsForTerminalTask } from './checkins/checkin-autoclose
 import type { CheckinRow } from './db/types.js';
 import { parseAgentRef, normalizeAlias, buildAmbiguityWarning, type AgentMatch } from './core/agent-identifier.js';
 import { resolveNewsTrigger } from './core/messaging-service.js';
+import {
+  extractLearningLoopCapture,
+  normalizeLearningLoopCapture,
+  type LearningLoopCapture,
+} from './core/learning-loop-capture.js';
 import type { HarnessType } from './harness/types.js';
 import { SchedulerService } from './scheduling/scheduler-service.js';
 import { heartbeatToSchedule, calendarToSchedule, validateIntervalSeconds, HEARTBEAT_GENERIC_MESSAGE } from './scheduling/schedule-config.js';
@@ -97,26 +120,26 @@ import {
   getDefaultRuntime,
   getRuntimePaths,
   isRemoteEndpointRuntime,
+  isProviderRuntimeSpecifier,
   isRuntimeId,
   isSupportedRuntimeSpecifier,
   resolveRuntime,
   runtimeIssueHint,
   validateRuntimePreflight,
 } from './runtime/registry.js';
+import { resolveModelAlias } from './core/model-aliases.js';
+export { MODEL_ALIASES, resolveModelAlias } from './core/model-aliases.js';
 
 // ES module equivalent of __dirname
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const DEFAULT_MAX_DOING_TASKS = 30;
+const DEFAULT_STALLED_TASK_MAX_PROBES = 3;
 
-// Model alias resolution
-const MODEL_ALIASES: Record<string, string> = {
-  'haiku': 'claude-haiku-4-5-20251001',
-  'sonnet': 'claude-sonnet-4-5-20250514',
-  'opus': 'claude-opus-4-5-20250514'
-};
-
-function resolveModelAlias(model: string): string {
-  return MODEL_ALIASES[model.toLowerCase()] || model;
+interface StalledProbeState {
+  lastAt: number;
+  attempts: number;
+  escalatedAt: number | null;
 }
 
 function tokenizeCommand(command: string): string[] {
@@ -183,7 +206,7 @@ interface RestAPCatalog {
  */
 const TOPIC_ALIASES: Record<string, readonly string[]> = {
   'query:terminal': ['query:delivered', 'query:failed', 'query:expired'],
-  'task:status': ['task:created', 'task:claimed', 'task:completed'],
+  'task:status': ['task:created', 'task:claimed', 'task:completed', 'task:refreshed', 'task:triaged'],
   'agent:lifecycle': ['agent:started', 'agent:stopped', 'agent:rebuild'],
 };
 
@@ -252,10 +275,15 @@ function parseAutoAttachFlags(body: Record<string, unknown>): AutoAttachFlagsRes
   return result;
 }
 
-function makeAutoAttachError(status: number, code: string): Error & { status: number; code: string } {
-  const err = new Error(code) as Error & { status: number; code: string };
+function makeAutoAttachError(
+  status: number,
+  code: string,
+  details?: Record<string, unknown>,
+): Error & { status: number; code: string; details?: Record<string, unknown> } {
+  const err = new Error(code) as Error & { status: number; code: string; details?: Record<string, unknown> };
   err.status = status;
   err.code = code;
+  err.details = details;
   return err;
 }
 
@@ -351,6 +379,22 @@ type AgentMetadata = Record<string, any> & {
   primaryLead?: boolean;
 };
 
+function envFlagEnabled(value: string | undefined): boolean {
+  return /^(1|true|yes|on)$/i.test(String(value || '').trim());
+}
+
+function envFlagDisabled(value: string | undefined): boolean {
+  return /^(0|false|no|off)$/i.test(String(value || '').trim());
+}
+
+function pluginLooksLikeSkillmesh(plugin: unknown): boolean {
+  if (!plugin || typeof plugin !== 'object') return false;
+  const record = plugin as Record<string, unknown>;
+  return [record.name, record.path]
+    .filter((value): value is string => typeof value === 'string')
+    .some(value => /(^|[/_.-])skillmesh([/_.-]|$)/i.test(value));
+}
+
 // WebSocket client tracking
 interface WSClient {
   ws: WebSocket;
@@ -408,6 +452,67 @@ interface ProcessInspection {
   commandLine: string;
 }
 
+type RuntimeLaneKind = 'subscription' | 'metered-api';
+
+interface RuntimeCredentialLane {
+  id: string;
+  runtime: HarnessType;
+  kind: RuntimeLaneKind;
+  env?: Record<string, string>;
+}
+
+interface ProviderRuntimeAssignment {
+  lane: string;
+  name: string;
+  kind?: string;
+  baseUrl: string;
+  keyEnv?: string;
+  apiKey?: string;
+}
+
+function providerRuntimeErrorStatus(message: string): number {
+  return /provider runtime lane|requires baseUrl/i.test(message) ? 400 : 500;
+}
+
+interface RuntimeLaneCooldown {
+  laneId: string;
+  runtime: HarnessType;
+  kind: RuntimeLaneKind;
+  coolingUntilMs: number;
+  observedAtMs: number;
+  reason: string;
+  teamId?: string;
+  agentId?: string;
+  agentName?: string;
+  queryId?: string;
+  resetText?: string;
+  message?: string;
+}
+
+interface ValidatorRecommendationLoopConfig {
+  enabled: boolean;
+  owners: string[];
+  lead: string;
+  objective: string;
+  trigger: 'validation_task_completed';
+  updatedAt: number | null;
+}
+
+const DEFAULT_VALIDATOR_RECOMMENDATION_OBJECTIVE =
+  `Default-team coder and researcher own the post-validation recommendation loop. ` +
+  `When either validator completes validation of work produced by another team, they must produce a concise next-step recommendation packet for lead. ` +
+  `The packet must keep approval separate from follow-up work: approval closes the validated task, while recommendations become new tracked objectives. ` +
+  `Lead reviews approved recommendations and relays each objective to the ideal team lead, who decomposes the objective into tasks for that team's dependent members.`;
+
+const DEFAULT_VALIDATOR_RECOMMENDATION_LOOP: ValidatorRecommendationLoopConfig = {
+  enabled: false,
+  owners: ['coder', 'researcher'],
+  lead: 'lead',
+  objective: DEFAULT_VALIDATOR_RECOMMENDATION_OBJECTIVE,
+  trigger: 'validation_task_completed',
+  updatedAt: null,
+};
+
 export class AgentManagerDb {
   private managementApp: express.Application;
   private httpServer: HttpServer | null = null;
@@ -418,6 +523,7 @@ export class AgentManagerDb {
   private runningServers: Map<string, AgentRestServer> = new Map(); // key: `${teamId}:${agentId}`
   private agentRole: 'manager' | 'worker' = 'manager';
   private defaultConfig: DeployConfig['defaults'] | null = null;
+  private defaultDeploymentConfig: DeployConfig | null = null;
   private schedulerService: SchedulerService | null = null;
   private queryWaiters: Map<string, QueryWaiter> = new Map(); // key: query_id
   private queryBrainContext: Map<string, BrainVolunteerContext> = new Map(); // key: query_id
@@ -430,7 +536,12 @@ export class AgentManagerDb {
   private remoteProbeInterval: NodeJS.Timeout | null = null;
   private querySweeperInterval: NodeJS.Timeout | null = null;
   private stalledSweepInterval: NodeJS.Timeout | null = null;
-  private stalledNudges = new Map<string, number>(); // taskId → last nudge ts (throttle)
+  private runtimeLaneCooldowns: Map<string, RuntimeLaneCooldown> = new Map();
+  private runtimeCredentialPoolByTeam: Map<string, RuntimeCredentialPoolConfig> = new Map();
+  private defaultRuntimeCredentialPool: RuntimeCredentialPoolConfig | null = null;
+  private providerRuntimeAssignments: Map<string, ProviderRuntimeAssignment> = new Map();
+  private runtimeFailoverRetryOf: Map<string, string> = new Map();
+  private stalledNudges = new Map<string, StalledProbeState>(); // probe key -> throttle/count state
   private retentionService: RetentionService | null = null;
   private checkinService: CheckinService | null = null;
   /**
@@ -469,6 +580,556 @@ export class AgentManagerDb {
     }
   }
 
+  private getMaxDoingTasks(): number {
+    const raw = process.env.ID_MAX_DOING_TASKS;
+    const parsed = raw ? Number(raw) : DEFAULT_MAX_DOING_TASKS;
+    return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : DEFAULT_MAX_DOING_TASKS;
+  }
+
+  private getMaxStalledTaskProbes(): number {
+    const raw = process.env.STALL_MAX_PROBES;
+    const parsed = raw ? Number(raw) : DEFAULT_STALLED_TASK_MAX_PROBES;
+    return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : DEFAULT_STALLED_TASK_MAX_PROBES;
+  }
+
+  private canRunStalledProbe(key: string, nowMs: number, renudgeMs: number, maxProbes: number): boolean {
+    const state = this.stalledNudges.get(key);
+    if (!state) return true;
+    if (state.attempts >= maxProbes) return false;
+    return nowMs - state.lastAt >= renudgeMs;
+  }
+
+  private markStalledProbe(key: string, nowMs: number): number {
+    const prev = this.stalledNudges.get(key);
+    const next: StalledProbeState = {
+      lastAt: nowMs,
+      attempts: (prev?.attempts ?? 0) + 1,
+      escalatedAt: prev?.escalatedAt ?? null,
+    };
+    this.stalledNudges.set(key, next);
+    return next.attempts;
+  }
+
+  private canEscalateStalledProbe(key: string, maxProbes: number): boolean {
+    const state = this.stalledNudges.get(key);
+    return !!state && state.attempts >= maxProbes && state.escalatedAt === null;
+  }
+
+  private markStalledProbeEscalated(key: string, nowMs: number): void {
+    const prev = this.stalledNudges.get(key);
+    this.stalledNudges.set(key, {
+      lastAt: prev?.lastAt ?? nowMs,
+      attempts: prev?.attempts ?? 0,
+      escalatedAt: nowMs,
+    });
+  }
+
+  private async countDoingTasks(teamId: string): Promise<number> {
+    const doing = await this.db.tasks.list({ status: 'doing', teamId });
+    return doing.length;
+  }
+
+  private async hasDoingTaskRoom(teamId: string): Promise<boolean> {
+    return (await this.countDoingTasks(teamId)) < this.getMaxDoingTasks();
+  }
+
+  private async doingTaskLimitMessage(teamId: string): Promise<string> {
+    const limit = this.getMaxDoingTasks();
+    const count = await this.countDoingTasks(teamId);
+    return `Doing column is full (${count}/${limit}); task remains in todo until a doing slot opens`;
+  }
+
+  private validateIncomingTaskBrief(
+    input: TaskBriefValidationInput,
+    options: { immediateExecution?: boolean } = {},
+  ): { validation: TaskBriefValidationResult; blocked: boolean } {
+    const validation = validateTaskBrief(input, getTaskBriefValidationMode());
+    const priority = getBittreesContributorPriority(input, this.taskBriefGuardText(input));
+    if (options.immediateExecution && (priority === 'low/backlog' || priority === 'reject')) {
+      const reasonCode = priority === 'reject'
+        ? 'rejected_bittrees_relevance_live_dispatch'
+        : 'low_bittrees_relevance_live_dispatch';
+      return {
+        validation: {
+          ...validation,
+          ok: false,
+          decision: 'goal_triage_required',
+          route: 'goal-triage',
+          dispatch_ready: false,
+          invalid: [...new Set([...validation.invalid, 'bittrees_relevance'])],
+          message: 'Low/backlog or rejected Bittrees contributor relevance must be routed to backlog, not live delegated work.',
+          reason_codes: [...new Set([...validation.reason_codes, reasonCode])],
+        },
+        blocked: true,
+      };
+    }
+    return {
+      validation,
+      blocked: shouldBlockTaskBrief(validation, options),
+    };
+  }
+
+  private validateCompletionPayload(payload: Record<string, unknown>): {
+    validation: TaskCompletionValidationResult;
+    blocked: boolean;
+  } {
+    const validation = validateTaskCompletionPacket(payload, getTaskBriefValidationMode());
+    return {
+      validation,
+      blocked: shouldBlockTaskCompletion(validation),
+    };
+  }
+
+  private taskBriefInputFromTask(task: TaskRow): TaskBriefValidationInput {
+    return {
+      title: task.title,
+      description: task.description,
+    };
+  }
+
+  private taskBriefGuardText(input: TaskBriefValidationInput | Record<string, unknown>): string {
+    return [
+      input.title,
+      input.description,
+      (input as any).message,
+      (input as any).bittrees_relevance,
+      (input as any).bittreesRelevance,
+      (input as any).bittrees_contributor_relevance,
+      (input as any).bittreesContributorRelevance,
+      (input as any).relevance,
+      (input as any).validation_purpose,
+      (input as any).validationPurpose,
+      (input as any).parent_task,
+      (input as any).parentTask,
+      (input as any).parent_task_name,
+      (input as any).parentTaskName,
+      (input as any).parent_ref,
+      (input as any).parentRef,
+    ]
+      .map((value) => typeof value === 'string' ? value : value && typeof value === 'object' ? JSON.stringify(value) : '')
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  private firstBriefString(input: TaskBriefValidationInput | Record<string, unknown>, keys: string[]): string | null {
+    for (const key of keys) {
+      const value = (input as any)[key];
+      if (typeof value === 'string' && value.trim()) return value.trim();
+    }
+    return null;
+  }
+
+  private briefLabel(text: string, label: string): string | null {
+    const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const match = text.match(new RegExp(`(?:^|\\n)\\s*${escaped}\\s*:\\s*([^\\n]+)`, 'i'));
+    return match?.[1]?.trim() || null;
+  }
+
+  private normalizeGuardKey(value: string): string {
+    return value.toLowerCase().replace(/[^a-z0-9#]+/g, '-').replace(/^-+|-+$/g, '');
+  }
+
+  private defaultValidatorName(agent: AgentRow | null | undefined): string | null {
+    if (!agent) return null;
+    const alias = typeof (agent.metadata as any)?.alias === 'string' ? (agent.metadata as any).alias : '';
+    const names = [agent.name, alias].map((s) => s.toLowerCase());
+    if (names.includes('coder')) return 'coder';
+    if (names.includes('researcher')) return 'researcher';
+    return null;
+  }
+
+  private validationChildKey(
+    input: TaskBriefValidationInput | Record<string, unknown>,
+    validatorName?: string | null,
+  ): { parentRef: string; purpose: string } | null {
+    const text = this.taskBriefGuardText(input);
+    if (!/\b(validat(e|ion|or)|review|approval|approve)\b/i.test(text)) return null;
+    const parent = this.firstBriefString(input, [
+      'parent_task',
+      'parentTask',
+      'parent_task_name',
+      'parentTaskName',
+      'parent_ref',
+      'parentRef',
+      'validates_task',
+      'validatesTask',
+    ])
+      || this.briefLabel(text, 'Parent task')
+      || this.briefLabel(text, 'Validation parent')
+      || this.briefLabel(text, 'Validates task');
+    if (!parent) return null;
+    const purpose = this.firstBriefString(input, ['validation_purpose', 'validationPurpose'])
+      || this.briefLabel(text, 'Validation purpose')
+      || (validatorName ? `${validatorName}-validation` : 'validation');
+    return {
+      parentRef: this.normalizeGuardKey(parent),
+      purpose: this.normalizeGuardKey(purpose),
+    };
+  }
+
+  private async validateValidatorChildTaskCreation(params: {
+    teamId: string;
+    input: TaskBriefValidationInput | Record<string, unknown>;
+    fromAgent?: AgentRow | null;
+    targetAgent?: AgentRow | null;
+  }): Promise<{ status: number; code: string; message: string; existingTask?: string } | null> {
+    const key = this.validationChildKey(params.input, this.defaultValidatorName(params.targetAgent));
+    if (!key) return null;
+
+    if (this.defaultValidatorName(params.fromAgent)) {
+      return {
+        status: 409,
+        code: 'validator_task_recursion_blocked',
+        message: 'Validator tasks must not create validator tasks.',
+      };
+    }
+
+    const tasks = await this.db.tasks.list({ teamId: params.teamId }).catch(() => [] as TaskRow[]);
+    for (const candidate of tasks) {
+      if (candidate.status === 'done') continue;
+      const owner = candidate.owner ? await this.db.agents.getById(candidate.owner).catch(() => null) : null;
+      const candidateKey = this.validationChildKey(this.taskBriefInputFromTask(candidate), this.defaultValidatorName(owner));
+      if (!candidateKey) continue;
+      if (candidateKey.parentRef === key.parentRef && candidateKey.purpose === key.purpose) {
+        return {
+          status: 409,
+          code: 'duplicate_validator_child_task',
+          message: `Duplicate validator child task for parent "${key.parentRef}" and purpose "${key.purpose}" already exists: ${candidate.name}.`,
+          existingTask: candidate.name,
+        };
+      }
+    }
+
+    return null;
+  }
+
+  private taskCompletionDelegationExemption(payload?: Record<string, unknown>): { exempt: boolean; reason?: string } {
+    if (!payload) return { exempt: false };
+    const noDelegationReason = typeof payload.no_delegation_reason === 'string' && payload.no_delegation_reason.trim()
+      ? payload.no_delegation_reason.trim()
+      : typeof payload.noDelegationReason === 'string' && payload.noDelegationReason.trim()
+        ? payload.noDelegationReason.trim()
+        : null;
+    if (noDelegationReason) return { exempt: true, reason: noDelegationReason };
+    if (payload.advisory_query === true || payload.advisoryQuery === true) {
+      return { exempt: true, reason: 'advisory_query' };
+    }
+    return { exempt: false };
+  }
+
+  private canClaimMalformedBriefForRepair(teamName: string, agent: AgentRow, task: TaskRow): boolean {
+    if (task.created_by && task.created_by === agent.id) return true;
+    if (this.isConfiguredTeamLead(teamName, agent)) return true;
+    const name = agent.name.toLowerCase();
+    return name.includes('manager') || name.includes('triage') || name.includes('lead') || name.includes('coordinator');
+  }
+
+  private normalizeValidatorRecommendationLoopConfig(raw: unknown): ValidatorRecommendationLoopConfig {
+    const cfg = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
+    const owners = Array.isArray(cfg.owners)
+      ? cfg.owners.map(String).map((s) => s.trim()).filter(Boolean)
+      : DEFAULT_VALIDATOR_RECOMMENDATION_LOOP.owners;
+    const lead = typeof cfg.lead === 'string' && cfg.lead.trim()
+      ? cfg.lead.trim()
+      : DEFAULT_VALIDATOR_RECOMMENDATION_LOOP.lead;
+    const objective = typeof cfg.objective === 'string' && cfg.objective.trim()
+      ? cfg.objective.trim()
+      : DEFAULT_VALIDATOR_RECOMMENDATION_LOOP.objective;
+    const updatedAt = typeof cfg.updatedAt === 'number' && Number.isFinite(cfg.updatedAt)
+      ? cfg.updatedAt
+      : null;
+    return {
+      enabled: cfg.enabled === true,
+      owners: owners.length ? owners : DEFAULT_VALIDATOR_RECOMMENDATION_LOOP.owners,
+      lead,
+      objective,
+      trigger: 'validation_task_completed',
+      updatedAt,
+    };
+  }
+
+  private async getValidatorRecommendationLoopConfig(teamId: string): Promise<ValidatorRecommendationLoopConfig> {
+    const cfg = await this.db.teams.getConfig(teamId).catch(() => ({} as Record<string, unknown>));
+    return this.normalizeValidatorRecommendationLoopConfig(cfg.validatorRecommendationLoop);
+  }
+
+  private isValidationTask(task: TaskRow): boolean {
+    const text = `${task.name}\n${task.title}\n${task.description || ''}`.toLowerCase();
+    return /\b(validat(e|ion|or)|review|approve|approval)\b/.test(text);
+  }
+
+  private isValidatorRecommendationTask(task: TaskRow): boolean {
+    const text = `${task.name}\n${task.title}\n${task.description || ''}`.toLowerCase();
+    return /\b(validator[-_\s])?recommendation\b/.test(text)
+      || /\brecommend-next-steps\b/.test(text)
+      || /\bnext-step recommendation\b/.test(text);
+  }
+
+  private readonly configuredTeamLeadNames: Record<string, string[]> = {
+    'engineering-team': ['engineering-lead'],
+    legal: ['general-counsel'],
+    'onchain-execution': ['onchain-lead'],
+    'ops-team': ['ops-lead'],
+    research: ['research-lead'],
+    'technology-security': ['security-router'],
+  };
+
+  private readonly teamLeadDelegationGraceSeconds = 10 * 60;
+
+  private isConfiguredTeamLead(teamName: string, owner: AgentRow | null | undefined): boolean {
+    if (!owner) return false;
+    const configured = this.configuredTeamLeadNames[teamName] || [];
+    if (configured.includes(owner.name)) return true;
+    const role = String((owner.metadata as any)?.role || (owner.metadata as any)?.catalog?.role || '').toLowerCase();
+    return /\b(lead|coordinator|router)\b/.test(role) && /\b(lead|counsel|router)\b/.test(owner.name);
+  }
+
+  private taskRefsFromCompletionPayload(payload: Record<string, unknown> | undefined): string[] {
+    if (!payload) return [];
+    const raw = payload.delegated_task_names
+      ?? payload.delegatedTaskNames
+      ?? payload.child_task_names
+      ?? payload.childTaskNames
+      ?? payload.child_tasks
+      ?? payload.childTasks;
+    if (!Array.isArray(raw)) return [];
+    return raw.map((item) => String(item).trim()).filter(Boolean);
+  }
+
+  private async validateTeamLeadDelegationBeforeDone(params: {
+    teamId: string;
+    teamName: string;
+    task: TaskRow;
+    payload?: Record<string, unknown>;
+  }): Promise<string | null> {
+    const owner = params.task.owner
+      ? await this.db.agents.getById(params.task.owner).catch(() => null)
+      : null;
+    if (!this.isConfiguredTeamLead(params.teamName, owner)) return null;
+    const exemption = this.taskCompletionDelegationExemption(params.payload);
+    if (exemption.exempt) return null;
+
+    const childRefs = this.taskRefsFromCompletionPayload(params.payload);
+    if (childRefs.length === 0) {
+      return `Team lead objectives require delegated_task_names (or child_task_names) naming at least one completed member-owned child task before completion`;
+    }
+
+    for (const childRef of childRefs) {
+      const { task: childTask, error } = await this.resolveTaskRef(childRef, params.teamId);
+      if (!childTask) {
+        return `Delegated child task "${childRef}" not found in ${params.teamName} team${error ? `: ${error}` : ''}`;
+      }
+      if (childTask.id === params.task.id) {
+        return `Delegated child task "${childRef}" cannot be the parent team-lead objective`;
+      }
+      if (childTask.team_id && childTask.team_id !== params.teamId) {
+        return `Delegated child task "${childRef}" is not in the ${params.teamName} team`;
+      }
+      if (!childTask.owner) {
+        return `Delegated child task "${childRef}" must be claimed by a ${params.teamName} member`;
+      }
+      if (owner && childTask.owner === owner.id) {
+        return `Delegated child task "${childRef}" must be owned by a ${params.teamName} member, not ${owner.name}`;
+      }
+      if (childTask.status !== 'done') {
+        return `Delegated child task "${childRef}" must be done before the team-lead objective can be completed`;
+      }
+    }
+
+    return null;
+  }
+
+  private taskMatchesParentRef(candidate: TaskRow, parent: TaskRow): boolean {
+    const shortId = parent.uuid ? parent.uuid.replace(/-/g, '').slice(0, 8).toLowerCase() : '';
+    const text = `${candidate.name}\n${candidate.title}\n${candidate.description || ''}`.toLowerCase();
+    return Boolean(
+      text.includes(parent.name.toLowerCase())
+      || (shortId && text.includes(shortId))
+      || (parent.uuid && text.includes(parent.uuid.toLowerCase())),
+    );
+  }
+
+  private async findDelegatedChildTasks(task: TaskRow, teamId: string, owner: AgentRow | null): Promise<TaskRow[]> {
+    const allTasks = await this.db.tasks.list({ teamId });
+    return allTasks.filter((candidate) => {
+      if (candidate.id === task.id || !candidate.owner || candidate.owner === owner?.id) return false;
+      if (candidate.team_id && candidate.team_id !== teamId) return false;
+      if (candidate.created_at < task.created_at) return false;
+      if (candidate.status !== 'done' && candidate.status !== 'doing' && candidate.status !== 'todo') return false;
+      return candidate.created_by === owner?.id || this.taskMatchesParentRef(candidate, task);
+    });
+  }
+
+  private async buildDelegationAudit(task: TaskRow, teamId: string, teamName: string | null, owner: AgentRow | null): Promise<Record<string, unknown> | null> {
+    if (!teamName || !this.isConfiguredTeamLead(teamName, owner)) return null;
+    if (task.status !== 'doing') return null;
+    const now = Math.floor(Date.now() / 1000);
+    const ageSeconds = Math.max(0, now - task.updated_at);
+    const childTasks = await this.findDelegatedChildTasks(task, teamId, owner);
+    const childTaskRefs = childTasks.map((child) => child.uuid ? `#${child.uuid.replace(/-/g, '').slice(0, 8)}` : child.name);
+    if (childTaskRefs.length > 0) {
+      return {
+        status: 'ok',
+        ownerRole: 'team-lead',
+        ageSeconds,
+        graceSeconds: this.teamLeadDelegationGraceSeconds,
+        childTaskRefs,
+      };
+    }
+    if (ageSeconds < this.teamLeadDelegationGraceSeconds) {
+      return {
+        status: 'pending-delegation',
+        ownerRole: 'team-lead',
+        reason: `Lead-owned doing task is within the ${Math.round(this.teamLeadDelegationGraceSeconds / 60)} minute delegation grace window`,
+        ageSeconds,
+        graceSeconds: this.teamLeadDelegationGraceSeconds,
+        childTaskRefs,
+      };
+    }
+    return {
+      status: 'needs-delegation',
+      ownerRole: 'team-lead',
+      reason: `Lead-owned doing task has no detected member-owned child tasks after ${Math.round(this.teamLeadDelegationGraceSeconds / 60)} minutes`,
+      ageSeconds,
+      graceSeconds: this.teamLeadDelegationGraceSeconds,
+      childTaskRefs,
+    };
+  }
+
+  private async buildLeadDelegationNudge(
+    task: TaskRow,
+    teamId: string,
+    teamName: string,
+    owner: AgentRow | null,
+    ref: string,
+    attempt: number,
+    maxProbes: number,
+    stalledMinutes: number,
+  ): Promise<string | null> {
+    const audit = await this.buildDelegationAudit(task, teamId, teamName, owner);
+    if (!audit || audit.status !== 'needs-delegation') return null;
+    return `Supervision: team-lead task ${ref} ("${task.title}") has no detected member-owned child tasks after ${Math.round(Number(audit.ageSeconds || 0) / 60)}m (delegation probe ${attempt}/${maxProbes}). Create member-owned child tasks with \`/task create ... --owner <teammate>\`, reassign/split the work, or if this is truly advisory close it with \`/task done ${ref} --no-delegation-reason "..." --failure-note "..."\`. Current stalled time: ${stalledMinutes}m.`;
+  }
+
+  private async sendInternalNewsTo(teamName: string, to: string, message: string, from: string): Promise<void> {
+    const res = await fetch(`http://127.0.0.1:${this.managementPort}/news-to`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-id-team': teamName,
+        'x-id-admin': '1',
+      },
+      body: JSON.stringify({ to, from, message }),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`/news-to ${to} failed: ${res.status} ${text.slice(0, 200)}`);
+    }
+  }
+
+  private validatorRecommendationPrompt(params: {
+    task: TaskRow;
+    validatorName: string;
+    leadName: string;
+    objective: string;
+    completionNote?: string;
+  }): string {
+    const ref = `#${params.task.uuid.slice(0, 8)}`;
+    return `Event-driven validator recommendation loop triggered.
+
+You are one of the default-team validators and you own the next-step recommendation objective for the validation you just completed.
+
+Loop objective:
+${params.objective}
+
+Completed validation task:
+- ref: ${ref}
+- name: ${params.task.name}
+- title: ${params.task.title}
+${params.task.description ? `- description: ${params.task.description}\n` : ''}${params.completionNote ? `- completion note: ${params.completionNote}\n` : ''}
+Required response:
+Create a concise recommendation packet for ${params.leadName}. Keep current-task approval separate from future work. If validation failed, set validation_status to needs-revision or blocked and include required fixes for the applicable team lead. If validation passed, include next_step_recommendations as separate follow-up objectives for lead to relay to the ideal team leads. Team leads then break those objectives into tasks for their own dependent team members.
+
+Validation-loop guardrails:
+- Do not create or request validator tasks from this validator task.
+- Use one validator pass per parent task and at most one rework cycle.
+- If a validator stayed processing after bounded polling and one retry, treat that stalled validation as terminal evidence and close it with a failure note instead of redispatching a replacement automatically.
+- Low/backlog or generic recommendations must be routed to backlog, not live child tasks.
+- Every live follow-up recommendation must include goal_id, expected_output, acceptance_criteria, validation_path, out_of_scope, backlog_policy, and Bittrees contributor relevance.
+
+Return this JSON shape:
+{
+  "validation_status": "approved | needs-revision | blocked",
+  "summary": "...",
+  "validation_budget": {
+    "validator_passes_allowed": 1,
+    "rework_cycles_allowed": 1,
+    "validator_tasks_may_create_validator_tasks": false
+  },
+  "validator_findings": {
+    "${params.validatorName}": "..."
+  },
+  "next_step_recommendations": [
+    {
+      "title": "...",
+      "owner_team": "engineering-team | legal | onchain-execution | ops-team | research | technology-security | installed optional provider team",
+      "priority": "high | medium | low/backlog | reject",
+      "goal_id": "goal_...",
+      "bittrees_relevance": "high | medium | low/backlog | reject - one sentence",
+      "rationale": "...",
+      "expected_output": "...",
+      "dependencies": ["..."],
+      "acceptance_criteria": ["..."],
+      "validation_path": "coder and researcher",
+      "out_of_scope": ["..."],
+      "backlog_policy": "..."
+    }
+  ],
+  "lead_routing_instruction": "Lead should dispatch only high/medium approved recommendation objectives with dispatch-ready briefs; low/backlog or generic objectives stay in backlog."
+}`;
+  }
+
+  private async maybeTriggerValidatorRecommendationLoop(params: {
+    teamId: string;
+    teamName: string;
+    task: TaskRow;
+    completionPayload?: Record<string, unknown>;
+  }): Promise<void> {
+    // This loop is strictly post-completion. Some command paths pass through here
+    // after assignment/status changes; do not let those create premature
+    // recommendation traffic or stale lead drafts.
+    if (params.task.status !== 'done' || !params.task.completed_at) return;
+    const cfg = await this.getValidatorRecommendationLoopConfig(params.teamId);
+    if (!cfg.enabled) return;
+    if (!params.task.owner) return;
+
+    const owner = await this.db.agents.getById(params.task.owner).catch(() => null);
+    if (!owner || !cfg.owners.includes(owner.name)) return;
+    if (!this.isValidationTask(params.task)) return;
+    if (this.isValidatorRecommendationTask(params.task)) return;
+
+    const completionNote = typeof params.completionPayload?.note === 'string'
+      ? params.completionPayload.note
+      : typeof params.completionPayload?.message === 'string'
+        ? params.completionPayload.message
+        : undefined;
+
+    const message = this.validatorRecommendationPrompt({
+      task: params.task,
+      validatorName: owner.name,
+      leadName: cfg.lead,
+      objective: cfg.objective,
+      completionNote,
+    });
+
+    try {
+      await this.sendInternalNewsTo(params.teamName, owner.name, message, cfg.lead);
+      this.managerLog(`validator recommendation loop asked ${owner.name} for task ${params.task.name}; lead ${cfg.lead} will route only if the validator returns approved follow-up recommendations`);
+    } catch (err: any) {
+      this.managerLog(`validator recommendation loop trigger failed for task ${params.task.name}: ${err?.message || err}`);
+    }
+  }
+
   constructor(
     baseWorkDir: string = '/workspace',
     db: Db,
@@ -503,6 +1164,13 @@ export class AgentManagerDb {
     this.loadDefaultConfig();
 
     this.managementApp = express();
+    // Local control-center traffic is high-churn and latency is negligible.
+    // Closing HTTP sockets after each response prevents Electron/agent clients
+    // from accumulating large keep-alive pools that can pin manager CPU.
+    this.managementApp.use((_req, res, next) => {
+      res.setHeader('Connection', 'close');
+      next();
+    });
     // Agent results can be large (git diffs, file contents, long replies). The
     // default 100kb limit rejected those with PayloadTooLargeError, surfacing as a
     // "failed" / "Claude Code produced an empty result" in chat. Match the agent
@@ -533,7 +1201,9 @@ export class AgentManagerDb {
         try {
           const content = readFileSync(configPath, 'utf-8');
           const config = yaml.load(content) as DeployConfig;
+          this.defaultDeploymentConfig = config || null;
           this.defaultConfig = config?.defaults || null;
+          this.defaultRuntimeCredentialPool = config?.runtimeCredentialPool || null;
           console.log(`[AgentManager] Loaded default config from ${configPath}`);
           if (this.defaultConfig?.plugins) {
             console.log(`[AgentManager] Default plugins: ${this.defaultConfig.plugins.map(p => p.name).join(', ')}`);
@@ -663,15 +1333,17 @@ export class AgentManagerDb {
       env.ID_TALK_TIMEOUT = String(agent.metadata.talkTimeout);
     }
 
-    // Inject per-agent SkillMesh signing key so the agent can call SkillMesh APIs
-    const skillmeshKey = (agent.metadata as any)?.skillmesh_private_key;
+    // SkillMesh is an optional provider. Only expose signing material to agents
+    // that explicitly carry the provider/plugin wiring.
+    const skillmeshProviderEnabled = this.isSkillmeshProviderEnabled(teamName, agent.metadata as AgentMetadata);
+    const skillmeshKey = skillmeshProviderEnabled ? (agent.metadata as any)?.skillmesh_private_key : undefined;
     if (skillmeshKey) {
       env.SKILLMESH_PRIVATE_KEY = skillmeshKey;
       env.SKILLMESH_APP_URL = process.env.SKILLMESH_APP_URL || 'https://skillmesh.bittrees.org';
       env.SKILLMESH_RPC_URL = process.env.SKILLMESH_RPC_URL || 'https://sepolia.drpc.org';
     }
     // Inject creator key for agents that need to publish skills on-chain
-    const skillmeshCreatorKey = (agent.metadata as any)?.skillmesh_creator_key;
+    const skillmeshCreatorKey = skillmeshProviderEnabled ? (agent.metadata as any)?.skillmesh_creator_key : undefined;
     if (skillmeshCreatorKey) {
       env.SKILLMESH_CREATOR_PRIVATE_KEY = skillmeshCreatorKey;
     }
@@ -869,7 +1541,45 @@ export class AgentManagerDb {
   }): Promise<void> {
     const { teamId, queryId, occurredAt, resultPayload, waiterReply, messagePreview } = params;
 
-    await this.db.queries.complete(teamId, queryId, occurredAt, resultPayload);
+    const rawUsedSourceIds = Array.isArray((resultPayload as any).used_source_ids)
+      ? (resultPayload as any).used_source_ids.map(String)
+      : Array.isArray((resultPayload as any).usedSourceIds)
+        ? (resultPayload as any).usedSourceIds.map(String)
+        : [];
+    const pendingBrainContext = this.queryBrainContext.get(queryId)
+      || ((resultPayload as any).brain_context as BrainVolunteerContext | undefined)
+      || ((resultPayload as any).brainContext as BrainVolunteerContext | undefined)
+      || null;
+    const rawVolunteeredSourceIds = Array.isArray((resultPayload as any).volunteered_source_ids)
+      ? (resultPayload as any).volunteered_source_ids.map(String)
+      : Array.isArray((resultPayload as any).volunteeredSourceIds)
+        ? (resultPayload as any).volunteeredSourceIds.map(String)
+        : Array.isArray(pendingBrainContext?.cited?.canonical_source_ids)
+          ? pendingBrainContext.cited.canonical_source_ids.map(String)
+          : [];
+    const queryLearningLoopInput = extractLearningLoopCapture(resultPayload);
+    const queryTeamName = queryLearningLoopInput
+      ? (await this.db.teams.getTeam(teamId))?.name || teamId
+      : teamId;
+    const queryLearningLoop = queryLearningLoopInput
+      ? normalizeLearningLoopCapture({
+        payload: resultPayload,
+        subject: {
+          kind: 'query',
+          ref: `query:${queryId}`,
+          route: 'manager.dispatch',
+        },
+        teamName: queryTeamName,
+        usedSourceIds: rawUsedSourceIds,
+        volunteeredSourceIds: rawVolunteeredSourceIds,
+        occurredAt,
+      })
+      : null;
+    const completionPayload = queryLearningLoop
+      ? { ...resultPayload, learning_loop: queryLearningLoop }
+      : resultPayload;
+
+    await this.db.queries.complete(teamId, queryId, occurredAt, completionPayload);
 
     const completedRow = await this.db.queries
       .getByQueryIdForTeam(teamId, queryId)
@@ -878,27 +1588,27 @@ export class AgentManagerDb {
       const brainContext = this.queryBrainContext.get(queryId)
         || ((completedRow.metadata as any)?.brain_context as BrainVolunteerContext | undefined)
         || null;
-      const usedSourceIds = Array.isArray((resultPayload as any).used_source_ids)
-        ? (resultPayload as any).used_source_ids.map(String)
-        : Array.isArray((resultPayload as any).usedSourceIds)
-          ? (resultPayload as any).usedSourceIds.map(String)
+      const usedSourceIds = Array.isArray((completionPayload as any).used_source_ids)
+        ? (completionPayload as any).used_source_ids.map(String)
+        : Array.isArray((completionPayload as any).usedSourceIds)
+          ? (completionPayload as any).usedSourceIds.map(String)
           : [];
       const metadataTaskId = typeof (brainContext as any)?.task_id === 'string'
         ? (brainContext as any).task_id
         : typeof ((completedRow.metadata as any)?.brain_context?.task_id) === 'string'
           ? (completedRow.metadata as any).brain_context.task_id
           : null;
-      const taskId = typeof (resultPayload as any).task_id === 'string'
-        ? (resultPayload as any).task_id
-        : typeof (resultPayload as any).taskId === 'string'
-          ? (resultPayload as any).taskId
+      const taskId = typeof (completionPayload as any).task_id === 'string'
+        ? (completionPayload as any).task_id
+        : typeof (completionPayload as any).taskId === 'string'
+          ? (completionPayload as any).taskId
           : metadataTaskId;
       await this.postBrainInstructionFeedback({
         taskId,
         queryId,
         agentId: completedRow.owner_kind === 'manager' ? null : completedRow.agent_id,
         context: brainContext,
-        payload: resultPayload,
+        payload: completionPayload,
       });
       await this.postBrainEvalCapture({
         queryText: completedRow.prompt || messagePreview || '',
@@ -908,6 +1618,7 @@ export class AgentManagerDb {
         queryId,
         context: brainContext,
         usedSourceIds,
+        learningLoop: queryLearningLoop,
       });
       await emitQueryDelivered(this.db.events, {
         teamId,
@@ -921,6 +1632,7 @@ export class AgentManagerDb {
         taskId,
         usedSourceIds,
         volunteeredSourceIds: brainContext?.cited?.canonical_source_ids || [],
+        learningLoop: queryLearningLoop,
       });
     }
 
@@ -1016,6 +1728,7 @@ export class AgentManagerDb {
     'ssh_private_key',
     'ssh_target',
     'internal_endpoint_url',
+    'runtimeCredentialPool',
   ]);
 
   private static readonly SENSITIVE_META_REGEX = /private_?key|secret/i;
@@ -1102,6 +1815,10 @@ export class AgentManagerDb {
       deploymentShape: 'local-process' as const,
     };
 
+    const runtimeDisplay = a.runtime === 'provider-api' && typeof (a.metadata as any)?.runtime === 'string'
+      ? (a.metadata as any).runtime
+      : a.runtime;
+
     const full = {
       id: a.id,
       // name is the displayId (e.g., "agent-5.xid.eth") for inter-agent communication
@@ -1115,7 +1832,7 @@ export class AgentManagerDb {
       workingDirectory: a.working_directory,
       createdAt: a.created_at,
       type: a.type,
-      runtime: a.runtime,
+      runtime: runtimeDisplay,
       url,
       metadata: a.metadata,
       // Identity fields
@@ -1164,6 +1881,75 @@ export class AgentManagerDb {
     return spawnResult;
   }
 
+  private async handleRuntimeRateLimitFailover(
+    teamId: string,
+    teamName: string,
+    cooldown: RuntimeLaneCooldown,
+  ): Promise<{ attempted: boolean; success?: boolean; pid?: number; retryQueryId?: string; laneId?: string; error?: string }> {
+    if (!cooldown.agentId) return { attempted: false };
+    const agent = await this.dbQueryAgentById(teamId, cooldown.agentId).catch(() => null);
+    const runtime = resolveRuntime(agent?.runtime || cooldown.runtime);
+    if (!agent || (runtime !== 'claude-code-cli' && runtime !== 'claude-code-local')) return { attempted: false };
+
+    const nextLane = this.chooseRuntimeCredentialLane(runtime, cooldown.laneId, teamId, true);
+    const metadata = (agent.metadata as Record<string, unknown>) || {};
+    await this.db.agents.updateMetadata(agent.id, {
+      ...metadata,
+      runtimeCredentialLane: nextLane.id,
+      runtimeRateLimitFailover: {
+        fromLaneId: cooldown.laneId,
+        toLaneId: nextLane.id,
+        queryId: cooldown.queryId,
+        observedAtMs: Date.now(),
+      },
+    });
+
+    const spawnResult = await this.rebuildLocalClaudeAgent(teamId, teamName, {
+      ...agent,
+      metadata: { ...metadata, runtimeCredentialLane: nextLane.id },
+    });
+    if (!spawnResult.success) {
+      return { attempted: true, success: false, pid: spawnResult.pid, laneId: nextLane.id, error: spawnResult.error };
+    }
+
+    if (!cooldown.queryId) {
+      return { attempted: true, success: true, pid: spawnResult.pid, laneId: nextLane.id };
+    }
+
+    const query = await this.db.queries.getByQueryIdForTeam(teamId, cooldown.queryId).catch(() => null);
+    if (!query || !query.prompt) {
+      return { attempted: true, success: true, pid: spawnResult.pid, laneId: nextLane.id, error: 'original query not found for failover replay' };
+    }
+
+    const targetUrl = `http://localhost:${agent.port}`;
+    const result = await this.forwardToAgent(targetUrl, query.prompt, 'manager', query.session_id ?? undefined);
+    if (!result.ok) {
+      return { attempted: true, success: false, pid: spawnResult.pid, laneId: nextLane.id, error: result.error };
+    }
+
+    const retryQueryId = result.data?.query_id;
+    if (retryQueryId) {
+      this.runtimeFailoverRetryOf.set(String(retryQueryId), cooldown.queryId);
+      await this.db.queries.create(
+        teamId,
+        String(retryQueryId),
+        agent.id,
+        query.prompt,
+        Date.now(),
+        query.session_id ?? undefined,
+        undefined,
+        {
+          ...(query.metadata || {}),
+          retry_of: cooldown.queryId,
+          runtimeCredentialLane: nextLane.id,
+          failedRuntimeCredentialLane: cooldown.laneId,
+        },
+      );
+    }
+
+    return { attempted: true, success: true, pid: spawnResult.pid, retryQueryId: retryQueryId ? String(retryQueryId) : undefined, laneId: nextLane.id };
+  }
+
   /**
    * Resolve agents matching an identifier pattern
    * Returns all matches for ambiguity detection
@@ -1188,6 +1974,46 @@ export class AgentManagerDb {
    * Get the shared deployer address.
    * Uses OWS wallet if OWS_REGISTRAR_WALLET is set, otherwise derives from PRIVATE_KEY.
    */
+  private explicitSkillmeshProviderState(metadata: AgentMetadata | null | undefined): boolean | null {
+    if (!metadata || typeof metadata !== 'object') return null;
+
+    if (metadata.skillmesh_provider !== undefined) return metadata.skillmesh_provider === true;
+    if (metadata.skillmeshProvider !== undefined) return metadata.skillmeshProvider === true;
+
+    const providers = metadata.providers;
+    if (providers && typeof providers === 'object') {
+      const skillmesh = (providers as Record<string, unknown>).skillmesh;
+      if (skillmesh === true) return true;
+      if (skillmesh === false) return false;
+      if (skillmesh && typeof skillmesh === 'object' && 'enabled' in skillmesh) {
+        return (skillmesh as Record<string, unknown>).enabled === true;
+      }
+    }
+
+    const skillmesh = metadata.skillmesh;
+    if (skillmesh === true) return true;
+    if (skillmesh === false) return false;
+    if (skillmesh && typeof skillmesh === 'object' && 'enabled' in skillmesh) {
+      return (skillmesh as Record<string, unknown>).enabled === true;
+    }
+
+    return null;
+  }
+
+  private isSkillmeshProviderEnabled(_teamName: string, metadata: AgentMetadata | null | undefined): boolean {
+    const explicit = this.explicitSkillmeshProviderState(metadata);
+    if (explicit !== null) return explicit;
+    if (envFlagDisabled(process.env.ID_AGENTS_SKILLMESH_AUTO_KEYS)) return false;
+    if (
+      envFlagEnabled(process.env.ID_AGENTS_SKILLMESH_AUTO_KEYS) ||
+      envFlagEnabled(process.env.ID_AGENTS_SKILLMESH_PROVIDER_ENABLED)
+    ) {
+      return true;
+    }
+    const plugins = Array.isArray(metadata?.plugins) ? metadata.plugins : [];
+    return plugins.some(pluginLooksLikeSkillmesh);
+  }
+
   /** Return the next available SkillMesh key index above all pre-provisioned agent slots (0-33). */
   private async getNextSkillmeshKeyIndex(): Promise<number> {
     try {
@@ -1202,8 +2028,9 @@ export class AgentManagerDb {
     }
   }
 
-  /** Derive and persist a SkillMesh key for a newly created agent. Returns updated metadata. */
-  private async assignSkillmeshKey(agentId: string, currentMeta: AgentMetadata): Promise<AgentMetadata> {
+  /** Derive and persist a SkillMesh key only when the optional provider is enabled. */
+  private async maybeAssignSkillmeshKey(agentId: string, teamName: string, currentMeta: AgentMetadata): Promise<AgentMetadata> {
+    if (!this.isSkillmeshProviderEnabled(teamName, currentMeta)) return currentMeta;
     // If the spawn request already supplied a pre-provisioned key, use it as-is
     if ((currentMeta as any).skillmesh_address && (currentMeta as any).skillmesh_private_key) {
       await this.db.agents.updateMetadata(agentId, currentMeta);
@@ -1612,6 +2439,266 @@ export class AgentManagerDb {
     return headers;
   }
 
+  private normalizeProviderRuntimeAssignment(runtime: string, raw: unknown): ProviderRuntimeAssignment {
+    const body = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
+    const lane = runtime.startsWith('provider:') ? runtime : String(body.lane || body.id || '').trim();
+    if (!isProviderRuntimeSpecifier(lane)) throw new Error('provider runtime lane must be provider:<name>');
+    const decoded = decodeURIComponent(lane.slice('provider:'.length));
+    const name = String(body.name || decoded || 'provider').trim();
+    const baseUrl = String(body.baseUrl || '').trim().replace(/\/+$/, '');
+    if (!baseUrl) throw new Error('provider runtime lane requires baseUrl');
+    const keyEnv = typeof body.keyEnv === 'string' && body.keyEnv.trim() ? body.keyEnv.trim() : undefined;
+    const apiKey = typeof body.apiKey === 'string' && body.apiKey.trim() ? body.apiKey.trim() : undefined;
+    return {
+      lane,
+      name,
+      kind: typeof body.kind === 'string' ? body.kind : undefined,
+      baseUrl,
+      keyEnv,
+      apiKey,
+    };
+  }
+
+  private providerRuntimeMetadata(a: ProviderRuntimeAssignment): Record<string, unknown> {
+    return {
+      lane: a.lane,
+      name: a.name,
+      kind: a.kind,
+      baseUrl: a.baseUrl,
+      keyEnv: a.keyEnv,
+      assignedAt: Date.now(),
+    };
+  }
+
+  private providerRuntimeForAgent(agent: AgentRow | null, metadata: AgentMetadata): ProviderRuntimeAssignment | null {
+    if (!agent) return null;
+    const runtime = agent.runtime || (metadata as any)?.runtime;
+    if (resolveRuntime(runtime as string | undefined) !== 'provider-api') return null;
+    const remembered = this.providerRuntimeAssignments.get(agent.id);
+    const safe = (metadata as any)?.providerRuntime;
+    if (remembered) {
+      return { ...remembered, ...(safe && typeof safe === 'object' ? safe : {}) };
+    }
+    if (!safe || typeof safe !== 'object') return null;
+    const lane = typeof safe.lane === 'string' ? safe.lane : typeof (metadata as any)?.runtime === 'string' ? (metadata as any).runtime : '';
+    const name = typeof safe.name === 'string' ? safe.name : lane.startsWith('provider:') ? decodeURIComponent(lane.slice('provider:'.length)) : 'provider';
+    const baseUrl = typeof safe.baseUrl === 'string' ? safe.baseUrl : '';
+    const keyEnv = typeof safe.keyEnv === 'string' ? safe.keyEnv : undefined;
+    if (!lane || !baseUrl) return null;
+    return { lane, name, kind: typeof safe.kind === 'string' ? safe.kind : undefined, baseUrl, keyEnv };
+  }
+
+  private parseRuntimeCredentialPool(raw: unknown, runtime: HarnessType | string | undefined): RuntimeCredentialLane[] {
+    const resolved = resolveRuntime(runtime) as HarnessType;
+    const lanesRaw = Array.isArray(raw) ? raw : (raw as any)?.lanes || (raw as any)?.runtimeCredentialPool?.lanes;
+    if (!Array.isArray(lanesRaw)) return [];
+    return lanesRaw
+      .map((lane: any): RuntimeCredentialLane | null => {
+        const laneRuntime = resolveRuntime(lane?.runtime || resolved) as HarnessType;
+        if (laneRuntime !== resolved) return null;
+        if (lane?.kind !== 'subscription' && lane?.kind !== 'metered-api') return null;
+        if (typeof lane?.id !== 'string' || !lane.id.trim()) return null;
+        return {
+          id: lane.id,
+          runtime: laneRuntime,
+          kind: lane.kind,
+          env: lane.env && typeof lane.env === 'object' ? lane.env : undefined,
+        };
+      })
+      .filter((lane): lane is RuntimeCredentialLane => Boolean(lane));
+  }
+
+  private runtimeCredentialLanes(runtime: HarnessType | string | undefined, teamId?: string): RuntimeCredentialLane[] {
+    const resolved = resolveRuntime(runtime) as HarnessType;
+    const configured = process.env.ID_RUNTIME_CREDENTIAL_POOL;
+    if (configured) {
+      try {
+        const lanes = this.parseRuntimeCredentialPool(JSON.parse(configured), resolved);
+        if (lanes.length) return lanes;
+      } catch (err: any) {
+        this.managerLog(`Ignoring invalid ID_RUNTIME_CREDENTIAL_POOL JSON: ${err?.message || err}`);
+      }
+    }
+
+    const teamPool = teamId ? this.runtimeCredentialPoolByTeam.get(teamId) : undefined;
+    const configuredPool = teamPool || this.defaultRuntimeCredentialPool;
+    const configuredLanes = configuredPool ? this.parseRuntimeCredentialPool(configuredPool, resolved) : [];
+    if (configuredLanes.length) return configuredLanes;
+
+    return [{ id: `${resolved}:default`, runtime: resolved, kind: 'subscription' }];
+  }
+
+  private chooseRuntimeCredentialLane(runtime: HarnessType | string | undefined, currentLaneId?: string, teamId?: string, excludeCurrentLane: boolean = false): RuntimeCredentialLane {
+    const resolved = resolveRuntime(runtime) as HarnessType;
+    const lanes = this.runtimeCredentialLanes(resolved, teamId);
+    const now = Date.now();
+    const healthy = lanes.filter((lane) => {
+      if (excludeCurrentLane && currentLaneId && lane.id === currentLaneId) return false;
+      const cooldown = this.runtimeLaneCooldowns.get(lane.id);
+      return !cooldown || cooldown.coolingUntilMs <= now;
+    });
+    const current = currentLaneId && !excludeCurrentLane ? healthy.find((lane) => lane.id === currentLaneId) : undefined;
+    if (current) return current;
+    const subscription = healthy.find((lane) => lane.kind === 'subscription');
+    if (subscription) return subscription;
+    const configuredMetered = healthy.find((lane) => lane.kind === 'metered-api');
+    if (configuredMetered) return configuredMetered;
+    return { id: `${resolved}:metered-overflow`, runtime: resolved, kind: 'metered-api' };
+  }
+
+  private parseCooldownUntilMs(rateLimit: any): number {
+    if (typeof rateLimit?.retryAfterSeconds === 'number' && Number.isFinite(rateLimit.retryAfterSeconds)) {
+      return Date.now() + Math.max(0, rateLimit.retryAfterSeconds) * 1000;
+    }
+    if (typeof rateLimit?.resetAt === 'string') {
+      const parsed = Date.parse(rateLimit.resetAt);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return Date.now() + 5 * 60 * 60 * 1000;
+  }
+
+  private async recordRuntimeRateLimit(teamId: string, input: {
+    agentId?: string;
+    agentName?: string;
+    runtime?: string;
+    laneId?: string;
+    queryId?: string;
+    rateLimit?: any;
+  }): Promise<RuntimeLaneCooldown> {
+    const runtime = resolveRuntime(input.runtime) as HarnessType;
+    const laneId = input.laneId || `${runtime}:default`;
+    const lane = this.runtimeCredentialLanes(runtime, teamId).find((candidate) => candidate.id === laneId);
+    const cooldown: RuntimeLaneCooldown = {
+      laneId,
+      runtime,
+      kind: lane?.kind || 'subscription',
+      coolingUntilMs: this.parseCooldownUntilMs(input.rateLimit),
+      observedAtMs: Date.now(),
+      reason: String(input.rateLimit?.reason || 'unknown_rate_limit'),
+      teamId,
+      agentId: input.agentId,
+      agentName: input.agentName,
+      queryId: input.queryId,
+      resetText: typeof input.rateLimit?.resetText === 'string' ? input.rateLimit.resetText : undefined,
+      message: typeof input.rateLimit?.message === 'string' ? input.rateLimit.message : undefined,
+    };
+    this.runtimeLaneCooldowns.set(laneId, cooldown);
+    await this.db.runtimeLaneCooldowns.upsert({
+      lane_id: cooldown.laneId,
+      runtime: cooldown.runtime,
+      kind: cooldown.kind,
+      cooling_until_ms: cooldown.coolingUntilMs,
+      observed_at_ms: cooldown.observedAtMs,
+      reason: cooldown.reason,
+      team_id: cooldown.teamId || null,
+      agent_id: cooldown.agentId || null,
+      agent_name: cooldown.agentName || null,
+      query_id: cooldown.queryId || null,
+      reset_text: cooldown.resetText || null,
+      message: cooldown.message || null,
+    });
+    await this.db.runtimeLaneCooldowns.pruneExpired(Date.now());
+
+    if (input.agentId) {
+      const agent = await this.dbQueryAgentById(teamId, input.agentId).catch(() => null);
+      if (agent) {
+        const metadata = (agent.metadata as Record<string, unknown>) || {};
+        await this.db.agents.updateMetadata(agent.id, {
+          ...metadata,
+          runtimeRateLimit: {
+            laneId,
+            coolingUntilMs: cooldown.coolingUntilMs,
+            reason: cooldown.reason,
+            observedAtMs: cooldown.observedAtMs,
+            queryId: cooldown.queryId,
+          },
+        });
+      }
+    }
+
+    return cooldown;
+  }
+
+  private async hydrateRuntimeStateFromTeams(): Promise<void> {
+    const now = Date.now();
+    const teams = await this.db.teams.listTeamsWithConfig();
+    for (const team of teams) {
+      const pool = (team.config as any)?.runtimeCredentialPool;
+      if (pool && typeof pool === 'object' && Array.isArray(pool.lanes)) {
+        this.runtimeCredentialPoolByTeam.set(team.id, pool as RuntimeCredentialPoolConfig);
+      }
+    }
+    await this.db.runtimeLaneCooldowns.pruneExpired(now);
+    const activeCooldowns = await this.db.runtimeLaneCooldowns.listActive(now);
+    for (const row of activeCooldowns) {
+      this.runtimeLaneCooldowns.set(row.lane_id, {
+        laneId: row.lane_id,
+        runtime: resolveRuntime(row.runtime) as HarnessType,
+        kind: row.kind === 'metered-api' ? 'metered-api' : 'subscription',
+        coolingUntilMs: Number(row.cooling_until_ms),
+        observedAtMs: Number(row.observed_at_ms),
+        reason: row.reason || 'unknown_rate_limit',
+        teamId: row.team_id || undefined,
+        agentId: row.agent_id || undefined,
+        agentName: row.agent_name || undefined,
+        queryId: row.query_id || undefined,
+        resetText: row.reset_text || undefined,
+        message: row.message || undefined,
+      });
+    }
+  }
+
+  private async reconcileDefaultCoderRuntimeFromConfig(): Promise<void> {
+    const config = this.defaultDeploymentConfig;
+    if (!config?.agents || config.agents.length === 0) return;
+
+    const defaultTeam = await this.db.teams.getTeamByName('default');
+    if (!defaultTeam) return;
+
+    const coderSpec = config.agents.find((agent) => agent.name === 'coder');
+    if (!coderSpec) return;
+
+    const coderRow = await this.db.agents.getByName(defaultTeam.id, 'coder');
+    if (!coderRow || coderRow.deleted_at !== null) return;
+
+    const drift = detectDefaultCoderRuntimeDrift(coderSpec, coderRow, this.defaultConfig?.model);
+    if (!drift) return;
+
+    const nextMetadata = {
+      ...stripDefaultCoderRuntimeMetadata((coderRow.metadata || {}) as Record<string, unknown>),
+      runtime: drift.runtime,
+    };
+    const nextStatus = coderRow.status === 'running' ? 'starting' : 'pending';
+
+    console.warn(
+      `[Manager] default/coder drift detected: runtime ${coderRow.runtime} -> ${drift.runtime}, model ${coderRow.model} -> ${drift.model}`,
+    );
+
+    await this.db.agents.updateStatus(coderRow.id, nextStatus, {
+      runtime: drift.runtime,
+      model: drift.model,
+      metadata: nextMetadata,
+    });
+
+    this.providerRuntimeAssignments.delete(coderRow.id);
+
+    if (coderRow.status !== 'running') return;
+
+    const refreshed = await this.db.agents.getById(coderRow.id);
+    if (!refreshed) return;
+
+    const spawnResult = await this.rebuildLocalClaudeAgent(defaultTeam.id, defaultTeam.name, refreshed);
+    if (!spawnResult.success) {
+      await this.db.agents.updateStatus(coderRow.id, 'error').catch(() => {});
+      console.error(`[Manager] Failed to resync default/coder at startup: ${spawnResult.error}`);
+      return;
+    }
+
+    console.log(
+      `[Manager] Resynced default/coder at startup to runtime ${drift.runtime} and model ${drift.model}`,
+    );
+  }
+
   private async volunteerBrainContext(input: {
     taskId?: string | null;
     agentId?: string | null;
@@ -1829,6 +2916,7 @@ export class AgentManagerDb {
     volunteeredSourceIds?: string[];
     injectedInstructionIds?: string[];
     latencyMs?: number | null;
+    learningLoop?: LearningLoopCapture | null;
   }): Promise<void> {
     const volunteeredSourceIds = input.volunteeredSourceIds?.length ? input.volunteeredSourceIds : input.context?.cited?.canonical_source_ids || [];
     const payload = {
@@ -1846,12 +2934,19 @@ export class AgentManagerDb {
         brain_context_timeline_event_id: input.context?.timelineEventId,
         source_origins: input.context?.cited?.source_origins || {},
         injected_instruction_ids: input.injectedInstructionIds || [],
+        ...(input.learningLoop ? { learning_loop: input.learningLoop } : {}),
       },
     };
     await this.validateBrainLearningContract({
       subject: input.taskId || input.queryId || 'manager.eval',
       eval_feedback: payload,
     });
+    if (input.learningLoop) {
+      await this.validateBrainLearningContract({
+        subject: input.taskId || input.queryId || 'manager.learning_loop',
+        learned_artifact: input.learningLoop,
+      });
+    }
     await this.postBrain('/eval/capture', payload);
     if (volunteeredSourceIds.length && !(input.usedSourceIds || []).length) {
       await this.postBrain('/context/feedback-missing', {
@@ -2156,7 +3251,7 @@ export class AgentManagerDb {
     if (!body.task || typeof body.task !== 'object') return null;
 
     const { id: teamId } = await this.getTeam(req);
-    const taskSpec = body.task as { title?: unknown; name?: unknown; description?: unknown };
+    const taskSpec = body.task as { title?: unknown; name?: unknown; description?: unknown } & TaskBriefValidationInput;
     if (!taskSpec.title || typeof taskSpec.title !== 'string') {
       throw makeAutoAttachError(400, 'invalid_task_title');
     }
@@ -2170,6 +3265,9 @@ export class AgentManagerDb {
       throw makeAutoAttachError(404, 'target_agent_not_found');
     }
     const targetAgent = targetResolved.agent;
+    if (!(await this.hasDoingTaskRoom(teamId))) {
+      throw makeAutoAttachError(409, 'doing_task_limit_reached');
+    }
 
     const fromRef = body.from;
     let fromAgent: AgentRow | undefined;
@@ -2181,6 +3279,40 @@ export class AgentManagerDb {
     const flagsResult = parseAutoAttachFlags(body);
     if (flagsResult.error) {
       throw makeAutoAttachError(400, flagsResult.error);
+    }
+
+    const description = appendTaskBriefFieldsToDescription(taskSpec.description, {
+      ...body,
+      ...taskSpec,
+      title: taskSpec.title,
+      description: taskSpec.description,
+    });
+    const brief = this.validateIncomingTaskBrief({
+      ...body,
+      ...taskSpec,
+      title: taskSpec.title,
+      description,
+    }, { immediateExecution: true });
+    if (brief.blocked) {
+      throw makeAutoAttachError(422, 'task_brief_not_dispatch_ready', { brief_validation: brief.validation });
+    }
+
+    const validatorGuard = await this.validateValidatorChildTaskCreation({
+      teamId,
+      input: {
+        ...body,
+        ...taskSpec,
+        title: taskSpec.title,
+        description,
+      },
+      fromAgent,
+      targetAgent,
+    });
+    if (validatorGuard) {
+      throw makeAutoAttachError(validatorGuard.status, validatorGuard.code, {
+        message: validatorGuard.message,
+        ...(validatorGuard.existingTask ? { existing_task: validatorGuard.existingTask } : {}),
+      });
     }
 
     const requestedName = typeof taskSpec.name === 'string' && taskSpec.name.length > 0
@@ -2206,7 +3338,7 @@ export class AgentManagerDb {
       uuid: crypto.randomUUID(),
       team_id: teamId,
       title: taskSpec.title,
-      description: typeof taskSpec.description === 'string' ? taskSpec.description : null,
+      description,
       status: 'doing',
       created_by: fromAgent?.id ?? null,
       owner: targetAgent.id,
@@ -3411,7 +4543,10 @@ export class AgentManagerDb {
         const result = await this.maybeAutoAttachForTalkTo(req);
         if (result) (req as any)._autoAttach = result;
       } catch (err: any) {
-        return res.status(err?.status || 400).json({ error: err?.code || err?.message || 'auto_attach_failed' });
+        return res.status(err?.status || 400).json({
+          error: err?.code || err?.message || 'auto_attach_failed',
+          ...(err?.details || {}),
+        });
       }
       this.handleMessage(req, res).catch(next);
     });
@@ -3424,6 +4559,64 @@ export class AgentManagerDb {
         req.body.wait = false;
       }
       this.handleMessage(req, res).catch(next);
+    });
+
+    this.managementApp.get('/runtime/cooldowns', async (req, res) => {
+      const now = Date.now();
+      const cooldowns = [...this.runtimeLaneCooldowns.values()]
+        .filter((cooldown) => cooldown.coolingUntilMs > now)
+        .sort((a, b) => a.laneId.localeCompare(b.laneId));
+      res.json({ cooldowns });
+    });
+
+    this.managementApp.post('/runtime/rate-limit', async (req, res) => {
+      const { id: teamId, name: teamName } = await this.getTeam(req);
+      const body = req.body || {};
+      const rateLimit = body.rateLimit || body.rate_limit || {};
+      if (!rateLimit?.isRateLimit) {
+        return res.status(400).json({ error: 'rateLimit.isRateLimit is required' });
+      }
+
+      const cooldown = await this.recordRuntimeRateLimit(teamId, {
+        agentId: typeof body.agent_id === 'string' ? body.agent_id : undefined,
+        agentName: typeof body.agent_name === 'string' ? body.agent_name : undefined,
+        runtime: typeof body.runtime === 'string' ? body.runtime : undefined,
+        laneId: typeof body.lane_id === 'string' ? body.lane_id : undefined,
+        queryId: typeof body.query_id === 'string' ? body.query_id : undefined,
+        rateLimit,
+      });
+
+      const message = `Runtime lane ${cooldown.laneId} is cooling until ${new Date(cooldown.coolingUntilMs).toISOString()} (${cooldown.reason})`;
+      const ts = Date.now();
+      const managerInbox = this.getManagerInboxRef(teamId, teamName);
+      await this.db.news.add(teamId, null, {
+        timestamp: ts,
+        type: 'runtime.rate_limit',
+        message,
+        data: { cooldown, rateLimit },
+        query_id: cooldown.queryId,
+        kind: 'notify',
+        reply_expected: false,
+        owner_kind: managerInbox.ownerKind,
+        owner_id: managerInbox.ownerId,
+      });
+      this.broadcastNews(teamId, {
+        type: 'runtime.rate_limit',
+        from: cooldown.agentName || cooldown.agentId || 'runtime',
+        message,
+        data: { cooldown, rateLimit },
+        timestamp: ts,
+      });
+      this.postBrain('/memory/manager', {
+        key: `runtime-cooldown:${cooldown.laneId}`,
+        content: JSON.stringify(cooldown),
+        shared: true,
+        project: teamName,
+      }).catch(() => {});
+
+      const failover = await this.handleRuntimeRateLimitFailover(teamId, teamName, cooldown);
+
+      res.json({ ok: true, cooldown, failover });
     });
 
     // REST-AP /news endpoint - receive replies from agents
@@ -3521,6 +4714,9 @@ export class AgentManagerDb {
         // (output/security-review-wakeup-service.md).
         const isQueryFailure = newsType === 'reply.error' || type === 'reply.error';
         if (in_reply_to) {
+          const queryRow = await this.db.queries.getByQueryIdForTeam(teamId, in_reply_to).catch(() => null);
+          const retryOf = this.runtimeFailoverRetryOf.get(in_reply_to)
+            || (typeof (queryRow?.metadata as any)?.retry_of === 'string' ? (queryRow?.metadata as any).retry_of : undefined);
           if (isQueryFailure) {
             const errorText =
               typeof message === 'string' && message.length > 0
@@ -3550,6 +4746,27 @@ export class AgentManagerDb {
               message: message || '',
             });
             this.releaseLocalGate(in_reply_to); // #7: free the local-model slot on failure
+            if (retryOf && retryOf !== in_reply_to) {
+              const transitionedOriginal = await this.db.queries.markFailed(teamId, retryOf, ts, errorText);
+              if (transitionedOriginal) {
+                const failedOriginal = await this.db.queries.getByQueryIdForTeam(teamId, retryOf).catch(() => null);
+                await emitQueryFailed(this.db.events, {
+                  teamId,
+                  queryId: retryOf,
+                  agentId:
+                    failedOriginal?.owner_kind === 'manager'
+                      ? null
+                      : failedOriginal?.agent_id ?? null,
+                  occurredAt: ts,
+                  reason: errorText,
+                });
+              }
+              this.wakeQueryWaiters(teamId, retryOf, {
+                from: from || 'unknown',
+                message: message || '',
+              });
+              this.runtimeFailoverRetryOf.delete(in_reply_to);
+            }
           } else {
             // Single canonical completion lifecycle (queries.complete +
             // delivered event + waiter wakeups). Shared with POST
@@ -3562,6 +4779,17 @@ export class AgentManagerDb {
               waiterReply: { from: from || 'unknown', message: message || '' },
               messagePreview: typeof message === 'string' ? message : null,
             });
+            if (retryOf && retryOf !== in_reply_to) {
+              await this.completeQueryDelivery({
+                teamId,
+                queryId: retryOf,
+                occurredAt: ts,
+                resultPayload: { from, message, ...data, failover_retry_query_id: in_reply_to },
+                waiterReply: { from: from || 'unknown', message: message || '' },
+                messagePreview: typeof message === 'string' ? message : null,
+              });
+              this.runtimeFailoverRetryOf.delete(in_reply_to);
+            }
           }
         }
 
@@ -4176,6 +5404,58 @@ export class AgentManagerDb {
       }
     });
 
+    // Event-driven loop: default-team validators produce recommendation packets
+    // when their validation tasks complete. This is deliberately not a schedule.
+    this.managementApp.get('/teams/:name/validator-recommendation-loop', async (req, res) => {
+      try {
+        const team = await this.db.teams.getTeamByName(req.params.name);
+        if (!team) return res.status(404).json({ error: `Team "${req.params.name}" not found` });
+        const loop = await this.getValidatorRecommendationLoopConfig(team.id);
+        res.json({ name: team.name, loop });
+      } catch (e: any) {
+        res.status(500).json({ error: e?.message || String(e) });
+      }
+    });
+
+    this.managementApp.post('/teams/:name/validator-recommendation-loop', async (req, res) => {
+      try {
+        if (!this.isAdminRequest(req)) return res.status(403).json({ error: 'admin_required' });
+        const team = await this.db.teams.getTeamByName(req.params.name);
+        if (!team) return res.status(404).json({ error: `Team "${req.params.name}" not found` });
+        const current = await this.getValidatorRecommendationLoopConfig(team.id);
+        const body = req.body || {};
+        const next = this.normalizeValidatorRecommendationLoopConfig({
+          ...current,
+          ...(typeof body.enabled === 'boolean' ? { enabled: body.enabled } : {}),
+          ...(Array.isArray(body.owners) ? { owners: body.owners } : {}),
+          ...(typeof body.lead === 'string' ? { lead: body.lead } : {}),
+          ...(typeof body.objective === 'string' ? { objective: body.objective } : {}),
+          updatedAt: Date.now(),
+        });
+        await this.db.teams.setValidatorRecommendationLoop(team.id, next as unknown as Record<string, unknown>);
+        res.json({ name: team.name, loop: next });
+      } catch (e: any) {
+        res.status(500).json({ error: e?.message || String(e) });
+      }
+    });
+
+    this.managementApp.delete('/teams/:name/validator-recommendation-loop', async (req, res) => {
+      try {
+        if (!this.isAdminRequest(req)) return res.status(403).json({ error: 'admin_required' });
+        const team = await this.db.teams.getTeamByName(req.params.name);
+        if (!team) return res.status(404).json({ error: `Team "${req.params.name}" not found` });
+        const disabled = this.normalizeValidatorRecommendationLoopConfig({
+          ...DEFAULT_VALIDATOR_RECOMMENDATION_LOOP,
+          enabled: false,
+          updatedAt: Date.now(),
+        });
+        await this.db.teams.setValidatorRecommendationLoop(team.id, disabled as unknown as Record<string, unknown>);
+        res.json({ name: team.name, loop: disabled });
+      } catch (e: any) {
+        res.status(500).json({ error: e?.message || String(e) });
+      }
+    });
+
     // POST /teams/:name/delegates — set the cross-team relay allow-list.
     // Body: { delegates: string[] | "*" | null }. "*" → ["*"] (allow all),
     // [] → block all, null → permissive default. Admin-gated.
@@ -4408,7 +5688,19 @@ export class AgentManagerDb {
           ...(heartbeat && { heartbeat: true }),
           ...(openMode !== undefined && { openMode: openMode === true || openMode === 'true' }),
           ...(dangerouslySkipPermissions !== undefined && { dangerouslySkipPermissions: dangerouslySkipPermissions === true || dangerouslySkipPermissions === 'true' }),
-          // Pass through pre-provisioned SkillMesh key fields so assignSkillmeshKey can skip derivation
+          // Pass through optional provider public metadata. Provider-specific
+          // secrets still require an enabled provider before env injection.
+          ...((reqMetadata as any)?.provider_wallet_address && {
+            provider_wallet_address: (reqMetadata as any).provider_wallet_address,
+          }),
+          ...((reqMetadata as any)?.providerWalletAddress && {
+            providerWalletAddress: (reqMetadata as any).providerWalletAddress,
+          }),
+          ...((reqMetadata as any)?.providers && typeof (reqMetadata as any).providers === 'object' && {
+            providers: (reqMetadata as any).providers,
+          }),
+          // Pass through pre-provisioned SkillMesh plugin fields; the provider
+          // still has to be enabled before keys are derived or injected.
           ...((reqMetadata as any)?.skillmesh_address && {
             skillmesh_address: (reqMetadata as any).skillmesh_address,
             skillmesh_private_key: (reqMetadata as any).skillmesh_private_key,
@@ -4451,14 +5743,15 @@ export class AgentManagerDb {
           local: true,
           runtime: effectiveRuntime
         };
-        // Assign a unique SkillMesh key to every new agent
-        const skillmeshMeta = await this.assignSkillmeshKey(id, finalMeta);
+        // SkillMesh stays a bundled optional provider. Neutral agents do not get
+        // SkillMesh keys just because a master key exists in the environment.
+        const providerMeta = await this.maybeAssignSkillmeshKey(id, teamName, finalMeta);
         // Strip private key before sending in API response (stays in DB for worker env injection)
-        const { skillmesh_private_key: _smKey, ...skillmeshMetaPublic } = skillmeshMeta as any;
+        const { skillmesh_private_key: _smKey, ...providerMetaPublic } = providerMeta as any;
         await this.db.agents.updateStatus(id, 'pending', {
           port: allocatedPort,
           endpoint: url,
-          metadata: skillmeshMeta,
+          metadata: providerMeta,
         });
 
         // Use host paths for local agents
@@ -4499,7 +5792,7 @@ export class AgentManagerDb {
           local: true,
           url,
           restap: `${url}/.well-known/restap.json`,
-          metadata: skillmeshMetaPublic,
+          metadata: providerMetaPublic,
           // Info for CLI to spawn local agent process
           teamId,
           teamName,
@@ -4897,12 +6190,123 @@ export class AgentManagerDb {
         return res.status(400).json({ error: 'Only local runtime-backed agents have a switchable runtime' });
       }
       try {
-        const resolved = resolveRuntime(runtime);
-        await this.db.agents.updateStatus(agent.id, 'pending', { runtime: resolved });
-        console.log(`[Manager] Updated runtime for ${agent.name} to ${resolved} - rebuild required`);
-        res.json({ id: agent.id, name: agent.name, runtime: resolved, status: 'pending', needsRebuild: true, message: 'Runtime updated. Rebuild the agent to apply.' });
+        const metadataBase = { ...((agent.metadata || {}) as AgentMetadata) };
+        const providerAssignment = isProviderRuntimeSpecifier(runtime)
+          ? this.normalizeProviderRuntimeAssignment(runtime, (req.body || {}).provider)
+          : null;
+        const resolved = providerAssignment ? 'provider-api' : resolveRuntime(runtime);
+        const metadata = providerAssignment
+          ? {
+              ...metadataBase,
+              runtime: providerAssignment.lane,
+              providerRuntime: this.providerRuntimeMetadata(providerAssignment),
+            }
+          : {
+              ...metadataBase,
+              runtime: resolved,
+              providerRuntime: undefined,
+            };
+        if (providerAssignment) this.providerRuntimeAssignments.set(agent.id, providerAssignment);
+        else this.providerRuntimeAssignments.delete(agent.id);
+        await this.db.agents.updateStatus(agent.id, 'pending', { runtime: resolved, metadata });
+        console.log(`[Manager] Updated runtime for ${agent.name} to ${providerAssignment?.lane ?? resolved} - rebuild required`);
+        res.json({
+          id: agent.id,
+          name: agent.name,
+          runtime: providerAssignment?.lane ?? resolved,
+          executionRuntime: resolved,
+          status: 'pending',
+          needsRebuild: true,
+          message: 'Runtime updated. Rebuild the agent to apply.',
+        });
       } catch (e: any) {
-        res.status(500).json({ error: e?.message || String(e) });
+        const msg = e?.message || String(e);
+        res.status(providerRuntimeErrorStatus(msg)).json({ error: msg });
+      }
+    });
+
+    // POST /agents/:id/team — move a local runtime-backed agent to another
+    // existing team. This is the Control Center primitive used by HR team
+    // rename/merge; it deliberately refuses to create target teams or move
+    // remote/public endpoints.
+    this.managementApp.post('/agents/:id/team', async (req, res) => {
+      try {
+        if (!this.isAdminRequest(req)) return res.status(403).json({ error: 'admin_required' });
+        const { id: sourceTeamId, name: sourceTeamName } = await this.getTeam(req);
+        const body = req.body || {};
+        const targetName = String(body.team || '').trim();
+        const createTarget = Boolean(body.createTarget || body.create);
+        if (!targetName) return res.status(400).json({ error: 'Missing target team' });
+        const nameCheck = validateName(targetName, 'team');
+        if (!nameCheck.valid) return res.status(400).json({ error: nameCheck.error });
+
+        let targetTeam = await this.db.teams.getTeamByName(targetName);
+        if (!targetTeam && createTarget) {
+          const targetTeamId = await this.db.teams.getOrCreateTeamId(targetName);
+          targetTeam = await this.db.teams.getTeam(targetTeamId);
+        }
+        if (!targetTeam) return res.status(404).json({ error: `Target team "${targetName}" not found` });
+        if (targetTeam.id === sourceTeamId) return res.status(400).json({ error: 'Agent is already in that team' });
+
+        const agent = await this.dbQueryAgentById(sourceTeamId, req.params.id);
+        if (!agent) return res.status(404).json({ error: 'Agent not found' });
+        if (isRemoteEndpointRuntime(agent.runtime)) {
+          return res.status(400).json({ error: 'team_move_not_supported_for_remote' });
+        }
+        if (agent.type !== 'claude') {
+          return res.status(400).json({ error: 'Only local runtime-backed agents can be moved between teams' });
+        }
+
+        const collision = await this.db.agents.getByName(targetTeam.id, agent.name);
+        if (collision && collision.id !== agent.id) {
+          return res.status(409).json({ error: `Target team already has an agent named "${agent.name}"` });
+        }
+
+        const oldServerKey = this.key(sourceTeamId, agent.id);
+        const oldServer = this.runningServers.get(oldServerKey);
+        if (oldServer) {
+          try {
+            await oldServer.stop();
+          } catch (e) {
+            console.error(`⚠️ Failed to stop moved agent server ${agent.name} (${agent.id}):`, e);
+          }
+          this.runningServers.delete(oldServerKey);
+        }
+
+        const shouldRebuild = agent.status === 'running' || agent.status === 'starting' || Boolean(oldServer);
+        await this.db.agents.moveToTeam(agent.id, targetTeam.id, shouldRebuild ? 'pending' : undefined);
+
+        let rebuilt = false;
+        let warning: string | undefined;
+        if (shouldRebuild) {
+          const spawnResult = await this.rebuildLocalClaudeAgent(targetTeam.id, targetTeam.name, {
+            ...agent,
+            team_id: targetTeam.id,
+            status: 'pending',
+          });
+          if (spawnResult.success) {
+            rebuilt = true;
+          } else {
+            warning = `moved but rebuild failed: ${spawnResult.error || 'unknown error'}`;
+            await this.db.agents.updateStatus(agent.id, 'error').catch(() => {});
+          }
+        } else {
+          warning = `moved while ${agent.status || 'not running'}; start or rebuild when ready`;
+        }
+
+        this.broadcastAgentsChanged(sourceTeamId, { reason: 'remove', removed: [agent.name] });
+        this.broadcastAgentsChanged(targetTeam.id, { reason: 'spawn', added: [agent.name] });
+        return res.json({
+          ok: true,
+          agent: agent.name,
+          id: agent.id,
+          from: sourceTeamName,
+          team: targetTeam.name,
+          rebuilt,
+          warning,
+        });
+      } catch (e: any) {
+        return res.status(500).json({ error: e?.message || String(e) });
       }
     });
 
@@ -5574,7 +6978,8 @@ export class AgentManagerDb {
       try {
         let { id: teamId, name: teamName } = await this.getTeam(req);
         const principal = (req as any).ctx?.principal || 'anon';
-        const { title, name: rawName, description, team: teamRef, from } = req.body || {};
+        const body = req.body || {};
+        const { title, name: rawName, description, team: teamRef, from } = body;
 
         if (!title || typeof title !== 'string') {
           return res.status(400).json({ error: 'Missing required field: title' });
@@ -5610,6 +7015,40 @@ export class AgentManagerDb {
           taskTeamId = teamRow.id;
         }
 
+        const taskDescription = appendTaskBriefFieldsToDescription(description, {
+          ...body,
+          title,
+          description,
+        });
+        const brief = this.validateIncomingTaskBrief({
+          ...body,
+          title,
+          description: taskDescription,
+        });
+        if (brief.blocked) {
+          return res.status(422).json({
+            error: 'task_brief_not_dispatch_ready',
+            brief_validation: brief.validation,
+          });
+        }
+
+        const validatorGuard = await this.validateValidatorChildTaskCreation({
+          teamId: taskTeamId,
+          input: {
+            ...body,
+            title,
+            description: taskDescription,
+          },
+          fromAgent: callerAgent,
+        });
+        if (validatorGuard) {
+          return res.status(validatorGuard.status).json({
+            error: validatorGuard.code,
+            message: validatorGuard.message,
+            ...(validatorGuard.existingTask ? { existing_task: validatorGuard.existingTask } : {}),
+          });
+        }
+
         // Generate or validate name slug, scoped to (team_id, name) uniqueness
         let name = rawName ? normalizeAlias(rawName) : normalizeAlias(title);
         if (rawName) {
@@ -5632,7 +7071,7 @@ export class AgentManagerDb {
           uuid: crypto.randomUUID(),
           team_id: taskTeamId,
           title,
-          description: description || null,
+          description: taskDescription,
           status: 'todo',
           created_by: createdBy,
           owner: null,
@@ -5642,7 +7081,11 @@ export class AgentManagerDb {
         };
 
         await this.db.tasks.create(taskRow);
-        res.status(201).json({ ok: true, task: await this.buildTaskResult(taskRow, teamId) });
+        res.status(201).json({
+          ok: true,
+          task: await this.buildTaskResult(taskRow, teamId),
+          brief_validation: brief.validation,
+        });
       } catch (err: any) {
         console.error('[Manager] Error in POST /tasks:', err);
         res.status(500).json({ error: err?.message || 'Internal server error' });
@@ -5652,7 +7095,10 @@ export class AgentManagerDb {
     this.managementApp.get('/tasks', async (req, res) => {
       try {
         const { id: teamId } = await this.getTeam(req);
-        const { status, owner, team: teamRef } = req.query as Record<string, string>;
+        const { status, owner, team: teamRef, limit: rawLimit } = req.query as Record<string, string>;
+        const limit = rawLimit && Number.isFinite(Number(rawLimit))
+          ? Math.max(1, Math.min(500, Math.floor(Number(rawLimit))))
+          : undefined;
 
         // Resolve owner
         let ownerIdFilter: string | undefined;
@@ -5675,6 +7121,7 @@ export class AgentManagerDb {
           status: status && validStatuses.includes(status) ? status as 'todo' | 'doing' | 'done' : undefined,
           owner: ownerIdFilter,
           teamId: teamIdFilter,
+          limit,
         });
 
         const results = [];
@@ -5737,9 +7184,23 @@ export class AgentManagerDb {
           return res.status(404).json({ error: `Task "${req.params.ref}" not found` });
         }
 
+        const claimBrief = this.validateIncomingTaskBrief(this.taskBriefInputFromTask(task));
+        if (claimBrief.blocked && !this.canClaimMalformedBriefForRepair(teamName, agent, task)) {
+          return res.status(409).json({
+            error: 'task_brief_not_dispatch_ready',
+            brief_validation: claimBrief.validation,
+          });
+        }
+
         const now = Math.floor(Date.now() / 1000);
-        const claimed = await this.db.tasks.claim(task.id, agent.id, now);
+        const claimed = await this.db.tasks.claim(task.id, agent.id, now, {
+          maxDoingForTeam: this.getMaxDoingTasks(),
+        });
         if (!claimed) {
+          const current = await this.db.tasks.getByNameForTeam(task.name, teamId);
+          if (current?.status === 'todo' && !current.owner && !(await this.hasDoingTaskRoom(teamId))) {
+            return res.status(409).json({ error: await this.doingTaskLimitMessage(teamId) });
+          }
           return res.status(409).json({ error: `Cannot claim "${task.name}" — already owned or not in todo status` });
         }
 
@@ -5772,6 +7233,7 @@ export class AgentManagerDb {
           bundles: brainContext.bundles,
           instructions: brainContext.instructions || [],
         };
+        (taskResult as any).brief_validation = claimBrief.validation;
         res.json({ ok: true, task: taskResult });
       } catch (err: any) {
         console.error('[Manager] Error in POST /tasks/:ref/claim:', err);
@@ -5816,6 +7278,24 @@ export class AgentManagerDb {
           return res.status(403).json({ error: `Agent "${callerRef}" is not the owner of task "${task.name}"` });
         }
 
+        const completion = this.validateCompletionPayload(req.body || {});
+        if (completion.blocked) {
+          return res.status(422).json({
+            error: 'task_completion_packet_required',
+            completion_validation: completion.validation,
+          });
+        }
+
+        const delegationError = await this.validateTeamLeadDelegationBeforeDone({
+          teamId,
+          teamName,
+          task,
+          payload: req.body || {},
+        });
+        if (delegationError) {
+          return res.status(409).json({ error: delegationError });
+        }
+
         const now = Math.floor(Date.now() / 1000);
         await this.db.tasks.updateFields(task.id, {
           status: 'done',
@@ -5840,6 +7320,19 @@ export class AgentManagerDb {
             : Array.isArray(effectiveBrainContext?.cited?.canonical_source_ids)
               ? effectiveBrainContext.cited.canonical_source_ids.map(String)
               : [];
+        const learningLoop = normalizeLearningLoopCapture({
+          payload: req.body || {},
+          subject: {
+            kind: 'task',
+            ref: `task:${updated!.uuid}`,
+            route: 'manager.task_completion',
+          },
+          teamName,
+          agentId: callerAgent?.id ?? updated!.owner ?? null,
+          usedSourceIds,
+          volunteeredSourceIds,
+          occurredAt: completedAt,
+        });
         const feedbackContext: BrainVolunteerContext | null = {
           bundles: Array.isArray(effectiveBrainContext?.bundles) ? effectiveBrainContext.bundles : [],
           task_id: `task:${updated!.uuid}`,
@@ -5874,6 +7367,7 @@ export class AgentManagerDb {
           volunteeredSourceIds,
           injectedInstructionIds: this.stringArray(req.body?.injected_instruction_ids || req.body?.injectedInstructionIds),
           latencyMs: updated!.completed_at && updated!.created_at ? Math.max(0, (updated!.completed_at - updated!.created_at) * 1000) : null,
+          learningLoop,
         });
         await emitTaskCompleted(this.db.events, {
           teamId,
@@ -5885,6 +7379,7 @@ export class AgentManagerDb {
           occurredAt: completedAt,
           usedSourceIds,
           volunteeredSourceIds,
+          learningLoop,
         });
         // Auto-close any active/snoozed checkins linked to this task and
         // emit one checkin:closed event per row. Pure consumer of the
@@ -5896,7 +7391,17 @@ export class AgentManagerDb {
           actorAgentId: callerAgent?.id ?? updated!.owner ?? null,
           occurredAt: completedAt,
         });
-        res.json({ ok: true, task: await this.buildTaskResult(updated!, teamId) });
+        void this.maybeTriggerValidatorRecommendationLoop({
+          teamId,
+          teamName,
+          task: updated!,
+          completionPayload: req.body || {},
+        });
+        res.json({
+          ok: true,
+          task: await this.buildTaskResult(updated!, teamId),
+          completion_validation: completion.validation,
+        });
       } catch (err: any) {
         console.error('[Manager] Error in POST /tasks/:ref/done:', err);
         res.status(500).json({ error: err?.message || 'Internal server error' });
@@ -6532,8 +8037,9 @@ export class AgentManagerDb {
 
   private async buildTaskResult(task: TaskRow, teamId: string): Promise<Record<string, unknown>> {
     let ownerName: string | null = null;
+    let ownerAgent: AgentRow | null = null;
     if (task.owner) {
-      const ownerAgent = await this.db.agents.getById(task.owner);
+      ownerAgent = await this.db.agents.getById(task.owner);
       if (ownerAgent) {
         ownerName = (ownerAgent.metadata as any)?.alias || ownerAgent.name;
       }
@@ -6547,6 +8053,7 @@ export class AgentManagerDb {
 
     const links = await this.db.tasks.listEventLinksForTask(task.id);
     const shortId = task.uuid ? `#${task.uuid.replace(/-/g, '').slice(0, 8)}` : null;
+    const delegationAudit = await this.buildDelegationAudit(task, teamId, teamName, ownerAgent);
 
     return {
       name: task.name,
@@ -6561,6 +8068,7 @@ export class AgentManagerDb {
       createdAt: task.created_at,
       updatedAt: task.updated_at,
       completedAt: task.completed_at,
+      ...(delegationAudit ? { delegationAudit } : {}),
     };
   }
 
@@ -7632,7 +9140,7 @@ export class AgentManagerDb {
         }
 
         const syncDeployArgs = syncFilteredArgs.slice(1);
-        const { agents: syncAgents, errors: syncErrors, teamName: syncConfigTeam, org: syncOrg, calendar: syncCalendar } =
+        const { agents: syncAgents, errors: syncErrors, teamName: syncConfigTeam, org: syncOrg, calendar: syncCalendar, runtimeCredentialPool: syncRuntimeCredentialPool } =
           processConfig(syncAbsolutePath, this.baseWorkDir, syncDeployArgs);
 
         let syncTeamId = teamId;
@@ -7652,6 +9160,9 @@ export class AgentManagerDb {
         }
 
         await this.db.teams.setOrg(syncTeamId, syncOrg ? syncOrg as unknown as Record<string, unknown> : null);
+        await this.db.teams.setRuntimeCredentialPool(syncTeamId, syncRuntimeCredentialPool ? syncRuntimeCredentialPool as unknown as Record<string, unknown> : null);
+        if (syncRuntimeCredentialPool) this.runtimeCredentialPoolByTeam.set(syncTeamId, syncRuntimeCredentialPool);
+        else this.runtimeCredentialPoolByTeam.delete(syncTeamId);
 
         // Get running agents for this team (include automators)
         const runningAgents = await this.db.agents.list(syncTeamId, true);
@@ -8083,7 +9594,7 @@ export class AgentManagerDb {
           };
         }
 
-        const { agents, calendar, errors, onchain, teamName: configTeam, org } = processConfig(absolutePath, this.baseWorkDir, deployArgs);
+        const { agents, calendar, errors, onchain, teamName: configTeam, org, runtimeCredentialPool } = processConfig(absolutePath, this.baseWorkDir, deployArgs);
 
         // If config specifies a team, use that instead of the request's team
         let effectiveTeamId = teamId;
@@ -8109,6 +9620,9 @@ export class AgentManagerDb {
         }
 
         await this.db.teams.setOrg(effectiveTeamId, org ? org as unknown as Record<string, unknown> : null);
+        await this.db.teams.setRuntimeCredentialPool(effectiveTeamId, runtimeCredentialPool ? runtimeCredentialPool as unknown as Record<string, unknown> : null);
+        if (runtimeCredentialPool) this.runtimeCredentialPoolByTeam.set(effectiveTeamId, runtimeCredentialPool);
+        else this.runtimeCredentialPoolByTeam.delete(effectiveTeamId);
 
         for (const agentConfig of agents) {
           const effectiveRuntime = resolveRuntime(agentConfig.runtime) as HarnessType;
@@ -9036,6 +10550,15 @@ export class AgentManagerDb {
           let description: string | undefined;
           let teamRef: string | undefined;
           let ownerRef: string | undefined;
+          let goalId: string | undefined;
+          let expectedOutput: string | undefined;
+          const acceptanceCriteria: string[] = [];
+          let validationPath: string | undefined;
+          let outOfScope: string | undefined;
+          let backlogPolicy: string | undefined;
+          let bittreesRelevance: string | undefined;
+          let parentTask: string | undefined;
+          let validationPurpose: string | undefined;
           const eventIds: string[] = [];
 
           for (let i = 0; i < rawArgs.length; i++) {
@@ -9045,6 +10568,15 @@ export class AgentManagerDb {
             if (token === '--team') { teamRef = rawArgs[++i]; continue; }
             if (token === '--owner') { ownerRef = rawArgs[++i]; continue; }
             if (token === '--event') { eventIds.push(rawArgs[++i]); continue; }
+            if (token === '--goal' || token === '--goal-id') { goalId = rawArgs[++i]; continue; }
+            if (token === '--expected-output') { expectedOutput = rawArgs[++i]; continue; }
+            if (token === '--acceptance' || token === '--acceptance-criteria') { acceptanceCriteria.push(rawArgs[++i]); continue; }
+            if (token === '--validation-path') { validationPath = rawArgs[++i]; continue; }
+            if (token === '--out-of-scope') { outOfScope = rawArgs[++i]; continue; }
+            if (token === '--backlog-policy') { backlogPolicy = rawArgs[++i]; continue; }
+            if (token === '--bittrees-relevance' || token === '--relevance') { bittreesRelevance = rawArgs[++i]; continue; }
+            if (token === '--parent-task' || token === '--parent-ref') { parentTask = rawArgs[++i]; continue; }
+            if (token === '--validation-purpose') { validationPurpose = rawArgs[++i]; continue; }
             if (!title) { title = token; continue; }
           }
 
@@ -9058,6 +10590,40 @@ export class AgentManagerDb {
             const teamRow = await this.db.teams.getTeamByName(teamRef);
             if (!teamRow) return { ok: false, error: `Team "${teamRef}" not found` };
             taskTeamId = teamRow.id;
+          }
+
+          const taskDescription = appendTaskBriefFieldsToDescription(description, {
+            title,
+            description,
+            goal_id: goalId,
+            expected_output: expectedOutput,
+            acceptance_criteria: acceptanceCriteria,
+            validation_path: validationPath,
+            out_of_scope: outOfScope,
+            backlog_policy: backlogPolicy,
+            bittrees_relevance: bittreesRelevance,
+            parent_task: parentTask,
+            validation_purpose: validationPurpose,
+          });
+          const brief = this.validateIncomingTaskBrief({
+            title,
+            description: taskDescription,
+            goal_id: goalId,
+            expected_output: expectedOutput,
+            acceptance_criteria: acceptanceCriteria,
+            validation_path: validationPath,
+            out_of_scope: outOfScope,
+            backlog_policy: backlogPolicy,
+            bittrees_relevance: bittreesRelevance,
+            parent_task: parentTask,
+            validation_purpose: validationPurpose,
+          }, { immediateExecution: Boolean(ownerRef) });
+          if (brief.blocked) {
+            return {
+              ok: false,
+              error: 'task_brief_not_dispatch_ready',
+              result: { brief_validation: brief.validation },
+            };
           }
 
           // Generate name from title if not provided
@@ -9079,11 +10645,42 @@ export class AgentManagerDb {
 
           // Resolve optional owner
           let ownerId: string | null = null;
+          let ownerAgentForGuard: AgentRow | null = null;
           if (ownerRef) {
             const resolveTeam = taskTeamId || teamId;
             const { agent, error } = await this.resolveSingleAgentForCommand(resolveTeam, ownerRef);
             if (!agent) return { ok: false, error: error || `Agent "${ownerRef}" not found` };
-            ownerId = agent.id;
+            ownerAgentForGuard = agent;
+            if (await this.hasDoingTaskRoom(taskTeamId)) {
+              ownerId = agent.id;
+            }
+          }
+
+          let callerAgentForGuard: AgentRow | null = null;
+          if (callerFrom) {
+            const { agent: callerAgent } = await this.resolveSingleAgentForCommand(teamId, callerFrom);
+            callerAgentForGuard = callerAgent ?? null;
+          }
+          const validatorGuard = await this.validateValidatorChildTaskCreation({
+            teamId: taskTeamId,
+            input: {
+              title,
+              description: taskDescription,
+              parent_task: parentTask,
+              validation_purpose: validationPurpose,
+            },
+            fromAgent: callerAgentForGuard,
+            targetAgent: ownerAgentForGuard,
+          });
+          if (validatorGuard) {
+            return {
+              ok: false,
+              error: validatorGuard.code,
+              result: {
+                message: validatorGuard.message,
+                ...(validatorGuard.existingTask ? { existing_task: validatorGuard.existingTask } : {}),
+              },
+            };
           }
 
           // Validate event links
@@ -9095,10 +10692,12 @@ export class AgentManagerDb {
 
           const now = Math.floor(Date.now() / 1000);
           const status = ownerId ? 'doing' : 'todo';
+          const queuedByDoingLimit = Boolean(ownerRef && !ownerId);
           // Resolve created_by from callerFrom if present
           let createdBy: string | null = null;
           if (callerFrom) {
-            const { agent: callerAgent } = await this.resolveSingleAgentForCommand(teamId, callerFrom);
+            const callerAgent = callerAgentForGuard
+              || (await this.resolveSingleAgentForCommand(teamId, callerFrom)).agent;
             if (callerAgent) createdBy = callerAgent.id;
           }
 
@@ -9108,7 +10707,7 @@ export class AgentManagerDb {
             uuid: crypto.randomUUID(),
             team_id: taskTeamId,
             title,
-            description: description || null,
+            description: taskDescription,
             status,
             created_by: createdBy,
             owner: ownerId,
@@ -9123,6 +10722,8 @@ export class AgentManagerDb {
             ok: true,
             result: {
               task: await this.buildTaskResult(taskRow, teamId),
+              warning: queuedByDoingLimit ? await this.doingTaskLimitMessage(taskTeamId) : undefined,
+              brief_validation: brief.validation,
             },
           };
         }
@@ -9197,6 +10798,9 @@ export class AgentManagerDb {
           if (!agent) return { ok: false, error: error || `Agent "${agentRef}" not found` };
 
           const now = Math.floor(Date.now() / 1000);
+          if (task.status !== 'doing' && !(await this.hasDoingTaskRoom(task.team_id || teamId))) {
+            return { ok: false, error: await this.doingTaskLimitMessage(task.team_id || teamId) };
+          }
           await this.db.tasks.updateFields(task.id, {
             owner: agent.id,
             status: 'doing',
@@ -9204,6 +10808,13 @@ export class AgentManagerDb {
           });
 
           const updated = await this.db.tasks.getByNameForTeam(task.name, teamId);
+          const teamRow = await this.db.teams.getTeam(teamId).catch(() => null);
+          void this.maybeTriggerValidatorRecommendationLoop({
+            teamId,
+            teamName: teamRow?.name || 'default',
+            task: updated!,
+            completionPayload: {},
+          });
           return { ok: true, result: { task: await this.buildTaskResult(updated!, teamId) } };
         }
 
@@ -9230,22 +10841,59 @@ export class AgentManagerDb {
           const { agent: callerAgent, error: callerError } = await this.resolveSingleAgentForCommand(teamId, callerFrom);
           if (!callerAgent) return { ok: false, error: callerError || `Caller agent "${callerFrom}" not found` };
 
+          const claimBrief = this.validateIncomingTaskBrief(this.taskBriefInputFromTask(task));
+          if (claimBrief.blocked && !this.canClaimMalformedBriefForRepair(teamName, callerAgent, task)) {
+            return {
+              ok: false,
+              error: 'task_brief_not_dispatch_ready',
+              result: { brief_validation: claimBrief.validation },
+            };
+          }
+
           const now = Math.floor(Date.now() / 1000);
-          const claimed = await this.db.tasks.claim(task.id, callerAgent.id, now);
+          const claimed = await this.db.tasks.claim(task.id, callerAgent.id, now, {
+            maxDoingForTeam: this.getMaxDoingTasks(),
+          });
           if (!claimed) {
+            const current = await this.db.tasks.getByNameForTeam(task.name, teamId);
+            if (current?.status === 'todo' && !current.owner && !(await this.hasDoingTaskRoom(teamId))) {
+              return { ok: false, error: await this.doingTaskLimitMessage(teamId) };
+            }
             return { ok: false, error: `Cannot claim "${task.name}" — task is already owned or not in todo status` };
           }
 
           const updated = await this.db.tasks.getByNameForTeam(task.name, teamId);
-          return { ok: true, result: { task: await this.buildTaskResult(updated!, teamId) } };
+          return { ok: true, result: { task: await this.buildTaskResult(updated!, teamId), brief_validation: claimBrief.validation } };
         }
 
         if (subCmd === 'done') {
-          // /task done <task-name|#shortid>
+          // /task done <task-name|#shortid> [--acceptance "..."] [--failure-note "..."] [--delegated-task-names "child-a,child-b"]
           // Manager can mark any task done; agent can only mark its own task done
           const taskRef = args[1];
           if (!taskRef) {
-            return { ok: false, error: 'Usage: /task done <task-name|#shortid>' };
+            return { ok: false, error: 'Usage: /task done <task-name|#shortid> [--acceptance "..."] [--failure-note "..."] [--delegated-task-names "child-a,child-b"]' };
+          }
+          const acceptanceCoverage: string[] = [];
+          const delegatedTaskNames: string[] = [];
+          let failureNote: string | undefined;
+          let noDelegationReason: string | undefined;
+          let advisoryQuery = false;
+          for (let i = 2; i < args.length; i++) {
+            const token = args[i];
+            if (token === '--acceptance' || token === '--acceptance-coverage') { acceptanceCoverage.push(args[++i]); continue; }
+            if (token === '--failure-note' || token === '--failure') { failureNote = args[++i]; continue; }
+            if (token === '--delegated-task-names' || token === '--child-task-names' || token === '--delegated-tasks' || token === '--child-tasks') {
+              const value = args[++i] || '';
+              delegatedTaskNames.push(...value.split(',').map((item) => item.trim()).filter(Boolean));
+              continue;
+            }
+            if (token === '--delegated-task' || token === '--child-task') {
+              const value = args[++i];
+              if (value) delegatedTaskNames.push(value);
+              continue;
+            }
+            if (token === '--no-delegation-reason') { noDelegationReason = args[++i]; continue; }
+            if (token === '--advisory-query') { advisoryQuery = true; continue; }
           }
 
           const { task, error: taskErr } = await this.resolveTaskRef(taskRef, teamId);
@@ -9264,6 +10912,33 @@ export class AgentManagerDb {
             }
           }
 
+          const completionPayload = {
+            acceptance_coverage: acceptanceCoverage,
+            delegated_task_names: delegatedTaskNames,
+            failure_note: failureNote,
+            no_delegation_reason: noDelegationReason,
+            advisory_query: advisoryQuery,
+          };
+          const completion = this.validateCompletionPayload(completionPayload);
+          if (completion.blocked) {
+            return {
+              ok: false,
+              error: 'task_completion_packet_required',
+              result: { completion_validation: completion.validation },
+            };
+          }
+
+          const teamRow = await this.db.teams.getTeam(teamId).catch(() => null);
+          const delegationError = await this.validateTeamLeadDelegationBeforeDone({
+            teamId,
+            teamName: teamRow?.name || 'default',
+            task,
+            payload: completionPayload,
+          });
+          if (delegationError) {
+            return { ok: false, error: delegationError };
+          }
+
           const now = Math.floor(Date.now() / 1000);
           await this.db.tasks.updateFields(task.id, {
             status: 'done',
@@ -9272,7 +10947,7 @@ export class AgentManagerDb {
           });
 
           const updated = await this.db.tasks.getByNameForTeam(task.name, teamId);
-          return { ok: true, result: { task: await this.buildTaskResult(updated!, teamId) } };
+          return { ok: true, result: { task: await this.buildTaskResult(updated!, teamId), completion_validation: completion.validation } };
         }
 
         if (subCmd === 'status') {
@@ -9293,6 +10968,17 @@ export class AgentManagerDb {
 
           if (task.team_id && task.team_id !== teamId) {
             return { ok: false, error: `Task "${taskRef}" not found` };
+          }
+
+          if (newStatus === 'done') {
+            const completion = this.validateCompletionPayload({});
+            if (completion.blocked) {
+              return {
+                ok: false,
+                error: 'task_completion_packet_required',
+                result: { completion_validation: completion.validation },
+              };
+            }
           }
 
           const now = Math.floor(Date.now() / 1000);
@@ -9487,50 +11173,304 @@ export class AgentManagerDb {
   private async sendSupervisionAsk(teamName: string, agentName: string, message: string): Promise<boolean> {
     const quoted = `"${message.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
     try {
-      await fetch(`http://127.0.0.1:${this.managementPort}/remote`, {
+      const res = await fetch(`http://127.0.0.1:${this.managementPort}/remote`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'X-Id-Admin': '1', 'X-Id-Team': teamName },
         body: JSON.stringify({ command: `/ask ${agentName} ${quoted}` }),
         signal: AbortSignal.timeout(20_000),
       });
-      return true;
+      return res.ok;
     } catch {
       return false;
     }
   }
 
+  private taskShortRef(task: TaskRow): string {
+    return task.uuid ? `#${task.uuid.replace(/-/g, '').slice(0, 8)}` : task.name;
+  }
+
+  private taskTimestampMs(timestamp: number): number {
+    return timestamp < 10_000_000_000 ? timestamp * 1000 : timestamp;
+  }
+
+  private taskLastActivityMs(task: TaskRow): number {
+    return this.taskTimestampMs(task.updated_at || task.created_at || 0);
+  }
+
+  private async recordTaskSupervision(
+    task: TaskRow,
+    teamId: string,
+    actorAgentId: string | null,
+    reason: 'owner_refresh' | 'owner_unavailable' | 'unclaimed' | 'checkin_heartbeat_probe' | 'probe_limit_reached' | 'validator_stalled_terminal' | 'lead_delegation_required' | 'lead_owner_unavailable',
+    stalledMinutes: number,
+    nowMs: number,
+  ): Promise<void> {
+    const input = {
+      teamId,
+      taskUuid: task.uuid,
+      taskName: task.name,
+      title: task.title,
+      ownerAgentId: task.owner,
+      actorAgentId,
+      occurredAt: nowMs,
+      reason,
+      stalledMinutes,
+    };
+    if (reason === 'owner_refresh' || reason === 'checkin_heartbeat_probe') {
+      await emitTaskRefreshed(this.db.events, input);
+    } else {
+      await emitTaskTriaged(this.db.events, input);
+    }
+  }
+
+  private async closeStalledValidatorTaskTerminal(params: {
+    task: TaskRow;
+    teamRow: { id: string; name: string };
+    ownerAgent: AgentRow | null;
+    stalledMinutes: number;
+    nowMs: number;
+    maxProbes: number;
+  }): Promise<boolean> {
+    const validatorName = this.defaultValidatorName(params.ownerAgent);
+    if (!validatorName) return false;
+    if (!this.isValidationTask(params.task)) return false;
+
+    const nowSec = Math.floor(params.nowMs / 1000);
+    const failureNote = `stalled_validation_terminal: ${validatorName} remained processing after ${params.maxProbes} bounded probe(s) and one retry over ${params.stalledMinutes}m; closed without automatic redispatch.`;
+    await this.db.tasks.updateFields(params.task.id, {
+      status: 'done',
+      completed_at: nowSec,
+      updated_at: nowSec,
+    });
+    await emitTaskCompleted(this.db.events, {
+      teamId: params.teamRow.id,
+      taskUuid: params.task.uuid,
+      taskName: params.task.name,
+      title: params.task.title,
+      ownerAgentId: params.task.owner ?? null,
+      actorAgentId: params.ownerAgent?.id ?? params.task.owner ?? null,
+      occurredAt: params.nowMs,
+      failureNote,
+    });
+    await closeLinkedCheckinsForTerminalTask(this.db, {
+      teamId: params.teamRow.id,
+      taskId: params.task.id,
+      taskStatus: 'done',
+      actorAgentId: params.ownerAgent?.id ?? params.task.owner ?? null,
+      occurredAt: params.nowMs,
+    });
+    await this.recordTaskSupervision(
+      params.task,
+      params.teamRow.id,
+      params.ownerAgent?.id ?? params.task.owner ?? null,
+      'validator_stalled_terminal',
+      params.stalledMinutes,
+      params.nowMs,
+    );
+    this.managerLog(`Closed stalled validation task ${params.task.name}: ${failureNote}`);
+    return true;
+  }
+
+  private hasExhaustedCheckinProbe(checkins: CheckinRow[], maxProbes: number): boolean {
+    return checkins.some((checkin) => this.canEscalateStalledProbe(`checkin:${checkin.id}`, maxProbes));
+  }
+
+  private markCheckinProbeEscalated(checkins: CheckinRow[], nowMs: number, maxProbes: number): void {
+    for (const checkin of checkins) {
+      const key = `checkin:${checkin.id}`;
+      if (this.canEscalateStalledProbe(key, maxProbes)) {
+        this.markStalledProbeEscalated(key, nowMs);
+      }
+    }
+  }
+
+  private async probeStalledTaskCheckins(
+    task: TaskRow,
+    teamRow: { id: string; name: string },
+    checkins: CheckinRow[],
+    stalledMinutes: number,
+    nowMs: number,
+    renudgeMs: number,
+    maxProbes: number,
+  ): Promise<boolean> {
+    for (const checkin of checkins) {
+      if (checkin.status !== 'active') continue;
+      if (!checkin.owner_agent_id) continue;
+      if (checkin.max_iterations !== null && checkin.iteration_count >= checkin.max_iterations) continue;
+      const key = `checkin:${checkin.id}`;
+      if (!this.canRunStalledProbe(key, nowMs, renudgeMs, maxProbes)) continue;
+      this.markStalledProbe(key, nowMs);
+      await this.db.checkins.updateFields(checkin.id, teamRow.id, {
+        next_fire_at: Math.min(checkin.next_fire_at ?? nowMs, nowMs),
+        updated_at: nowMs,
+      });
+      await this.recordTaskSupervision(
+        task,
+        teamRow.id,
+        checkin.owner_agent_id,
+        'checkin_heartbeat_probe',
+        stalledMinutes,
+        nowMs,
+      );
+      return true;
+    }
+    return false;
+  }
+
   private async sweepStalledTasks(): Promise<void> {
-    const STALL_MS = Number(process.env.STALL_SWEEP_MS) || 25 * 60 * 1000;     // 'doing' this long with no update
-    const RENUDGE_MS = Number(process.env.STALL_RENUDGE_MS) || 25 * 60 * 1000; // don't re-nudge a task within this
-    const MAX_PER_SWEEP = 6;
+    const STALL_MS = Number(process.env.STALL_SWEEP_MS) || 45 * 60 * 1000;     // 'doing' this long with no update
+    const RENUDGE_MS = Number(process.env.STALL_RENUDGE_MS) || 90 * 60 * 1000; // don't re-nudge a task within this
+    const MAX_PER_SWEEP = Math.max(1, Number(process.env.STALL_SWEEP_MAX_PER_SWEEP) || 2);
+    const MAX_PROBES = this.getMaxStalledTaskProbes();
     const now = Date.now();
     const doing = await this.db.tasks.list({ status: 'doing' }).catch(() => [] as TaskRow[]);
     let nudged = 0;
     for (const t of doing) {
       if (nudged >= MAX_PER_SWEEP) break;
       if (!t.owner) continue;
-      const updated = t.updated_at || t.created_at || 0;
-      if (now - updated < STALL_MS) continue;
-      if (now - (this.stalledNudges.get(t.id) || 0) < RENUDGE_MS) continue;
+      const updated = this.taskLastActivityMs(t);
       // Resolve owner id → agent name + the task's team name for the dispatch.
       const ownerAgent = await this.db.agents.getById(t.owner).catch(() => null);
       const ownerName = ownerAgent?.name || t.owner;
       const teamRow = t.team_id ? await this.db.teams.getTeam(t.team_id).catch(() => null) : null;
+      if (!teamRow) continue;
       const teamName = teamRow?.name || 'default';
-      // Defer to the manager's native auto check-ins: if an active check-in is already supervising
-      // this task, let it be the single supervisor — don't double-poke. (CC refactor Phase 2: one
-      // supervisor, not three. The sweeper only backstops tasks no check-in is covering.)
-      if (teamRow) {
-        const active = await this.db.checkins
-          .list({ teamId: teamRow.id, linkedTaskId: t.id, status: ['active', 'snoozed'], limit: 1 })
-          .catch(() => [] as CheckinRow[]);
-        if (active.length) continue;
-      }
-      const ref = t.uuid ? `#${t.uuid.replace(/-/g, '').slice(0, 8)}` : t.name;
+      const ref = this.taskShortRef(t);
       const mins = Math.round((now - updated) / 60000);
-      const msg = `Supervision: task ${ref} ("${t.title}") has been in progress ${mins}m with no completion. If the work is done, mark it done now with \`/task done ${ref}\`. If you're blocked, reply briefly with what's blocking it. If it isn't started, start and finish it.`;
-      this.stalledNudges.set(t.id, now);
-      if (await this.sendSupervisionAsk(teamName, ownerName, msg)) nudged++;
+
+      if (this.isLiveForSupervision(ownerAgent) && this.isConfiguredTeamLead(teamName, ownerAgent)) {
+        const nudgeKey = `task:${t.id}:lead-delegation`;
+        const canRun = this.canRunStalledProbe(nudgeKey, now, RENUDGE_MS, MAX_PROBES);
+        const canEscalate = !canRun && this.canEscalateStalledProbe(nudgeKey, MAX_PROBES);
+        if (canRun || canEscalate) {
+          const attempt = canRun ? this.markStalledProbe(nudgeKey, now) : MAX_PROBES;
+          const msg = await this.buildLeadDelegationNudge(
+            t,
+            teamRow.id,
+            teamName,
+            ownerAgent,
+            ref,
+            attempt,
+            MAX_PROBES,
+            mins,
+          );
+          if (msg) {
+            if (canEscalate) this.markStalledProbeEscalated(nudgeKey, now);
+            if (await this.sendSupervisionAsk(teamName, ownerName, msg)) {
+              await this.recordTaskSupervision(
+                t,
+                teamRow.id,
+                ownerAgent.id,
+                canEscalate ? 'probe_limit_reached' : 'lead_delegation_required',
+                mins,
+                now,
+              );
+              nudged++;
+            }
+            continue;
+          }
+          if (canRun) this.stalledNudges.delete(nudgeKey);
+        }
+      }
+
+      if (!this.isLiveForSupervision(ownerAgent) && this.isConfiguredTeamLead(teamName, ownerAgent)) {
+        const audit = await this.buildDelegationAudit(t, teamRow.id, teamName, ownerAgent);
+        if (audit?.status === 'needs-delegation') {
+          const nowSec = Math.floor(now / 1000);
+          await this.db.tasks.updateFields(t.id, {
+            status: 'todo',
+            owner: null,
+            updated_at: nowSec,
+          });
+          await this.recordTaskSupervision(
+            t,
+            teamRow.id,
+            t.owner ?? null,
+            'lead_owner_unavailable',
+            mins,
+            now,
+          );
+          this.managerLog(`Parked lead-owned task ${t.name}: owner ${ownerName} is unavailable and no delegated child task was detected`);
+          nudged++;
+          continue;
+        }
+      }
+
+      if (now - updated < STALL_MS) continue;
+
+      // Heartbeat probes for checkin-supervised stalled work. A linked checkin
+      // remains the single owner-facing supervisor; the sweeper only pulls its
+      // next fire forward, bounded by the same max-probe guard as direct nudges.
+      const active = await this.db.checkins
+        .list({ teamId: teamRow.id, linkedTaskId: t.id, status: ['active'], limit: 5 })
+        .catch(() => [] as CheckinRow[]);
+      if (active.length) {
+        if (await this.probeStalledTaskCheckins(t, teamRow, active, mins, now, RENUDGE_MS, MAX_PROBES)) {
+          nudged++;
+        } else if (this.hasExhaustedCheckinProbe(active, MAX_PROBES)) {
+          this.markCheckinProbeEscalated(active, now, MAX_PROBES);
+          if (await this.closeStalledValidatorTaskTerminal({
+            task: t,
+            teamRow,
+            ownerAgent,
+            stalledMinutes: mins,
+            nowMs: now,
+            maxProbes: MAX_PROBES,
+          })) {
+            nudged++;
+          }
+        }
+        continue;
+      }
+
+      const unavailable = ownerAgent ? `owner ${ownerName} is ${ownerAgent.status || 'not live'}` : `owner id ${t.owner} is missing`;
+      if (this.isLiveForSupervision(ownerAgent)) {
+        const nudgeKey = `task:${t.id}:owner-refresh`;
+        if (!this.canRunStalledProbe(nudgeKey, now, RENUDGE_MS, MAX_PROBES)) {
+          if (this.canEscalateStalledProbe(nudgeKey, MAX_PROBES)) {
+            if (await this.closeStalledValidatorTaskTerminal({
+              task: t,
+              teamRow,
+              ownerAgent,
+              stalledMinutes: mins,
+              nowMs: now,
+              maxProbes: MAX_PROBES,
+            })) {
+              this.markStalledProbeEscalated(nudgeKey, now);
+              nudged++;
+              continue;
+            }
+            const lead = await this.findSupervisionLead(teamRow.id);
+            if (lead) {
+              this.markStalledProbeEscalated(nudgeKey, now);
+              const msg = `Supervision: task ${ref} ("${t.title}") is still in progress after ${MAX_PROBES} stalled owner probes over ${mins}m. Please triage it: close it if finished, unblock it, reassign it, or split it into a new tracked task.`;
+              if (await this.sendSupervisionAsk(teamRow.name, lead.name, msg)) {
+                await this.recordTaskSupervision(t, teamRow.id, lead.id, 'probe_limit_reached', mins, now);
+                nudged++;
+              }
+            }
+          }
+          continue;
+        }
+        const attempt = this.markStalledProbe(nudgeKey, now);
+        const msg = `Supervision: task ${ref} ("${t.title}") has been in progress ${mins}m with no completion (probe ${attempt}/${MAX_PROBES}). If the work is done, mark it done now with \`/task done ${ref}\`. If you're blocked, reply briefly with what's blocking it. If it isn't started, start and finish it.`;
+        if (await this.sendSupervisionAsk(teamName, ownerName, msg)) {
+          await this.recordTaskSupervision(t, teamRow.id, ownerAgent.id, 'owner_refresh', mins, now);
+          nudged++;
+        }
+        continue;
+      }
+
+      const lead = await this.findSupervisionLead(teamRow.id);
+      if (!lead) continue;
+      const nudgeKey = `task:${t.id}:owner-unavailable`;
+      if (!this.canRunStalledProbe(nudgeKey, now, RENUDGE_MS, MAX_PROBES)) continue;
+      const attempt = this.markStalledProbe(nudgeKey, now);
+      const msg = `Supervision: task ${ref} ("${t.title}") has been in progress ${mins}m, but ${unavailable} (triage probe ${attempt}/${MAX_PROBES}). Please triage it: claim it, reassign it, or route it to the right teammate.`;
+      if (await this.sendSupervisionAsk(teamRow.name, lead.name, msg)) {
+        await this.recordTaskSupervision(t, teamRow.id, lead.id, 'owner_unavailable', mins, now);
+        nudged++;
+      }
     }
 
     const todo = nudged < MAX_PER_SWEEP
@@ -9539,10 +11479,10 @@ export class AgentManagerDb {
     for (const t of todo) {
       if (nudged >= MAX_PER_SWEEP) break;
       if (t.owner || !t.team_id) continue;
-      const updated = t.updated_at || t.created_at || 0;
+      const updated = this.taskLastActivityMs(t);
       if (now - updated < STALL_MS) continue;
       const nudgeKey = `todo:${t.id}`;
-      if (now - (this.stalledNudges.get(nudgeKey) || 0) < RENUDGE_MS) continue;
+      if (!this.canRunStalledProbe(nudgeKey, now, RENUDGE_MS, MAX_PROBES)) continue;
 
       const teamRow = await this.db.teams.getTeam(t.team_id).catch(() => null);
       if (!teamRow) continue;
@@ -9553,11 +11493,14 @@ export class AgentManagerDb {
 
       const lead = await this.findSupervisionLead(teamRow.id);
       if (!lead) continue;
-      const ref = t.uuid ? `#${t.uuid.replace(/-/g, '').slice(0, 8)}` : t.name;
+      const ref = this.taskShortRef(t);
       const mins = Math.round((now - updated) / 60000);
-      const msg = `Supervision: unclaimed task ${ref} ("${t.title}") has been waiting ${mins}m with no owner. Please claim it if it is yours, or route it to the right teammate.`;
-      this.stalledNudges.set(nudgeKey, now);
-      if (await this.sendSupervisionAsk(teamRow.name, lead.name, msg)) nudged++;
+      const attempt = this.markStalledProbe(nudgeKey, now);
+      const msg = `Supervision: unclaimed task ${ref} ("${t.title}") has been waiting ${mins}m with no owner (triage probe ${attempt}/${MAX_PROBES}). Please claim it if it is yours, or route it to the right teammate.`;
+      if (await this.sendSupervisionAsk(teamRow.name, lead.name, msg)) {
+        await this.recordTaskSupervision(t, teamRow.id, lead.id, 'unclaimed', mins, now);
+        nudged++;
+      }
     }
 
     if (nudged < MAX_PER_SWEEP) {
@@ -9572,22 +11515,26 @@ export class AgentManagerDb {
           if (nudged >= MAX_PER_SWEEP) break;
           if (now - q.created < STALL_MS) continue;
           const nudgeKey = `manager-query:${q.query_id}`;
-          if (now - (this.stalledNudges.get(nudgeKey) || 0) < RENUDGE_MS) continue;
+          if (!this.canRunStalledProbe(nudgeKey, now, RENUDGE_MS, MAX_PROBES)) continue;
           const lead = await this.findSupervisionLead(team.id);
           if (!lead) continue;
           const mins = Math.round((now - q.created) / 60000);
           const prompt = q.prompt ? ` ("${q.prompt.slice(0, 120)}${q.prompt.length > 120 ? '...' : ''}")` : '';
-          const msg = `Supervision: manager inbox request ${q.query_id}${prompt} has been pending ${mins}m. Please answer it, claim it, or route it to the right teammate.`;
-          this.stalledNudges.set(nudgeKey, now);
+          const attempt = this.markStalledProbe(nudgeKey, now);
+          const msg = `Supervision: manager inbox request ${q.query_id}${prompt} has been pending ${mins}m (triage probe ${attempt}/${MAX_PROBES}). Please answer it, claim it, or route it to the right teammate.`;
           if (await this.sendSupervisionAsk(team.name, lead.name, msg)) nudged++;
         }
       }
     }
     // Keep the throttle map from growing without bound.
     if (this.stalledNudges.size > 2000) {
-      for (const [k, ts] of this.stalledNudges) if (now - ts > 2 * RENUDGE_MS) this.stalledNudges.delete(k);
+      for (const [k, state] of this.stalledNudges) {
+        if (state.attempts < MAX_PROBES && now - state.lastAt > 2 * RENUDGE_MS) {
+          this.stalledNudges.delete(k);
+        }
+      }
     }
-    if (nudged) console.log(`[Manager] Stalled-task sweep: re-nudged ${nudged} owner(s)`);
+    if (nudged) console.log(`[Manager] Stalled-task sweep: probed ${nudged} stalled item(s)`);
   }
 
   /**
@@ -9668,8 +11615,10 @@ export class AgentManagerDb {
             const isOnline = resp.ok;
             this.healthStatus.set(key, { status: isOnline ? 'online' : 'offline', lastCheck: Date.now() });
 
-            // Update DB status if it changed
-            if (isOnline && agent.status === 'offline') {
+            // Update DB status if it changed. A stale local-agent shutdown can
+            // leave a replacement process labeled "stopped"; a successful
+            // local /health probe is authoritative for local-process liveness.
+            if (isOnline && agent.status !== 'running') {
               await this.db.agents.updateStatus(agent.id, 'running');
             } else if (!isOnline && agent.status === 'running') {
               await this.db.agents.updateStatus(agent.id, 'offline');
@@ -9754,6 +11703,13 @@ export class AgentManagerDb {
     return new Promise((resolve) => {
       // Create HTTP server from Express app
       this.httpServer = createHttpServer(this.managementApp);
+      const keepAliveRaw = Number(process.env.ID_MANAGER_KEEPALIVE_TIMEOUT_MS || 5_000);
+      const headersRaw = Number(process.env.ID_MANAGER_HEADERS_TIMEOUT_MS || 10_000);
+      const maxRequestsRaw = Number(process.env.ID_MANAGER_MAX_REQUESTS_PER_SOCKET || 500);
+      const keepAliveTimeoutMs = Number.isFinite(keepAliveRaw) ? Math.max(1_000, keepAliveRaw) : 5_000;
+      this.httpServer.keepAliveTimeout = keepAliveTimeoutMs;
+      this.httpServer.headersTimeout = Number.isFinite(headersRaw) ? Math.max(keepAliveTimeoutMs + 1_000, headersRaw) : 10_000;
+      this.httpServer.maxRequestsPerSocket = Number.isFinite(maxRequestsRaw) ? Math.max(1, maxRequestsRaw) : 500;
 
       // Create WebSocket server attached to HTTP server
       this.wss = new WebSocketServer({ server: this.httpServer, path: '/ws' });
@@ -9787,6 +11743,15 @@ export class AgentManagerDb {
 
         // Seed well-known teams (idempotent — getOrCreateTeamId is safe to call repeatedly)
         await this.seedWellKnownTeams();
+
+        // Rehydrate runtime credential pools and lane cooldowns from team config
+        // before any spawned agents select a lane.
+        await this.hydrateRuntimeStateFromTeams();
+
+        // Keep the durable default config authoritative for the default-team
+        // coder row only. This avoids silent recurrence after one-off repairs
+        // while leaving researcher and the rest of the fleet untouched.
+        await this.reconcileDefaultCoderRuntimeFromConfig();
 
         // Start periodic health monitoring (every 30s)
         this.startHealthMonitor();
@@ -9871,6 +11836,10 @@ export class AgentManagerDb {
     if (this.querySweeperInterval) {
       clearInterval(this.querySweeperInterval);
       this.querySweeperInterval = null;
+    }
+    if (this.stalledSweepInterval) {
+      clearInterval(this.stalledSweepInterval);
+      this.stalledSweepInterval = null;
     }
     if (this.healthCheckInterval) {
       clearInterval(this.healthCheckInterval);
@@ -10311,6 +12280,7 @@ export class AgentManagerDb {
   }
 
   private buildLocalAgentEnv(
+    teamId: string,
     teamName: string,
     port: number,
     agentRow: AgentRow | null,
@@ -10324,17 +12294,46 @@ export class AgentManagerDb {
     const catalogEnv = catalogSeed && typeof catalogSeed === 'object'
       ? Buffer.from(JSON.stringify(catalogSeed), 'utf8').toString('base64')
       : undefined;
+    const metadata = (agentRow?.metadata || {}) as AgentMetadata;
 
     // Reasoning effort for cloud-subscription runtimes (codex / claude-code-cli) —
     // lower effort = fewer reasoning tokens. Read by those harnesses; n/a for ollama.
     const effortRaw = (agentRow?.metadata as any)?.effort;
     const effort = (typeof effortRaw === 'string' && /^(minimal|low|medium|high|xhigh)$/.test(effortRaw)) ? effortRaw : undefined;
+    const speedRaw = (agentRow?.metadata as any)?.speed;
+    const speed = (typeof speedRaw === 'string' && /^(default|fast)$/.test(speedRaw) && speedRaw !== 'default') ? speedRaw : undefined;
 
     // External MCP servers attached to this agent (Modules view → metadata).
     // Serialized as JSON for claude-agent-server to parse into HarnessOptions.
     const mcpServers = (agentRow?.metadata as any)?.mcpServers;
     const mcpEnv = Array.isArray(mcpServers) && mcpServers.length > 0
       ? JSON.stringify(mcpServers)
+      : undefined;
+    const runtime = resolveRuntime((agentRow?.runtime || metadata.runtime) as string | undefined);
+    const providerRuntime = this.providerRuntimeForAgent(agentRow, metadata);
+    const providerApiKey = providerRuntime?.apiKey
+      || (providerRuntime?.keyEnv ? process.env[providerRuntime.keyEnv] : undefined)
+      || undefined;
+    const previousLaneId = typeof metadata.runtimeCredentialLane === 'string'
+      ? metadata.runtimeCredentialLane
+      : undefined;
+    const runtimeLane = this.chooseRuntimeCredentialLane(runtime, previousLaneId, teamId);
+    const laneEnv = runtimeLane.env || {};
+    const { ANTHROPIC_API_KEY: laneAnthropicApiKey, ...safeLaneEnv } = laneEnv;
+    const useMeteredOverflow = runtimeLane.kind === 'metered-api'
+      && (runtime === 'claude-code-cli' || runtime === 'claude-code-local')
+      && Boolean(laneAnthropicApiKey || process.env.ID_AGENT_OVERFLOW_ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY);
+    const childAnthropicApiKey = useMeteredOverflow
+      ? (laneAnthropicApiKey || process.env.ID_AGENT_OVERFLOW_ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY)
+      : runtime === 'claude-agent-sdk'
+        ? (laneAnthropicApiKey || process.env.ANTHROPIC_API_KEY)
+        : undefined;
+    const skillmeshProviderEnabled = this.isSkillmeshProviderEnabled(teamName, metadata);
+    const skillmeshKey = skillmeshProviderEnabled && typeof metadata.skillmesh_private_key === 'string'
+      ? metadata.skillmesh_private_key
+      : undefined;
+    const skillmeshCreatorKey = skillmeshProviderEnabled && typeof metadata.skillmesh_creator_key === 'string'
+      ? metadata.skillmesh_creator_key
       : undefined;
 
     return {
@@ -10348,19 +12347,36 @@ export class AgentManagerDb {
       ...(process.env.NVM_DIR && { NVM_DIR: process.env.NVM_DIR }),
       ...(process.env.XDG_CONFIG_HOME && { XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME }),
       ...filterClaudeEnvVars(process.env),
-      ...(agentRow?.runtime && { ID_HARNESS: resolveRuntime(agentRow.runtime) }),
+      ...(agentRow?.runtime && { ID_HARNESS: runtime }),
       ID_TEAM: teamName,
       ID_AGENT_PORT: String(port),
+      ID_RUNTIME_LANE_ID: runtimeLane.id,
+      ID_RUNTIME_LANE_KIND: runtimeLane.kind,
       MANAGER_URL: `http://127.0.0.1:4100`,
       ID_AGENT_SKIP_PERMISSIONS: skipPermissions ? 'true' : 'false',
-      ...(model && { CLAUDE_MODEL: model }),
+      ...safeLaneEnv,
+      ...(useMeteredOverflow && { ID_AGENT_CLAUDE_BARE: '1' }),
+      ...(model && { CLAUDE_MODEL: resolveModelAlias(model) }),
       ...(tokenId && { ID_AGENT_TOKEN_ID: tokenId }),
       ...(owsWallet && { OWS_WALLET: owsWallet }),
       ...(catalogEnv && { ID_AGENT_CATALOG: catalogEnv }),
       ...(effort && { ID_AGENT_EFFORT: effort }),
+      ...(speed && { ID_AGENT_SPEED: speed }),
       ...(mcpEnv && { ID_MCP_SERVERS: mcpEnv }),
-      ...(process.env.ANTHROPIC_API_KEY && { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY }),
+      ...(providerRuntime && {
+        ID_PROVIDER_LANE: providerRuntime.lane,
+        ID_PROVIDER_NAME: providerRuntime.name,
+        ID_PROVIDER_BASE_URL: providerRuntime.baseUrl,
+      }),
+      ...(providerApiKey && { ID_PROVIDER_API_KEY: providerApiKey }),
+      ...(childAnthropicApiKey && { ANTHROPIC_API_KEY: childAnthropicApiKey }),
       ...(process.env.OPENAI_API_KEY && { OPENAI_API_KEY: process.env.OPENAI_API_KEY }),
+      ...(skillmeshKey && {
+        SKILLMESH_PRIVATE_KEY: skillmeshKey,
+        SKILLMESH_APP_URL: process.env.SKILLMESH_APP_URL || 'https://skillmesh.bittrees.org',
+        SKILLMESH_RPC_URL: process.env.SKILLMESH_RPC_URL || 'https://sepolia.drpc.org',
+      }),
+      ...(skillmeshCreatorKey && { SKILLMESH_CREATOR_PRIVATE_KEY: skillmeshCreatorKey }),
     };
   }
 
@@ -10461,7 +12477,7 @@ export class AgentManagerDb {
       // Set environment
       // Look up OWS wallet name and permissions flag from agent metadata
       const agentRow = await this.dbQueryAgentById(teamId, id);
-      const localEnv = this.buildLocalAgentEnv(teamName, port, agentRow, model, tokenId);
+      const localEnv = this.buildLocalAgentEnv(teamId, teamName, port, agentRow, model, tokenId);
 
       // Create log file
       const logFile = `/tmp/${name}.log`;
@@ -10512,7 +12528,7 @@ export class AgentManagerDb {
 
   private listPidsListeningOnPort(port: number): number[] {
     try {
-      const lsofOutput = execFileSync('lsof', ['-ti', `:${port}`], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+      const lsofOutput = execFileSync('lsof', [`-tiTCP:${port}`, '-sTCP:LISTEN'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
       if (!lsofOutput) return [];
       return lsofOutput
         .split('\n')

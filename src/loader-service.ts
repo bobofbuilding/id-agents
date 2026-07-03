@@ -55,18 +55,24 @@ async function pingManager(): Promise<{ ok: boolean; data?: unknown }> {
   }
 }
 
+function listPidsListeningOnManagerPort(): string[] {
+  try {
+    const pids = execFileSync('lsof', [`-tiTCP:${MANAGER_PORT}`, '-sTCP:LISTEN'], { encoding: 'utf-8' }).trim();
+    return pids.split('\n').map(pid => pid.trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
 async function killManager(): Promise<boolean> {
   const myPid = process.pid;
-  let pids: string;
-  try {
-    pids = execFileSync('lsof', ['-ti', `:${MANAGER_PORT}`], { encoding: 'utf-8' }).trim();
-  } catch {
+  const pids = listPidsListeningOnManagerPort();
+  if (pids.length === 0) {
     log('No process on manager port');
     return true; // nothing running
   }
-  if (!pids) return true;
 
-  const pidList = pids.split('\n').filter(p => p && parseInt(p) !== myPid);
+  const pidList = pids.filter(p => p && parseInt(p) !== myPid);
   if (pidList.length === 0) {
     log('No manager process found (only self)');
     return true;
@@ -80,21 +86,16 @@ async function killManager(): Promise<boolean> {
   // Wait up to 5 seconds for graceful shutdown
   for (let i = 0; i < 10; i++) {
     await new Promise(r => setTimeout(r, 500));
-    try {
-      execFileSync('lsof', ['-ti', `:${MANAGER_PORT}`], { encoding: 'utf-8' });
-    } catch {
+    if (listPidsListeningOnManagerPort().length === 0) {
       return true; // port is free
     }
   }
 
   // Force kill
-  try {
-    const remaining = execFileSync('lsof', ['-ti', `:${MANAGER_PORT}`], { encoding: 'utf-8' }).trim();
-    for (const pid of remaining.split('\n').filter(p => p && parseInt(p) !== myPid)) {
-      log(`Force killing ${pid}`);
-      try { process.kill(parseInt(pid), 'SIGKILL'); } catch {}
-    }
-  } catch {}
+  for (const pid of listPidsListeningOnManagerPort().filter(p => p && parseInt(p) !== myPid)) {
+    log(`Force killing ${pid}`);
+    try { process.kill(parseInt(pid), 'SIGKILL'); } catch {}
+  }
   return true;
 }
 

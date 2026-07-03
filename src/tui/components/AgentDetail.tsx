@@ -1,8 +1,7 @@
 /**
- * AgentDetail — full-screen detail view for a focused remote agent.
- * Shows: customer_domain, public_endpoint_url, ows_wallet, idchain_domain,
- * last_seen, last_error, consecutive_failures, ssh_target.
- * Accessible in the agents view via → arrow when a remote agent is selected.
+ * AgentDetail — full-screen detail view for a focused agent.
+ * Shows runtime, health, workspace/endpoint details, connector/module state,
+ * and troubleshooting fields.
  */
 import React from 'react';
 import { Box, Text } from 'ink';
@@ -18,11 +17,22 @@ interface AgentDetailProps {
   nowMs: number;
 }
 
-function fieldRow(label: string, value: string | null | undefined, color?: string): string {
-  const v = value ?? '(none)';
-  const w = 22;
-  const padded = label.padEnd(w);
-  return `${padded}${v}`;
+function listNames(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => {
+      if (typeof item === 'string') return item;
+      if (item && typeof item === 'object') {
+        const record = item as Record<string, unknown>;
+        return typeof record.name === 'string' ? record.name : null;
+      }
+      return null;
+    })
+    .filter((item): item is string => Boolean(item));
+}
+
+function yesNo(value: boolean): string {
+  return value ? 'yes' : 'no';
 }
 
 export function AgentDetail(props: AgentDetailProps): React.ReactElement {
@@ -45,11 +55,27 @@ export function AgentDetail(props: AgentDetailProps): React.ReactElement {
     agent.metadata?.runtime === 'public-agent-remote';
 
   const lines: Array<{ label: string; value: string; color?: string }> = [];
+  const skills = listNames(agent.metadata?.skills);
+  const plugins = listNames(agent.metadata?.plugins);
+  const mcpServers = listNames(agent.metadata?.mcpServers);
+  const delegates = listNames(agent.metadata?.delegates);
+  const hasInstructions = typeof agent.metadata?.instructions === 'string' && agent.metadata.instructions.trim().length > 0;
 
   lines.push({ label: 'name', value: agent.alias ?? agent.name });
-  lines.push({ label: 'runtime', value: agent.metadata?.runtime ?? '—' });
+  lines.push({ label: 'runtime', value: agent.runtime ?? agent.metadata?.runtime ?? '—' });
   lines.push({ label: 'health', value: agent.health, color: healthColor(agent.health) });
   lines.push({ label: 'status', value: agent.status });
+  if (agent.status === 'pending') {
+    lines.push({ label: 'operator_hint', value: 'rebuild/restart needed for pending changes', color: 'yellow' });
+  }
+
+  lines.push({ label: '', value: '' });
+  lines.push({ label: '--- Capabilities ---', value: '' });
+  lines.push({ label: 'skills', value: skills.length ? skills.join(', ') : '(none)' });
+  lines.push({ label: 'plugins', value: plugins.length ? plugins.join(', ') : '(none)' });
+  lines.push({ label: 'mcp_servers', value: mcpServers.length ? mcpServers.join(', ') : '(none)' });
+  lines.push({ label: 'delegates', value: delegates.length ? delegates.join(', ') : '(none)' });
+  lines.push({ label: 'instructions', value: yesNo(hasInstructions) });
 
   if (isRemote) {
     lines.push({ label: '', value: '' });
@@ -77,7 +103,8 @@ export function AgentDetail(props: AgentDetailProps): React.ReactElement {
   const skillmeshAddress = agent.metadata?.skillmesh_address;
   if (skillmeshAddress) {
     lines.push({ label: '', value: '' });
-    lines.push({ label: '--- SkillMesh Identity ---', value: '' });
+    lines.push({ label: '--- Optional Provider Identity ---', value: '' });
+    lines.push({ label: 'provider', value: 'skillmesh', color: 'cyan' });
     lines.push({ label: 'address', value: skillmeshAddress, color: 'cyan' });
     const keyIndex = agent.metadata?.skillmesh_key_index;
     lines.push({ label: 'key_path', value: agent.metadata?.skillmesh_key_path ?? `m/44'/60'/0'/0/${keyIndex ?? '?'}` });

@@ -14,6 +14,7 @@ team: operations-team
 defaults:
   local: true
   runtime: codex
+  model: gpt-5.4
   skills:
     - identity
     - inter-agent
@@ -22,36 +23,70 @@ defaults:
 
 agents:
   - name: ops-lead
+    model: gpt-5.5
     description: >-
       Coordinator. Triages operations requests, breaks them into work for the
-      specialists (git-manager, deployer, monitor, maintainer), delegates via the
-      inter-agent skill, and reports back one clear status. Owns the team's routine
-      cadence and escalates anything risky — production pushes/deploys, mainnet,
-      deletes — to the human instead of acting unilaterally.
+      specialists (task-master, git-manager, deployer, monitor, maintainer,
+      content-ops, content-moderator), delegates via the inter-agent skill, and
+      reports back one clear status. Routes IDACC wiki maintenance and release-cycle documentation
+      freshness to content-ops by default. Routes content moderation, safety
+      classification, and policy-screening requests to content-moderator by default.
+      Owns the team's routine cadence and escalates anything risky — production
+      pushes/deploys, mainnet, deletes — to the human instead of acting unilaterally.
+      Returns substantial accomplishment packets through default/coder and
+      default/researcher validation before default/lead treats the work as final.
     skills:
       - team-coordinator
       - brain
+      - idagents-team-builder
 
   - name: git-manager
     description: >-
-      Owns the git repositories under the projects root
-      (/Users/jhineline/bob/Library/Assistants/idagents/id-agents/workspace/projects).
-      For each repo: report `git status`, stage and commit meaningful changes with
-      clear messages, keep branches tidy, and keep the working tree clean so the
-      control center's Projects page reflects accurate, current state — branch,
-      ahead/behind, dirty files, last commit. PUSH only when explicitly asked or to a
-      non-production branch; NEVER force-push, NEVER push a branch that auto-deploys
-      to production (e.g. chat/chirpy → main) without confirmation, and treat any repo
-      you were told is read-only (e.g. upstream id-agents) as off-limits for writes.
+      Owns git hygiene and push coordination for every git repository under the
+      projects root
+      (/Users/jhineline/bob/Library/Assistants/idagents/id-agents/workspace/projects),
+      which is the repo set surfaced on the control center's Projects page. For each
+      repo: report `git status`, preserve untracked/local-only files, stage only
+      intentional changes, commit meaningful changes with clear messages, keep
+      branches tidy, and keep the working tree clean so the Projects page reflects
+      accurate, current state — branch, ahead/behind, dirty files, last commit. When
+      a push should land on main, integrate it non-destructively: fetch first, merge
+      or rebase without discarding local work, resolve conflicts explicitly, verify
+      status/tests as appropriate, then push normally. NEVER force-push, reset hard,
+      clean untracked files, delete local-only files, or push a branch that
+      auto-deploys to production (e.g. chat/chirpy -> main) without confirmation.
+      Treat any repo flagged read-only (e.g. upstream id-agents) as off-limits for
+      writes.
     skills:
       - brain
+
+  - name: task-master
+    runtime: codex
+    model: gpt-5.5
+    description: >-
+      Ops supervisor — audits the task board, closes stale doing tasks with no
+      assignee, dispatches unclaimed todos to the right agents, probes the full
+      fleet for offline agents and restarts them, and sends a structured ops
+      digest to ops-lead. Single point of fleet hygiene.
+    skills:
+      - brain
+    catalog:
+      role: supervisor
+      expertise:
+        - task-management
+        - fleet-health
+        - ops-automation
+        - agent-orchestration
+      costTier: medium
 
   - name: deployer
     description: >-
       Build, CI, and release. Runs each project's build/test, cuts versioned releases
       and tags, and deploys — but confirms before any production deploy and reports the
-      result (version, target, URL). Rolls back on failure. Hands the commit/push parts
-      to the git-manager.
+      result (version, target, URL). Owns deploy readiness for the same Projects page
+      repos, but hands staging, committing, merging to main, and pushing to the
+      git-manager so local project-folder changes are preserved and published through
+      one non-destructive git path. Rolls back on failure.
 
   - name: monitor
     description: >-
@@ -64,3 +99,38 @@ agents:
       Routine maintenance. Dependency updates, cleanup, scheduled chores, and small
       automation scripts. Proposes changes as commits for the git-manager to land, and
       keeps maintenance low-risk and reversible.
+
+  - name: content-ops
+    description: >-
+      Owns IDACC wiki maintenance for the ops team. Keeps
+      docs/CONTROL_CENTER_WIKI.json current with shipped Control Center behavior,
+      coordinates wiki drift fixes during release cycles, preserves route/nav/sourceFiles
+      metadata, and keeps release-cycle documentation fresh. Coordinates with deployer
+      and git-manager for release and commit flow, reports concise status to ops-lead,
+      and escalates ambiguous content or policy calls instead of editing silently.
+    model: gpt-5.4-mini
+    catalog:
+      role: content-lead
+      expertise:
+        - idacc-wiki-maintenance
+        - release-cycle-docs
+        - content-operations
+        - documentation-freshness
+      costTier: medium
+
+  - name: content-moderator
+    description: >-
+      Owns content moderation for the ops team. Classifies inbound content, performs
+      safety/compliance screening and policy-fit checks, and returns go/no-go
+      moderation verdicts before content is rewritten, published, or routed onward.
+      Reports concise verdicts to ops-lead and escalates ambiguous or high-risk
+      policy calls instead of approving them silently.
+    model: gpt-5.4-mini
+    catalog:
+      role: content-moderator
+      expertise:
+        - content-moderation
+        - safety-classification
+        - compliance-screening
+        - policy-fit
+      costTier: low

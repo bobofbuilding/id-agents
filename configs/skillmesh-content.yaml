@@ -16,6 +16,7 @@ defaults:
     - identity
     - inter-agent
     - catalog
+    - task-discipline
   plugins:
     - name: skillmesh
       path: ../workspace/projects/skillmesh/agents/plugins/skillmesh
@@ -26,7 +27,12 @@ agents:
     description: >
       Content Ops Stack lead — moderates inbound content for safety and compliance,
       rewrites drafts for tone and clarity, generates structured metadata (title,
-      tags, SEO signals), and formats output for distribution channels.
+      tags, SEO signals), and formats output for distribution channels. Returns
+      substantial accomplishment packets through default/coder and default/researcher
+      validation before default/lead treats the work as final.
+    skills:
+      - team-coordinator
+      - brain
     catalog:
       role: content-lead
       expertise:
