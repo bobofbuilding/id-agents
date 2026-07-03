@@ -412,6 +412,12 @@ interface QueryWaiter {
   timeout: NodeJS.Timeout | null;
 }
 
+interface StaleQuerySweepResult {
+  pending: number;
+  processing: number;
+  total: number;
+}
+
 interface BrainVolunteerContext {
   bundles: Array<{
     query?: string;
@@ -550,6 +556,8 @@ export class AgentManagerDb {
   private healthCheckInterval: NodeJS.Timeout | null = null;
   private remoteProbeInterval: NodeJS.Timeout | null = null;
   private querySweeperInterval: NodeJS.Timeout | null = null;
+  private querySweepInFlight: Promise<StaleQuerySweepResult> | null = null;
+  private lastQuerySweepAt = 0;
   private stalledSweepInterval: NodeJS.Timeout | null = null;
   private runtimeLaneCooldowns: Map<string, RuntimeLaneCooldown> = new Map();
   private runtimeCredentialPoolByTeam: Map<string, RuntimeCredentialPoolConfig> = new Map();
@@ -5684,12 +5692,14 @@ Return this JSON shape:
         if (matches.length === 0) return res.status(404).json({ error: 'Agent not found' });
         if (matches.length > 1) return res.status(409).json({ error: `Multiple agents match "${ref}". Use a specific id or name.` });
         const agent = matches[0];
+        const staleSweep = await this.sweepStaleQueries();
         const rows = await this.db.queries.getPending(agent.id);
         const now = Date.now();
         res.json({
           team: teamName,
           agent: { id: agent.id, name: agent.name, status: agent.status },
           count: rows.length,
+          staleSweep,
           queries: rows.map((q) => ({
             query_id: q.query_id,
             status: q.status,
@@ -9385,6 +9395,7 @@ Return this JSON shape:
           }
           a = matches[0];
         }
+        await this.sweepStaleQueriesIfDue(0);
         const maxActiveQueries = this.getMaxActiveQueriesPerAgent();
         if (maxActiveQueries > 0) {
           const activeQueries = await this.countActiveQueries(a.id);
@@ -11687,11 +11698,15 @@ Return this JSON shape:
    * written 'completed' or 'failed'). Without this sweeper the queries table
    * accumulates ghosts and callers polling /query/:id see 'pending' forever.
    *
-   * We run every 5 minutes and mark any pending/processing query older than
-   * QUERY_EXPIRY_MINUTES as 'expired'. See expireStale() for the actual SQL.
+   * We run every minute by default and mark any pending/processing query older
+   * than its lane-specific expiry as 'expired'. See expireStale() for the
+   * actual SQL. Override cadence with ID_QUERY_SWEEP_INTERVAL_MS.
    */
   private startQuerySweeper(): void {
-    const intervalMs = 5 * 60 * 1000;
+    const rawInterval = Number(process.env.ID_QUERY_SWEEP_INTERVAL_MS || 60_000);
+    const intervalMs = Number.isFinite(rawInterval) && rawInterval > 0
+      ? Math.max(10_000, Math.floor(rawInterval))
+      : 60_000;
     const runSweep = () => {
       this.sweepStaleQueries().catch((err) => {
         console.error('[Manager] Query sweeper failed:', err);
@@ -12150,7 +12165,23 @@ Return this JSON shape:
     this.retentionService.start();
   }
 
-  private async sweepStaleQueries(): Promise<void> {
+  private async sweepStaleQueriesIfDue(minIntervalMs = 30_000): Promise<StaleQuerySweepResult> {
+    const now = Date.now();
+    if (this.querySweepInFlight) return this.querySweepInFlight;
+    if (this.lastQuerySweepAt > 0 && now - this.lastQuerySweepAt < minIntervalMs) {
+      return { pending: 0, processing: 0, total: 0 };
+    }
+    return this.sweepStaleQueries();
+  }
+
+  private async sweepStaleQueries(): Promise<StaleQuerySweepResult> {
+    if (this.querySweepInFlight) return this.querySweepInFlight;
+    this.querySweepInFlight = this.sweepStaleQueriesUnlocked()
+      .finally(() => { this.querySweepInFlight = null; });
+    return this.querySweepInFlight;
+  }
+
+  private async sweepStaleQueriesUnlocked(): Promise<StaleQuerySweepResult> {
     const now = Date.now();
     const pendingCutoff = now - this.PENDING_QUERY_EXPIRY_MINUTES * 60 * 1000;
     const processingCutoff = now - this.PROCESSING_QUERY_EXPIRY_MINUTES * 60 * 1000;
@@ -12158,6 +12189,7 @@ Return this JSON shape:
       this.db.queries.expireStale(pendingCutoff, ['pending']),
       this.db.queries.expireStale(processingCutoff, ['processing']),
     ]);
+    this.lastQuerySweepAt = now;
     const expired = [...expiredPending, ...expiredProcessing];
     const count = expired.length;
     if (count > 0) {
@@ -12179,6 +12211,7 @@ Return this JSON shape:
         `[Manager] Query sweeper expired ${count} stale queries (pending>${this.PENDING_QUERY_EXPIRY_MINUTES}m, processing>${this.PROCESSING_QUERY_EXPIRY_MINUTES}m)`,
       );
     }
+    return { pending: expiredPending.length, processing: expiredProcessing.length, total: count };
   }
 
   /**
@@ -13376,6 +13409,7 @@ Return this JSON shape:
       ? await this.db.teams.listTeams()
       : [{ id: opts.teamId, name: opts.teamName } as { id: string; name: string }];
     const rows: Array<{ team: string; name: string; status: 'candidate' | 'parked' | 'skipped' | 'failed'; reason: string; pids?: number[] }> = [];
+    await this.sweepStaleQueries();
 
     for (const team of teams) {
       if (team.name === 'default' && !opts.includeDefault) {

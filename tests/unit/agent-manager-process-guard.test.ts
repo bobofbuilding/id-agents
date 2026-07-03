@@ -2,6 +2,7 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'fs';
+import http from 'node:http';
 import os from 'os';
 import path from 'path';
 
@@ -38,6 +39,40 @@ async function makeManager() {
   const db = await createInMemoryDb();
   const manager = new AgentManagerDb(workDir, db as any);
   return { manager, db, workDir };
+}
+
+async function startTalkServer(response: Record<string, unknown>) {
+  const talkBodies: string[] = [];
+  const server = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/.well-known/restap.json') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ endpoints: { talk: '/talk' } }));
+      return;
+    }
+    if (req.method === 'POST' && req.url === '/talk') {
+      let body = '';
+      req.setEncoding('utf8');
+      req.on('data', (chunk) => { body += chunk; });
+      req.on('end', () => {
+        talkBodies.push(body);
+        res.writeHead(202, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(response));
+      });
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('talk server failed to bind a loopback port');
+  return {
+    endpoint: `http://127.0.0.1:${address.port}`,
+    talkBodies,
+    close: () => new Promise<void>((resolve, reject) => {
+      server.close((err) => (err ? reject(err) : resolve()));
+    }),
+  };
 }
 
 function agentRow(overrides: Partial<AgentRow> = {}): AgentRow {
@@ -549,6 +584,68 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     } finally {
       if (saved === undefined) delete process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
       else process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT = saved;
+    }
+  });
+
+  it('expires stale target queries before applying the /ask saturation guard', async () => {
+    const savedEnv = {
+      maxActive: process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT,
+      brainDisabled: process.env.BRAIN_CONTEXT_DISABLED,
+      pending: process.env.ID_PENDING_QUERY_EXPIRY_MINUTES,
+    };
+    let talkServer: Awaited<ReturnType<typeof startTalkServer>> | null = null;
+    process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT = '2';
+    process.env.BRAIN_CONTEXT_DISABLED = 'true';
+    delete process.env.ID_PENDING_QUERY_EXPIRY_MINUTES;
+    try {
+      const { manager, db, workDir } = await makeManager();
+      dbs.push(db);
+      workDirs.push(workDir);
+      talkServer = await startTalkServer({ query_id: 'new-query' });
+
+      const teamId = await db.teams.getOrCreateTeamId('default');
+      await db.agents.create({
+        ...agentRow({
+          team_id: teamId,
+          id: 'agent-stale-busy',
+          name: 'stale-busy-lead',
+          port: 4113,
+          status: 'running',
+          endpoint: talkServer.endpoint,
+        }),
+      });
+      const now = Date.now();
+      await db.queries.upsert(teamId, 'agent-stale-busy', {
+        query_id: 'stale-pending',
+        status: 'pending',
+        prompt: 'stale queued work',
+        created: now - 31 * 60 * 1000,
+        owner_kind: 'agent',
+        owner_id: 'agent-stale-busy',
+      });
+      await db.queries.upsert(teamId, 'agent-stale-busy', {
+        query_id: 'fresh-processing',
+        status: 'processing',
+        prompt: 'fresh current work',
+        created: now,
+        owner_kind: 'agent',
+        owner_id: 'agent-stale-busy',
+      });
+
+      const result = await (manager as any).executeRemoteCommand('/ask stale-busy-lead do one more thing', teamId, 'default');
+
+      expect(result.ok).toBe(true);
+      expect(result.result?.queryId).toBe('new-query');
+      expect((await db.queries.getByQueryIdForTeam(teamId, 'stale-pending'))?.status).toBe('expired');
+      expect(talkServer.talkBodies).toHaveLength(1);
+    } finally {
+      await talkServer?.close();
+      if (savedEnv.maxActive === undefined) delete process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
+      else process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT = savedEnv.maxActive;
+      if (savedEnv.brainDisabled === undefined) delete process.env.BRAIN_CONTEXT_DISABLED;
+      else process.env.BRAIN_CONTEXT_DISABLED = savedEnv.brainDisabled;
+      if (savedEnv.pending === undefined) delete process.env.ID_PENDING_QUERY_EXPIRY_MINUTES;
+      else process.env.ID_PENDING_QUERY_EXPIRY_MINUTES = savedEnv.pending;
     }
   });
 });
