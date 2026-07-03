@@ -51,7 +51,7 @@ function agentRow(overrides: Partial<AgentRow> = {}): AgentRow {
     status: 'running',
     created_at: 1,
     registry: null,
-    metadata: { pid: 12345, runtime: 'codex' },
+    metadata: { pid: 12345, runtime: 'codex', processOwner: 'adopted', processParentPid: 1, processInspectedAt: 1000 },
     deleted_at: null,
     runtime: 'codex',
     token_id: null,
@@ -207,10 +207,102 @@ describe('AgentManagerDb killAgentProcess guards', () => {
 
     const stopped = (manager as any).agentToResponse(agentRow({ status: 'stopped' }));
     expect(stopped.pid).toBeNull();
+    expect(stopped.processOwner).toBeNull();
+    expect(stopped.processParentPid).toBeNull();
     expect(stopped.metadata).not.toHaveProperty('pid');
+    expect(stopped.metadata).not.toHaveProperty('processOwner');
+    expect(stopped.metadata).not.toHaveProperty('processParentPid');
+    expect(stopped.metadata).not.toHaveProperty('processInspectedAt');
 
     const running = (manager as any).agentToResponse(agentRow({ status: 'running' }));
     expect(running.pid).toBe(12345);
+    expect(running.processOwner).toBe('adopted');
+    expect(running.processParentPid).toBe(1);
     expect(running.metadata.pid).toBe(12345);
+    expect(running.metadata.processOwner).toBe('adopted');
+    expect(running.metadata.processParentPid).toBe(1);
+
+    const invalidOwner = (manager as any).agentToResponse(agentRow({
+      status: 'running',
+      metadata: { pid: 12345, runtime: 'codex', processOwner: 'other', processParentPid: 1 },
+    }));
+    expect(invalidOwner.processOwner).toBeNull();
+  });
+
+  it('clears all local process metadata together', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-process-meta',
+        metadata: { pid: 43210, processOwner: 'manager-child', processParentPid: process.pid, processInspectedAt: 2000 },
+      }),
+    });
+
+    await (manager as any).clearAgentPid('agent-process-meta');
+
+    const row = await db.agents.getById('agent-process-meta');
+    expect(row?.metadata).not.toHaveProperty('pid');
+    expect(row?.metadata).not.toHaveProperty('processOwner');
+    expect(row?.metadata).not.toHaveProperty('processParentPid');
+    expect(row?.metadata).not.toHaveProperty('processInspectedAt');
+  });
+
+  it('reconciles running local process ownership on startup audit', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-adopted',
+        name: 'coder',
+        port: 4101,
+        status: 'running',
+        metadata: { pid: 22222, runtime: 'codex' },
+      }),
+    });
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-stale',
+        name: 'researcher',
+        port: 4102,
+        status: 'running',
+        metadata: { pid: 33333, runtime: 'codex', processOwner: 'manager-child', processParentPid: process.pid },
+      }),
+    });
+
+    (manager as any).inspectProcess = vi.fn((pid: number) => {
+      if (pid === 22222) {
+        return {
+          pid,
+          ppid: 1,
+          argv0: 'node',
+          commandLine: 'node dist/local-agent-server.js coder --team default --port 4101',
+        };
+      }
+      return null;
+    });
+
+    await (manager as any).reconcileLocalAgentProcessMetadata();
+
+    const adopted = await db.agents.getById('agent-adopted');
+    expect(adopted?.metadata?.pid).toBe(22222);
+    expect(adopted?.metadata?.processOwner).toBe('adopted');
+    expect(adopted?.metadata?.processParentPid).toBe(1);
+    expect(typeof adopted?.metadata?.processInspectedAt).toBe('number');
+
+    const stale = await db.agents.getById('agent-stale');
+    expect(stale?.status).toBe('offline');
+    expect(stale?.metadata).not.toHaveProperty('pid');
+    expect(stale?.metadata).not.toHaveProperty('processOwner');
+    expect(stale?.metadata).not.toHaveProperty('processParentPid');
   });
 });

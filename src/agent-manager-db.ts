@@ -452,6 +452,12 @@ interface ProcessInspection {
   commandLine: string;
 }
 
+type LocalProcessOwner = 'manager-child' | 'adopted' | 'external';
+
+function localProcessOwnerValue(value: unknown): LocalProcessOwner | null {
+  return value === 'manager-child' || value === 'adopted' || value === 'external' ? value : null;
+}
+
 type RuntimeLaneKind = 'subscription' | 'metered-api';
 
 interface RuntimeCredentialLane {
@@ -1883,7 +1889,17 @@ Return this JSON shape:
     const metaPid = metadata.pid;
     const metaPidNumber = typeof metaPid === 'number' ? metaPid : Number(metaPid);
     const pid = localRunning && Number.isFinite(metaPidNumber) && metaPidNumber > 0 ? metaPidNumber : null;
-    if (!localRunning) delete metadata.pid;
+    const processOwner = localRunning && pid ? localProcessOwnerValue(metadata.processOwner) : null;
+    const processParentPidRaw = metadata.processParentPid;
+    const processParentPid = localRunning && pid && typeof processParentPidRaw === 'number'
+      ? processParentPidRaw
+      : null;
+    if (!localRunning) {
+      delete metadata.pid;
+      delete metadata.processOwner;
+      delete metadata.processParentPid;
+      delete metadata.processInspectedAt;
+    }
 
     // Remote-endpoint agents have no local port or pid; health is derived from probe columns.
     const remoteFields = isRemote ? {
@@ -1916,6 +1932,8 @@ Return this JSON shape:
       model: a.model,
       port: a.port,
       pid,
+      processOwner,
+      processParentPid,
       status: a.status,
       workingDirectory: a.working_directory,
       createdAt: a.created_at,
@@ -11906,7 +11924,7 @@ Return this JSON shape:
 
         // Seed well-known teams (idempotent — getOrCreateTeamId is safe to call repeatedly)
         await this.seedWellKnownTeams();
-        await this.clearInactiveAgentPids();
+        await this.reconcileLocalAgentProcessMetadata();
 
         // Rehydrate runtime credential pools and lane cooldowns from team config
         // before any spawned agents select a lane.
@@ -12050,25 +12068,74 @@ Return this JSON shape:
     }
   }
 
-  private async clearInactiveAgentPids(): Promise<void> {
+  private localProcessOwnerFromInspection(info: ProcessInspection): LocalProcessOwner {
+    if (info.ppid === process.pid) return 'manager-child';
+    if (info.ppid === 1) return 'adopted';
+    return 'external';
+  }
+
+  private matchesLocalAgentProcess(info: ProcessInspection, agent: AgentRow): boolean {
+    if (!/local-agent-server\.(js|ts)\b/.test(info.commandLine)) return false;
+    if (agent.port && !new RegExp(`--port(?:=|\\s+)${agent.port}(?:\\s|$)`).test(info.commandLine)) return false;
+    return true;
+  }
+
+  private async reconcileLocalAgentProcessMetadata(): Promise<void> {
     try {
       let cleared = 0;
+      let updated = 0;
       const teams = await this.db.teams.listTeams();
       for (const team of teams) {
         const agents = await this.dbListAgents(team.id, true);
         for (const agent of agents) {
-          const metadata = (agent.metadata as Record<string, unknown> | null | undefined) ?? {};
-          if (agent.status === 'running' || !('pid' in metadata)) continue;
-          await this.clearAgentPid(agent.id);
-          cleared += 1;
+          if (isRemoteEndpointRuntime(agent.runtime)) continue;
+          const metadata = { ...((agent.metadata as Record<string, unknown> | null | undefined) ?? {}) };
+          const rawPid = metadata.pid;
+          const pid = typeof rawPid === 'number' ? rawPid : Number(rawPid);
+          if (agent.status !== 'running') {
+            if (!('pid' in metadata) && !('processOwner' in metadata) && !('processParentPid' in metadata) && !('processInspectedAt' in metadata)) continue;
+            await this.clearAgentPid(agent.id);
+            cleared += 1;
+            continue;
+          }
+          if (!Number.isFinite(pid) || pid <= 0) {
+            if ('processOwner' in metadata || 'processParentPid' in metadata || 'processInspectedAt' in metadata) {
+              await this.clearAgentPid(agent.id);
+              cleared += 1;
+            }
+            continue;
+          }
+          const info = this.inspectProcess(pid);
+          if (!info || !this.matchesLocalAgentProcess(info, agent)) {
+            await this.clearAgentPid(agent.id, pid);
+            await this.db.agents.updateStatus(agent.id, 'offline').catch(() => {});
+            cleared += 1;
+            continue;
+          }
+          const owner = this.localProcessOwnerFromInspection(info);
+          const next = {
+            ...metadata,
+            pid,
+            processOwner: owner,
+            processParentPid: info.ppid,
+            processInspectedAt: Date.now(),
+          };
+          if (
+            metadata.pid !== next.pid ||
+            metadata.processOwner !== next.processOwner ||
+            metadata.processParentPid !== next.processParentPid
+          ) {
+            await this.db.agents.updateMetadata(agent.id, next);
+            updated += 1;
+          }
         }
       }
-      if (cleared > 0) console.log(`[Manager] Cleared ${cleared} stale pid metadata entr${cleared === 1 ? 'y' : 'ies'} for inactive agents`);
+      if (cleared > 0) console.log(`[Manager] Cleared ${cleared} stale local-agent process metadata entr${cleared === 1 ? 'y' : 'ies'}`);
+      if (updated > 0) console.log(`[Manager] Tagged ${updated} local-agent process owner entr${updated === 1 ? 'y' : 'ies'}`);
     } catch (err: any) {
-      console.warn('[Manager] Failed to clear inactive agent pid metadata:', err?.message || err);
+      console.warn('[Manager] Failed to reconcile local-agent process metadata:', err?.message || err);
     }
   }
-
 
   /**
    * Handle a new WebSocket connection
@@ -12764,7 +12831,13 @@ Return this JSON shape:
       if (proc.pid) {
         try {
           const cur = (agentRow?.metadata as Record<string, unknown>) || {};
-          await this.db.agents.updateMetadata(id, { ...cur, pid: proc.pid });
+          await this.db.agents.updateMetadata(id, {
+            ...cur,
+            pid: proc.pid,
+            processOwner: 'manager-child',
+            processParentPid: process.pid,
+            processInspectedAt: Date.now(),
+          });
         } catch (metaErr: any) {
           console.warn(`[Manager] Failed to persist pid for ${name}: ${metaErr?.message || metaErr}`);
         }
@@ -13020,8 +13093,11 @@ Return this JSON shape:
       const currentPid = metadata.pid;
       const currentPidNumber = typeof currentPid === 'number' ? currentPid : Number(currentPid);
       if (expectedPid && currentPidNumber !== expectedPid) return;
-      if (!('pid' in metadata)) return;
+      if (!('pid' in metadata) && !('processOwner' in metadata) && !('processParentPid' in metadata) && !('processInspectedAt' in metadata)) return;
       delete metadata.pid;
+      delete metadata.processOwner;
+      delete metadata.processParentPid;
+      delete metadata.processInspectedAt;
       await this.db.agents.updateMetadata(agentId, metadata);
     } catch {
       // PID metadata is diagnostic only; lifecycle status is the source of truth.
