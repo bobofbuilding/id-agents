@@ -13528,6 +13528,22 @@ Return this JSON shape:
     return (await this.db.queries.getPending(agentId)).length;
   }
 
+  private parkIdleRecentActivityMs(): number {
+    const raw = Number(process.env.ID_PARK_IDLE_RECENT_ACTIVITY_MS || 10 * 60 * 1000);
+    return Number.isFinite(raw) && raw >= 0 ? raw : 10 * 60 * 1000;
+  }
+
+  private async countRecentQueriesForAgent(agentId: string, sinceMs: number): Promise<number> {
+    const { rows } = await this.db.adapter.query<{ c: string | number }>(
+      `SELECT COUNT(*) AS c
+         FROM queries
+        WHERE agent_id = ?
+          AND (created >= ? OR COALESCE(completed, 0) >= ?)`,
+      [agentId, sinceMs, sinceMs],
+    );
+    return Number(rows[0]?.c ?? 0) || 0;
+  }
+
   private async parkIdleAgents(opts: {
     teamId: string;
     teamName: string;
@@ -13600,6 +13616,14 @@ Return this JSON shape:
           rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: `has_${activeQueries}_active_${activeQueries === 1 ? 'query' : 'queries'}` });
           continue;
         }
+        const recentActivityMs = this.parkIdleRecentActivityMs();
+        const recentQueries = recentActivityMs > 0
+          ? await this.countRecentQueriesForAgent(agent.id, Date.now() - recentActivityMs)
+          : 0;
+        if (recentQueries > 0) {
+          rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: `recent_query_activity_${recentQueries}_within_${Math.round(recentActivityMs / 60000)}m` });
+          continue;
+        }
 
         if (!opts.confirmed) {
           rows.push({ team: team.name, name: agent.name, status: 'candidate', reason: 'idle_running_agent' });
@@ -13610,6 +13634,14 @@ Return this JSON shape:
           const freshActiveQueries = await this.countActiveQueries(agent.id);
           if (freshActiveQueries > 0) {
             rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: `has_${freshActiveQueries}_active_${freshActiveQueries === 1 ? 'query' : 'queries'}` });
+            continue;
+          }
+          const freshRecentActivityMs = this.parkIdleRecentActivityMs();
+          const freshRecentQueries = freshRecentActivityMs > 0
+            ? await this.countRecentQueriesForAgent(agent.id, Date.now() - freshRecentActivityMs)
+            : 0;
+          if (freshRecentQueries > 0) {
+            rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: `recent_query_activity_${freshRecentQueries}_within_${Math.round(freshRecentActivityMs / 60000)}m` });
             continue;
           }
           const killResult = await this.killAgentProcess(agent.port);

@@ -394,6 +394,53 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     expect(agent?.status).toBe('running');
   });
 
+  it('does not park a running agent with recent completed query activity', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-recent-query',
+        name: 'researcher',
+        port: 4118,
+        status: 'running',
+        metadata: { runtime: 'codex', pid: 55558, processOwner: 'manager-child', processParentPid: process.pid },
+      }),
+    });
+    await db.queries.upsert(teamId, 'agent-recent-query', {
+      query_id: 'query-recent-completed',
+      status: 'completed',
+      prompt: 'recently handled work',
+      created: Date.now() - 30_000,
+      completed: Date.now() - 5_000,
+      owner_kind: 'agent',
+      owner_id: 'agent-recent-query',
+    });
+
+    (manager as any).killAgentProcess = vi.fn(async () => ({ killed: true, pids: [55558] }));
+
+    const result = await (manager as any).parkIdleAgents({
+      teamId,
+      teamName: 'default',
+      confirmed: true,
+      allTeams: false,
+      includeDefault: true,
+      includeLeads: false,
+      includeScheduled: false,
+      includeActiveTeams: false,
+    });
+
+    expect(result.result.parked).toBe(0);
+    expect(result.result.agents).toEqual([
+      { team: 'default', name: 'researcher', status: 'skipped', reason: 'recent_query_activity_1_within_10m' },
+    ]);
+    expect((manager as any).killAgentProcess).not.toHaveBeenCalled();
+    expect((await db.agents.getById('agent-recent-query'))?.status).toBe('running');
+  });
+
   it('does not park idle helpers in teams that still have open work by default', async () => {
     const { manager, db, workDir } = await makeManager();
     dbs.push(db);
