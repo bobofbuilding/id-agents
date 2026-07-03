@@ -5667,6 +5667,34 @@ Return this JSON shape:
       res.json(this.agentToResponse(agent, { isAdmin: this.isAdminRequest(req) }));
     });
 
+    this.managementApp.get('/agents/:id/queries/active', async (req, res) => {
+      const { id: teamId, name: teamName } = await this.getTeam(req);
+      const ref = decodeURIComponent(req.params.id);
+      try {
+        const byId = await this.dbQueryAgentById(teamId, ref);
+        const matches = byId ? [byId] : await this.dbResolveAgents(teamId, ref);
+        if (matches.length === 0) return res.status(404).json({ error: 'Agent not found' });
+        if (matches.length > 1) return res.status(409).json({ error: `Multiple agents match "${ref}". Use a specific id or name.` });
+        const agent = matches[0];
+        const rows = await this.db.queries.getPending(agent.id);
+        const now = Date.now();
+        res.json({
+          team: teamName,
+          agent: { id: agent.id, name: agent.name, status: agent.status },
+          count: rows.length,
+          queries: rows.map((q) => ({
+            query_id: q.query_id,
+            status: q.status,
+            created: Number(q.created) || 0,
+            age_ms: Math.max(0, now - (Number(q.created) || now)),
+            prompt_preview: String(q.prompt ?? '').replace(/\s+/g, ' ').trim().slice(0, 220),
+          })),
+        });
+      } catch (err: any) {
+        res.status(500).json({ error: err?.message || String(err) });
+      }
+    });
+
     this.managementApp.get('/agents/:id', async (req, res) => {
       const { id: teamId } = await this.getTeam(req);
       const agent = await this.dbQueryAgentById(teamId, req.params.id);

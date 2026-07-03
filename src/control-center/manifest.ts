@@ -29,6 +29,7 @@ export const CC_ROUTES: CcRoute[] = [
   { method: 'GET', path: '/usage', group: 'observability' },
   { method: 'POST', path: '/usage/record', group: 'observability' },
   { method: 'GET', path: '/usage/by-task', group: 'observability' },
+  { method: 'GET', path: '/agents/:id/queries/active', group: 'observability' },
   // per-agent configuration
   { method: 'GET', path: '/agents/:id/instructions', group: 'agent-config' },
   { method: 'POST', path: '/agents/:id/instructions', group: 'agent-config' },
