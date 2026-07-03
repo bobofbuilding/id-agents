@@ -161,43 +161,7 @@ Check your news feed before starting new tasks to maintain context.
 
 ## Task management
 
-The manager has a dedicated `/tasks` API for coordinating work.
-
-**Create a task** (when you discover work that needs doing):
-```bash
-curl -s -X POST $MANAGER_URL/tasks \
-  -H "Content-Type: application/json" \
-  -H "X-Id-Team: $ID_TEAM" \
-  -d '{"title": "Fix the overflow bug", "name": "fix-overflow", "from": "'$ID_AGENT_ALIAS'"}'
-```
-
-**Claim an unassigned task** (take responsibility for it):
-```bash
-curl -s -X POST $MANAGER_URL/tasks/fix-overflow/claim \
-  -H "Content-Type: application/json" \
-  -H "X-Id-Team: $ID_TEAM" \
-  -d '{"agent_id": "'$ID_AGENT_ALIAS'"}'
-```
-
-**Mark your task done** (when you finish):
-```bash
-curl -s -X POST $MANAGER_URL/tasks/fix-overflow/done \
-  -H "Content-Type: application/json" \
-  -H "X-Id-Team: $ID_TEAM" \
-  -d '{"agent_id": "'$ID_AGENT_ALIAS'"}'
-```
-
-**List tasks** (see what needs doing):
-```bash
-curl -s "$MANAGER_URL/tasks?status=todo" -H "X-Id-Team: $ID_TEAM" | jq
-```
-
-**Get a single task:**
-```bash
-curl -s "$MANAGER_URL/tasks/fix-overflow" -H "X-Id-Team: $ID_TEAM" | jq
-```
-
-Tasks have three statuses: `todo` (unclaimed), `doing` (someone is working on it), `done` (completed). When you find work during a review or heartbeat, create a task so it gets tracked.
+The `task-discipline` skill owns the full task lifecycle (create → claim → do → done) and the canonical endpoint patterns. Load it whenever your agent is assigned non-trivial work. The brief summary: every real piece of work gets a task row; use the explicit claim and done URLs from the dispatch brief verbatim; never create a parallel task when one was already dispatched to you.
 
 ## Dispatch brief template
 
