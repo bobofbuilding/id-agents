@@ -14,6 +14,7 @@ import { SqliteQueriesRepo } from '../../src/db/repos/sqlite/queries-repo.js';
 import { SqliteNewsRepo } from '../../src/db/repos/sqlite/news-repo.js';
 import { SqliteSchedulesRepo } from '../../src/db/repos/sqlite/schedules-repo.js';
 import { SqliteTasksRepo } from '../../src/db/repos/sqlite/tasks-repo.js';
+import { SqliteEventsRepo } from '../../src/db/repos/sqlite/events-repo.js';
 import type { AgentRow, TaskRow } from '../../src/db/types.js';
 
 async function createInMemoryDb() {
@@ -27,6 +28,7 @@ async function createInMemoryDb() {
     news: new SqliteNewsRepo(adapter),
     schedules: new SqliteSchedulesRepo(adapter),
     tasks: new SqliteTasksRepo(adapter),
+    events: new SqliteEventsRepo(adapter),
     async close() { await adapter.close(); },
   };
 }
@@ -431,5 +433,75 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     expect(fakeServer.closeIdleConnections).toHaveBeenCalledTimes(1);
     expect(fakeServer.closeAllConnections).toHaveBeenCalledTimes(1);
     expect((manager as any).httpServer).toBeNull();
+  });
+
+  it('expires stale pending backlog sooner than long-running processing queries', async () => {
+    const savedEnv = {
+      legacy: process.env.ID_QUERY_EXPIRY_MINUTES,
+      pending: process.env.ID_PENDING_QUERY_EXPIRY_MINUTES,
+      processing: process.env.ID_PROCESSING_QUERY_EXPIRY_MINUTES,
+    };
+    delete process.env.ID_QUERY_EXPIRY_MINUTES;
+    delete process.env.ID_PENDING_QUERY_EXPIRY_MINUTES;
+    delete process.env.ID_PROCESSING_QUERY_EXPIRY_MINUTES;
+
+    try {
+      const { manager, db, workDir } = await makeManager();
+      dbs.push(db);
+      workDirs.push(workDir);
+
+      const teamId = await db.teams.getOrCreateTeamId('ops-team');
+      await db.agents.create({
+        ...agentRow({
+          team_id: teamId,
+          id: 'ops-lead-agent',
+          name: 'ops-lead',
+          port: 4111,
+          status: 'running',
+        }),
+      });
+
+      const now = Date.now();
+      await db.queries.upsert(teamId, 'ops-lead-agent', {
+        query_id: 'pending-old',
+        status: 'pending',
+        prompt: 'old queued work',
+        created: now - 31 * 60 * 1000,
+        owner_kind: 'agent',
+        owner_id: 'ops-lead-agent',
+      });
+      await db.queries.upsert(teamId, 'ops-lead-agent', {
+        query_id: 'processing-moderate',
+        status: 'processing',
+        prompt: 'long but allowed work',
+        created: now - 31 * 60 * 1000,
+        owner_kind: 'agent',
+        owner_id: 'ops-lead-agent',
+      });
+      await db.queries.upsert(teamId, 'ops-lead-agent', {
+        query_id: 'processing-old',
+        status: 'processing',
+        prompt: 'stuck processing work',
+        created: now - 121 * 60 * 1000,
+        owner_kind: 'agent',
+        owner_id: 'ops-lead-agent',
+      });
+
+      await (manager as any).sweepStaleQueries();
+
+      expect((await db.queries.getByQueryIdForTeam(teamId, 'pending-old'))?.status).toBe('expired');
+      expect((await db.queries.getByQueryIdForTeam(teamId, 'processing-moderate'))?.status).toBe('processing');
+      expect((await db.queries.getByQueryIdForTeam(teamId, 'processing-old'))?.status).toBe('expired');
+
+      const events = await db.events.query({ teamId, topics: ['query:expired'], limit: 10 });
+      expect(events.map((event) => event.subject_id).sort()).toEqual(['pending-old', 'processing-old']);
+    } finally {
+      if (savedEnv.legacy === undefined) delete process.env.ID_QUERY_EXPIRY_MINUTES;
+      else process.env.ID_QUERY_EXPIRY_MINUTES = savedEnv.legacy;
+      if (savedEnv.pending === undefined) delete process.env.ID_PENDING_QUERY_EXPIRY_MINUTES;
+      else process.env.ID_PENDING_QUERY_EXPIRY_MINUTES = savedEnv.pending;
+      if (savedEnv.processing === undefined) delete process.env.ID_PROCESSING_QUERY_EXPIRY_MINUTES;
+      else process.env.ID_PROCESSING_QUERY_EXPIRY_MINUTES = savedEnv.processing;
+    }
   });
 });

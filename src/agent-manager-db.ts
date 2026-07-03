@@ -522,6 +522,11 @@ const DEFAULT_VALIDATOR_RECOMMENDATION_LOOP: ValidatorRecommendationLoopConfig =
 };
 const MANAGER_HTTP_SHUTDOWN_TIMEOUT_MS = 3_000;
 
+function positiveEnvNumber(name: string): number | null {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
 export class AgentManagerDb {
   private managementApp: express.Application;
   private httpServer: HttpServer | null = null;
@@ -556,17 +561,21 @@ export class AgentManagerDb {
   private retentionService: RetentionService | null = null;
   private checkinService: CheckinService | null = null;
   /**
-   * Stuck-query sweeper timeout, in minutes. Queries whose status is still
-   * pending/processing this long after their `created` timestamp are assumed
-   * to belong to a crashed agent and are marked 'expired'.
-   * Coordinated/long tasks (a lead delegating to teammates) can legitimately
-   * run for many minutes, so the default is generous (120m); override with
-   * ID_QUERY_EXPIRY_MINUTES. (Crashed queries just linger this long, harmless.)
+   * Stuck-query sweeper timeouts, in minutes. Pending backlog is short-lived by
+   * default so dead lead queues do not accumulate behind one long processing
+   * query; processing work remains more generous for legitimate long tasks.
+   * ID_QUERY_EXPIRY_MINUTES is the legacy override for both lanes. Prefer the
+   * lane-specific ID_PENDING_QUERY_EXPIRY_MINUTES and
+   * ID_PROCESSING_QUERY_EXPIRY_MINUTES when tuning production.
    */
-  private readonly QUERY_EXPIRY_MINUTES = (() => {
-    const n = Number(process.env.ID_QUERY_EXPIRY_MINUTES);
-    return Number.isFinite(n) && n > 0 ? n : 120;
-  })();
+  private readonly PENDING_QUERY_EXPIRY_MINUTES =
+    positiveEnvNumber('ID_PENDING_QUERY_EXPIRY_MINUTES') ??
+    positiveEnvNumber('ID_QUERY_EXPIRY_MINUTES') ??
+    30;
+  private readonly PROCESSING_QUERY_EXPIRY_MINUTES =
+    positiveEnvNumber('ID_PROCESSING_QUERY_EXPIRY_MINUTES') ??
+    positiveEnvNumber('ID_QUERY_EXPIRY_MINUTES') ??
+    120;
   private logBuffer: Array<{ ts: number; msg: string }> = [];
   private readonly LOG_BUFFER_SIZE = 500;
   private managementPort: number = 4100;
@@ -12096,11 +12105,17 @@ Return this JSON shape:
   }
 
   private async sweepStaleQueries(): Promise<void> {
-    const cutoff = Date.now() - this.QUERY_EXPIRY_MINUTES * 60 * 1000;
-    const expired = await this.db.queries.expireStale(cutoff, ['pending', 'processing']);
+    const now = Date.now();
+    const pendingCutoff = now - this.PENDING_QUERY_EXPIRY_MINUTES * 60 * 1000;
+    const processingCutoff = now - this.PROCESSING_QUERY_EXPIRY_MINUTES * 60 * 1000;
+    const [expiredPending, expiredProcessing] = await Promise.all([
+      this.db.queries.expireStale(pendingCutoff, ['pending']),
+      this.db.queries.expireStale(processingCutoff, ['processing']),
+    ]);
+    const expired = [...expiredPending, ...expiredProcessing];
     const count = expired.length;
     if (count > 0) {
-      const occurredAt = Date.now();
+      const occurredAt = now;
       for (const row of expired) {
         await emitQueryExpired(this.db.events, {
           teamId: row.team_id,
@@ -12112,10 +12127,10 @@ Return this JSON shape:
         });
       }
       this.managerLog(
-        `Expired ${count} stale queries older than ${this.QUERY_EXPIRY_MINUTES} minutes`,
+        `Expired ${count} stale queries (pending>${this.PENDING_QUERY_EXPIRY_MINUTES}m, processing>${this.PROCESSING_QUERY_EXPIRY_MINUTES}m)`,
       );
       console.log(
-        `[Manager] Query sweeper expired ${count} stale queries (>${this.QUERY_EXPIRY_MINUTES} min old)`,
+        `[Manager] Query sweeper expired ${count} stale queries (pending>${this.PENDING_QUERY_EXPIRY_MINUTES}m, processing>${this.PROCESSING_QUERY_EXPIRY_MINUTES}m)`,
       );
     }
   }
