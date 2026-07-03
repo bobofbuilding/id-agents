@@ -220,6 +220,17 @@ async function insertAgent(
   return id;
 }
 
+async function getOrInsertAgent(
+  db: Awaited<ReturnType<typeof createInMemoryDb>>,
+  teamId: string,
+  name: string,
+  endpoint: string | null,
+): Promise<string> {
+  const existing = await db.agents.getByName(teamId, name);
+  if (existing) return existing.id;
+  return insertAgent(db, teamId, name, endpoint);
+}
+
 function adminHeaders(team: string): Record<string, string> {
   return { 'Content-Type': 'application/json', 'X-Id-Team': team, 'X-Id-Admin': '1' };
 }
@@ -639,8 +650,8 @@ describe('/talk-to auto-attach', () => {
 
   it('allows configured team leads to complete advisory tasks with no_delegation_reason', async () => {
     const engTeamId = await db.teams.getOrCreateTeamId('engineering-team');
-    const leadId = await insertAgent(db, engTeamId, 'engineering-lead', null);
-    const memberId = await insertAgent(db, engTeamId, 'implementation-engineer', null);
+    const leadId = await getOrInsertAgent(db, engTeamId, 'engineering-lead', null);
+    const memberId = await getOrInsertAgent(db, engTeamId, 'implementation-engineer', null);
 
     const created = await fetch(`${baseUrl}/tasks`, {
       method: 'POST',
@@ -768,6 +779,96 @@ describe('/talk-to auto-attach', () => {
     const delegatedAuditBody = await delegatedAudit.json() as { task: { delegationAudit?: { status?: string; childTaskRefs?: string[] } } };
     expect(delegatedAuditBody.task.delegationAudit?.status).toBe('ok');
     expect(delegatedAuditBody.task.delegationAudit?.childTaskRefs).toEqual(['#33333333']);
+  });
+
+  it('blocks team leads from accepting another parent objective until current lead work is delegated', async () => {
+    const engTeamId = await db.teams.getOrCreateTeamId('engineering-team');
+    const leadId = await getOrInsertAgent(db, engTeamId, 'engineering-lead', null);
+    const memberId = await getOrInsertAgent(db, engTeamId, 'implementation-engineer', null);
+    const now = Math.floor(Date.now() / 1000);
+
+    await db.tasks.create({
+      id: 'task_existing_parent',
+      name: 'existing-lead-parent',
+      uuid: '55555555-5555-4555-8555-555555555555',
+      team_id: engTeamId,
+      title: 'Existing lead parent',
+      description: 'Lead-owned parent objective that must be decomposed',
+      status: 'doing',
+      created_by: leadId,
+      owner: leadId,
+      created_at: now - 900,
+      updated_at: now - 900,
+      completed_at: null,
+    });
+
+    const created = await fetch(`${baseUrl}/tasks`, {
+      method: 'POST',
+      headers: adminHeaders('engineering-team'),
+      body: JSON.stringify({
+        title: 'Second lead parent',
+        name: 'second-lead-parent',
+        from: 'engineering-lead',
+        ...validBriefFields(),
+      }),
+    });
+    expect(created.status).toBe(201);
+
+    const blockedClaim = await fetch(`${baseUrl}/tasks/second-lead-parent/claim`, {
+      method: 'POST',
+      headers: adminHeaders('engineering-team'),
+      body: JSON.stringify({ agent_id: 'engineering-lead' }),
+    });
+    expect(blockedClaim.status).toBe(409);
+    const blockedBody = await blockedClaim.json() as { error: string; blocking_tasks?: string[] };
+    expect(blockedBody.error).toBe('lead_delegation_backlog');
+    expect(blockedBody.blocking_tasks).toContain('#55555555');
+    const stillQueued = await db.tasks.getByNameForTeam('second-lead-parent', engTeamId);
+    expect(stillQueued?.status).toBe('todo');
+    expect(stillQueued?.owner).toBeNull();
+
+    await db.tasks.create({
+      id: 'task_existing_child',
+      name: 'existing-child-work',
+      uuid: '66666666-6666-4666-8666-666666666666',
+      team_id: engTeamId,
+      title: 'Existing child work',
+      description: 'Member-owned child for existing-lead-parent',
+      status: 'doing',
+      created_by: leadId,
+      owner: memberId,
+      created_at: now - 800,
+      updated_at: now - 700,
+      completed_at: null,
+    });
+
+    const allowedClaim = await fetch(`${baseUrl}/tasks/second-lead-parent/claim`, {
+      method: 'POST',
+      headers: adminHeaders('engineering-team'),
+      body: JSON.stringify({ agent_id: 'engineering-lead' }),
+    });
+    expect(allowedClaim.status).toBe(200);
+    const claimed = await db.tasks.getByNameForTeam('second-lead-parent', engTeamId);
+    expect(claimed?.status).toBe('doing');
+    expect(claimed?.owner).toBe(leadId);
+
+    const cliBlocked = await fetch(`${baseUrl}/remote`, {
+      method: 'POST',
+      headers: adminHeaders('engineering-team'),
+      body: JSON.stringify({
+        from: 'engineering-lead',
+        command: '/task create "CLI blocked lead parent" --name cli-blocked-lead-parent --owner engineering-lead --goal goal_mqxibu5r_2k2my --expected-output "implementation patch and tests" --acceptance "covers CLI lead backlog guard" --validation-path "coder and researcher" --out-of-scope "optional recommendations" --backlog-policy "Non-required recommendations become backlog candidates." --bittrees-relevance "medium: improves manager delegation reliability for Bittrees contributor work."',
+      }),
+    });
+    expect(cliBlocked.status).toBe(200);
+    const cliBlockedBody = await cliBlocked.json() as {
+      ok: boolean;
+      result?: { warning?: string; task?: { status?: string; ownerName?: string | null } };
+    };
+    expect(cliBlockedBody).toMatchObject({ ok: true });
+    expect(cliBlockedBody.result?.warning).toContain('lead_delegation_backlog');
+    expect(cliBlockedBody.result?.task?.status).toBe('todo');
+    expect(cliBlockedBody.result?.task?.ownerName).toBeNull();
   });
 
   it('rejects duplicate validator children for the same parent and purpose', async () => {

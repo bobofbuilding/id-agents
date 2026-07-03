@@ -1070,6 +1070,71 @@ export class AgentManagerDb {
     };
   }
 
+  private async findLeadDelegationBlockers(
+    teamId: string,
+    teamName: string,
+    owner: AgentRow | null,
+    excludeTaskId?: string,
+  ): Promise<TaskRow[]> {
+    if (!owner || !this.isConfiguredTeamLead(teamName, owner)) return [];
+    const doing = await this.db.tasks.list({ teamId, status: 'doing', owner: owner.id }).catch(() => [] as TaskRow[]);
+    const blockers: TaskRow[] = [];
+    for (const candidate of doing) {
+      if (excludeTaskId && candidate.id === excludeTaskId) continue;
+      const audit = await this.buildDelegationAudit(candidate, teamId, teamName, owner);
+      if (audit && audit.status !== 'ok') blockers.push(candidate);
+    }
+    return blockers;
+  }
+
+  private leadDelegationBlockerRefs(blockers: TaskRow[]): string[] {
+    return blockers.map((task) => this.taskShortRef(task));
+  }
+
+  private leadDelegationBacklogMessage(teamName: string, owner: AgentRow, blockers: TaskRow[]): string {
+    const refs = this.leadDelegationBlockerRefs(blockers).join(', ');
+    return `lead_delegation_backlog: ${teamName}/${owner.name} already has ${blockers.length} lead-owned objective${blockers.length === 1 ? '' : 's'} without member-owned child tasks (${refs}). Delegate or close that work before claiming another parent objective.`;
+  }
+
+  private async leadDelegationBacklogGuard(params: {
+    teamId: string;
+    teamName: string;
+    owner: AgentRow | null;
+    excludeTaskId?: string;
+  }): Promise<{ message: string; blockers: string[] } | null> {
+    if (!params.owner || !this.isConfiguredTeamLead(params.teamName, params.owner)) return null;
+    const blockers = await this.findLeadDelegationBlockers(
+      params.teamId,
+      params.teamName,
+      params.owner,
+      params.excludeTaskId,
+    );
+    if (!blockers.length) return null;
+    return {
+      message: this.leadDelegationBacklogMessage(params.teamName, params.owner, blockers),
+      blockers: this.leadDelegationBlockerRefs(blockers),
+    };
+  }
+
+  private async promptLeadForDelegationKickoff(teamId: string, teamName: string, task: TaskRow, owner: AgentRow | null): Promise<void> {
+    if (!this.isConfiguredTeamLead(teamName, owner)) return;
+    if (!this.isLiveForSupervision(owner) || !owner.endpoint) return;
+    const key = `task:${task.id}:lead-delegation-kickoff`;
+    if (this.stalledNudges.has(key)) return;
+    const children = await this.findDelegatedChildTasks(task, teamId, owner);
+    if (children.length) return;
+    this.markStalledProbe(key, Date.now());
+    const members = (await this.db.agents.list(teamId).catch(() => [] as AgentRow[]))
+      .filter((agent) => agent.id !== owner.id && this.isLiveForSupervision(agent))
+      .map((agent) => agent.name);
+    const ref = this.taskShortRef(task);
+    const memberHint = members.length ? ` Available teammates: ${members.join(', ')}.` : '';
+    const message = `Lead delegation kickoff: task ${ref} ("${task.title}") is assigned to you as the team coordinator. Do not do the whole task yourself. Immediately decompose it into member-owned child tasks with \`/task create ... --owner <teammate> --parent-task ${ref}\`, then close this parent only after child tasks are done using \`/task done ${ref} --delegated-task-names "child-a,child-b"\`. If this is truly advisory, close it with \`--no-delegation-reason\` and a failure/summary note.${memberHint}`;
+    if (await this.sendSupervisionAsk(teamName, owner.name, message)) {
+      await this.recordTaskSupervision(task, teamId, owner.id, 'lead_delegation_required', 0, Date.now());
+    }
+  }
+
   private async buildLeadDelegationNudge(
     task: TaskRow,
     teamId: string,
@@ -3361,7 +3426,7 @@ Return this JSON shape:
     const body = req.body || {};
     if (!body.task || typeof body.task !== 'object') return null;
 
-    const { id: teamId } = await this.getTeam(req);
+    const { id: teamId, name: teamName } = await this.getTeam(req);
     const taskSpec = body.task as { title?: unknown; name?: unknown; description?: unknown } & TaskBriefValidationInput;
     if (!taskSpec.title || typeof taskSpec.title !== 'string') {
       throw makeAutoAttachError(400, 'invalid_task_title');
@@ -3426,6 +3491,18 @@ Return this JSON shape:
       });
     }
 
+    const leadBacklog = await this.leadDelegationBacklogGuard({
+      teamId,
+      teamName,
+      owner: targetAgent,
+    });
+    if (leadBacklog) {
+      throw makeAutoAttachError(409, 'lead_delegation_backlog', {
+        message: leadBacklog.message,
+        blocking_tasks: leadBacklog.blockers,
+      });
+    }
+
     const requestedName = typeof taskSpec.name === 'string' && taskSpec.name.length > 0
       ? normalizeAlias(taskSpec.name)
       : null;
@@ -3458,6 +3535,9 @@ Return this JSON shape:
       completed_at: null,
     };
     await this.db.tasks.create(taskRow);
+    void this.promptLeadForDelegationKickoff(teamId, teamName, taskRow, targetAgent).catch((err) => {
+      console.warn(`[Supervision] Lead delegation kickoff failed for ${taskRow.name}: ${err?.message || err}`);
+    });
 
     if (flagsResult.disabled) {
       return { task: taskRow, checkin: null };
@@ -7303,6 +7383,20 @@ Return this JSON shape:
           });
         }
 
+        const leadBacklog = await this.leadDelegationBacklogGuard({
+          teamId,
+          teamName,
+          owner: agent,
+          excludeTaskId: task.id,
+        });
+        if (leadBacklog) {
+          return res.status(409).json({
+            error: 'lead_delegation_backlog',
+            message: leadBacklog.message,
+            blocking_tasks: leadBacklog.blockers,
+          });
+        }
+
         const now = Math.floor(Date.now() / 1000);
         const claimed = await this.db.tasks.claim(task.id, agent.id, now, {
           maxDoingForTeam: this.getMaxDoingTasks(),
@@ -7335,6 +7429,9 @@ Return this JSON shape:
             timelineEventId: brainContext.timelineEventId,
             context_package_id: brainContext.context_package_id ?? brainContext.contextPackageId,
           } : null,
+        });
+        void this.promptLeadForDelegationKickoff(teamId, teamName, updated!, agent).catch((err) => {
+          console.warn(`[Supervision] Lead delegation kickoff failed for ${updated!.name}: ${err?.message || err}`);
         });
         const taskResult = await this.buildTaskResult(updated!, teamId);
         if (brainContext) (taskResult as any).brain_context = {
@@ -10816,13 +10913,24 @@ Return this JSON shape:
           // Resolve optional owner
           let ownerId: string | null = null;
           let ownerAgentForGuard: AgentRow | null = null;
+          let leadDelegationWarning: string | undefined;
           if (ownerRef) {
             const resolveTeam = taskTeamId || teamId;
             const { agent, error } = await this.resolveSingleAgentForCommand(resolveTeam, ownerRef);
             if (!agent) return { ok: false, error: error || `Agent "${ownerRef}" not found` };
             ownerAgentForGuard = agent;
             if (await this.hasDoingTaskRoom(taskTeamId)) {
-              ownerId = agent.id;
+              const taskTeamRow = await this.db.teams.getTeam(taskTeamId).catch(() => null);
+              const leadBacklog = await this.leadDelegationBacklogGuard({
+                teamId: taskTeamId,
+                teamName: taskTeamRow?.name || teamName,
+                owner: agent,
+              });
+              if (leadBacklog) {
+                leadDelegationWarning = leadBacklog.message;
+              } else {
+                ownerId = agent.id;
+              }
             }
           }
 
@@ -10863,6 +10971,7 @@ Return this JSON shape:
           const now = Math.floor(Date.now() / 1000);
           const status = ownerId ? 'doing' : 'todo';
           const queuedByDoingLimit = Boolean(ownerRef && !ownerId);
+          const queuedByLeadDelegation = Boolean(leadDelegationWarning);
           // Resolve created_by from callerFrom if present
           let createdBy: string | null = null;
           if (callerFrom) {
@@ -10887,12 +10996,27 @@ Return this JSON shape:
           };
 
           await this.db.tasks.create(taskRow, eventIds.length > 0 ? eventIds : undefined);
+          if (ownerId && ownerAgentForGuard) {
+            const taskTeamRow = await this.db.teams.getTeam(taskTeamId).catch(() => null);
+            void this.promptLeadForDelegationKickoff(
+              taskTeamId,
+              taskTeamRow?.name || teamName,
+              taskRow,
+              ownerAgentForGuard,
+            ).catch((err) => {
+              console.warn(`[Supervision] Lead delegation kickoff failed for ${taskRow.name}: ${err?.message || err}`);
+            });
+          }
+          const warnings = [
+            queuedByDoingLimit && !queuedByLeadDelegation ? await this.doingTaskLimitMessage(taskTeamId) : undefined,
+            leadDelegationWarning,
+          ].filter((item): item is string => Boolean(item));
 
           return {
             ok: true,
             result: {
               task: await this.buildTaskResult(taskRow, teamId),
-              warning: queuedByDoingLimit ? await this.doingTaskLimitMessage(taskTeamId) : undefined,
+              warning: warnings.length ? warnings.join(' ') : undefined,
               brief_validation: brief.validation,
             },
           };
@@ -10966,6 +11090,24 @@ Return this JSON shape:
 
           const { agent, error } = await this.resolveSingleAgentForCommand(resolveTeam, agentRef);
           if (!agent) return { ok: false, error: error || `Agent "${agentRef}" not found` };
+          const taskTeamIdForGuard = task.team_id || teamId;
+          const taskTeamRowForGuard = await this.db.teams.getTeam(taskTeamIdForGuard).catch(() => null);
+          const leadBacklog = await this.leadDelegationBacklogGuard({
+            teamId: taskTeamIdForGuard,
+            teamName: taskTeamRowForGuard?.name || teamName,
+            owner: agent,
+            excludeTaskId: task.id,
+          });
+          if (leadBacklog) {
+            return {
+              ok: false,
+              error: 'lead_delegation_backlog',
+              result: {
+                message: leadBacklog.message,
+                blocking_tasks: leadBacklog.blockers,
+              },
+            };
+          }
 
           const now = Math.floor(Date.now() / 1000);
           if (task.status !== 'doing' && !(await this.hasDoingTaskRoom(task.team_id || teamId))) {
@@ -10978,6 +11120,16 @@ Return this JSON shape:
           });
 
           const updated = await this.db.tasks.getByNameForTeam(task.name, teamId);
+          if (updated) {
+            void this.promptLeadForDelegationKickoff(
+              taskTeamIdForGuard,
+              taskTeamRowForGuard?.name || teamName,
+              updated,
+              agent,
+            ).catch((err) => {
+              console.warn(`[Supervision] Lead delegation kickoff failed for ${updated.name}: ${err?.message || err}`);
+            });
+          }
           const teamRow = await this.db.teams.getTeam(teamId).catch(() => null);
           void this.maybeTriggerValidatorRecommendationLoop({
             teamId,
@@ -11019,6 +11171,22 @@ Return this JSON shape:
               result: { brief_validation: claimBrief.validation },
             };
           }
+          const leadBacklog = await this.leadDelegationBacklogGuard({
+            teamId,
+            teamName,
+            owner: callerAgent,
+            excludeTaskId: task.id,
+          });
+          if (leadBacklog) {
+            return {
+              ok: false,
+              error: 'lead_delegation_backlog',
+              result: {
+                message: leadBacklog.message,
+                blocking_tasks: leadBacklog.blockers,
+              },
+            };
+          }
 
           const now = Math.floor(Date.now() / 1000);
           const claimed = await this.db.tasks.claim(task.id, callerAgent.id, now, {
@@ -11033,6 +11201,11 @@ Return this JSON shape:
           }
 
           const updated = await this.db.tasks.getByNameForTeam(task.name, teamId);
+          if (updated) {
+            void this.promptLeadForDelegationKickoff(teamId, teamName, updated, callerAgent).catch((err) => {
+              console.warn(`[Supervision] Lead delegation kickoff failed for ${updated.name}: ${err?.message || err}`);
+            });
+          }
           return { ok: true, result: { task: await this.buildTaskResult(updated!, teamId), brief_validation: claimBrief.validation } };
         }
 
