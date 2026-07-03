@@ -503,6 +503,7 @@ const DEFAULT_VALIDATOR_RECOMMENDATION_OBJECTIVE =
   `When either validator completes validation of work produced by another team, they must produce a concise next-step recommendation packet for lead. ` +
   `The packet must keep approval separate from follow-up work: approval closes the validated task, while recommendations become new tracked objectives. ` +
   `Lead reviews approved recommendations and relays each objective to the ideal team lead, who decomposes the objective into tasks for that team's dependent members.`;
+const VALIDATOR_RECOMMENDATION_LOOP_TRIGGERED = 'validator:recommendation-loop';
 
 const DEFAULT_VALIDATOR_RECOMMENDATION_LOOP: ValidatorRecommendationLoopConfig = {
   enabled: false,
@@ -542,6 +543,7 @@ export class AgentManagerDb {
   private providerRuntimeAssignments: Map<string, ProviderRuntimeAssignment> = new Map();
   private runtimeFailoverRetryOf: Map<string, string> = new Map();
   private agentLifecycleLocks: Map<string, Promise<void>> = new Map();
+  private validatorRecommendationLoopLocks: Map<string, Promise<void>> = new Map();
   private stalledNudges = new Map<string, StalledProbeState>(); // probe key -> throttle/count state
   private retentionService: RetentionService | null = null;
   private checkinService: CheckinService | null = null;
@@ -854,6 +856,71 @@ export class AgentManagerDb {
     return this.normalizeValidatorRecommendationLoopConfig(cfg.validatorRecommendationLoop);
   }
 
+  private validatorRecommendationLoopKey(teamId: string, taskUuid: string, ownerAgentId: string): string {
+    return `${teamId}:${taskUuid}:${ownerAgentId}`;
+  }
+
+  private async withValidatorRecommendationLoopLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.validatorRecommendationLoopLocks.get(key) || Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => { release = resolve; });
+    const gate = previous.catch(() => {}).then(() => current);
+    this.validatorRecommendationLoopLocks.set(key, gate);
+
+    await previous.catch(() => {});
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.validatorRecommendationLoopLocks.get(key) === gate) {
+        this.validatorRecommendationLoopLocks.delete(key);
+      }
+    }
+  }
+
+  private async hasValidatorRecommendationLoopTriggered(teamId: string, taskUuid: string, ownerAgentId: string): Promise<boolean> {
+    const { rows } = await this.db.adapter.query<{ seq: number | string }>(
+      `SELECT seq
+         FROM event_log
+        WHERE team_id = $1
+          AND topic = $2
+          AND subject_kind = 'task'
+          AND subject_id = $3
+          AND actor_agent_id = $4
+        ORDER BY seq ASC
+        LIMIT 1`,
+      [teamId, VALIDATOR_RECOMMENDATION_LOOP_TRIGGERED, taskUuid, ownerAgentId],
+    );
+    return rows.length > 0;
+  }
+
+  private async recordValidatorRecommendationLoopTriggered(params: {
+    teamId: string;
+    task: TaskRow;
+    owner: AgentRow;
+    leadName: string;
+    completionNote?: string;
+    occurredAt: number;
+  }): Promise<void> {
+    await this.db.events.insert({
+      team_id: params.teamId,
+      topic: VALIDATOR_RECOMMENDATION_LOOP_TRIGGERED,
+      actor_agent_id: params.owner.id,
+      subject_kind: 'task',
+      subject_id: params.task.uuid,
+      occurred_at: params.occurredAt,
+      data: {
+        task_name: params.task.name,
+        task_uuid: params.task.uuid,
+        validator: params.owner.name,
+        lead: params.leadName,
+        trigger: 'validation_task_completed',
+        ...(params.task.title ? { title_preview: params.task.title.slice(0, 280) } : {}),
+        ...(params.completionNote ? { completion_note_preview: params.completionNote.slice(0, 280) } : {}),
+      },
+    });
+  }
+
   private isValidationTask(task: TaskRow): boolean {
     const text = `${task.name}\n${task.title}\n${task.description || ''}`.toLowerCase();
     return /\b(validat(e|ion|or)|review|approve|approval)\b/.test(text);
@@ -1115,20 +1182,36 @@ Return this JSON shape:
         ? params.completionPayload.message
         : undefined;
 
-    const message = this.validatorRecommendationPrompt({
-      task: params.task,
-      validatorName: owner.name,
-      leadName: cfg.lead,
-      objective: cfg.objective,
-      completionNote,
-    });
+    const key = this.validatorRecommendationLoopKey(params.teamId, params.task.uuid, owner.id);
+    await this.withValidatorRecommendationLoopLock(key, async () => {
+      try {
+        if (await this.hasValidatorRecommendationLoopTriggered(params.teamId, params.task.uuid, owner.id)) {
+          this.managerLog(`validator recommendation loop already triggered for task ${params.task.name} and validator ${owner.name}; skipping duplicate completion event`);
+          return;
+        }
 
-    try {
-      await this.sendInternalNewsTo(params.teamName, owner.name, message, cfg.lead);
-      this.managerLog(`validator recommendation loop asked ${owner.name} for task ${params.task.name}; lead ${cfg.lead} will route only if the validator returns approved follow-up recommendations`);
-    } catch (err: any) {
-      this.managerLog(`validator recommendation loop trigger failed for task ${params.task.name}: ${err?.message || err}`);
-    }
+        const message = this.validatorRecommendationPrompt({
+          task: params.task,
+          validatorName: owner.name,
+          leadName: cfg.lead,
+          objective: cfg.objective,
+          completionNote,
+        });
+
+        await this.recordValidatorRecommendationLoopTriggered({
+          teamId: params.teamId,
+          task: params.task,
+          owner,
+          leadName: cfg.lead,
+          completionNote,
+          occurredAt: Date.now(),
+        });
+        await this.sendInternalNewsTo(params.teamName, owner.name, message, cfg.lead);
+        this.managerLog(`validator recommendation loop asked ${owner.name} for task ${params.task.name}; lead ${cfg.lead} will route only if the validator returns approved follow-up recommendations`);
+      } catch (err: any) {
+        this.managerLog(`validator recommendation loop trigger failed for task ${params.task.name}: ${err?.message || err}`);
+      }
+    });
   }
 
   constructor(
