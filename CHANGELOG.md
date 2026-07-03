@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.100-beta
+
+### Fixes
+
+- **Apply the agent's configured model in the Claude Code CLI harness.** `src/harness/claude-code-cli.ts` now passes each agent's configured model (alias-resolved) as `--model` when spawning `claude`. Previously the CLI harness omitted `--model` entirely and only honored `CLAUDE_CLI_MODEL`, so every `claude-code-cli` agent ran Claude Code's account/subscription default regardless of its YAML `model:` field. `CLAUDE_CLI_MODEL` remains a global override; with neither set, Claude Code falls back to its own default.
+
+### Changes
+
+- **`sonnet` alias now resolves to Claude Sonnet 5.** `MODEL_ALIASES` repoints bare `sonnet` to `claude-sonnet-5` and adds `sonnet-5` / `sonnet5` shorthands (`src/core/model-aliases.ts`).
+- **TUI model abbreviations for Sonnet 5.** Added `claude-sonnet-5` → `sonn-5` and the raw `fable` alias → `fable-5` to the agents-table abbreviations (`src/tui/util/models.ts`).
+
 ## 0.1.99-beta
 
 ### Fixes

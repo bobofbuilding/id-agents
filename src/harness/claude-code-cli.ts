@@ -16,6 +16,7 @@
 
 import { spawn, ChildProcess } from 'child_process';
 import { AgentHarness, HarnessOptions, HarnessMessage, HarnessType } from './types.js';
+import { resolveModelAlias } from '../core/model-aliases.js';
 import { toMcpServerRecord } from './mcp.js';
 import { reportTurnUsage } from './usage-report.js';
 import { detectClaudeCliRateLimit } from './rate-limit.js';
@@ -111,11 +112,17 @@ export class ClaudeCodeCliHarness implements AgentHarness {
     ];
     console.log(`[Claude CLI] Permission mode: ${skipPermissions ? '--dangerously-skip-permissions (default)' : 'interactive (config opt-out)'}`);
 
-    // Don't pass --model flag for CLI harness - let Claude Code use its default settings
-    // This ensures Max subscription users don't get charged API credits
-    // The model can still be overridden via CLAUDE_CLI_MODEL env var if needed
-    if (process.env.CLAUDE_CLI_MODEL) {
-      args.push('--model', process.env.CLAUDE_CLI_MODEL);
+    // Apply the agent's configured model. Operator-friendly aliases (e.g.
+    // `fable`, `sonnet`) are resolved to the canonical Claude model id the CLI
+    // expects. CLAUDE_CLI_MODEL remains a global override; when neither is set
+    // Claude Code falls back to its own default (the logged-in subscription
+    // default), which keeps Max users off API-metered billing.
+    // Note: premium models (e.g. claude-fable-5) may bill API credits rather
+    // than the subscription depending on the account's plan.
+    const cliModel = process.env.CLAUDE_CLI_MODEL
+      || (options.model ? resolveModelAlias(options.model) : undefined);
+    if (cliModel) {
+      args.push('--model', cliModel);
     }
 
     // Reasoning effort (set per-agent in the Control Center) — fewer reasoning tokens at
