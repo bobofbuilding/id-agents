@@ -13,6 +13,7 @@ import { SqliteCheckinsRepo } from '../../src/db/repos/sqlite/checkins-repo.js';
 import { SqliteEventsRepo } from '../../src/db/repos/sqlite/events-repo.js';
 import { SqliteNewsRepo } from '../../src/db/repos/sqlite/news-repo.js';
 import { SqliteQueriesRepo } from '../../src/db/repos/sqlite/queries-repo.js';
+import { SqliteRuntimeLaneCooldownsRepo } from '../../src/db/repos/sqlite/runtime-lane-cooldowns-repo.js';
 import { SqliteSchedulesRepo } from '../../src/db/repos/sqlite/schedules-repo.js';
 import { SqliteSubscriptionsRepo } from '../../src/db/repos/sqlite/subscriptions-repo.js';
 import { SqliteTasksRepo } from '../../src/db/repos/sqlite/tasks-repo.js';
@@ -37,6 +38,7 @@ async function createInMemoryDb() {
     teams: new SqliteTeamsRepo(adapter),
     agents: new SqliteAgentsRepo(adapter),
     queries: new SqliteQueriesRepo(adapter),
+    runtimeLaneCooldowns: new SqliteRuntimeLaneCooldownsRepo(adapter),
     news: new SqliteNewsRepo(adapter),
     schedules: new SqliteSchedulesRepo(adapter),
     tasks: new SqliteTasksRepo(adapter),

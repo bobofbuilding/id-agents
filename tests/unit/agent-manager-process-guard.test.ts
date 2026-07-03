@@ -123,4 +123,48 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     expect(killSpy).toHaveBeenCalledWith(agentPid, 'SIGTERM');
     expect(result).toEqual({ killed: true, pids: [agentPid] });
   });
+
+  it('serializes concurrent spawn attempts for the same local agent', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const starts: string[] = [];
+    let firstStarted!: () => void;
+    let releaseFirst!: () => void;
+    const firstStartedPromise = new Promise<void>((resolve) => { firstStarted = resolve; });
+    const releaseFirstPromise = new Promise<void>((resolve) => { releaseFirst = resolve; });
+
+    let calls = 0;
+    (manager as any).spawnLocalAgentProcessUnlocked = vi.fn(async (_teamId: string, _teamName: string, agentData: { name: string }) => {
+      calls += 1;
+      starts.push(agentData.name);
+      if (calls === 1) {
+        firstStarted();
+        await releaseFirstPromise;
+      }
+      return { success: true, pid: 5000 + calls, logFile: `/tmp/${agentData.name}.log` };
+    });
+
+    const first = (manager as any).spawnLocalAgentProcess('team-1', 'default', {
+      name: 'coder-first',
+      id: 'agent-1',
+      port: 4243,
+    });
+    await firstStartedPromise;
+
+    const second = (manager as any).spawnLocalAgentProcess('team-1', 'default', {
+      name: 'coder-second',
+      id: 'agent-1',
+      port: 4243,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    expect(starts).toEqual(['coder-first']);
+
+    releaseFirst();
+    await Promise.all([first, second]);
+
+    expect(starts).toEqual(['coder-first', 'coder-second']);
+  });
 });

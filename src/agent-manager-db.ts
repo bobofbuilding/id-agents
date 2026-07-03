@@ -15,7 +15,7 @@ import crypto from 'crypto';
 import path from 'path';
 import { createServer as createHttpServer, type Server as HttpServer } from 'http';
 import { existsSync, mkdirSync, rmSync, readFileSync, writeFileSync, readdirSync, copyFileSync, statSync, openSync, closeSync } from 'fs';
-import { execFileSync, spawn } from 'child_process';
+import { execFileSync, spawn, type ChildProcess } from 'child_process';
 import { fileURLToPath } from 'url';
 import { WebSocketServer, WebSocket } from 'ws';
 import { type Address, type Hex } from 'viem';
@@ -541,6 +541,7 @@ export class AgentManagerDb {
   private defaultRuntimeCredentialPool: RuntimeCredentialPoolConfig | null = null;
   private providerRuntimeAssignments: Map<string, ProviderRuntimeAssignment> = new Map();
   private runtimeFailoverRetryOf: Map<string, string> = new Map();
+  private agentLifecycleLocks: Map<string, Promise<void>> = new Map();
   private stalledNudges = new Map<string, StalledProbeState>(); // probe key -> throttle/count state
   private retentionService: RetentionService | null = null;
   private checkinService: CheckinService | null = null;
@@ -12454,6 +12455,76 @@ Return this JSON shape:
     teamName: string,
     agentData: { name: string; id: string; port: number; model?: string; workingDirectory?: string; tokenId?: string; address?: string }
   ): Promise<{ success: boolean; pid?: number; logFile?: string; error?: string }> {
+    const key = this.agentLifecycleKey(teamId, agentData);
+    return this.withAgentLifecycleLock(key, () => this.spawnLocalAgentProcessUnlocked(teamId, teamName, agentData));
+  }
+
+  private agentLifecycleKey(
+    teamId: string,
+    agentData: { id?: string; name?: string; port?: number },
+  ): string {
+    return `${teamId}:${agentData.id || agentData.name || 'unknown'}:${agentData.port || 'no-port'}`;
+  }
+
+  private async withAgentLifecycleLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.agentLifecycleLocks.get(key) || Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => { release = resolve; });
+    const gate = previous.catch(() => {}).then(() => current);
+    this.agentLifecycleLocks.set(key, gate);
+
+    await previous.catch(() => {});
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.agentLifecycleLocks.get(key) === gate) {
+        this.agentLifecycleLocks.delete(key);
+      }
+    }
+  }
+
+  private async waitForAgentPortToBind(
+    proc: ChildProcess,
+    port: number,
+    timeoutMs: number = 10_000,
+  ): Promise<{ ok: true } | { ok: false; error: string }> {
+    const pid = proc.pid;
+    if (!pid) return { ok: false, error: 'spawn did not return a process id' };
+
+    let exited: { code: number | null; signal: NodeJS.Signals | null } | null = null;
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      exited = { code, signal };
+    };
+    proc.once('exit', onExit);
+
+    const deadline = Date.now() + timeoutMs;
+    try {
+      while (Date.now() < deadline) {
+        if (exited !== null) {
+          const exitInfo = exited as { code: number | null; signal: NodeJS.Signals | null };
+          const exit = exitInfo.signal ? `signal ${exitInfo.signal}` : `code ${exitInfo.code ?? 'unknown'}`;
+          return { ok: false, error: `agent process ${pid} exited before listening on port ${port} (${exit})` };
+        }
+
+        if (this.listPidsListeningOnPort(port).includes(pid)) {
+          return { ok: true };
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    } finally {
+      proc.off('exit', onExit);
+    }
+
+    return { ok: false, error: `agent process ${pid} did not listen on port ${port} within ${timeoutMs}ms` };
+  }
+
+  private async spawnLocalAgentProcessUnlocked(
+    teamId: string,
+    teamName: string,
+    agentData: { name: string; id: string; port: number; model?: string; workingDirectory?: string; tokenId?: string; address?: string }
+  ): Promise<{ success: boolean; pid?: number; logFile?: string; error?: string }> {
     try {
       const scriptPath = path.resolve(__dirname, 'local-agent-server.js');
       const { name, id, port, model, workingDirectory, tokenId, address } = agentData;
@@ -12495,6 +12566,14 @@ Return this JSON shape:
       closeSync(logFd);
 
       console.log(`[Manager] Agent ${name} spawned with PID ${proc.pid}`);
+
+      const bindResult = await this.waitForAgentPortToBind(proc, port);
+      if (!bindResult.ok) {
+        if (proc.pid) {
+          try { process.kill(proc.pid, 'SIGTERM'); } catch { /* already exited */ }
+        }
+        return { success: false, pid: proc.pid, logFile, error: bindResult.error };
+      }
 
       // Persist pid into agent metadata so /agents responses can carry it.
       // The TUI uses this to resolve per-agent RSS via a batched `ps` call.
