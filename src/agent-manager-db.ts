@@ -1508,6 +1508,13 @@ Return this JSON shape:
     // "failed" / "Claude Code produced an empty result" in chat. Match the agent
     // server's generous limit (overridable via ID_MANAGER_BODY_LIMIT).
     this.managementApp.use(express.json({ limit: process.env.ID_MANAGER_BODY_LIMIT || '50mb' }));
+    this.managementApp.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+      if (err instanceof SyntaxError && 'body' in err) {
+        console.warn(`[Manager] Invalid JSON on ${req.method} ${req.path}: ${err.message}`);
+        return res.status(400).json({ ok: false, error: 'Invalid JSON', details: err.message });
+      }
+      return next(err);
+    });
 
     // Ensure teams + manager dirs exist in the mounted workspace
     const teamsDir = `${baseWorkDir}/teams`;

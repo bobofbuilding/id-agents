@@ -752,4 +752,35 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     expect(result.result?.queryId).toBe('existing-task-delegation');
     expect(result.result?.deduped).toBe(true);
   });
+
+  it('returns a concise 400 for malformed manager JSON requests', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const server = http.createServer((manager as any).managementApp);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const address = server.address();
+      const port = address && typeof address === 'object' ? address.port : 0;
+      expect(port).toBeGreaterThan(0);
+
+      const res = await fetch(`http://127.0.0.1:${port}/remote`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{"command":"bad\njson"}',
+      });
+      const body = await res.json();
+
+      expect(res.status).toBe(400);
+      expect(body).toMatchObject({ ok: false, error: 'Invalid JSON' });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('[Manager] Invalid JSON on POST /remote:'));
+    } finally {
+      warn.mockRestore();
+      await new Promise<void>((resolve, reject) => {
+        server.close((err) => (err ? reject(err) : resolve()));
+      });
+    }
+  });
 });
