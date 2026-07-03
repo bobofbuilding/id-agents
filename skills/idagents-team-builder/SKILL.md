@@ -104,6 +104,8 @@ The per-agent skill copy is **a full copy at deploy time**. Each agent owns its 
 
 `/sync <team>` and `/deploy <team>` DO re-overlay skills. Per-agent skill edits made after deploy survive a `/agents rebuild` but get clobbered by a `/sync` or `/deploy`. If an agent has customizations worth keeping, either fold them back into a library template or skip `/sync` and use targeted edits.
 
+**Cross-template skill copies:** Several skills appear identically in multiple agent templates (e.g., `frontend-design`, `react-best-practices`, `test-driven-development` live in both `frontend-react` and `fullstack-nextjs`; `systematic-debugging` lives in both `devops` and `fullstack-nextjs`). These are intentional deploy-time copies — the system does not have a "shared library skill" layer below the template level. Maintenance rule: if you update content in one template's skill copy, search for and update all other copies, or extract the skill to a canonical location (`skills/<name>/`) and list it in `defaults.skills` instead.
+
 ### 7. Structure: defaults + org + agents.
 
 ```yaml
@@ -312,6 +314,8 @@ Brief paragraph: what this agent owns, who it reports to, who reports to it.
 | Agent role says "read .claude/agents/<name>/CLAUDE.md" but file isn't there | Role brief references the directory-pattern context file but you used single-file pattern | Either move detail into the .md body (single-file) or switch to directory pattern |
 
 ## Quick reference: deploy verbs
+
+For full operational details (restarting the manager, long-poll polling, heartbeat management, `/agents probe`), see the `idagents-admin-control` skill.
 
 | Command | Effect | When to use |
 |---------|--------|-------------|
