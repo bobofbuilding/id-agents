@@ -14,7 +14,7 @@ import { SqliteQueriesRepo } from '../../src/db/repos/sqlite/queries-repo.js';
 import { SqliteNewsRepo } from '../../src/db/repos/sqlite/news-repo.js';
 import { SqliteSchedulesRepo } from '../../src/db/repos/sqlite/schedules-repo.js';
 import { SqliteTasksRepo } from '../../src/db/repos/sqlite/tasks-repo.js';
-import type { AgentRow } from '../../src/db/types.js';
+import type { AgentRow, TaskRow } from '../../src/db/types.js';
 
 async function createInMemoryDb() {
   const adapter = new SqliteAdapter(':memory:');
@@ -74,6 +74,7 @@ describe('AgentManagerDb killAgentProcess guards', () => {
   const dbs: Array<Awaited<ReturnType<typeof createInMemoryDb>>> = [];
 
   afterEach(async () => {
+    vi.useRealTimers();
     while (dbs.length > 0) {
       await dbs.pop()!.close();
     }
@@ -341,6 +342,7 @@ describe('AgentManagerDb killAgentProcess guards', () => {
       includeDefault: true,
       includeLeads: false,
       includeScheduled: false,
+      includeActiveTeams: false,
     });
 
     expect(result.result.parked).toBe(0);
@@ -353,5 +355,81 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     const agent = await db.agents.getById('agent-active-query');
     expect(query?.status).toBe('processing');
     expect(agent?.status).toBe('running');
+  });
+
+  it('does not park idle helpers in teams that still have open work by default', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('research');
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-idle-helper',
+        name: 'analyst',
+        port: 4110,
+        status: 'running',
+        metadata: { runtime: 'codex', pid: 55556, processOwner: 'manager-child', processParentPid: process.pid },
+      }),
+    });
+    const now = Date.now();
+    await db.tasks.create({
+      id: 'task-open-team',
+      name: 'open-team-task',
+      uuid: 'open-team-task',
+      team_id: teamId,
+      title: 'Open team work',
+      description: null,
+      status: 'todo',
+      created_by: null,
+      owner: null,
+      created_at: now,
+      updated_at: now,
+      completed_at: null,
+    } satisfies TaskRow);
+
+    (manager as any).killAgentProcess = vi.fn(async () => ({ killed: true, pids: [55556] }));
+
+    const result = await (manager as any).parkIdleAgents({
+      teamId,
+      teamName: 'research',
+      confirmed: true,
+      allTeams: false,
+      includeDefault: false,
+      includeLeads: false,
+      includeScheduled: false,
+      includeActiveTeams: false,
+    });
+
+    expect(result.result.parked).toBe(0);
+    expect(result.result.agents).toEqual([
+      { team: 'research', name: 'analyst', status: 'skipped', reason: 'team_has_1_open_task_requires_--include-active-teams' },
+    ]);
+    expect((manager as any).killAgentProcess).not.toHaveBeenCalled();
+    expect((await db.agents.getById('agent-idle-helper'))?.status).toBe('running');
+  });
+
+  it('bounds manager shutdown when the HTTP close callback never fires', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const fakeServer = {
+      close: vi.fn(),
+      closeIdleConnections: vi.fn(),
+      closeAllConnections: vi.fn(),
+    };
+    (manager as any).httpServer = fakeServer;
+
+    vi.useFakeTimers();
+    const shutdown = (manager as any).shutdown();
+    await vi.advanceTimersByTimeAsync(3_001);
+    await shutdown;
+
+    expect(fakeServer.close).toHaveBeenCalledTimes(1);
+    expect(fakeServer.closeIdleConnections).toHaveBeenCalledTimes(1);
+    expect(fakeServer.closeAllConnections).toHaveBeenCalledTimes(1);
+    expect((manager as any).httpServer).toBeNull();
   });
 });

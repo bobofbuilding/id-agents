@@ -520,6 +520,7 @@ const DEFAULT_VALIDATOR_RECOMMENDATION_LOOP: ValidatorRecommendationLoopConfig =
   trigger: 'validation_task_completed',
   updatedAt: null,
 };
+const MANAGER_HTTP_SHUTDOWN_TIMEOUT_MS = 3_000;
 
 export class AgentManagerDb {
   private managementApp: express.Application;
@@ -8631,6 +8632,7 @@ Return this JSON shape:
           const includeDefault = args.includes('--include-default');
           const includeLeads = args.includes('--include-leads');
           const includeScheduled = args.includes('--include-scheduled');
+          const includeActiveTeams = args.includes('--include-active-teams');
           return this.parkIdleAgents({
             teamId,
             teamName,
@@ -8639,6 +8641,7 @@ Return this JSON shape:
             includeDefault,
             includeLeads,
             includeScheduled,
+            includeActiveTeams,
           });
         }
         if (sub === 'rebuild') {
@@ -12408,8 +12411,23 @@ Return this JSON shape:
       this.wss = null;
     }
     if (this.httpServer) {
-      await new Promise<void>((res) => this.httpServer!.close(() => res()));
+      const server = this.httpServer;
       this.httpServer = null;
+      await new Promise<void>((res) => {
+        let done = false;
+        const finish = () => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          res();
+        };
+        const timer = setTimeout(() => {
+          try { (server as any).closeAllConnections?.(); } catch { /* best effort */ }
+          finish();
+        }, MANAGER_HTTP_SHUTDOWN_TIMEOUT_MS);
+        try { (server as any).closeIdleConnections?.(); } catch { /* best effort */ }
+        try { server.close(() => finish()); } catch { finish(); }
+      });
     }
   }
 
@@ -13237,6 +13255,17 @@ Return this JSON shape:
     return Number(rows[0]?.c ?? 0) || 0;
   }
 
+  private async countOpenTeamTasks(teamId: string): Promise<number> {
+    const { rows } = await this.db.adapter.query<{ c: string | number }>(
+      `SELECT COUNT(*) AS c
+         FROM tasks
+        WHERE team_id = $1
+          AND LOWER(status) NOT IN ('done', 'completed', 'archived', 'cancelled', 'canceled')`,
+      [teamId],
+    );
+    return Number(rows[0]?.c ?? 0) || 0;
+  }
+
   private async countActiveSchedules(agentId: string): Promise<number> {
     const { rows } = await this.db.adapter.query<{ c: string | number }>(
       `SELECT COUNT(*) AS c
@@ -13272,6 +13301,7 @@ Return this JSON shape:
     includeDefault: boolean;
     includeLeads: boolean;
     includeScheduled: boolean;
+    includeActiveTeams: boolean;
   }): Promise<{ ok: boolean; result: {
     action: 'agents-park-idle';
     dryRun: boolean;
@@ -13291,6 +13321,7 @@ Return this JSON shape:
         rows.push({ team: team.name, name: '*', status: 'skipped', reason: 'default_team_requires_--include-default' });
         continue;
       }
+      const teamOpenTasks = await this.countOpenTeamTasks(team.id);
       const agents = await this.dbListAgents(team.id, true);
       for (const agent of agents) {
         if (agent.status !== 'running') continue;
@@ -13304,6 +13335,10 @@ Return this JSON shape:
         }
         if (!opts.includeLeads && this.isLeadLikeAgentName(agent.name)) {
           rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: 'lead_like_requires_--include-leads' });
+          continue;
+        }
+        if (!opts.includeActiveTeams && teamOpenTasks > 0) {
+          rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: `team_has_${teamOpenTasks}_open_task${teamOpenTasks === 1 ? '' : 's'}_requires_--include-active-teams` });
           continue;
         }
 
