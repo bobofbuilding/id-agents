@@ -345,7 +345,7 @@ export async function discoverRestAPEndpoints(baseEndpoint: string): Promise<{ t
 
     const response = await fetch(catalogUrl, {
       signal: controller.signal,
-      headers: { 'Accept': 'application/json' }
+      headers: { Accept: 'application/json', Connection: 'close' },
     });
     clearTimeout(timeoutId);
 
@@ -12389,7 +12389,8 @@ Return this JSON shape:
 
           try {
             const resp = await fetch(`${agentUrl}/health`, {
-              signal: AbortSignal.timeout(3000)
+              headers: { Accept: 'application/json', Connection: 'close' },
+              signal: AbortSignal.timeout(3000),
             });
             const isOnline = resp.ok;
             this.healthStatus.set(key, { status: isOnline ? 'online' : 'offline', lastCheck: Date.now() });
@@ -12582,7 +12583,7 @@ Return this JSON shape:
             // entire due-service loop. 5s matches the /news-to forward path.
             const res = await fetch(url, {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
+              headers: { 'Content-Type': 'application/json', Connection: 'close' },
               body: JSON.stringify({
                 from: 'checkin-service',
                 trigger: true,

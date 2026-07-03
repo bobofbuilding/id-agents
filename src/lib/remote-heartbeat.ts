@@ -57,7 +57,7 @@ export const defaultHealthProbeFn: HealthProbeFn = async (
   const nodeFetch = (await import('node-fetch')).default;
   try {
     const resp = await (nodeFetch as any)(url, {
-      headers: { Accept: 'application/json' },
+      headers: { Accept: 'application/json', Connection: 'close' },
       redirect: 'error',
       signal: AbortSignal.timeout(timeoutMs),
     });
