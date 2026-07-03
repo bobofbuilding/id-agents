@@ -28,6 +28,8 @@ export interface AgentListEntry {
   shape: AgentLibraryShape;
   hasReadme: boolean;
   hasLicense: boolean;
+  /** First human-authored README body paragraph, or null when no README is present. */
+  description: string | null;
   /** Immediate subdirectory names (non-dot) under the entry's directory. */
   subfolders: string[];
   /** Absolute filesystem path to the entry's directory. */
@@ -219,6 +221,42 @@ function readFileIfExists(p: string): string | null {
   try { return fs.readFileSync(p, 'utf-8'); } catch { return null; }
 }
 
+function firstMarkdownBodyParagraph(raw: string | null): string | null {
+  if (!raw) return null;
+  const lines = raw.split(/\r?\n/);
+  let i = 0;
+  if (lines[0]?.trim() === '---') {
+    i = 1;
+    while (i < lines.length && lines[i].trim() !== '---' && lines[i].trim() !== '...') i++;
+    if (i < lines.length) i++;
+  }
+
+  let inFence = false;
+  let paragraph: string[] = [];
+  for (; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (/^(```|~~~)/.test(trimmed)) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence) continue;
+    if (!trimmed) {
+      if (paragraph.length > 0) break;
+      continue;
+    }
+    if (paragraph.length === 0) {
+      if (/^#{1,6}\s+/.test(trimmed)) continue;
+      if (/^<!--/.test(trimmed)) continue;
+      if (/^(?:!\[|\[!\[)/.test(trimmed)) continue;
+      if (/^[-*_]{3,}$/.test(trimmed)) continue;
+    }
+    paragraph.push(trimmed);
+  }
+
+  const text = paragraph.join(' ').replace(/\s+/g, ' ').trim();
+  return text || null;
+}
+
 function bundledSkillNames(agentDir: string): string[] {
   const skillsDir = path.join(agentDir, 'skills');
   return enumerateLibrarySkills(skillsDir).map(e => e.name);
@@ -229,11 +267,13 @@ function decorateAgentEntry(
   shape: AgentLibraryShape,
   dirPath: string,
 ): AgentListEntry {
+  const readme = readFileIfExists(path.join(dirPath, 'README.md'));
   return {
     name,
     shape,
-    hasReadme: fileExists(path.join(dirPath, 'README.md')),
+    hasReadme: readme != null,
     hasLicense: fileExists(path.join(dirPath, 'LICENSE')),
+    description: firstMarkdownBodyParagraph(readme),
     subfolders: listSubfolders(dirPath),
     source_path: dirPath,
   };
@@ -250,15 +290,16 @@ function normalizeTags(v: unknown): string[] {
 function readSkillCatalogMeta(skillFile: string): { description: string | null; tags: string[]; license: string | null } {
   const raw = readFileIfExists(skillFile);
   if (raw == null) return { description: null, tags: [], license: null };
-  const { frontmatter } = parseSkillMd(raw);
+  const { frontmatter, body } = parseSkillMd(raw);
   const metaRaw = frontmatter.metadata;
   const meta = metaRaw && typeof metaRaw === 'object' && !Array.isArray(metaRaw)
     ? (metaRaw as Record<string, unknown>)
     : {};
   // Tags live under metadata.tags (spec extension); accept a top-level `tags` too.
   const tags = normalizeTags(meta.tags ?? (frontmatter as Record<string, unknown>).tags);
+  const frontmatterDescription = stringFieldOrNull(frontmatter, 'description');
   return {
-    description: stringFieldOrNull(frontmatter, 'description'),
+    description: frontmatterDescription ?? firstMarkdownBodyParagraph(body),
     tags,
     license: stringFieldOrNull(frontmatter, 'license'),
   };
@@ -367,14 +408,17 @@ export function listLibraryTeams(libraryRoot: string | null): TeamListResult {
   const entries = enumerateLibraryTeams(teams);
   return {
     libraryRoot,
-    entries: entries.map((entry) => ({
-      name: entry.name,
-      hasReadme: fileExists(path.join(entry.dirPath, 'README.md')),
-      hasLicense: fileExists(path.join(entry.dirPath, 'LICENSE')),
-      hasTeamYaml: fileExists(entry.teamYamlFile),
-      source_path: entry.dirPath,
-      description: null,
-    })),
+    entries: entries.map((entry) => {
+      const readme = readFileIfExists(path.join(entry.dirPath, 'README.md'));
+      return {
+        name: entry.name,
+        hasReadme: readme != null,
+        hasLicense: fileExists(path.join(entry.dirPath, 'LICENSE')),
+        hasTeamYaml: fileExists(entry.teamYamlFile),
+        source_path: entry.dirPath,
+        description: firstMarkdownBodyParagraph(readme),
+      };
+    }),
   };
 }
 
@@ -406,11 +450,11 @@ export function getLibraryTeam(libraryRoot: string | null, name: string): TeamDe
   }
   return {
     name: entry.name,
-    hasReadme: fileExists(path.join(entry.dirPath, 'README.md')),
+    hasReadme: readme != null,
     hasLicense: fileExists(path.join(entry.dirPath, 'LICENSE')),
     hasTeamYaml: fileExists(entry.teamYamlFile),
     source_path: entry.dirPath,
-    description: null,
+    description: firstMarkdownBodyParagraph(readme),
     teamYamlFile: entry.teamYamlFile,
     readme,
     teamYaml,
@@ -689,7 +733,7 @@ export function getLibrarySkill(
     ...base,
     skillFile: entry.skillFile,
     skillName: stringFieldOrNull(frontmatter, 'name'),
-    description: stringFieldOrNull(frontmatter, 'description'),
+    description: stringFieldOrNull(frontmatter, 'description') ?? firstMarkdownBodyParagraph(body),
     bodyLength: body.length,
   };
 }
