@@ -37,6 +37,24 @@ function logTime(): string {
   return `[${now.toTimeString().slice(0, 8)}.${String(now.getMilliseconds()).padStart(3, '0')}]`;
 }
 
+type ExternalStopQueryStatus = 'cancelled' | 'expired' | 'failed';
+
+const EXTERNAL_STOP_QUERY_STATUSES = new Set<ExternalStopQueryStatus>(['cancelled', 'expired', 'failed']);
+
+class ExternalQueryStopError extends Error {
+  constructor(
+    readonly queryId: string,
+    readonly status: ExternalStopQueryStatus,
+  ) {
+    super(`Query ${queryId} was marked ${status} by the manager`);
+    this.name = 'ExternalQueryStopError';
+  }
+}
+
+function isExternalQueryStopError(error: unknown): error is ExternalQueryStopError {
+  return error instanceof ExternalQueryStopError;
+}
+
 /**
  * Detect API-related errors and return a helpful message
  */
@@ -211,6 +229,7 @@ export class AgentRestServer {
     agentName?: string;
     agentIdentity?: { name?: string; team?: string; network?: string; metadata?: any; tokenId?: string; domain?: string };
     db?: { db: Db; teamId: string; agentId: string };
+    harness?: AgentHarness;
   } = {}) {
     const resolvedRuntime = resolveRuntime(process.env.ID_HARNESS || 'claude-agent-sdk');
     this.model = options.model || process.env.CLAUDE_MODEL || getDefaultModelForRuntime(resolvedRuntime);
@@ -232,7 +251,7 @@ export class AgentRestServer {
 
     // Initialize harness based on ID_HARNESS env var (defaults to 'claude-agent-sdk')
     this.harnessType = resolvedRuntime as HarnessType;
-    this.harness = createHarness(this.harnessType);
+    this.harness = options.harness || createHarness(this.harnessType);
 
     // Note: do NOT set process.env.AGENT_NAME here (shared process; multiple agents).
 
@@ -314,6 +333,69 @@ export class AgentRestServer {
       error: query.error ?? null,
       session_id: query.sessionId ?? null,
     });
+  }
+
+  private getExternalQueryStopPollMs(): number {
+    const raw = process.env.ID_AGENT_QUERY_TERMINAL_POLL_MS;
+    if (raw === undefined) return 5000;
+    const parsed = Number.parseInt(raw, 10);
+    if (!Number.isFinite(parsed) || parsed < 0) return 5000;
+    return parsed;
+  }
+
+  private async readExternalQueryStopStatus(queryId: string): Promise<ExternalStopQueryStatus | undefined> {
+    if (!this.db || !this.dbTeamId) return undefined;
+    const row = await this.db.queries.getByQueryIdForTeam(this.dbTeamId, queryId);
+    const status = row?.status;
+    if (status === 'cancelled' || status === 'expired' || status === 'failed') return status;
+    return undefined;
+  }
+
+  private startExternalQueryStopWatcher(
+    queryId: string,
+    onStop: (error: ExternalQueryStopError) => void,
+  ): () => void {
+    if (!this.db || !this.dbTeamId || typeof this.harness.cancel !== 'function') {
+      return () => {};
+    }
+
+    const pollMs = this.getExternalQueryStopPollMs();
+    if (pollMs <= 0) return () => {};
+
+    let stopped = false;
+    let inFlight = false;
+    let warned = false;
+
+    const check = async () => {
+      if (stopped || inFlight) return;
+      inFlight = true;
+      try {
+        const status = await this.readExternalQueryStopStatus(queryId);
+        if (status && EXTERNAL_STOP_QUERY_STATUSES.has(status)) {
+          stopped = true;
+          const error = new ExternalQueryStopError(queryId, status);
+          console.log(`${logTime()} [Agent] ${error.message}; cancelling local harness`);
+          onStop(error);
+          this.harness.cancel?.();
+        }
+      } catch (err: any) {
+        if (!warned) {
+          warned = true;
+          console.warn(`${logTime()} [Agent] Could not check external query status for ${queryId}: ${err?.message || err}`);
+        }
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    const interval = setInterval(check, pollMs);
+    interval.unref?.();
+    void check();
+
+    return () => {
+      stopped = true;
+      clearInterval(interval);
+    };
   }
 
   private setupRoutes() {
@@ -808,7 +890,7 @@ export class AgentRestServer {
 
         if (cancelled) {
           // Find the currently processing query and mark it as cancelled
-          const processingQuery = this.activeQueries.values().next().value;
+          const processingQuery = Array.from(this.activeQueries.values()).find(q => q.status === 'processing');
           if (processingQuery && processingQuery.status === 'processing') {
             processingQuery.status = 'failed';
             processingQuery.error = 'Query was cancelled';
@@ -1693,6 +1775,9 @@ What would you like to do with this information?`;
       console.log(`${logTime()} [Agent] 🔄 Resuming previous session: ${sessionId.slice(0, 20)}...`);
     }
 
+    let externalStopError: ExternalQueryStopError | undefined;
+    let stopExternalQueryWatcher: (() => void) | undefined;
+
     try {
       let result = '';
       const messages: string[] = [];
@@ -1725,6 +1810,10 @@ ${prompt}`
       const pluginsEnv = process.env.ID_PLUGINS;
       const plugins = pluginsEnv ? JSON.parse(pluginsEnv) : undefined;
 
+      stopExternalQueryWatcher = this.startExternalQueryStopWatcher(queryId, (error) => {
+        externalStopError ??= error;
+      });
+
       for await (const message of this.harness.run(enhancedPrompt, {
         model: this.model,
         allowedTools: this.allowedTools,
@@ -1732,6 +1821,8 @@ ${prompt}`
         resume: allowSessionResume ? sessionId : undefined,
         plugins: plugins
       })) {
+        if (externalStopError) throw externalStopError;
+
         // Capture session ID from system init or result message
         if (message.session_id) {
           sessionId = message.session_id;
@@ -1801,6 +1892,8 @@ ${prompt}`
         }
       }
 
+      if (externalStopError) throw externalStopError;
+
       // Never treat "empty result" as success; bubble it up as a failure so it's debuggable.
       if (!result || !result.trim() || result.trim() === `No response from ${getRuntimeDisplayName(this.harnessType)}`) {
         throw new Error(`${getRuntimeDisplayName(this.harnessType)} produced an empty result`);
@@ -1823,6 +1916,11 @@ ${prompt}`
         } catch (e: any) {
           if (e?.message) throw e;
         }
+      }
+
+      const externalStatusBeforeComplete = await this.readExternalQueryStopStatus(queryId).catch(() => undefined);
+      if (externalStatusBeforeComplete) {
+        throw new ExternalQueryStopError(queryId, externalStatusBeforeComplete);
       }
 
       // Mark as completed
@@ -1866,6 +1964,29 @@ ${prompt}`
       }
 
     } catch (error) {
+      const externalStopStatus = isExternalQueryStopError(error)
+        ? error.status
+        : await this.readExternalQueryStopStatus(queryId).catch(() => undefined);
+      if (isExternalQueryStopError(error) || externalStopStatus) {
+        const stopError = isExternalQueryStopError(error)
+          ? error
+          : new ExternalQueryStopError(queryId, externalStopStatus!);
+        query.status = 'failed';
+        query.completed = Date.now();
+        query.error = stopError.message;
+        const newsType = stopError.status === 'cancelled'
+          ? 'query.cancelled'
+          : stopError.status === 'expired'
+            ? 'query.expired'
+            : 'query.failed';
+        await this.addNews(newsType, stopError.message, {
+          query_id: queryId,
+          external_status: stopError.status
+        });
+        console.log(`${logTime()} [Agent] ${stopError.message}; preserving manager terminal state`);
+        return;
+      }
+
       query.status = 'failed';
       query.completed = Date.now();
       query.error = error instanceof Error ? error.message : String(error);
@@ -1909,6 +2030,27 @@ ${prompt}`
           : (query.error || 'Unknown error');
         await this.sendReplyToSender(from!, queryId, replyMessage, false, sessionId);
       }
+    } finally {
+      stopExternalQueryWatcher?.();
+      if (this.db) {
+        this.activeQueries.delete(queryId);
+      } else {
+        this.trimTerminalActiveQueries();
+      }
+    }
+  }
+
+  private trimTerminalActiveQueries() {
+    const maxRetainedQueries = 100;
+    if (this.activeQueries.size <= maxRetainedQueries) return;
+
+    const terminal = Array.from(this.activeQueries.entries())
+      .filter(([, q]) => q.status === 'completed' || q.status === 'failed')
+      .sort((a, b) => (a[1].completed || a[1].created) - (b[1].completed || b[1].created));
+
+    for (const [id] of terminal) {
+      if (this.activeQueries.size <= maxRetainedQueries) break;
+      this.activeQueries.delete(id);
     }
   }
 

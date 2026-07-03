@@ -1,0 +1,116 @@
+// SPDX-License-Identifier: MIT
+
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import { AgentRestServer } from '../../src/claude-agent-server.js';
+import type { AgentHarness, HarnessMessage, HarnessOptions, HarnessType } from '../../src/harness/index.js';
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+class CancellableHarness implements AgentHarness {
+  readonly type = 'claude-code-cli' as HarnessType;
+  cancelled = false;
+  cancelCalls = 0;
+  private doneResolve!: () => void;
+  done = new Promise<void>((resolve) => {
+    this.doneResolve = resolve;
+  });
+
+  async *run(_prompt: string, _options: HarnessOptions): AsyncGenerator<HarnessMessage> {
+    try {
+      while (!this.cancelled) {
+        await sleep(5);
+      }
+      yield { type: 'error', content: 'Query was cancelled' };
+    } finally {
+      this.doneResolve();
+    }
+  }
+
+  cancel(): boolean {
+    this.cancelCalls += 1;
+    this.cancelled = true;
+    return true;
+  }
+}
+
+function queryRow(status: string) {
+  return {
+    team_id: 'team-1',
+    agent_id: 'agent-1',
+    query_id: 'query-1',
+    status,
+    prompt: 'prompt',
+    created: 1,
+    completed: status === 'processing' ? null : 2,
+    result: null,
+    error: status === 'failed' ? 'manager marked failed' : null,
+    session_id: null,
+    owner_kind: 'agent',
+    owner_id: 'agent-1',
+    metadata: null,
+  };
+}
+
+describe('AgentRestServer external query terminal watcher', () => {
+  afterEach(() => {
+    delete process.env.ID_AGENT_QUERY_TERMINAL_POLL_MS;
+    delete process.env.ID_HARNESS;
+  });
+
+  it.each([
+    ['expired', 'query.expired'],
+    ['failed', 'query.failed'],
+  ] as const)('cancels the local harness without overwriting manager-%s query state', async (terminalStatus, newsType) => {
+    process.env.ID_AGENT_QUERY_TERMINAL_POLL_MS = '5';
+    process.env.ID_HARNESS = 'claude-code-cli';
+
+    const harness = new CancellableHarness();
+    let reads = 0;
+    const db: any = {
+      queries: {
+        upsert: vi.fn(async () => {}),
+        getByQueryIdForTeam: vi.fn(async () => {
+          reads += 1;
+          return queryRow(reads >= 2 ? terminalStatus : 'processing');
+        }),
+      },
+      news: {
+        add: vi.fn(async () => {}),
+      },
+    };
+
+    const server = new AgentRestServer({
+      agentName: 'worker',
+      db: { db, teamId: 'team-1', agentId: 'agent-1' },
+      harness,
+    });
+
+    try {
+      await (server as any).startQuery('query-1', 'prompt', undefined, 'manager');
+
+      await vi.waitFor(() => {
+        expect(harness.cancelCalls).toBeGreaterThan(0);
+      }, { timeout: 1000 });
+      await harness.done;
+
+      expect(db.queries.upsert).toHaveBeenCalledWith(
+        'team-1',
+        'agent-1',
+        expect.objectContaining({ query_id: 'query-1', status: 'processing' }),
+      );
+      expect(db.queries.upsert.mock.calls.some((call: any[]) => call[2]?.status === 'failed')).toBe(false);
+      expect(db.news.add).toHaveBeenCalledWith(
+        'team-1',
+        'agent-1',
+        expect.objectContaining({
+          type: newsType,
+          query_id: 'query-1',
+          data: expect.objectContaining({ external_status: terminalStatus }),
+        }),
+      );
+    } finally {
+      await server.stop();
+    }
+  });
+});

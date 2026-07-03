@@ -261,15 +261,23 @@ export class ClaudeCodeCliHarness implements AgentHarness {
       const newArgs = args.filter((_, i) => i !== promptIndex && i !== promptIndex + 1);
 
       // Read prompt from file using shell redirection
-      const quotedArgs = newArgs.map(arg => `'${arg.replace(/'/g, "'\\''")}'`).join(' ');
-      const fullCommand = `${claudePath} -p "$(cat ${tmpFile})" ${quotedArgs}; rm ${tmpFile}`;
+      const quotedArgs = newArgs.map(shellQuote).join(' ');
+      const fullCommand = `${shellQuote(claudePath)} -p "$(cat ${shellQuote(tmpFile)})" ${quotedArgs}`;
 
       console.log(`[Claude CLI] Prompt written to temp file: ${tmpFile} (${prompt.length} chars)`);
       console.log(`[Claude CLI] Full command: ${claudePath} -p "$(cat ...)" ${quotedArgs}`);
 
+      let tmpCleaned = false;
+      const cleanupTmpFile = () => {
+        if (tmpCleaned) return;
+        tmpCleaned = true;
+        try { fs.rmSync(tmpFile, { force: true }); } catch { /* best-effort */ }
+      };
+
       const proc = spawn('/bin/bash', ['-c', fullCommand], {
         cwd,
         env,
+        detached: process.platform !== 'win32',
         stdio: ['pipe', 'pipe', 'pipe']
       });
 
@@ -317,13 +325,15 @@ export class ClaudeCodeCliHarness implements AgentHarness {
       });
 
       proc.on('error', (err) => {
+        cleanupTmpFile();
         console.error(`[Claude CLI] Spawn error: ${err.message}`);
         reject(err);
       });
 
       proc.on('close', (code) => {
         // Clear process reference
-        this.currentProcess = null;
+        if (this.currentProcess === proc) this.currentProcess = null;
+        cleanupTmpFile();
 
         console.log(`[Claude CLI] Process exited with code ${code}`);
         resolve({
@@ -346,20 +356,56 @@ export class ClaudeCodeCliHarness implements AgentHarness {
       console.log(`[Claude CLI] Cancelling process PID: ${pid}`);
       this.cancelled = true;
 
-      // Kill the bash process (which will also kill claude as its child)
-      this.currentProcess.kill('SIGTERM');
+      // Kill the whole process group. Killing only the bash wrapper can leave
+      // an orphaned Claude child process running after a manager-side cancel.
+      terminateChildProcessTree(this.currentProcess, 'SIGTERM');
 
       // Force kill after 2 seconds if still running
       const proc = this.currentProcess;
       setTimeout(() => {
-        if (proc && !proc.killed) {
+        if (proc && proc.exitCode === null && proc.signalCode === null) {
           console.log(`[Claude CLI] Force killing process PID: ${pid}`);
-          proc.kill('SIGKILL');
+          terminateChildProcessTree(proc, 'SIGKILL');
         }
-      }, 2000);
+      }, 2000).unref?.();
 
       return true;
     }
     return false;
   }
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+export function terminateChildProcessTree(proc: ChildProcess, signal: NodeJS.Signals): boolean {
+  const pid = proc.pid;
+  if (!pid) return false;
+
+  let signalled = false;
+
+  if (process.platform !== 'win32') {
+    try {
+      // The CLI is spawned as a detached process group leader. Signalling the
+      // negative pid reaches the shell wrapper and its Claude child process.
+      process.kill(-pid, signal);
+      signalled = true;
+    } catch (err: any) {
+      if (err?.code !== 'ESRCH') {
+        console.warn(`[Claude CLI] Failed to signal process group ${pid}: ${err?.message || err}`);
+      }
+    }
+  }
+
+  try {
+    proc.kill(signal);
+    signalled = true;
+  } catch (err: any) {
+    if (err?.code !== 'ESRCH') {
+      console.warn(`[Claude CLI] Failed to signal process ${pid}: ${err?.message || err}`);
+    }
+  }
+
+  return signalled;
 }
