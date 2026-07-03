@@ -8038,11 +8038,36 @@ export class AgentManagerDb {
         }
 
         if (subCmd === 'done') {
-          // /task done <task-name|#shortid>
+          // /task done <task-name|#shortid> [--delegated-task-names "child-a,child-b"] [--no-delegation-reason "..."] [--advisory-query]
           // Manager can mark any task done; agent can only mark its own task done
           const taskRef = args[1];
           if (!taskRef) {
-            return { ok: false, error: 'Usage: /task done <task-name|#shortid>' };
+            return { ok: false, error: 'Usage: /task done <task-name|#shortid> [--delegated-task-names "child-a,child-b"] [--no-delegation-reason "..."] [--advisory-query]' };
+          }
+
+          const delegatedTaskNames: string[] = [];
+          let noDelegationReason: string | undefined;
+          let advisoryQuery = false;
+          for (let i = 2; i < args.length; i++) {
+            const token = args[i];
+            if (token === '--delegated-task-names' || token === '--child-task-names' || token === '--delegated-tasks' || token === '--child-tasks') {
+              const value = args[++i] || '';
+              delegatedTaskNames.push(...value.split(',').map((item) => item.trim()).filter(Boolean));
+              continue;
+            }
+            if (token === '--delegated-task' || token === '--child-task') {
+              const value = args[++i];
+              if (value) delegatedTaskNames.push(value);
+              continue;
+            }
+            if (token === '--no-delegation-reason') {
+              noDelegationReason = args[++i];
+              continue;
+            }
+            if (token === '--advisory-query') {
+              advisoryQuery = true;
+              continue;
+            }
           }
 
           const { task, error: taskErr } = await this.resolveTaskRef(taskRef, teamId);
@@ -8059,6 +8084,22 @@ export class AgentManagerDb {
             if (callerAgent && task.owner !== callerAgent.id) {
               return { ok: false, error: `Agent "${callerFrom}" is not the owner of task "${task.name}"` };
             }
+          }
+
+          const teamRow = await this.db.teams.getTeam(teamId).catch(() => null);
+          const delegationPayload = {
+            delegated_task_names: delegatedTaskNames,
+            no_delegation_reason: noDelegationReason,
+            advisory_query: advisoryQuery,
+          };
+          const delegationError = await this.validateTeamLeadDelegationBeforeDone({
+            teamId,
+            teamName: teamRow?.name || 'default',
+            task,
+            payload: delegationPayload,
+          });
+          if (delegationError) {
+            return { ok: false, error: delegationError };
           }
 
           const now = Math.floor(Date.now() / 1000);

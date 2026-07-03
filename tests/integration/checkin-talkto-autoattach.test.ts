@@ -469,4 +469,68 @@ describe('/talk-to auto-attach', () => {
     const completedTask = await db.tasks.getByNameForTeam('guarded-lead-objective', opsTeamId);
     expect(completedTask?.status).toBe('done');
   });
+
+  it('lets team leads satisfy delegation evidence through the /remote task CLI', async () => {
+    const opsTeamId = await db.teams.getOrCreateTeamId('ops-team');
+    const leadId = await insertAgent(db, opsTeamId, 'ops-lead', null, { catalog: { role: 'lead' } });
+    const memberId = await insertAgent(db, opsTeamId, 'ops-runner', null);
+    const now = Math.floor(Date.now() / 1000);
+
+    await db.tasks.create({
+      id: 'task_cli_guard_parent',
+      name: 'cli-guarded-lead-objective',
+      uuid: '77777777-7777-4777-8777-777777777777',
+      team_id: opsTeamId,
+      title: 'CLI guarded lead objective',
+      description: 'Parent objective requiring CLI child evidence',
+      status: 'doing',
+      created_by: leadId,
+      owner: leadId,
+      created_at: now - 900,
+      updated_at: now - 900,
+      completed_at: null,
+    });
+
+    await db.tasks.create({
+      id: 'task_cli_guard_child',
+      name: 'cli-child-work',
+      uuid: '88888888-8888-4888-8888-888888888888',
+      team_id: opsTeamId,
+      title: 'CLI child work',
+      description: 'Completed child evidence for the CLI parent',
+      status: 'done',
+      created_by: leadId,
+      owner: memberId,
+      created_at: now - 800,
+      updated_at: now - 700,
+      completed_at: now - 700,
+    });
+
+    const rejected = await fetch(`${baseUrl}/remote`, {
+      method: 'POST',
+      headers: adminHeaders('ops-team'),
+      body: JSON.stringify({
+        from: 'ops-lead',
+        command: '/task done cli-guarded-lead-objective',
+      }),
+    });
+    expect(rejected.status).toBe(200);
+    const rejectedBody = await rejected.json() as { ok: boolean; error?: string };
+    expect(rejectedBody.ok).toBe(false);
+    expect(rejectedBody.error).toContain('delegated_task_names');
+
+    const completed = await fetch(`${baseUrl}/remote`, {
+      method: 'POST',
+      headers: adminHeaders('ops-team'),
+      body: JSON.stringify({
+        from: 'ops-lead',
+        command: '/task done cli-guarded-lead-objective --delegated-task-names "cli-child-work"',
+      }),
+    });
+    expect(completed.status).toBe(200);
+    const completedBody = await completed.json() as { ok: boolean };
+    expect(completedBody.ok).toBe(true);
+    const completedTask = await db.tasks.getByNameForTeam('cli-guarded-lead-objective', opsTeamId);
+    expect(completedTask?.status).toBe('done');
+  });
 });
