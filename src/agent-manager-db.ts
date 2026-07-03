@@ -13260,6 +13260,10 @@ Return this JSON shape:
     return Number(rows[0]?.c ?? 0) || 0;
   }
 
+  private async countActiveQueries(agentId: string): Promise<number> {
+    return (await this.db.queries.getPending(agentId)).length;
+  }
+
   private async parkIdleAgents(opts: {
     teamId: string;
     teamName: string;
@@ -13303,10 +13307,11 @@ Return this JSON shape:
           continue;
         }
 
-        const [openTasks, schedules, checkins] = await Promise.all([
+        const [openTasks, schedules, checkins, activeQueries] = await Promise.all([
           this.countOpenOwnedTasks(agent.id),
           this.countActiveSchedules(agent.id),
           this.countActiveCheckins(agent.id),
+          this.countActiveQueries(agent.id),
         ]);
         if (openTasks > 0) {
           rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: `owns_${openTasks}_open_task${openTasks === 1 ? '' : 's'}` });
@@ -13320,6 +13325,10 @@ Return this JSON shape:
           rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: `has_${checkins}_active_checkin${checkins === 1 ? '' : 's'}` });
           continue;
         }
+        if (activeQueries > 0) {
+          rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: `has_${activeQueries}_active_${activeQueries === 1 ? 'query' : 'queries'}` });
+          continue;
+        }
 
         if (!opts.confirmed) {
           rows.push({ team: team.name, name: agent.name, status: 'candidate', reason: 'idle_running_agent' });
@@ -13327,6 +13336,11 @@ Return this JSON shape:
         }
 
         try {
+          const freshActiveQueries = await this.countActiveQueries(agent.id);
+          if (freshActiveQueries > 0) {
+            rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: `has_${freshActiveQueries}_active_${freshActiveQueries === 1 ? 'query' : 'queries'}` });
+            continue;
+          }
           const killResult = await this.killAgentProcess(agent.port);
           const cancelled = await this.cancelPendingQueriesForAgent(team.id, agent.id);
           await this.db.agents.updateStatus(agent.id, 'stopped');

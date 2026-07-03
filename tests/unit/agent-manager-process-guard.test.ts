@@ -305,4 +305,53 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     expect(stale?.metadata).not.toHaveProperty('processOwner');
     expect(stale?.metadata).not.toHaveProperty('processParentPid');
   });
+
+  it('does not park a running agent with pending or processing queries', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-active-query',
+        name: 'coder',
+        port: 4109,
+        status: 'running',
+        metadata: { runtime: 'codex', pid: 55555, processOwner: 'manager-child', processParentPid: process.pid },
+      }),
+    });
+    await db.queries.upsert(teamId, 'agent-active-query', {
+      query_id: 'query-active',
+      status: 'processing',
+      prompt: 'keep working',
+      created: Date.now(),
+      owner_kind: 'agent',
+      owner_id: 'agent-active-query',
+    });
+
+    (manager as any).killAgentProcess = vi.fn(async () => ({ killed: true, pids: [55555] }));
+
+    const result = await (manager as any).parkIdleAgents({
+      teamId,
+      teamName: 'default',
+      confirmed: true,
+      allTeams: false,
+      includeDefault: true,
+      includeLeads: false,
+      includeScheduled: false,
+    });
+
+    expect(result.result.parked).toBe(0);
+    expect(result.result.agents).toEqual([
+      { team: 'default', name: 'coder', status: 'skipped', reason: 'has_1_active_query' },
+    ]);
+    expect((manager as any).killAgentProcess).not.toHaveBeenCalled();
+
+    const query = await db.queries.getByQueryIdForTeam(teamId, 'query-active');
+    const agent = await db.agents.getById('agent-active-query');
+    expect(query?.status).toBe('processing');
+    expect(agent?.status).toBe('running');
+  });
 });
