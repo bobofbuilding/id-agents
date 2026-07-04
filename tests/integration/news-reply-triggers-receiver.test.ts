@@ -47,6 +47,7 @@ describe('POST /news — trigger default for replies', () => {
   });
 
   afterEach(async () => {
+    delete process.env.ID_AGENT_NEWS_TRIGGER_MESSAGE_CHARS;
     if (server) await server.stop();
     server = null;
   });
@@ -147,5 +148,55 @@ describe('POST /news — trigger default for replies', () => {
         prompt: expect.stringContaining('[Incoming Message from "checkin-service"]'),
       }),
     ]);
+  });
+
+  it('bounds automatic checkin wake prompts before prewriting the query row', async () => {
+    if (server) await server.stop();
+    server = null;
+    process.env.ID_AGENT_NEWS_TRIGGER_MESSAGE_CHARS = '320';
+
+    const db: any = {
+      queries: {
+        upsert: vi.fn(async () => undefined),
+      },
+      news: {
+        add: vi.fn(async () => undefined),
+      },
+    };
+    const dbServer = new AgentRestServer({
+      agentName: 'news-bounded-checkin-test',
+      workingDirectory: process.cwd(),
+      sharedDirectory: process.cwd(),
+      db: { db, teamId: 'team-1', agentId: 'agent-1' },
+      harness: new ImmediateHarness(),
+    });
+    await dbServer.start(0);
+    server = dbServer;
+    const httpServer = (server as any).httpServer as { address: () => AddressInfo };
+    baseUrl = `http://127.0.0.1:${httpServer.address().port}`;
+
+    const tailMarker = 'TAIL_MARKER_SHOULD_NOT_REACH_TRIGGER_PROMPT';
+    const res = await fetch(`${baseUrl}/news`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: 'checkin-service',
+        trigger: true,
+        skip_persist: true,
+        type: 'checkin_due',
+        message: `Checkin due (normal) - task-a\n${'x'.repeat(600)}\n${tailMarker}`,
+      }),
+    });
+
+    expect(res.status).toBe(202);
+    const pendingCall = db.queries.upsert.mock.calls.find((call: any[]) => call[2]?.status === 'pending');
+    const prompt = pendingCall?.[2]?.prompt as string;
+    expect(prompt).toContain('[Incoming Message from "checkin-service"]');
+    expect(prompt).toContain('[message truncated:');
+    expect(prompt).toContain('INBOUND WAKE BOUNDARY');
+    expect(prompt).toContain('AUTOMATED CHECK-IN BOUNDARY');
+    expect(prompt).toContain('Produce the smallest useful action/result');
+    expect(prompt).not.toContain(tailMarker);
+    expect(prompt).not.toContain('What would you like to do');
   });
 });

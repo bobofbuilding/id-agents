@@ -44,6 +44,21 @@ type ExternalStopQueryStatus = 'cancelled' | 'expired' | 'failed';
 
 const EXTERNAL_STOP_QUERY_STATUSES = new Set<ExternalStopQueryStatus>(['cancelled', 'expired', 'failed']);
 
+const DEFAULT_NEWS_TRIGGER_MESSAGE_CHAR_LIMIT = 2400;
+
+function getNewsTriggerMessageCharLimit(): number {
+  const parsed = Number.parseInt(process.env.ID_AGENT_NEWS_TRIGGER_MESSAGE_CHARS || '', 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_NEWS_TRIGGER_MESSAGE_CHAR_LIMIT;
+  return Math.max(256, parsed);
+}
+
+function truncateNewsTriggerMessage(message: string): string {
+  const text = String(message || '');
+  const limit = getNewsTriggerMessageCharLimit();
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit)}\n\n[message truncated: ${text.length - limit} additional chars omitted from this wake; inspect the news item or linked task only if needed]`;
+}
+
 const MCP_CONTROL_PLANE_PROMPT_PATTERNS = [
   /^Heartbeat:/,
   /^Supervision:/,
@@ -1452,7 +1467,7 @@ export class AgentRestServer {
           const queryId = `news_${ts}_${Math.random().toString(36).substring(7)}`;
 
           // Craft a prompt that prevents infinite loops
-          const triggerPrompt = this.craftNewsTriggerPrompt(from, newsMessage, in_reply_to);
+          const triggerPrompt = this.craftNewsTriggerPrompt(from, newsMessage, in_reply_to, newsType);
 
           // Mirror /talk: make triggered wake work visible before it enters the
           // in-memory serial queue. Manager busy guards depend on pending rows
@@ -1992,24 +2007,39 @@ export class AgentRestServer {
    * Craft a prompt for processing incoming news/messages that prevents infinite loops.
    * The prompt instructs the agent NOT to reply to the sender but allows other actions.
    */
-  private craftNewsTriggerPrompt(from: string, message: string, inReplyTo?: string): string {
-    const myName = this.agentName || this.agentIdentity?.name || 'this agent';
+  private craftNewsTriggerPrompt(from: string, message: string, inReplyTo?: string, newsType?: string): string {
     const isReply = !!inReplyTo;
+    const sender = from.trim().toLowerCase();
+    const boundedMessage = truncateNewsTriggerMessage(message);
+    const checkinInstructions = sender === 'checkin-service' || newsType === 'checkin_due'
+      ? `
+AUTOMATED CHECK-IN BOUNDARY:
+- Treat this as a bounded check-in on the linked/current task only.
+- Update status, unblock, or close the linked task if the next action is explicit.
+- Do not start unrelated discovery, create parallel tasks, or perform a broad audit from this wake.`
+      : '';
 
     return `[Incoming ${isReply ? 'Reply' : 'Message'} from "${from}"]
 
-${message}
+${boundedMessage}
 
 ---
 
-IMPORTANT INSTRUCTIONS:
+INBOUND WAKE BOUNDARY:
 1. You have received ${isReply ? 'a reply' : 'a message'} from agent "${from}".
-2. You may process this information, update your understanding, or take action based on it.
-3. You may communicate with OTHER agents if needed (not "${from}").
-4. DO NOT send a message or reply back to "${from}" - this would create an infinite loop.
-5. If you need to respond to "${from}", simply include your response in your final output and it will be recorded in your news feed where "${from}" can check it later.
+2. Keep this wake bounded to the explicit task, reply, validation result, or check-in above.
+3. If the message says work is already done, record or close the existing task; do not redo the work.
+4. If the message contains explicit follow-up recommendations, route only those recommendations and avoid duplicates.
+5. If there is no concrete next action, write a concise note and stop.
+6. You may communicate with OTHER agents only when needed to route explicit follow-up work.
+7. Do not browse, search the repo, or inspect broad Brain context unless the message explicitly requires that for the linked task.
+${checkinInstructions}
 
-What would you like to do with this information?`;
+LOOP SAFETY:
+1. DO NOT send a message or reply back to "${from}" - this would create an infinite loop.
+2. If you need to respond to "${from}", include your response in your final output and it will be recorded in your news feed where "${from}" can check it later.
+
+Produce the smallest useful action/result for this inbound wake.`;
   }
 
   private shouldDeferAutomaticSchedule(schedule: unknown): boolean {
