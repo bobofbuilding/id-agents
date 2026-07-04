@@ -724,6 +724,11 @@ export class AgentManagerDb {
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : 60_000;
   }
 
+  private getStallEventOnlyGraceMs(): number {
+    const parsed = Number(process.env.STALL_EVENT_ONLY_GRACE_MS || process.env.ID_STALL_EVENT_ONLY_GRACE_MS);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 5 * 60 * 1000;
+  }
+
   private getMaxActiveQueriesPerAgent(): number {
     const raw = process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
     if (raw === '0') return 0;
@@ -14071,7 +14076,7 @@ Return this JSON shape:
     if (!task.uuid) return false;
     const dialect = this.db.adapter.dialect;
     const p = (n: number) => dialect === 'postgres' ? `$${n}` : '?';
-    const sql = `SELECT seq
+    const sql = `SELECT seq, occurred_at
        FROM event_log
        WHERE team_id = ${p(1)}
          AND subject_kind = 'task'
@@ -14081,9 +14086,17 @@ Return this JSON shape:
        ORDER BY occurred_at DESC
        LIMIT 1`;
     const { rows } = await this.db.adapter
-      .query<{ seq: number | string }>(sql, [teamId, task.uuid, sinceMs])
-      .catch(() => ({ rows: [] as Array<{ seq: number | string }> }));
-    return rows.length > 0;
+      .query<{ seq: number | string; occurred_at: number | string }>(sql, [teamId, task.uuid, sinceMs])
+      .catch(() => ({ rows: [] as Array<{ seq: number | string; occurred_at: number | string }> }));
+    if (!rows.length) return false;
+
+    // Event rows survive manager restarts, while the in-memory nudge throttle
+    // does not. Keep a short event-only grace window to prevent immediate
+    // duplicate probes after restart, then let active-query checks decide
+    // whether supervision is still actually in flight.
+    const occurredAt = Number(rows[0]?.occurred_at || 0);
+    const graceMs = this.getStallEventOnlyGraceMs();
+    return graceMs > 0 && occurredAt >= Date.now() - graceMs;
   }
 
   private isTerminalTaskStatus(status: string | null | undefined): boolean {

@@ -685,7 +685,7 @@ describe('stalled task sweeper', () => {
       adapter: {
         query: vi.fn(async (sql: string) => {
           if (sql.includes('FROM event_log')) {
-            return { rows: [{ seq: 42 }], rowCount: 1 };
+            return { rows: [{ seq: 42, occurred_at: NOW_MS - 2 * 60 * 1000 }], rowCount: 1 };
           }
           return { rows: [], rowCount: 0 };
         }),
@@ -702,6 +702,40 @@ describe('stalled task sweeper', () => {
       expect.stringContaining('FROM event_log'),
       [TEAM_ID, '12345678-1234-1234-1234-123456789abc', NOW_MS - 90 * 60 * 1000],
     );
+  });
+
+  it('does not let an older event-only supervision record mask an expired probe after restart', async () => {
+    const db = fakeDb({
+      adapter: {
+        query: vi.fn(async (sql: string) => {
+          if (sql.includes('FROM event_log')) {
+            return { rows: [{ seq: 42, occurred_at: NOW_MS - 10 * 60 * 1000 }], rowCount: 1 };
+          }
+          return { rows: [], rowCount: 0 };
+        }),
+      },
+      queries: {
+        getPending: vi.fn(async () => []),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-old-event-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.sweepStalledTasks();
+
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledTimes(1);
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'worker',
+      expect.stringContaining('probe 1/3'),
+    );
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:refreshed',
+      actor_agent_id: 'agent-1',
+      data: expect.objectContaining({
+        reason: 'owner_refresh',
+      }),
+    }));
   });
 
   it('does not consume a stalled-probe attempt when supervision dispatch is rejected', async () => {
@@ -2300,7 +2334,7 @@ describe('stalled task sweeper', () => {
       adapter: {
         query: vi.fn(async (sql: string) => {
           if (sql.includes('FROM event_log')) {
-            return { rows: [{ seq: 99 }], rowCount: 1 };
+            return { rows: [{ seq: 99, occurred_at: NOW_MS - 2 * 60 * 1000 }], rowCount: 1 };
           }
           return { rows: [], rowCount: 0 };
         }),
@@ -2313,6 +2347,58 @@ describe('stalled task sweeper', () => {
 
     expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
     expect(db.events.insert).not.toHaveBeenCalled();
+  });
+
+  it('does not let an older event-only unclaimed-task record suppress triage after restart', async () => {
+    const staleTodo = task({
+      id: 'todo-1',
+      name: 'stale-unclaimed',
+      uuid: '88888888-8888-4777-9666-555555555555',
+      title: 'Stale unclaimed work',
+      status: 'todo',
+      owner: null,
+      updated_at: Math.floor((NOW_MS - 60 * 60 * 1000) / 1000),
+    });
+    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
+    const db = fakeDb({
+      agents: {
+        getByName: vi.fn(async () => lead),
+        list: vi.fn(async () => [lead]),
+      },
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => {
+          if (status === 'doing') return [];
+          if (status === 'todo') return [staleTodo];
+          return [];
+        }),
+        updateFields: vi.fn(async () => {}),
+      },
+      adapter: {
+        query: vi.fn(async (sql: string) => {
+          if (sql.includes('FROM event_log')) {
+            return { rows: [{ seq: 99, occurred_at: NOW_MS - 10 * 60 * 1000 }], rowCount: 1 };
+          }
+          return { rows: [], rowCount: 0 };
+        }),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-old-unclaimed-event-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.sweepStalledTasks();
+
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'lead',
+      expect.stringContaining('unclaimed task #88888888'),
+    );
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:triaged',
+      actor_agent_id: 'lead-1',
+      data: expect.objectContaining({
+        reason: 'unclaimed',
+      }),
+    }));
   });
 
   it('auto-assigns old unclaimed todo work to an idle live non-lead member', async () => {
