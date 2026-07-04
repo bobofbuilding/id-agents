@@ -978,12 +978,49 @@ export class AgentManagerDb {
 
   private readonly teamLeadDelegationGraceSeconds = 10 * 60;
 
+  private agentLeadRoleText(owner: AgentRow): string {
+    const meta = (owner.metadata as AgentMetadata | null | undefined) ?? {};
+    const catalog = meta.catalog && typeof meta.catalog === 'object'
+      ? meta.catalog as Record<string, unknown>
+      : {};
+    return [
+      meta.role,
+      catalog.role,
+      meta.description,
+      catalog.description,
+    ].map((value) => String(value || '').toLowerCase()).join('\n');
+  }
+
+  private agentLeadRoleNameText(owner: AgentRow): string {
+    const meta = (owner.metadata as AgentMetadata | null | undefined) ?? {};
+    const catalog = meta.catalog && typeof meta.catalog === 'object'
+      ? meta.catalog as Record<string, unknown>
+      : {};
+    return [
+      meta.role,
+      catalog.role,
+    ].map((value) => String(value || '').toLowerCase()).join('\n');
+  }
+
+  private agentNameLooksLikeLead(owner: AgentRow): boolean {
+    const name = owner.name.toLowerCase();
+    return name === 'lead'
+      || /(^|[-_\s])(lead|coordinator|router)$/.test(name)
+      || /^hr[-_\s]?manager$/.test(name);
+  }
+
   private isConfiguredTeamLead(teamName: string, owner: AgentRow | null | undefined): boolean {
     if (!owner) return false;
     const configured = this.configuredTeamLeadNames[teamName] || [];
     if (configured.includes(owner.name)) return true;
-    const role = String((owner.metadata as any)?.role || (owner.metadata as any)?.catalog?.role || '').toLowerCase();
-    return /\b(lead|coordinator|router)\b/.test(role) && /\b(lead|counsel|router)\b/.test(owner.name);
+    const meta = (owner.metadata as AgentMetadata | null | undefined) ?? {};
+    if (meta.primaryLead === true) return true;
+    const roleText = this.agentLeadRoleText(owner);
+    const roleNameText = this.agentLeadRoleNameText(owner);
+    if (this.agentNameLooksLikeLead(owner)) return true;
+    if (/\b(lead|coordinator|router)\b/.test(roleNameText)) return true;
+    return /\bhr[-_\s]?manager\b/.test(roleText)
+      && /\b(coordinate|coordinator|routing|route|staffing|onboarding|team operations)\b/.test(roleText);
   }
 
   private taskRefsFromCompletionPayload(payload: Record<string, unknown> | undefined): string[] {

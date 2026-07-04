@@ -242,6 +242,173 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('treats HR managers and stand-in lead names as delegation-constrained coordinators', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const owners = [
+      {
+        teamName: 'legal',
+        agent: agent({
+          id: 'hr-lead-1',
+          name: 'hr-manager',
+          metadata: {
+            catalog: {
+              role: 'HR manager',
+              description: 'Coordinate staffing, onboarding, team operations, and task routing with the legal team lead.',
+            },
+          },
+        }),
+      },
+      {
+        teamName: 'technology-security',
+        agent: agent({
+          id: 'sandbox-lead-1',
+          name: 'ctf-sandbox-lead',
+          metadata: {
+            catalog: {
+              role: 'ctf-orchestrator',
+              description: 'Coordinates sandbox challenges, assigns specialists, and tracks handoffs.',
+            },
+          },
+        }),
+      },
+    ];
+
+    for (const [index, ownerCase] of owners.entries()) {
+      const leadTask = task({
+        id: `task-${ownerCase.agent.id}`,
+        name: `coordinate-${ownerCase.agent.name}`,
+        uuid: index === 0 ? 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' : 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+        title: `Coordinate ${ownerCase.agent.name}`,
+        owner: ownerCase.agent.id,
+        created_by: ownerCase.agent.id,
+        created_at: nowSec - 11 * 60,
+        updated_at: nowSec - 11 * 60,
+      });
+      const db = fakeDb({
+        teams: {
+          getTeam: vi.fn(async () => team({ name: ownerCase.teamName })),
+        },
+        agents: {
+          getById: vi.fn(async (id: string) => id === ownerCase.agent.id ? ownerCase.agent : agent()),
+          list: vi.fn(async () => [ownerCase.agent, agent()]),
+        },
+        tasks: {
+          list: vi.fn(async ({ status, teamId }: { status?: string; teamId?: string } = {}) => {
+            if (status === 'doing') return [leadTask];
+            if (teamId === TEAM_ID) return [leadTask];
+            return [];
+          }),
+          updateFields: vi.fn(async () => {}),
+        },
+      });
+      const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', db, { libraryRoot: null }) as any;
+      manager.sendSupervisionAsk = vi.fn(async () => true);
+
+      await manager.sweepStalledTasks();
+
+      expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+        ownerCase.teamName,
+        ownerCase.agent.name,
+        expect.stringContaining('has no detected member-owned child tasks'),
+      );
+      expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+        topic: 'task:triaged',
+        actor_agent_id: ownerCase.agent.id,
+        data: expect.objectContaining({ reason: 'lead_delegation_required' }),
+      }));
+    }
+  });
+
+  it('does not classify every manager-named specialist as a lead', async () => {
+    const managerAgent = agent({
+      id: 'marketplace-manager-1',
+      name: 'marketplace-manager',
+      metadata: {
+        catalog: {
+          role: 'manager',
+          description: 'Marketplace health, listings, pricing, demand analysis, and inventory optimization.',
+        },
+      },
+    });
+    const managerTask = task({
+      owner: managerAgent.id,
+      created_by: managerAgent.id,
+    });
+    const db = fakeDb({
+      teams: {
+        getTeam: vi.fn(async () => team({ name: 'skillmesh' })),
+      },
+      agents: {
+        getById: vi.fn(async (id: string) => id === managerAgent.id ? managerAgent : agent()),
+        list: vi.fn(async () => [managerAgent, agent()]),
+      },
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => status === 'doing' ? [managerTask] : [managerTask]),
+        updateFields: vi.fn(async () => {}),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.sweepStalledTasks();
+
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'skillmesh',
+      'marketplace-manager',
+      expect.not.stringContaining('has no detected member-owned child tasks'),
+    );
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:refreshed',
+      actor_agent_id: managerAgent.id,
+      data: expect.objectContaining({ reason: 'owner_refresh' }),
+    }));
+  });
+
+  it('does not classify standalone orchestrators as team leads without lead-like names', async () => {
+    const orchestrator = agent({
+      id: 'skill-discoverer-1',
+      name: 'skill-discoverer',
+      metadata: {
+        catalog: {
+          role: 'orchestrator',
+          description: 'Runs catalog audits and reports actions to skillmesh-ops-lead.',
+        },
+      },
+    });
+    const orchestratorTask = task({
+      owner: orchestrator.id,
+      created_by: orchestrator.id,
+    });
+    const db = fakeDb({
+      teams: {
+        getTeam: vi.fn(async () => team({ name: 'skillmesh' })),
+      },
+      agents: {
+        getById: vi.fn(async (id: string) => id === orchestrator.id ? orchestrator : agent()),
+        list: vi.fn(async () => [orchestrator, agent()]),
+      },
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => status === 'doing' ? [orchestratorTask] : [orchestratorTask]),
+        updateFields: vi.fn(async () => {}),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.sweepStalledTasks();
+
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'skillmesh',
+      'skill-discoverer',
+      expect.not.stringContaining('has no detected member-owned child tasks'),
+    );
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:refreshed',
+      actor_agent_id: orchestrator.id,
+      data: expect.objectContaining({ reason: 'owner_refresh' }),
+    }));
+  });
+
   it('does not stack lead delegation probes while a prior task supervision ask is active', async () => {
     const nowSec = Math.floor(NOW_MS / 1000);
     const lead = agent({
