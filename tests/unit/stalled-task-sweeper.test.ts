@@ -180,6 +180,36 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('blocks additional owner work and immediately bumps the stale task first', async () => {
+    const db = fakeDb();
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-owner-guard-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const guard = await manager.stalledOwnerBacklogGuard({
+      teamId: TEAM_ID,
+      teamName: 'default',
+      owner: agent(),
+    });
+
+    expect(guard?.message).toContain('stalled_task_backlog');
+    expect(guard?.blockers).toEqual(['#12345678']);
+    expect(guard?.triage).toMatchObject({ status: 'sent_owner', taskRef: '#12345678', actor: 'worker' });
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'worker',
+      expect.stringContaining('New task assignment to you is held'),
+    );
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      team_id: TEAM_ID,
+      topic: 'task:refreshed',
+      actor_agent_id: 'agent-1',
+      data: expect.objectContaining({
+        reason: 'owner_refresh',
+        stalled_minutes: 60,
+      }),
+    }));
+  });
+
   it('starts the stalled-task probe reads in parallel before sending a nudge', async () => {
     let releaseEvent!: () => void;
     let releasePending!: () => void;
@@ -312,6 +342,68 @@ describe('stalled task sweeper', () => {
 
     expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
     expect(db.events.insert).not.toHaveBeenCalled();
+  });
+
+  it('does not auto-assign queued work to an owner with stale active work', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const staleOwner = agent({ id: 'agent-1', name: 'aaa-stalled' });
+    const freshOwner = agent({ id: 'agent-2', name: 'zzz-fresh', port: 4211 });
+    const staleActive = task({
+      id: 'stale-active',
+      name: 'stale-active',
+      uuid: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      owner: staleOwner.id,
+      updated_at: nowSec - 3600,
+    });
+    const freshActive = task({
+      id: 'fresh-active',
+      name: 'fresh-active',
+      uuid: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      owner: freshOwner.id,
+      updated_at: nowSec - 60,
+    });
+    const queued = task({
+      id: 'queued-task',
+      name: 'queued-task',
+      uuid: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+      title: 'Queued task',
+      status: 'todo',
+      owner: null,
+      updated_at: nowSec - 900,
+    });
+    const db = fakeDb({
+      agents: {
+        list: vi.fn(async () => [staleOwner, freshOwner]),
+        getById: vi.fn(async (id: string) => id === staleOwner.id ? staleOwner : id === freshOwner.id ? freshOwner : null),
+      },
+      tasks: {
+        list: vi.fn(async ({ status, owner }: { status?: string; owner?: string } = {}) => {
+          if (status === 'doing' && owner === staleOwner.id) return [staleActive];
+          if (status === 'doing' && owner === freshOwner.id) return [freshActive];
+          if (status === 'doing') return [staleActive, freshActive];
+          return [];
+        }),
+        getByNameForTeam: vi.fn(async () => queued),
+        claim: vi.fn(async () => true),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-autoassign-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const result = await manager.assignUnownedTodoTask(queued, team(), NOW_MS);
+
+    expect(result).toMatchObject({ assigned: true, owner: expect.objectContaining({ id: freshOwner.id }) });
+    expect(db.tasks.claim).toHaveBeenCalledWith('queued-task', freshOwner.id, nowSec, { maxDoingForTeam: expect.any(Number) });
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'aaa-stalled',
+      expect.stringContaining('New task assignment to you is held'),
+    );
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'zzz-fresh',
+      expect.stringContaining('TASK DELEGATION from manager'),
+    );
   });
 
   it('asks a live team lead to delegate when a lead-owned task has no real child tasks', async () => {
@@ -1294,7 +1386,9 @@ describe('stalled task sweeper', () => {
         list: vi.fn(async () => [busyWorker, idleWorker]),
       },
       tasks: {
-        list: vi.fn(async ({ status }: { status?: string } = {}) => {
+        list: vi.fn(async ({ status, owner }: { status?: string; owner?: string } = {}) => {
+          if (status === 'doing' && owner === busyWorker.id) return [staleDoing];
+          if (status === 'doing' && owner === idleWorker.id) return [];
           if (status === 'doing') return [staleDoing];
           if (status === 'todo') return [staleTodo];
           return [];

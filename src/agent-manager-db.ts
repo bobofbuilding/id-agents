@@ -664,6 +664,14 @@ export class AgentManagerDb {
     return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : DEFAULT_STALLED_TASK_MAX_PROBES;
   }
 
+  private getStallSweepMs(): number {
+    return Number(process.env.STALL_SWEEP_MS) || 45 * 60 * 1000;
+  }
+
+  private getStallRenudgeMs(): number {
+    return Number(process.env.STALL_RENUDGE_MS) || 90 * 60 * 1000;
+  }
+
   private getMaxActiveQueriesPerAgent(): number {
     const raw = process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
     if (raw === '0') return 0;
@@ -1240,6 +1248,122 @@ export class AgentManagerDb {
     return {
       message: this.leadDelegationBacklogMessage(params.teamName, params.owner, blockers),
       blockers: this.leadDelegationBlockerRefs(blockers),
+    };
+  }
+
+  private async findStalledOwnerTaskBlockers(params: {
+    teamId: string;
+    owner: AgentRow | null;
+    excludeTaskId?: string;
+    nowMs?: number;
+  }): Promise<Array<{ task: TaskRow; ref: string; stalledMinutes: number }>> {
+    if (!params.owner) return [];
+    const nowMs = params.nowMs ?? Date.now();
+    const stallMs = this.getStallSweepMs();
+    const doing = await this.db.tasks
+      .list({ teamId: params.teamId, status: 'doing', owner: params.owner.id })
+      .catch(() => [] as TaskRow[]);
+    return doing
+      .filter((task) => task.id !== params.excludeTaskId)
+      .map((task) => ({
+        task,
+        ref: this.taskShortRef(task),
+        stalledMinutes: Math.max(0, Math.round((nowMs - this.taskLastActivityMs(task)) / 60000)),
+      }))
+      .filter((item) => nowMs - this.taskLastActivityMs(item.task) >= stallMs)
+      .sort((a, b) => this.taskLastActivityMs(a.task) - this.taskLastActivityMs(b.task));
+  }
+
+  private stalledOwnerBacklogMessage(teamName: string, owner: AgentRow, blockers: Array<{ ref: string }>): string {
+    const refs = blockers.map((item) => item.ref).join(', ');
+    return `stalled_task_backlog: ${teamName}/${owner.name} already has ${blockers.length} stalled active task${blockers.length === 1 ? '' : 's'} (${refs}). New work for this owner is held until the stalled task is updated, completed, or reassigned.`;
+  }
+
+  private async triageStalledOwnerBacklog(params: {
+    teamId: string;
+    teamName: string;
+    owner: AgentRow;
+    blocker: { task: TaskRow; ref: string; stalledMinutes: number };
+    nowMs: number;
+  }): Promise<{ status: string; taskRef: string; actor?: string; attempt?: number }> {
+    const maxProbes = this.getMaxStalledTaskProbes();
+    const renudgeMs = this.getStallRenudgeMs();
+    const { task, ref, stalledMinutes } = params.blocker;
+    const ownerName = params.owner.name;
+
+    if (this.isLiveForSupervision(params.owner)) {
+      const key = `task:${task.id}:owner-refresh`;
+      if (!this.canRunStalledProbe(key, params.nowMs, renudgeMs, maxProbes)) {
+        return { status: 'throttled', taskRef: ref };
+      }
+      const pending = await this.loadPendingQueriesForRecipient(params.owner).catch(() => [] as QueryRow[]);
+      const state = this.supervisionQueryStateFromRows(params.teamId, pending, ref);
+      if (state.hasActiveSupervisionAsk || state.hasAnyActiveQuery) {
+        return { status: 'owner_busy', taskRef: ref, actor: ownerName };
+      }
+      const prevProbe = this.stalledNudges.get(key);
+      const attempt = this.markStalledProbe(key, params.nowMs);
+      const msg = `Backlog guard: task ${ref} ("${task.title}") has been active ${stalledMinutes}m with no progress update. New task assignment to you is held until this task is updated, completed, or reassigned. If it is done, mark it done now with \`/task done ${ref}\`. If blocked, reply with the blocker.`;
+      if (await this.sendSupervisionAsk(params.teamName, ownerName, msg)) {
+        await this.recordTaskSupervision(task, params.teamId, params.owner.id, 'owner_refresh', stalledMinutes, params.nowMs);
+        return { status: 'sent_owner', taskRef: ref, actor: ownerName, attempt };
+      }
+      this.restoreStalledProbe(key, prevProbe);
+      return { status: 'send_failed', taskRef: ref, actor: ownerName };
+    }
+
+    const lead = await this.findSupervisionLead(params.teamId).catch(() => null);
+    if (!lead) return { status: 'no_lead', taskRef: ref };
+    const key = `task:${task.id}:owner-unavailable`;
+    if (!this.canRunStalledProbe(key, params.nowMs, renudgeMs, maxProbes)) {
+      return { status: 'throttled', taskRef: ref, actor: lead.name };
+    }
+    const pending = await this.loadPendingQueriesForRecipient(lead).catch(() => [] as QueryRow[]);
+    const state = this.supervisionQueryStateFromRows(params.teamId, pending, ref);
+    if (state.hasActiveSupervisionAsk || state.hasAnyActiveQuery) {
+      return { status: 'lead_busy', taskRef: ref, actor: lead.name };
+    }
+    const prevProbe = this.stalledNudges.get(key);
+    const attempt = this.markStalledProbe(key, params.nowMs);
+    const msg = `Backlog guard: task ${ref} ("${task.title}") has been active ${stalledMinutes}m, but owner ${ownerName} is not live. New task assignment to that owner is held until this is triaged. Please claim it, reassign it, or route it to the right teammate.`;
+    if (await this.sendSupervisionAsk(params.teamName, lead.name, msg)) {
+      await this.recordTaskSupervision(task, params.teamId, lead.id, 'owner_unavailable', stalledMinutes, params.nowMs);
+      return { status: 'sent_lead', taskRef: ref, actor: lead.name, attempt };
+    }
+    this.restoreStalledProbe(key, prevProbe);
+    return { status: 'send_failed', taskRef: ref, actor: lead.name };
+  }
+
+  private async stalledOwnerBacklogGuard(params: {
+    teamId: string;
+    teamName: string;
+    owner: AgentRow | null;
+    excludeTaskId?: string;
+  }): Promise<{ message: string; blockers: string[]; triage: Record<string, unknown> | null } | null> {
+    if (!params.owner) return null;
+    const nowMs = Date.now();
+    const blockers = await this.findStalledOwnerTaskBlockers({
+      teamId: params.teamId,
+      owner: params.owner,
+      excludeTaskId: params.excludeTaskId,
+      nowMs,
+    });
+    if (!blockers.length) return null;
+    const triage = await this.triageStalledOwnerBacklog({
+      teamId: params.teamId,
+      teamName: params.teamName,
+      owner: params.owner,
+      blocker: blockers[0],
+      nowMs,
+    }).catch((err) => ({
+      status: 'triage_error',
+      taskRef: blockers[0].ref,
+      error: err?.message || String(err),
+    }));
+    return {
+      message: this.stalledOwnerBacklogMessage(params.teamName, params.owner, blockers),
+      blockers: blockers.map((item) => item.ref),
+      triage,
     };
   }
 
@@ -4029,6 +4153,18 @@ Return this JSON shape:
       throw makeAutoAttachError(409, 'lead_delegation_backlog', {
         message: leadBacklog.message,
         blocking_tasks: leadBacklog.blockers,
+      });
+    }
+    const stalledBacklog = await this.stalledOwnerBacklogGuard({
+      teamId,
+      teamName,
+      owner: targetAgent,
+    });
+    if (stalledBacklog) {
+      throw makeAutoAttachError(409, 'stalled_task_backlog', {
+        message: stalledBacklog.message,
+        blocking_tasks: stalledBacklog.blockers,
+        triage: stalledBacklog.triage,
       });
     }
 
@@ -7975,6 +8111,20 @@ Return this JSON shape:
             blocking_tasks: leadBacklog.blockers,
           });
         }
+        const stalledBacklog = await this.stalledOwnerBacklogGuard({
+          teamId,
+          teamName,
+          owner: agent,
+          excludeTaskId: task.id,
+        });
+        if (stalledBacklog) {
+          return res.status(409).json({
+            error: 'stalled_task_backlog',
+            message: stalledBacklog.message,
+            blocking_tasks: stalledBacklog.blockers,
+            triage: stalledBacklog.triage,
+          });
+        }
 
         const now = Math.floor(Date.now() / 1000);
         const claimed = await this.db.tasks.claim(task.id, agent.id, now, {
@@ -11598,13 +11748,23 @@ Return this JSON shape:
           let ownerId: string | null = null;
           let ownerAgentForGuard: AgentRow | null = null;
           let leadDelegationWarning: string | undefined;
+          let stalledOwnerWarning: string | undefined;
+          let stalledOwnerTriage: Record<string, unknown> | null = null;
           if (ownerRef) {
             const resolveTeam = taskTeamId || teamId;
             const { agent, error } = await this.resolveSingleAgentForCommand(resolveTeam, ownerRef);
             if (!agent) return { ok: false, error: error || `Agent "${ownerRef}" not found` };
             ownerAgentForGuard = agent;
-            if (await this.hasDoingTaskRoom(taskTeamId)) {
-              const taskTeamRow = await this.db.teams.getTeam(taskTeamId).catch(() => null);
+            const taskTeamRow = await this.db.teams.getTeam(taskTeamId).catch(() => null);
+            const stalledBacklog = await this.stalledOwnerBacklogGuard({
+              teamId: taskTeamId,
+              teamName: taskTeamRow?.name || teamName,
+              owner: agent,
+            });
+            if (stalledBacklog) {
+              stalledOwnerWarning = stalledBacklog.message;
+              stalledOwnerTriage = stalledBacklog.triage;
+            } else if (await this.hasDoingTaskRoom(taskTeamId)) {
               const leadBacklog = await this.leadDelegationBacklogGuard({
                 teamId: taskTeamId,
                 teamName: taskTeamRow?.name || teamName,
@@ -11656,6 +11816,7 @@ Return this JSON shape:
           const status = ownerId ? 'doing' : 'todo';
           const queuedByDoingLimit = Boolean(ownerRef && !ownerId);
           const queuedByLeadDelegation = Boolean(leadDelegationWarning);
+          const queuedByStalledOwner = Boolean(stalledOwnerWarning);
           // Resolve created_by from callerFrom if present
           let createdBy: string | null = null;
           if (callerFrom) {
@@ -11700,8 +11861,9 @@ Return this JSON shape:
             });
           }
           const warnings = [
-            queuedByDoingLimit && !queuedByLeadDelegation ? await this.doingTaskLimitMessage(taskTeamId) : undefined,
+            queuedByDoingLimit && !queuedByLeadDelegation && !queuedByStalledOwner ? await this.doingTaskLimitMessage(taskTeamId) : undefined,
             leadDelegationWarning,
+            stalledOwnerWarning,
           ].filter((item): item is string => Boolean(item));
 
           return {
@@ -11710,6 +11872,7 @@ Return this JSON shape:
               task: await this.buildTaskResult(taskRow, teamId),
               owner_wake: ownerWake,
               warning: warnings.length ? warnings.join(' ') : undefined,
+              stalled_task_triage: stalledOwnerTriage || undefined,
               brief_validation: brief.validation,
             },
           };
@@ -11923,6 +12086,23 @@ Return this JSON shape:
               },
             };
           }
+          const stalledBacklog = await this.stalledOwnerBacklogGuard({
+            teamId: taskTeamIdForGuard,
+            teamName: taskTeamRowForGuard?.name || teamName,
+            owner: agent,
+            excludeTaskId: task.id,
+          });
+          if (stalledBacklog) {
+            return {
+              ok: false,
+              error: 'stalled_task_backlog',
+              result: {
+                message: stalledBacklog.message,
+                blocking_tasks: stalledBacklog.blockers,
+                triage: stalledBacklog.triage,
+              },
+            };
+          }
 
           const now = Math.floor(Date.now() / 1000);
           if (task.status !== 'doing' && !(await this.hasDoingTaskRoom(task.team_id || teamId))) {
@@ -12002,6 +12182,23 @@ Return this JSON shape:
               result: {
                 message: leadBacklog.message,
                 blocking_tasks: leadBacklog.blockers,
+              },
+            };
+          }
+          const stalledBacklog = await this.stalledOwnerBacklogGuard({
+            teamId,
+            teamName,
+            owner: callerAgent,
+            excludeTaskId: task.id,
+          });
+          if (stalledBacklog) {
+            return {
+              ok: false,
+              error: 'stalled_task_backlog',
+              result: {
+                message: stalledBacklog.message,
+                blocking_tasks: stalledBacklog.blockers,
+                triage: stalledBacklog.triage,
               },
             };
           }
@@ -12719,6 +12916,12 @@ Return this JSON shape:
       );
 
     for (const owner of candidates) {
+      const stalledBacklog = await this.stalledOwnerBacklogGuard({
+        teamId: teamRow.id,
+        teamName: teamRow.name,
+        owner,
+      });
+      if (stalledBacklog) continue;
       if (await this.hasAnyActiveQuery(owner)) continue;
       const current = await this.db.tasks.getByNameForTeam(task.name, teamRow.id).catch(() => null);
       if (!current || current.status !== 'todo' || current.owner) {
@@ -12759,8 +12962,8 @@ Return this JSON shape:
   }
 
   private async sweepStalledTasks(): Promise<void> {
-    const STALL_MS = Number(process.env.STALL_SWEEP_MS) || 45 * 60 * 1000;     // 'doing' this long with no update
-    const RENUDGE_MS = Number(process.env.STALL_RENUDGE_MS) || 90 * 60 * 1000; // don't re-nudge a task within this
+    const STALL_MS = this.getStallSweepMs();       // 'doing' this long with no update
+    const RENUDGE_MS = this.getStallRenudgeMs();   // don't re-nudge a task within this
     const UNOWNED_ASSIGN_MS = Math.max(60_000, Number(process.env.ID_UNOWNED_ASSIGN_MIN_MS) || 5 * 60 * 1000);
     const MAX_PER_SWEEP = Math.max(1, Number(process.env.STALL_SWEEP_MAX_PER_SWEEP) || 2);
     const UNOWNED_ASSIGN_MAX_PER_SWEEP = Math.max(
