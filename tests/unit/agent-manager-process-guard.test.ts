@@ -938,7 +938,7 @@ describe('AgentManagerDb killAgentProcess guards', () => {
         }),
       });
       const now = Date.now();
-      for (const [idx, status] of ['processing', 'pending', 'pending'].entries()) {
+      for (const [idx, status] of ['processing', 'pending'].entries()) {
         await db.queries.upsert(teamId, 'agent-default-busy', {
           query_id: `default-busy-${idx}`,
           status,
@@ -953,7 +953,7 @@ describe('AgentManagerDb killAgentProcess guards', () => {
       const result = await (manager as any).executeRemoteCommand('/ask default-busy-lead do one more thing', teamId, 'default');
 
       expect(result.ok).toBe(false);
-      expect(result.error).toContain('already has 3 active queries');
+      expect(result.error).toContain('already has 2 active queries');
       expect(fetchSpy).not.toHaveBeenCalled();
     } finally {
       if (saved === undefined) delete process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
@@ -1143,11 +1143,43 @@ describe('AgentManagerDb killAgentProcess guards', () => {
       owner_kind: 'agent',
       owner_id: 'agent-supervised',
     });
+    await db.queries.upsert(teamId, 'agent-supervised', {
+      query_id: 'processing-backlog-guard',
+      status: 'processing',
+      prompt: 'Backlog guard: task #bg123456 ("Inventory Brain facts") has been active 57m with no progress update.',
+      created: now + 13000,
+      owner_kind: 'agent',
+      owner_id: 'agent-supervised',
+    });
+    await db.queries.upsert(teamId, 'agent-supervised', {
+      query_id: 'pending-backlog-guard',
+      status: 'pending',
+      prompt: 'Backlog guard: task #bg123456 ("Inventory Brain facts") has been active 63m with no progress update.',
+      created: now + 14000,
+      owner_kind: 'agent',
+      owner_id: 'agent-supervised',
+    });
+    await db.queries.upsert(teamId, 'agent-supervised', {
+      query_id: 'processing-sweep-ack',
+      status: 'processing',
+      prompt: 'Ack on the sweep. One flag: onchain-execution assignment landed on an offline agent.',
+      created: now + 15000,
+      owner_kind: 'agent',
+      owner_id: 'agent-supervised',
+    });
+    await db.queries.upsert(teamId, 'agent-supervised', {
+      query_id: 'pending-sweep-ack',
+      status: 'pending',
+      prompt: 'Ack on the sweep. One flag: onchain-execution assignment landed on an offline agent.',
+      created: now + 16000,
+      owner_kind: 'agent',
+      owner_id: 'agent-supervised',
+    });
 
     const result = await (manager as any).sweepStaleQueries();
 
-    expect(result.duplicateTaskAsk).toBe(6);
-    expect(result.total).toBe(6);
+    expect(result.duplicateTaskAsk).toBe(8);
+    expect(result.total).toBe(8);
     expect((await db.queries.getByQueryIdForTeam(teamId, 'older-pending-supervision'))?.status).toBe('expired');
     expect((await db.queries.getByQueryIdForTeam(teamId, 'active-processing-supervision'))?.status).toBe('processing');
     expect((await db.queries.getByQueryIdForTeam(teamId, 'other-task-supervision'))?.status).toBe('pending');
@@ -1161,6 +1193,10 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     expect((await db.queries.getByQueryIdForTeam(teamId, 'processing-urgent-delegation-probe'))?.status).toBe('processing');
     expect((await db.queries.getByQueryIdForTeam(teamId, 'older-manager-supervision-probe'))?.status).toBe('expired');
     expect((await db.queries.getByQueryIdForTeam(teamId, 'processing-manager-supervision-probe'))?.status).toBe('processing');
+    expect((await db.queries.getByQueryIdForTeam(teamId, 'processing-backlog-guard'))?.status).toBe('processing');
+    expect((await db.queries.getByQueryIdForTeam(teamId, 'pending-backlog-guard'))?.status).toBe('expired');
+    expect((await db.queries.getByQueryIdForTeam(teamId, 'processing-sweep-ack'))?.status).toBe('processing');
+    expect((await db.queries.getByQueryIdForTeam(teamId, 'pending-sweep-ack'))?.status).toBe('expired');
   });
 
   it('dedupes active task delegation /ask prompts before dispatching', async () => {
@@ -1197,6 +1233,45 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     expect(result.ok).toBe(true);
     expect(result.result?.queryId).toBe('existing-task-delegation');
     expect(result.result?.deduped).toBe(true);
+  });
+
+  it('dedupes exact active assignment-sweep /ask prompts before dispatching', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('ops-team');
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-task-master',
+        name: 'task-master',
+        port: 4116,
+        status: 'running',
+        endpoint: 'http://127.0.0.1:9',
+      }),
+    });
+    const prompt = 'Ack on the sweep. One flag: onchain-execution assignment landed on an offline agent.';
+    await db.queries.upsert(teamId, 'agent-task-master', {
+      query_id: 'existing-sweep-ack',
+      status: 'processing',
+      prompt,
+      created: Date.now(),
+      owner_kind: 'agent',
+      owner_id: 'agent-task-master',
+    });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+    const result = await (manager as any).executeRemoteCommand(
+      `/ask task-master ${prompt}`,
+      teamId,
+      'ops-team',
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.result?.queryId).toBe('existing-sweep-ack');
+    expect(result.result?.deduped).toBe(true);
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 
   it('dedupes active supervision routing /ask prompts before dispatching', async () => {

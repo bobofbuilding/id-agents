@@ -136,7 +136,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DEFAULT_MAX_DOING_TASKS = 30;
 const DEFAULT_STALLED_TASK_MAX_PROBES = 3;
-const DEFAULT_MAX_ACTIVE_QUERIES_PER_AGENT = 3;
+const DEFAULT_MAX_ACTIVE_QUERIES_PER_AGENT = 2;
 
 interface StalledProbeState {
   lastAt: number;
@@ -13030,9 +13030,33 @@ Return this JSON shape:
       || lower.startsWith('supervision probe from manager:')
       || lower.startsWith('lead delegation kickoff:')
       || lower.startsWith('urgent delegation probe:')
-      || lower.startsWith('resume and complete task');
+      || lower.startsWith('resume and complete task')
+      || lower.startsWith('backlog guard:')
+      || lower.startsWith('backlog guard alert:')
+      || lower.startsWith('status check on')
+      || lower.startsWith('please claim and execute #');
     if (!managedTaskAsk) return null;
     return text.match(/#[a-z0-9][a-z0-9_-]{3,}/i)?.[0]?.toLowerCase() ?? null;
+  }
+
+  private exactControlPromptDedupKey(prompt: string | null | undefined): string | null {
+    const text = String(prompt ?? '').trim().replace(/\s+/g, ' ');
+    const lower = text.toLowerCase();
+    const dedupePrefixes = [
+      'assignment sweep complete',
+      'ack on the sweep',
+      're your assignment sweep',
+      'task assignment sweep:',
+    ];
+    if (!dedupePrefixes.some((prefix) => lower.startsWith(prefix))) return null;
+    return lower.slice(0, 1024);
+  }
+
+  private activeAskDedupKey(prompt: string | null | undefined): string | null {
+    const marker = this.activeTaskAskMarker(prompt) ?? this.supervisionPromptMarker(prompt);
+    if (marker) return `marker:${marker}`;
+    const exact = this.exactControlPromptDedupKey(prompt);
+    return exact ? `exact:${exact}` : null;
   }
 
   private async loadPendingQueriesForRecipient(recipient: AgentRow | null | undefined): Promise<QueryRow[]> {
@@ -13090,13 +13114,13 @@ Return this JSON shape:
     recipient: AgentRow,
     message: string,
   ): Promise<QueryRow | null> {
-    const marker = this.activeTaskAskMarker(message);
-    if (!marker) return null;
+    const dedupKey = this.activeAskDedupKey(message);
+    if (!dedupKey) return null;
     const active = await this.loadPendingQueriesForRecipient(recipient);
     return active.find((row) =>
       row.team_id === teamId
       && (row.status === 'pending' || row.status === 'processing')
-      && this.activeTaskAskMarker(row.prompt) === marker,
+      && this.activeAskDedupKey(row.prompt) === dedupKey,
     ) ?? null;
   }
 
@@ -13113,14 +13137,22 @@ Return this JSON shape:
            OR LOWER(prompt) LIKE 'urgent delegation probe:%'
            OR LOWER(prompt) LIKE 'task delegation%'
            OR LOWER(prompt) LIKE 'resume and complete task #%'
+           OR LOWER(prompt) LIKE 'backlog guard:%'
+           OR LOWER(prompt) LIKE 'backlog guard alert:%'
+           OR LOWER(prompt) LIKE 'status check on%'
+           OR LOWER(prompt) LIKE 'please claim and execute #%'
+           OR LOWER(prompt) LIKE 'assignment sweep complete%'
+           OR LOWER(prompt) LIKE 'ack on the sweep%'
+           OR LOWER(prompt) LIKE 're your assignment sweep%'
+           OR LOWER(prompt) LIKE 'task assignment sweep:%'
          )
        ORDER BY team_id ASC, owner_kind ASC, owner_id ASC, created ASC, query_id ASC`,
     ).then((r) => r.rows).catch(() => [] as QueryRow[]);
     const grouped = new Map<string, QueryRow[]>();
     for (const row of rows) {
-      const marker = this.activeTaskAskMarker(row.prompt) ?? this.supervisionPromptMarker(row.prompt);
-      if (!marker) continue;
-      const key = `${row.team_id}\u0001${row.owner_kind}\u0001${row.owner_id}\u0001${marker}`;
+      const dedupKey = this.activeAskDedupKey(row.prompt);
+      if (!dedupKey) continue;
+      const key = `${row.team_id}\u0001${row.owner_kind}\u0001${row.owner_id}\u0001${dedupKey}`;
       const list = grouped.get(key) ?? [];
       list.push(row);
       grouped.set(key, list);
