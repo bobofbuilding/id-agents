@@ -109,7 +109,11 @@ function fakeDb(overrides: Record<string, any> = {}): any {
       listActive: vi.fn(async () => []),
       pruneExpired: vi.fn(async () => 0),
     },
-    adapter: { query: vi.fn(async () => ({ rows: [], rowCount: 0 })) },
+    adapter: {
+      dialect: 'sqlite',
+      query: vi.fn(async () => ({ rows: [], rowCount: 0 })),
+      ...overrides.adapter,
+    },
   };
 }
 
@@ -167,6 +171,30 @@ describe('stalled task sweeper', () => {
         stalled_minutes: 60,
       }),
     }));
+  });
+
+  it('does not repeat owner refresh after restart when a recent supervision event exists', async () => {
+    const db = fakeDb({
+      adapter: {
+        query: vi.fn(async (sql: string) => {
+          if (sql.includes('FROM event_log')) {
+            return { rows: [{ seq: 42 }], rowCount: 1 };
+          }
+          return { rows: [], rowCount: 0 };
+        }),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.sweepStalledTasks();
+
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
+    expect(db.events.insert).not.toHaveBeenCalled();
+    expect(db.adapter.query).toHaveBeenCalledWith(
+      expect.stringContaining('FROM event_log'),
+      [TEAM_ID, '12345678-1234-1234-1234-123456789abc', NOW_MS - 90 * 60 * 1000],
+    );
   });
 
   it('does not consume a stalled-probe attempt when supervision dispatch is rejected', async () => {
@@ -1025,5 +1053,46 @@ describe('stalled task sweeper', () => {
         reason: 'validator_stalled_terminal',
       }),
     }));
+  });
+
+  it('does not repeat unclaimed todo triage after restart when a recent supervision event exists', async () => {
+    const staleTodo = task({
+      id: 'todo-1',
+      name: 'stale-unclaimed',
+      uuid: '88888888-8888-4888-8888-888888888888',
+      title: 'Stale unclaimed work',
+      status: 'todo',
+      owner: null,
+    });
+    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
+    const db = fakeDb({
+      agents: {
+        getByName: vi.fn(async () => lead),
+        list: vi.fn(async () => [lead]),
+      },
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => {
+          if (status === 'doing') return [];
+          if (status === 'todo') return [staleTodo];
+          return [];
+        }),
+        updateFields: vi.fn(async () => {}),
+      },
+      adapter: {
+        query: vi.fn(async (sql: string) => {
+          if (sql.includes('FROM event_log')) {
+            return { rows: [{ seq: 99 }], rowCount: 1 };
+          }
+          return { rows: [], rowCount: 0 };
+        }),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.sweepStalledTasks();
+
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
+    expect(db.events.insert).not.toHaveBeenCalled();
   });
 });

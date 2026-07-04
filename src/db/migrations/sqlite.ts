@@ -370,6 +370,7 @@ export async function migrateSqlite(adapter: SqliteAdapter): Promise<void> {
     CREATE INDEX IF NOT EXISTS tasks_owner_idx ON tasks(owner, status, updated_at);
     CREATE INDEX IF NOT EXISTS tasks_team_idx ON tasks(team_id, status, updated_at);
     CREATE INDEX IF NOT EXISTS task_event_links_schedule_idx ON task_event_links(schedule_id, task_id);
+    CREATE INDEX IF NOT EXISTS tasks_uuid_prefix_idx ON tasks(SUBSTR(uuid, 1, 8));
 
     CREATE TABLE IF NOT EXISTS event_log (
       seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -580,6 +581,7 @@ export async function migrateSqlite(adapter: SqliteAdapter): Promise<void> {
   }
 
   adapter.exec(`CREATE UNIQUE INDEX IF NOT EXISTS tasks_uuid_idx ON tasks(uuid)`);
+  adapter.exec(`CREATE INDEX IF NOT EXISTS tasks_uuid_prefix_idx ON tasks(SUBSTR(uuid, 1, 8))`);
 
   await migrateQueriesTeamQueryPkSqlite(adapter);
   await migrateNewsItemsNullableAgentSqlite(adapter);
@@ -646,6 +648,7 @@ async function migrateTasks_TeamNameUnique(adapter: SqliteAdapter): Promise<void
     CREATE INDEX IF NOT EXISTS tasks_owner_idx ON tasks(owner, status, updated_at);
     CREATE INDEX IF NOT EXISTS tasks_team_idx ON tasks(team_id, status, updated_at);
     CREATE UNIQUE INDEX IF NOT EXISTS tasks_uuid_idx ON tasks(uuid);
+    CREATE INDEX IF NOT EXISTS tasks_uuid_prefix_idx ON tasks(SUBSTR(uuid, 1, 8));
   `);
 }
 

@@ -175,6 +175,22 @@ export interface ValidatorRecommendationRouteBlock {
 }
 
 const VALIDATOR_RECOMMENDATION_LOOP_MARKER = 'Event-driven validator recommendation loop triggered.';
+const NEWS_TO_DELIVERY_TIMEOUT_MS = 5_000;
+const NEWS_TO_MAX_ATTEMPTS = 2;
+const NEWS_TO_RETRY_DELAY_MS = 250;
+
+interface RoutedAgentTarget {
+  name: string;
+  id: string;
+  alias?: string;
+  displayId?: string;
+  internal_url?: string;
+  url?: string;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 export function isValidatorRecommendationLoopPrompt(prompt: unknown): boolean {
   return typeof prompt === 'string' && prompt.includes(VALIDATOR_RECOMMENDATION_LOOP_MARKER);
@@ -341,6 +357,89 @@ export class AgentRestServer {
         this.newsItems = this.newsItems.slice(0, this.maxNewsItems);
       }
     }, 5 * 60 * 1000);
+  }
+
+  private async fetchRoutedAgentTarget(
+    managerUrl: string,
+    headers: Record<string, string>,
+    to: string,
+  ): Promise<{ targetAgent: RoutedAgentTarget; targetUrl: string } | null> {
+    const agentsRes = await fetch(`${managerUrl}/agents`, {
+      headers,
+      signal: AbortSignal.timeout(NEWS_TO_DELIVERY_TIMEOUT_MS),
+    });
+    if (!agentsRes.ok) {
+      throw new Error(`Failed to fetch agents list: ${agentsRes.status}`);
+    }
+
+    const agentsData = await agentsRes.json() as { agents: RoutedAgentTarget[] };
+    const targetAgent = agentsData.agents?.find(
+      (agent) => agent.name === to || agent.alias === to || agent.id === to || agent.displayId === to,
+    );
+    if (!targetAgent) return null;
+
+    const targetUrl = (targetAgent.internal_url || targetAgent.url || '').replace(/\/+$/, '');
+    if (!targetUrl) {
+      throw new Error(`No URL for agent "${to}"`);
+    }
+    return { targetAgent, targetUrl };
+  }
+
+  private async postNewsWithRetry(params: {
+    label: string;
+    initialBaseUrl: string;
+    payload: Record<string, unknown>;
+    headers?: Record<string, string>;
+    refreshBaseUrl?: () => Promise<string | null>;
+    onFinalFailure?: (failure: string) => Promise<void>;
+  }): Promise<{ ok: true } | { ok: false; failure: string }> {
+    let baseUrl = params.initialBaseUrl.replace(/\/+$/, '');
+    let failure = 'unknown delivery failure';
+
+    for (let attempt = 1; attempt <= NEWS_TO_MAX_ATTEMPTS; attempt += 1) {
+      try {
+        const res = await fetch(`${baseUrl}/news`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...(params.headers ?? {}) },
+          body: JSON.stringify(params.payload),
+          signal: AbortSignal.timeout(NEWS_TO_DELIVERY_TIMEOUT_MS),
+        });
+        if (res.ok) {
+          if (attempt > 1) {
+            console.log(`${logTime()} [Agent] /news-to delivery to ${params.label} succeeded on retry ${attempt}/${NEWS_TO_MAX_ATTEMPTS}`);
+          }
+          return { ok: true };
+        }
+
+        const errText = await res.text().catch(() => res.statusText);
+        failure = `${res.status} ${errText.slice(0, 200)}`.trim();
+        if (attempt >= NEWS_TO_MAX_ATTEMPTS || res.status < 500) break;
+      } catch (err: any) {
+        failure = err?.message || String(err);
+        if (attempt >= NEWS_TO_MAX_ATTEMPTS) break;
+      }
+
+      console.warn(
+        `${logTime()} [Agent] /news-to delivery to ${params.label} failed on attempt ${attempt}/${NEWS_TO_MAX_ATTEMPTS}: ${failure}. Retrying...`,
+      );
+      if (params.refreshBaseUrl) {
+        try {
+          const refreshedBaseUrl = await params.refreshBaseUrl();
+          if (refreshedBaseUrl) {
+            baseUrl = refreshedBaseUrl.replace(/\/+$/, '');
+          }
+        } catch (refreshErr: any) {
+          console.warn(`${logTime()} [Agent] /news-to refresh lookup for ${params.label} failed:`, refreshErr?.message || refreshErr);
+        }
+      }
+      await sleep(NEWS_TO_RETRY_DELAY_MS);
+    }
+
+    console.error(`${logTime()} [Agent] /news-to delivery to ${params.label} failed after ${NEWS_TO_MAX_ATTEMPTS} attempt(s): ${failure}`);
+    if (params.onFinalFailure) {
+      await params.onFinalFailure(failure);
+    }
+    return { ok: false, failure };
   }
 
   private async dbAddNews(type: string, message: string, data?: any) {
@@ -1484,44 +1583,23 @@ export class AgentRestServer {
             reply_expected: false,
             ...(trigger === true ? { trigger: true } : {}),
           };
-          const newsRes = await fetch(`${managerUrl}/news`, {
-            method: 'POST',
+          const delivery = await this.postNewsWithRetry({
+            label: 'manager',
+            initialBaseUrl: managerUrl,
             headers,
-            body: JSON.stringify(payload),
+            payload,
           });
-          if (!newsRes.ok) {
-            const errText = await newsRes.text().catch(() => newsRes.statusText);
-            return res.status(502).json({ error: `Failed to send notification to manager: ${errText}` });
+          if (!delivery.ok) {
+            return res.status(502).json({ error: `Failed to send notification to manager: ${delivery.failure}` });
           }
           return res.status(202).json({ success: true, delivered_to: 'manager', status: 'delivered' });
         }
 
-        // Same lookup path /talk-to uses — manager catalog.
-        const agentsRes = await fetch(`${managerUrl}/agents`, { headers });
-        if (!agentsRes.ok) {
-          return res.status(502).json({ error: `Failed to fetch agents list: ${agentsRes.status}` });
-        }
-        const agentsData = (await agentsRes.json()) as {
-          agents: Array<{
-            name: string;
-            id: string;
-            alias?: string;
-            displayId?: string;
-            internal_url?: string;
-            url?: string;
-          }>;
-        };
-        const targetAgent = agentsData.agents?.find(
-          (a) => a.name === to || a.alias === to || a.id === to || a.displayId === to,
-        );
-        if (!targetAgent) {
+        const routedTarget = await this.fetchRoutedAgentTarget(managerUrl, headers, String(to));
+        if (!routedTarget) {
           return res.status(404).json({ error: `Agent "${to}" not found` });
         }
-
-        const targetUrl = targetAgent.internal_url || targetAgent.url;
-        if (!targetUrl) {
-          return res.status(404).json({ error: `No URL for agent "${to}"` });
-        }
+        const { targetUrl } = routedTarget;
 
         // Fire-and-forget POST to target's /news. Do NOT route through the
         // manager — symmetry with /talk-to matters, asymmetric routing
@@ -1534,19 +1612,33 @@ export class AgentRestServer {
           reply_expected: false,
           ...(trigger === true ? { trigger: true } : {}),
         };
-        fetch(`${targetUrl}/news`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-          signal: AbortSignal.timeout(5000),
-        }).catch((err) => {
-          console.error(`${logTime()} [Agent] /news-to delivery to ${to} failed:`, err?.message || err);
+        void this.postNewsWithRetry({
+          label: String(to),
+          initialBaseUrl: targetUrl,
+          payload,
+          refreshBaseUrl: async () => {
+            const refreshed = await this.fetchRoutedAgentTarget(managerUrl, headers, String(to));
+            return refreshed?.targetUrl || null;
+          },
+          onFinalFailure: async (failure) => {
+            await this.addNews('outbound.notify_failed', `Failed notify to ${to}`, {
+              to,
+              message,
+              trigger: trigger === true,
+              failure,
+              attempts: NEWS_TO_MAX_ATTEMPTS,
+              ...(data && typeof data === 'object' ? data : {}),
+            });
+          },
         });
 
         // Record outbound notify in our own news feed for auditability.
-        await this.addNews('outbound.notify', `Sent notify to ${to}`, {
+        await this.addNews('outbound.notify', `Queued notify to ${to}`, {
           to,
           message,
+          trigger: trigger === true,
+          attempts: NEWS_TO_MAX_ATTEMPTS,
+          delivery_status: 'queued',
           ...(data && typeof data === 'object' ? data : {}),
         });
 

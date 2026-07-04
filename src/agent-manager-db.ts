@@ -30,7 +30,7 @@ import { LocalModelGate, isLocalModelRuntime } from './lib/local-model-gate.js';
 import { ccCapabilities } from './control-center/manifest.js';
 import { loadMasterKey, deriveKeyAtIndex } from './lib/skillmesh-key-manager.js';
 import { type Db } from './db/db-service.js';
-import type { AgentRow, QueryRow, ScheduleDefinitionRow, TaskRow } from './db/types.js';
+import type { AgentRow, QueryRow, ScheduleDefinitionRow, TaskRow, TeamRow } from './db/types.js';
 import fetch from 'node-fetch';
 import type { PluginConfig, DeployConfig, HeartbeatConfig, CalendarSpec, ScheduleDeliveryMode, OrgConfig, RuntimeCredentialPoolConfig } from './config-parser.js';
 import {
@@ -304,7 +304,8 @@ function getCatalogEndpoint(catalog: RestAPCatalog, key: 'talk' | 'news' | 'sche
 
 // Cache for REST-AP catalogs (endpoint -> catalog)
 const restapCatalogCache = new Map<string, { catalog: RestAPCatalog; fetchedAt: number }>();
-const CATALOG_CACHE_TTL = 60000; // 1 minute cache
+const restapCatalogFetches = new Map<string, Promise<RestAPCatalog | null>>();
+const CATALOG_CACHE_TTL = 5 * 60 * 1000; // 5 minute cache
 
 // Ephemeral in-memory ring of agent activity (tool/file steps), fed by agents'
 // fire-and-forget POST /activity/record and read back via GET /activity. Lost on
@@ -327,46 +328,61 @@ export async function discoverRestAPEndpoints(baseEndpoint: string): Promise<{ t
     return { talk: '/talk', news: '/news', schedule: null };
   }
 
+  const normalizedBaseEndpoint = baseEndpoint.replace(/\/+$/, '');
   const now = Date.now();
-  const cached = restapCatalogCache.get(baseEndpoint);
+  const cached = restapCatalogCache.get(normalizedBaseEndpoint);
+  const toEndpoints = (catalog: RestAPCatalog) => ({
+    talk: getCatalogEndpoint(catalog, 'talk') || '/talk',
+    news: getCatalogEndpoint(catalog, 'news') || '/news',
+    schedule: getCatalogEndpoint(catalog, 'schedule') || null,
+  });
 
   // Return cached catalog if still valid
   if (cached && (now - cached.fetchedAt) < CATALOG_CACHE_TTL) {
-    return {
-      talk: getCatalogEndpoint(cached.catalog, 'talk') || '/talk',
-      news: getCatalogEndpoint(cached.catalog, 'news') || '/news',
-      schedule: getCatalogEndpoint(cached.catalog, 'schedule') || null
-    };
+    return toEndpoints(cached.catalog);
   }
 
-  try {
-    const catalogUrl = `${baseEndpoint.replace(/\/+$/, '')}/.well-known/restap.json`;
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 5000);
+  const inFlight = restapCatalogFetches.get(normalizedBaseEndpoint);
+  if (inFlight) {
+    const catalog = await inFlight;
+    return catalog ? toEndpoints(catalog) : { talk: '/talk', news: '/news', schedule: null };
+  }
 
-    const response = await fetch(catalogUrl, {
-      signal: controller.signal,
-      headers: { Accept: 'application/json', Connection: 'close' },
-    });
-    clearTimeout(timeoutId);
+  const fetchCatalog = (async () => {
+    try {
+      const catalogUrl = `${normalizedBaseEndpoint}/.well-known/restap.json`;
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000);
 
-    if (response.ok) {
-      const catalog = await response.json() as RestAPCatalog;
-      restapCatalogCache.set(baseEndpoint, { catalog, fetchedAt: now });
+      try {
+        const response = await fetch(catalogUrl, {
+          signal: controller.signal,
+          headers: { Accept: 'application/json', Connection: 'close' },
+        });
 
-      return {
-        talk: getCatalogEndpoint(catalog, 'talk') || '/talk',
-        news: getCatalogEndpoint(catalog, 'news') || '/news',
-        schedule: getCatalogEndpoint(catalog, 'schedule') || null
-      };
+        if (response.ok) {
+          const catalog = await response.json() as RestAPCatalog;
+          restapCatalogCache.set(normalizedBaseEndpoint, { catalog, fetchedAt: Date.now() });
+          return catalog;
+        }
+      } finally {
+        clearTimeout(timeoutId);
+      }
+    } catch (err) {
+      // Catalog fetch failed, use defaults
+      console.log(`[REST-AP] Could not fetch catalog from ${normalizedBaseEndpoint}: ${(err as Error).message}`);
     }
-  } catch (err) {
-    // Catalog fetch failed, use defaults
-    console.log(`[REST-AP] Could not fetch catalog from ${baseEndpoint}: ${(err as Error).message}`);
-  }
 
-  // Default REST-AP endpoints
-  return { talk: '/talk', news: '/news', schedule: null };
+    return null;
+  })();
+
+  restapCatalogFetches.set(normalizedBaseEndpoint, fetchCatalog);
+  try {
+    const catalog = await fetchCatalog;
+    return catalog ? toEndpoints(catalog) : { talk: '/talk', news: '/news', schedule: null };
+  } finally {
+    restapCatalogFetches.delete(normalizedBaseEndpoint);
+  }
 }
 
 type AgentRegistryId = {
@@ -7757,10 +7773,8 @@ Return this JSON shape:
           limit,
         });
 
-        const results = [];
-        for (const t of tasks) {
-          results.push(await this.buildTaskResult(t, teamId));
-        }
+        const lookups = tasks.length > 0 ? await this.preloadTaskResultLookups(tasks) : undefined;
+        const results = await Promise.all(tasks.map((task) => this.buildTaskResult(task, teamId, lookups)));
         res.json({ ok: true, tasks: results });
       } catch (err: any) {
         console.error('[Manager] Error in GET /tasks:', err);
@@ -8754,11 +8768,43 @@ Return this JSON shape:
     return { agent: matches[0] };
   }
 
-  private async buildTaskResult(task: TaskRow, teamId: string): Promise<Record<string, unknown>> {
+  private async preloadTaskResultLookups(tasks: TaskRow[]): Promise<{
+    agentsById: Map<string, AgentRow>;
+    teamsById: Map<string, TeamRow>;
+  }> {
+    const ownerIds = [...new Set(tasks.map((task) => task.owner).filter((owner): owner is string => Boolean(owner)))];
+    const teamIds = [...new Set(tasks.map((task) => task.team_id).filter((taskTeamId): taskTeamId is string => Boolean(taskTeamId)))];
+
+    const [ownerEntries, teamEntries] = await Promise.all([
+      Promise.all(ownerIds.map(async (ownerId) => [ownerId, await this.db.agents.getById(ownerId)] as const)),
+      Promise.all(teamIds.map(async (taskTeamId) => [taskTeamId, await this.db.teams.getTeam(taskTeamId)] as const)),
+    ]);
+
+    const agentsById = new Map<string, AgentRow>();
+    for (const [ownerId, agent] of ownerEntries) {
+      if (agent) agentsById.set(ownerId, agent);
+    }
+
+    const teamsById = new Map<string, TeamRow>();
+    for (const [taskTeamId, team] of teamEntries) {
+      if (team) teamsById.set(taskTeamId, team);
+    }
+
+    return { agentsById, teamsById };
+  }
+
+  private async buildTaskResult(
+    task: TaskRow,
+    teamId: string,
+    lookups?: {
+      agentsById?: Map<string, AgentRow>;
+      teamsById?: Map<string, TeamRow>;
+    },
+  ): Promise<Record<string, unknown>> {
     let ownerName: string | null = null;
     let ownerAgent: AgentRow | null = null;
     if (task.owner) {
-      ownerAgent = await this.db.agents.getById(task.owner);
+      ownerAgent = lookups?.agentsById?.get(task.owner) || await this.db.agents.getById(task.owner);
       if (ownerAgent) {
         ownerName = (ownerAgent.metadata as any)?.alias || ownerAgent.name;
       }
@@ -8766,7 +8812,7 @@ Return this JSON shape:
 
     let teamName: string | null = null;
     if (task.team_id) {
-      const teamRow = await this.db.teams.getTeam(task.team_id);
+      const teamRow = lookups?.teamsById?.get(task.team_id) || await this.db.teams.getTeam(task.team_id);
       if (teamRow) teamName = teamRow.name;
     }
 
@@ -12331,6 +12377,25 @@ Return this JSON shape:
     return this.taskTimestampMs(task.updated_at || task.created_at || 0);
   }
 
+  private async hasRecentTaskSupervisionEvent(teamId: string, task: TaskRow, sinceMs: number): Promise<boolean> {
+    if (!task.uuid) return false;
+    const dialect = this.db.adapter.dialect;
+    const p = (n: number) => dialect === 'postgres' ? `$${n}` : '?';
+    const sql = `SELECT seq
+       FROM event_log
+       WHERE team_id = ${p(1)}
+         AND subject_kind = 'task'
+         AND subject_id = ${p(2)}
+         AND topic IN ('task:refreshed', 'task:triaged')
+         AND occurred_at >= ${p(3)}
+       ORDER BY occurred_at DESC
+       LIMIT 1`;
+    const { rows } = await this.db.adapter
+      .query<{ seq: number | string }>(sql, [teamId, task.uuid, sinceMs])
+      .catch(() => ({ rows: [] as Array<{ seq: number | string }> }));
+    return rows.length > 0;
+  }
+
   private isTerminalTaskStatus(status: string | null | undefined): boolean {
     return ['done', 'completed', 'archived', 'cancelled', 'canceled'].includes(String(status || '').toLowerCase());
   }
@@ -12476,6 +12541,7 @@ Return this JSON shape:
       const teamName = teamRow?.name || 'default';
       const ref = this.taskShortRef(t);
       const mins = Math.round((now - updated) / 60000);
+      if (await this.hasRecentTaskSupervisionEvent(teamRow.id, t, now - RENUDGE_MS)) continue;
 
       if (this.isLiveForSupervision(ownerAgent) && this.isConfiguredTeamLead(teamName, ownerAgent)) {
         const nudgeKey = `task:${t.id}:lead-delegation`;
@@ -12654,6 +12720,7 @@ Return this JSON shape:
       if (!lead) continue;
       const ref = this.taskShortRef(t);
       const mins = Math.round((now - updated) / 60000);
+      if (await this.hasRecentTaskSupervisionEvent(teamRow.id, t, now - RENUDGE_MS)) continue;
       if (await this.hasActiveSupervisionAskForMarker(teamRow.id, lead, ref)) continue;
       if (await this.hasAnyActiveQuery(lead)) continue;
       const prevProbe = this.stalledNudges.get(nudgeKey);
