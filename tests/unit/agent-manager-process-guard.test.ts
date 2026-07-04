@@ -694,6 +694,170 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     expect((await db.agents.getById('agent-default-researcher'))?.status).toBe('running');
   });
 
+  it('parks idle specialist counsels while protecting the configured legal coordinator', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('legal');
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-contracts-counsel',
+        name: 'contracts-counsel',
+        port: 4115,
+        status: 'running',
+        created_at: 10,
+        metadata: {
+          runtime: 'codex',
+          pid: 55562,
+          processOwner: 'manager-child',
+          processParentPid: process.pid,
+          catalog: {
+            role: 'Contract drafting and review',
+            description: 'Drafts, reviews, and redlines contracts and partnership agreements.',
+          },
+        },
+      }),
+    });
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-general-counsel',
+        name: 'general-counsel',
+        port: 4116,
+        status: 'running',
+        created_at: 11,
+        metadata: {
+          runtime: 'claude-code-cli',
+          pid: 55563,
+          processOwner: 'manager-child',
+          processParentPid: process.pid,
+          catalog: {
+            role: 'General Counsel: coordinates the legal team and delegates to specialist counsels.',
+            expertise: ['team-coordination', 'orchestration'],
+          },
+        },
+      }),
+    });
+
+    (manager as any).killAgentProcess = vi.fn(async (port: number) => ({ killed: true, pids: [port] }));
+
+    const result = await (manager as any).parkIdleAgents({
+      teamId,
+      teamName: 'legal',
+      confirmed: true,
+      allTeams: false,
+      includeDefault: false,
+      includeLeads: false,
+      includeScheduled: false,
+      includeActiveTeams: true,
+    });
+
+    expect(result.result.parked).toBe(1);
+    expect(result.result.agents).toEqual(expect.arrayContaining([
+      { team: 'legal', name: 'contracts-counsel', status: 'parked', reason: 'idle', pids: [4115] },
+      { team: 'legal', name: 'general-counsel', status: 'skipped', reason: 'lead_like_requires_--include-leads' },
+    ]));
+    expect((manager as any).killAgentProcess).toHaveBeenCalledTimes(1);
+    expect((await db.agents.getById('agent-contracts-counsel'))?.status).toBe('stopped');
+    expect((await db.agents.getById('agent-general-counsel'))?.status).toBe('running');
+  });
+
+  it('parks idle specialist manager/master agents while protecting the team lead', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('skillmesh');
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-marketplace-manager',
+        name: 'marketplace-manager',
+        port: 4117,
+        status: 'running',
+        created_at: 10,
+        metadata: {
+          runtime: 'ollama',
+          pid: 55564,
+          processOwner: 'manager-child',
+          processParentPid: process.pid,
+          catalog: {
+            role: 'manager',
+            description: 'Maintains marketplace health: listings, pricing, demand analysis, and inventory optimization.',
+            expertise: ['marketplace', 'pricing', 'inventory'],
+          },
+        },
+      }),
+    });
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-skill-master',
+        name: 'skill-master',
+        port: 4118,
+        status: 'running',
+        created_at: 11,
+        metadata: {
+          runtime: 'claude-code-cli',
+          pid: 55565,
+          processOwner: 'manager-child',
+          processParentPid: process.pid,
+          catalog: {
+            role: 'developer',
+            description: 'Skill catalog growth, validation, and publishing.',
+            expertise: ['skill-design', 'catalog-growth'],
+          },
+        },
+      }),
+    });
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-skillmesh-lead',
+        name: 'skillmesh-ops-lead',
+        port: 4119,
+        status: 'running',
+        created_at: 12,
+        metadata: {
+          runtime: 'claude-code-cli',
+          pid: 55566,
+          processOwner: 'manager-child',
+          processParentPid: process.pid,
+          catalog: {
+            role: 'Coordinates the skillmesh team and delegates work across marketplace operations.',
+            expertise: ['team-coordination', 'orchestration'],
+          },
+        },
+      }),
+    });
+
+    (manager as any).killAgentProcess = vi.fn(async (port: number) => ({ killed: true, pids: [port] }));
+
+    const result = await (manager as any).parkIdleAgents({
+      teamId,
+      teamName: 'skillmesh',
+      confirmed: true,
+      allTeams: false,
+      includeDefault: false,
+      includeLeads: false,
+      includeScheduled: false,
+      includeActiveTeams: true,
+    });
+
+    expect(result.result.parked).toBe(2);
+    expect(result.result.agents).toEqual(expect.arrayContaining([
+      { team: 'skillmesh', name: 'marketplace-manager', status: 'parked', reason: 'idle', pids: [4117] },
+      { team: 'skillmesh', name: 'skill-master', status: 'parked', reason: 'idle', pids: [4118] },
+      { team: 'skillmesh', name: 'skillmesh-ops-lead', status: 'skipped', reason: 'lead_like_requires_--include-leads' },
+    ]));
+    expect((manager as any).killAgentProcess).toHaveBeenCalledTimes(2);
+    expect((await db.agents.getById('agent-marketplace-manager'))?.status).toBe('stopped');
+    expect((await db.agents.getById('agent-skill-master'))?.status).toBe('stopped');
+    expect((await db.agents.getById('agent-skillmesh-lead'))?.status).toBe('running');
+  });
+
   it('prunes only stale generated unassigned todo backlog and archives applied removals', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-07-04T04:00:00Z'));

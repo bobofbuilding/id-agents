@@ -15281,8 +15281,49 @@ Return this JSON shape:
     }
   }
 
-  private isLeadLikeAgentName(name: string): boolean {
-    return /(^lead$|[-_]lead$|manager$|coordinator$|counsel$|[-_]master$)/i.test(name);
+  private agentParkingLeadershipText(agent: AgentRow): string {
+    const meta = (agent.metadata as AgentMetadata | null | undefined) ?? {};
+    const catalog = meta.catalog && typeof meta.catalog === 'object'
+      ? meta.catalog as Record<string, unknown>
+      : {};
+    const expertise = Array.isArray(catalog.expertise)
+      ? catalog.expertise
+      : Array.isArray(meta.expertise)
+        ? meta.expertise
+        : [];
+    return [
+      agent.name,
+      meta.role,
+      catalog.role,
+      meta.description,
+      catalog.description,
+      ...expertise,
+    ].map((value) => String(value || '').toLowerCase()).join('\n');
+  }
+
+  private agentTextIndicatesCoordinator(agent: AgentRow): boolean {
+    const text = this.agentParkingLeadershipText(agent);
+    return /\b(coordinates?|coordinator|orchestrat(?:e|es|ion)|delegat(?:e|es|ion)|decomposes?|liaison|supervisor|staffing|onboarding)\b/.test(text)
+      || /\bteam[-_\s]?(coordination|operations|routing)\b/.test(text)
+      || /\btask[-_\s]?routing\b/.test(text)
+      || /\bfleet[-_\s]?health\b/.test(text);
+  }
+
+  private isLeadLikeAgentForParking(agent: AgentRow, teamName: string): boolean {
+    const metadata = (agent.metadata as AgentMetadata | null | undefined) ?? {};
+    if (metadata.primaryLead === true || metadata.lead === true) return true;
+    const configured = this.configuredTeamLeadNames[teamName] || [];
+    if (configured.includes(agent.name)) return true;
+
+    const name = agent.name.toLowerCase();
+    if (name === 'lead' || /(^|[-_\s])(lead|coordinator|router)$/.test(name)) return true;
+    if (/^hr[-_\s]?manager$/.test(name)) return this.agentTextIndicatesCoordinator(agent);
+
+    if (/(manager|counsel|[-_\s]master)$/i.test(name)) {
+      return this.agentTextIndicatesCoordinator(agent);
+    }
+
+    return false;
   }
 
   private isIdleParkingProtectedAgent(agent: AgentRow, teamName?: string): boolean {
@@ -15440,7 +15481,7 @@ Return this JSON shape:
           rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: 'idle_parking_protected' });
           continue;
         }
-        if (!opts.includeLeads && this.isLeadLikeAgentName(agent.name)) {
+        if (!opts.includeLeads && this.isLeadLikeAgentForParking(agent, team.name)) {
           rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: 'lead_like_requires_--include-leads' });
           continue;
         }
