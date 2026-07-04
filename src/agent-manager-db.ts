@@ -614,7 +614,8 @@ export class AgentManagerDb {
   /**
    * Stuck-query sweeper timeouts, in minutes. Pending backlog is short-lived by
    * default so dead lead queues do not accumulate behind one long processing
-   * query; processing work remains more generous for legitimate long tasks.
+   * query; processing work remains bounded for desktop resource control while
+   * still allowing longer jobs through the lane-specific override.
    * ID_QUERY_EXPIRY_MINUTES is the legacy override for both lanes. Prefer the
    * lane-specific ID_PENDING_QUERY_EXPIRY_MINUTES and
    * ID_PROCESSING_QUERY_EXPIRY_MINUTES when tuning production.
@@ -626,7 +627,7 @@ export class AgentManagerDb {
   private readonly PROCESSING_QUERY_EXPIRY_MINUTES =
     positiveEnvNumber('ID_PROCESSING_QUERY_EXPIRY_MINUTES') ??
     positiveEnvNumber('ID_QUERY_EXPIRY_MINUTES') ??
-    120;
+    45;
   private logBuffer: Array<{ ts: number; msg: string }> = [];
   private readonly LOG_BUFFER_SIZE = 500;
   private managementPort: number = 4100;

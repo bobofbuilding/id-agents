@@ -847,7 +847,7 @@ describe('AgentManagerDb killAgentProcess guards', () => {
         query_id: 'processing-old',
         status: 'processing',
         prompt: 'stuck processing work',
-        created: now - 121 * 60 * 1000,
+        created: now - 46 * 60 * 1000,
         owner_kind: 'agent',
         owner_id: 'ops-lead-agent',
       });
