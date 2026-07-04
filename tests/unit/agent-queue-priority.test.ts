@@ -243,6 +243,70 @@ describe('agent query queue priority', () => {
       await server.stop();
     }
   });
+
+  it('uses DB-visible active queries to defer triggered peer replies', async () => {
+    const harness = new RecordingHarness();
+    let checkedDb = false;
+    const db = {
+      queries: {
+        getPending: async (agentId: string) => {
+          checkedDb = true;
+          return [{
+            team_id: 'team-skillmesh',
+            agent_id: agentId,
+            query_id: 'active-db-row',
+            status: 'processing',
+            prompt: 'visible active query',
+            created: Date.now(),
+            completed: null,
+            result: null,
+            error: null,
+            session_id: null,
+            owner_kind: 'agent',
+            owner_id: agentId,
+            metadata: null,
+          }];
+        },
+      },
+      news: {
+        add: async () => {},
+      },
+    };
+    const server = new AgentRestServer({
+      agentName: 'skillmesh-ops-lead',
+      agentIdentity: { name: 'skillmesh-ops-lead', team: 'skillmesh' },
+      harness,
+      db: { db: db as any, teamId: 'team-skillmesh', agentId: 'agent-skillmesh-lead' },
+    });
+
+    try {
+      await server.start(0);
+      const port = ((server as any).httpServer.address() as AddressInfo).port;
+
+      const res = await fetch(`http://127.0.0.1:${port}/news`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: 'reply',
+          from: 'skill-discoverer',
+          message: 'Task output landed while the DB still has active work.',
+          in_reply_to: 'query_1',
+        }),
+      });
+
+      expect(res.status).toBe(202);
+      await expect(res.json()).resolves.toMatchObject({
+        triggered: false,
+        deferred: true,
+        reason: 'agent_busy',
+      });
+      expect(checkedDb).toBe(true);
+      await sleep(20);
+      expect(harness.prompts).toHaveLength(0);
+    } finally {
+      await server.stop();
+    }
+  });
 });
 
 async function viWaitFor(assertion: () => void): Promise<void> {

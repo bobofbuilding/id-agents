@@ -1344,7 +1344,7 @@ export class AgentRestServer {
 
         // If trigger is true, process the message with the LLM
         if (trigger && from) {
-          const deferReason = this.getTriggeredNewsWakeDeferReason(from);
+          const deferReason = await this.getTriggeredNewsWakeDeferReason(from);
           if (deferReason) {
             console.log(`${logTime()} [Agent] Deferred triggered news wake from ${from}: ${newsMessage.substring(0, 80)}...`);
             return res.status(202).json({
@@ -1927,15 +1927,26 @@ What would you like to do with this information?`;
     return this.isPrimaryLeadIdentity() || this.isAgentBusy();
   }
 
-  private getTriggeredNewsWakeDeferReason(from: string): 'agent_busy' | 'primary_lead_busy' | undefined {
+  private async getTriggeredNewsWakeDeferReason(from: string): Promise<'agent_busy' | 'primary_lead_busy' | undefined> {
     const sender = from.trim().toLowerCase();
     if (sender === 'manager' || sender === 'remote' || sender === 'operator' || sender === 'checkin-service') return undefined;
-    if (!this.isAgentBusy()) return undefined;
+    if (!this.isAgentBusy() && !(await this.hasDbActiveQuery())) return undefined;
     return this.isPrimaryLeadIdentity() ? 'primary_lead_busy' : 'agent_busy';
   }
 
   private isAgentBusy(): boolean {
     return this.isProcessingQuery || this.queryQueue.length > 0 || this.activeQueries.size > 0;
+  }
+
+  private async hasDbActiveQuery(): Promise<boolean> {
+    if (!this.db || !this.dbAgentId) return false;
+    try {
+      const rows = await this.db.queries.getPending(this.dbAgentId);
+      return rows.some((row) => row.status === 'pending' || row.status === 'processing');
+    } catch (err: any) {
+      console.warn(`${logTime()} [Agent] Failed to check DB active queries before triggered wake:`, err?.message || err);
+      return false;
+    }
   }
 
   private isPrimaryLeadIdentity(): boolean {
