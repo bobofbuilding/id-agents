@@ -1369,6 +1369,74 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     expect((await db.queries.getByQueryIdForTeam(teamId, 'pending-sweep-reworded'))?.status).toBe('expired');
   });
 
+  it('expires active control prompts that reference already done tasks', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-supervised',
+        name: 'supervised-lead',
+        port: 4114,
+        status: 'running',
+      }),
+    });
+
+    const now = Date.now();
+    await db.tasks.create(taskRow({
+      id: 'done-task',
+      name: 'done-task',
+      uuid: 'abc12345-0000-4000-8000-000000000000',
+      team_id: teamId,
+      status: 'done',
+      owner: 'agent-supervised',
+      completed_at: Math.floor(now / 1000),
+    }));
+    await db.tasks.create(taskRow({
+      id: 'doing-task',
+      name: 'doing-task',
+      uuid: 'def67890-0000-4000-8000-000000000000',
+      team_id: teamId,
+      status: 'doing',
+      owner: 'agent-supervised',
+    }));
+    await db.queries.upsert(teamId, 'agent-supervised', {
+      query_id: 'terminal-lead-kickoff',
+      status: 'processing',
+      prompt: 'Lead delegation kickoff: task #abc12345 ("Finished coordination") is assigned to you as the team coordinator.',
+      created: now,
+      owner_kind: 'agent',
+      owner_id: 'agent-supervised',
+    });
+    await db.queries.upsert(teamId, 'agent-supervised', {
+      query_id: 'active-backlog-guard',
+      status: 'processing',
+      prompt: 'Backlog guard: task #def67890 ("Still active") has been active 57m with no progress update.',
+      created: now + 1000,
+      owner_kind: 'agent',
+      owner_id: 'agent-supervised',
+    });
+    await db.queries.upsert(teamId, 'agent-supervised', {
+      query_id: 'normal-done-task-mention',
+      status: 'processing',
+      prompt: 'Please write a summary that mentions #abc12345 for the release note.',
+      created: now + 2000,
+      owner_kind: 'agent',
+      owner_id: 'agent-supervised',
+    });
+
+    const result = await (manager as any).sweepStaleQueries();
+
+    expect(result.terminalTaskAsk).toBe(1);
+    expect(result.total).toBe(1);
+    expect((await db.queries.getByQueryIdForTeam(teamId, 'terminal-lead-kickoff'))?.status).toBe('expired');
+    expect((await db.queries.getByQueryIdForTeam(teamId, 'active-backlog-guard'))?.status).toBe('processing');
+    expect((await db.queries.getByQueryIdForTeam(teamId, 'normal-done-task-mention'))?.status).toBe('processing');
+  });
+
   it('expires active control prompts that duplicate a recent completed equivalent', async () => {
     const { manager, db, workDir } = await makeManager();
     dbs.push(db);

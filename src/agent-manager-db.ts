@@ -474,6 +474,7 @@ interface StaleQuerySweepResult {
   pending: number;
   processing: number;
   duplicateTaskAsk: number;
+  terminalTaskAsk: number;
   queuedPeerWake: number;
   total: number;
 }
@@ -4233,6 +4234,8 @@ Return this JSON shape:
       /^Backlog guard alert:/,
       /^Urgent:\s+task\b[\s\S]*\bstalled\b/i,
       /^Status check on task\b/,
+      /^Lead delegation kickoff:/,
+      /^Team objective:/,
       /^You have \d+ stalled doing tasks\b/,
       /^Task assignment sweep:/,
       /^Assignment sweep complete\b/,
@@ -13356,12 +13359,13 @@ Return this JSON shape:
     ) ?? null;
   }
 
-  private async expireDuplicateActiveTaskAsks(nowMs: number): Promise<QueryRow[]> {
-    const duplicatePromptWhere = `(
+  private activeControlPromptWhereSql(): string {
+    return `(
            LOWER(prompt) LIKE 'supervision:%'
            OR LOWER(prompt) LIKE 'supervision routing:%'
            OR LOWER(prompt) LIKE 'supervision probe from manager:%'
            OR LOWER(prompt) LIKE 'lead delegation kickoff:%'
+           OR LOWER(prompt) LIKE 'team objective:%'
            OR LOWER(prompt) LIKE 'urgent delegation probe:%'
            OR LOWER(prompt) LIKE 'task delegation%'
            OR LOWER(prompt) LIKE 'resume and complete task #%'
@@ -13374,6 +13378,10 @@ Return this JSON shape:
            OR LOWER(prompt) LIKE 're your assignment sweep%'
            OR LOWER(prompt) LIKE 'task assignment sweep:%'
          )`;
+  }
+
+  private async expireDuplicateActiveTaskAsks(nowMs: number): Promise<QueryRow[]> {
+    const duplicatePromptWhere = this.activeControlPromptWhereSql();
     const rows = await this.db.adapter.query<QueryRow>(
       `SELECT team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id, metadata
        FROM queries
@@ -13446,6 +13454,51 @@ Return this JSON shape:
        WHERE status IN ('pending', 'processing') AND query_id IN (${placeholders})
        RETURNING team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id, metadata`,
       [nowMs, ...duplicateIds],
+    );
+    return result.rows;
+  }
+
+  private async expireTerminalTaskAsks(nowMs: number): Promise<QueryRow[]> {
+    const promptWhere = this.activeControlPromptWhereSql();
+    const rows = await this.db.adapter.query<QueryRow>(
+      `SELECT team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id, metadata
+       FROM queries
+       WHERE status IN ('pending', 'processing')
+         AND ${promptWhere}
+       ORDER BY created ASC, query_id ASC`,
+    ).then((r) => r.rows).catch(() => [] as QueryRow[]);
+
+    const terminalByKey = new Map<string, boolean>();
+    const terminalIds: string[] = [];
+    const terminalIdSet = new Set<string>();
+    for (const row of rows) {
+      const marker = this.activeTaskAskMarker(row.prompt);
+      if (!marker?.startsWith('#')) continue;
+      const key = `${row.team_id}\u0001${marker}`;
+      let terminal = terminalByKey.get(key);
+      if (terminal === undefined) {
+        const { task } = await this.resolveTaskRef(marker, row.team_id).catch(() => ({ task: undefined }));
+        terminal = task?.status === 'done';
+        terminalByKey.set(key, terminal);
+      }
+      if (terminal && !terminalIdSet.has(row.query_id)) {
+        terminalIdSet.add(row.query_id);
+        terminalIds.push(row.query_id);
+      }
+    }
+    if (!terminalIds.length) return [];
+
+    const dialect = this.db.adapter.dialect;
+    const completedParam = dialect === 'postgres' ? '$1' : '?';
+    const placeholders = terminalIds
+      .map((_, i) => dialect === 'postgres' ? `$${i + 2}` : '?')
+      .join(', ');
+    const result = await this.db.adapter.query<QueryRow>(
+      `UPDATE queries
+       SET status = 'expired', completed = ${completedParam}
+       WHERE status IN ('pending', 'processing') AND query_id IN (${placeholders})
+       RETURNING team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id, metadata`,
+      [nowMs, ...terminalIds],
     );
     return result.rows;
   }
@@ -14130,7 +14183,7 @@ Return this JSON shape:
     const now = Date.now();
     if (this.querySweepInFlight) return this.querySweepInFlight;
     if (this.lastQuerySweepAt > 0 && now - this.lastQuerySweepAt < minIntervalMs) {
-      return { pending: 0, processing: 0, duplicateTaskAsk: 0, queuedPeerWake: 0, total: 0 };
+      return { pending: 0, processing: 0, duplicateTaskAsk: 0, terminalTaskAsk: 0, queuedPeerWake: 0, total: 0 };
     }
     return this.sweepStaleQueries();
   }
@@ -14153,9 +14206,10 @@ Return this JSON shape:
     ]);
     const cancelledProcessingAgents = await this.cancelExpiredProcessingQueryAgents(expiredProcessing);
     const expiredDuplicateTaskAsks = await this.expireDuplicateActiveTaskAsks(now);
+    const expiredTerminalTaskAsks = await this.expireTerminalTaskAsks(now);
     const expiredQueuedPeerWakes = await this.db.queries.expireQueuedPeerWakes(peerWakeCutoff);
     this.lastQuerySweepAt = now;
-    const expired = [...expiredPending, ...expiredProcessing, ...expiredDuplicateTaskAsks, ...expiredQueuedPeerWakes];
+    const expired = [...expiredPending, ...expiredProcessing, ...expiredDuplicateTaskAsks, ...expiredTerminalTaskAsks, ...expiredQueuedPeerWakes];
     const count = expired.length;
     if (count > 0) {
       const occurredAt = now;
@@ -14170,16 +14224,17 @@ Return this JSON shape:
         });
       }
       this.managerLog(
-        `Expired ${count} stale/duplicate queries (pending>${this.PENDING_QUERY_EXPIRY_MINUTES}m, processing>${this.PROCESSING_QUERY_EXPIRY_MINUTES}m, duplicate-task-asks=${expiredDuplicateTaskAsks.length}, queued-peer-wakes>${this.QUEUED_PEER_WAKE_EXPIRY_MINUTES}m=${expiredQueuedPeerWakes.length}, cancelled-processing-agents=${cancelledProcessingAgents})`,
+        `Expired ${count} stale/duplicate queries (pending>${this.PENDING_QUERY_EXPIRY_MINUTES}m, processing>${this.PROCESSING_QUERY_EXPIRY_MINUTES}m, duplicate-task-asks=${expiredDuplicateTaskAsks.length}, terminal-task-asks=${expiredTerminalTaskAsks.length}, queued-peer-wakes>${this.QUEUED_PEER_WAKE_EXPIRY_MINUTES}m=${expiredQueuedPeerWakes.length}, cancelled-processing-agents=${cancelledProcessingAgents})`,
       );
       console.log(
-        `[Manager] Query sweeper expired ${count} stale/duplicate queries (pending>${this.PENDING_QUERY_EXPIRY_MINUTES}m, processing>${this.PROCESSING_QUERY_EXPIRY_MINUTES}m, duplicate-task-asks=${expiredDuplicateTaskAsks.length}, queued-peer-wakes>${this.QUEUED_PEER_WAKE_EXPIRY_MINUTES}m=${expiredQueuedPeerWakes.length}, cancelled-processing-agents=${cancelledProcessingAgents})`,
+        `[Manager] Query sweeper expired ${count} stale/duplicate queries (pending>${this.PENDING_QUERY_EXPIRY_MINUTES}m, processing>${this.PROCESSING_QUERY_EXPIRY_MINUTES}m, duplicate-task-asks=${expiredDuplicateTaskAsks.length}, terminal-task-asks=${expiredTerminalTaskAsks.length}, queued-peer-wakes>${this.QUEUED_PEER_WAKE_EXPIRY_MINUTES}m=${expiredQueuedPeerWakes.length}, cancelled-processing-agents=${cancelledProcessingAgents})`,
       );
     }
     return {
       pending: expiredPending.length,
       processing: expiredProcessing.length,
       duplicateTaskAsk: expiredDuplicateTaskAsks.length,
+      terminalTaskAsk: expiredTerminalTaskAsks.length,
       queuedPeerWake: expiredQueuedPeerWakes.length,
       total: count,
     };

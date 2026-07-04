@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { AddressInfo } from 'net';
 
 import { AgentRestServer } from '../../src/claude-agent-server.js';
 import type { AgentHarness, HarnessMessage, HarnessOptions, HarnessType } from '../../src/harness/index.js';
@@ -110,6 +111,66 @@ describe('AgentRestServer external query terminal watcher', () => {
         }),
       );
     } finally {
+      await server.stop();
+    }
+  });
+
+  it('persists direct cancel as a terminal query row', async () => {
+    process.env.ID_HARNESS = 'claude-code-cli';
+
+    const harness = new CancellableHarness();
+    const db: any = {
+      queries: {
+        upsert: vi.fn(async () => {}),
+        getByQueryIdForTeam: vi.fn(async () => queryRow('processing')),
+      },
+      news: {
+        add: vi.fn(async () => {}),
+      },
+    };
+
+    const server = new AgentRestServer({
+      agentName: 'worker',
+      db: { db, teamId: 'team-1', agentId: 'agent-1' },
+      harness,
+    });
+
+    try {
+      await server.start(0);
+      const port = ((server as any).httpServer.address() as AddressInfo).port;
+      await (server as any).startQuery('query-1', 'prompt', undefined, 'manager');
+      await vi.waitFor(() => {
+        expect(db.queries.upsert).toHaveBeenCalledWith(
+          'team-1',
+          'agent-1',
+          expect.objectContaining({ query_id: 'query-1', status: 'processing' }),
+        );
+      });
+
+      const res = await fetch(`http://127.0.0.1:${port}/cancel`, { method: 'POST' });
+      expect(res.status).toBe(200);
+      await vi.waitFor(() => {
+        expect(db.queries.upsert).toHaveBeenCalledWith(
+          'team-1',
+          'agent-1',
+          expect.objectContaining({
+            query_id: 'query-1',
+            status: 'failed',
+            error: 'Query was cancelled',
+            completed: expect.any(Number),
+          }),
+        );
+      });
+      expect(db.news.add).toHaveBeenCalledWith(
+        'team-1',
+        'agent-1',
+        expect.objectContaining({
+          type: 'query.cancelled',
+          query_id: 'query-1',
+        }),
+      );
+    } finally {
+      await harness.done;
       await server.stop();
     }
   });

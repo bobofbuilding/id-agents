@@ -48,6 +48,8 @@ const MCP_CONTROL_PLANE_PROMPT_PATTERNS = [
   /^Heartbeat:/,
   /^Supervision:/,
   /^Supervision probe on task\b/,
+  /^Lead delegation kickoff:/,
+  /^Team objective:/,
   /^Backlog guard:/,
   /^Backlog guard alert:/,
   /^Urgent:\s+task\b[\s\S]*\bstalled\b/i,
@@ -69,6 +71,8 @@ const MCP_CONTROL_PLANE_PROMPT_PATTERNS = [
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nHeartbeat:/,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nSupervision:/,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nSupervision probe on task\b/,
+  /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nLead delegation kickoff:/,
+  /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nTeam objective:/,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nBacklog guard:/,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nBacklog guard alert:/,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nUrgent:\s+task\b[\s\S]*\bstalled\b/i,
@@ -1215,7 +1219,9 @@ export class AgentRestServer {
           const processingQuery = Array.from(this.activeQueries.values()).find(q => q.status === 'processing');
           if (processingQuery && processingQuery.status === 'processing') {
             processingQuery.status = 'failed';
+            processingQuery.completed = Date.now();
             processingQuery.error = 'Query was cancelled';
+            await this.dbUpsertQuery(processingQuery);
 
             // Add news item about cancellation
             await this.addNews('query.cancelled', 'Query was cancelled by user', {

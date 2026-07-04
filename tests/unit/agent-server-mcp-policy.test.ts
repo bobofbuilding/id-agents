@@ -23,6 +23,8 @@ Heartbeat: review your checklist and act on anything that needs attention.`)).to
     expect(shouldSuppressMcpForPrompt('Backlog guard alert: task #12345678 has stalled and needs owner triage.')).toBe(true);
     expect(shouldSuppressMcpForPrompt('Urgent: task #12345678 has been stalled 88+ minutes on ops-team with no progress.')).toBe(true);
     expect(shouldSuppressMcpForPrompt('Status check on task #12345678. Reply in one sentence.')).toBe(true);
+    expect(shouldSuppressMcpForPrompt('Lead delegation kickoff: task #12345678 is assigned to you as the team coordinator.')).toBe(true);
+    expect(shouldSuppressMcpForPrompt('Team objective: Decompose this objective into member-owned work.')).toBe(true);
   });
 
   it('suppresses MCP for incoming-reply processing loops', () => {
@@ -90,6 +92,16 @@ Urgent: task #0abb791f has been stalled 88+ minutes on ops-team with no progress
 [Note: research-assistant will poll for your reply for ~2 minutes.]
 
 Status check on task #73b71406. You are the owner. Reply in one sentence.`)).toBe(true);
+
+    expect(shouldSuppressMcpForPrompt(`[Message from the manager (your owner/operator) | Query ID: query_9]
+[Respond directly and helpfully — this is the person who manages you.]
+
+Lead delegation kickoff: task #f0b7515a is assigned to you as the team coordinator.`)).toBe(true);
+
+    expect(shouldSuppressMcpForPrompt(`[Message from the manager (your owner/operator) | Query ID: query_10]
+[Respond directly and helpfully — this is the person who manages you.]
+
+Team objective: Decompose this objective into member-owned work.`)).toBe(true);
   });
 
   it('keeps MCP available for normal delegated task work', () => {
