@@ -56,6 +56,29 @@ export class PgQueriesRepo implements QueriesRepository {
     return rows;
   }
 
+  async expireQueuedPeerWakes(cutoffCreated: number): Promise<QueryRow[]> {
+    const { rows } = await this.db.query<QueryRow>(
+      `UPDATE queries AS q
+       SET status = 'expired', completed = $1
+       WHERE q.status = 'pending'
+         AND q.created < $2
+         AND q.agent_id IS NOT NULL
+         AND q.query_id LIKE 'news_%'
+         AND q.prompt LIKE '[Incoming Reply from "%'
+         AND EXISTS (
+           SELECT 1
+           FROM queries processing
+           WHERE processing.team_id = q.team_id
+             AND processing.agent_id = q.agent_id
+             AND processing.status = 'processing'
+             AND processing.query_id <> q.query_id
+         )
+       RETURNING q.team_id, q.agent_id, q.query_id, q.status, q.prompt, q.created, q.completed, q.result, q.error, q.session_id, q.owner_kind, q.owner_id, q.metadata`,
+      [Date.now(), cutoffCreated],
+    );
+    return rows;
+  }
+
   async create(
     teamId: string,
     queryId: string,

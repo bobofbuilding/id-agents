@@ -87,6 +87,29 @@ export class SqliteQueriesRepo implements QueriesRepository {
     return r.rows.map((row) => this.parseQueryRow(row)!);
   }
 
+  async expireQueuedPeerWakes(cutoffCreated: number): Promise<QueryRow[]> {
+    const r = await this.db.query<QueryRow>(
+      `UPDATE queries
+       SET status = 'expired', completed = ?
+       WHERE status = 'pending'
+         AND created < ?
+         AND agent_id IS NOT NULL
+         AND query_id LIKE 'news_%'
+         AND prompt LIKE '[Incoming Reply from "%'
+         AND EXISTS (
+           SELECT 1
+           FROM queries processing
+           WHERE processing.team_id = queries.team_id
+             AND processing.agent_id = queries.agent_id
+             AND processing.status = 'processing'
+             AND processing.query_id <> queries.query_id
+         )
+       RETURNING team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id, metadata`,
+      [Date.now(), cutoffCreated],
+    );
+    return r.rows.map((row) => this.parseQueryRow(row)!);
+  }
+
   async create(
     teamId: string,
     queryId: string,

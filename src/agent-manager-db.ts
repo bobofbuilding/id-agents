@@ -458,6 +458,7 @@ interface StaleQuerySweepResult {
   pending: number;
   processing: number;
   duplicateTaskAsk: number;
+  queuedPeerWake: number;
   total: number;
 }
 
@@ -654,6 +655,9 @@ export class AgentManagerDb {
     positiveEnvNumber('ID_PROCESSING_QUERY_EXPIRY_MINUTES') ??
     positiveEnvNumber('ID_QUERY_EXPIRY_MINUTES') ??
     45;
+  private readonly QUEUED_PEER_WAKE_EXPIRY_MINUTES =
+    positiveEnvNumber('ID_QUEUED_PEER_WAKE_EXPIRY_MINUTES') ??
+    2;
   private logBuffer: Array<{ ts: number; msg: string }> = [];
   private readonly LOG_BUFFER_SIZE = 500;
   private managementPort: number = 4100;
@@ -13790,7 +13794,7 @@ Return this JSON shape:
     const now = Date.now();
     if (this.querySweepInFlight) return this.querySweepInFlight;
     if (this.lastQuerySweepAt > 0 && now - this.lastQuerySweepAt < minIntervalMs) {
-      return { pending: 0, processing: 0, duplicateTaskAsk: 0, total: 0 };
+      return { pending: 0, processing: 0, duplicateTaskAsk: 0, queuedPeerWake: 0, total: 0 };
     }
     return this.sweepStaleQueries();
   }
@@ -13806,14 +13810,16 @@ Return this JSON shape:
     const now = Date.now();
     const pendingCutoff = now - this.PENDING_QUERY_EXPIRY_MINUTES * 60 * 1000;
     const processingCutoff = now - this.PROCESSING_QUERY_EXPIRY_MINUTES * 60 * 1000;
+    const peerWakeCutoff = now - this.QUEUED_PEER_WAKE_EXPIRY_MINUTES * 60 * 1000;
     const [expiredPending, expiredProcessing] = await Promise.all([
       this.db.queries.expireStale(pendingCutoff, ['pending']),
       this.db.queries.expireStale(processingCutoff, ['processing']),
     ]);
     const cancelledProcessingAgents = await this.cancelExpiredProcessingQueryAgents(expiredProcessing);
     const expiredDuplicateTaskAsks = await this.expireDuplicateActiveTaskAsks(now);
+    const expiredQueuedPeerWakes = await this.db.queries.expireQueuedPeerWakes(peerWakeCutoff);
     this.lastQuerySweepAt = now;
-    const expired = [...expiredPending, ...expiredProcessing, ...expiredDuplicateTaskAsks];
+    const expired = [...expiredPending, ...expiredProcessing, ...expiredDuplicateTaskAsks, ...expiredQueuedPeerWakes];
     const count = expired.length;
     if (count > 0) {
       const occurredAt = now;
@@ -13828,16 +13834,17 @@ Return this JSON shape:
         });
       }
       this.managerLog(
-        `Expired ${count} stale/duplicate queries (pending>${this.PENDING_QUERY_EXPIRY_MINUTES}m, processing>${this.PROCESSING_QUERY_EXPIRY_MINUTES}m, duplicate-task-asks=${expiredDuplicateTaskAsks.length}, cancelled-processing-agents=${cancelledProcessingAgents})`,
+        `Expired ${count} stale/duplicate queries (pending>${this.PENDING_QUERY_EXPIRY_MINUTES}m, processing>${this.PROCESSING_QUERY_EXPIRY_MINUTES}m, duplicate-task-asks=${expiredDuplicateTaskAsks.length}, queued-peer-wakes>${this.QUEUED_PEER_WAKE_EXPIRY_MINUTES}m=${expiredQueuedPeerWakes.length}, cancelled-processing-agents=${cancelledProcessingAgents})`,
       );
       console.log(
-        `[Manager] Query sweeper expired ${count} stale/duplicate queries (pending>${this.PENDING_QUERY_EXPIRY_MINUTES}m, processing>${this.PROCESSING_QUERY_EXPIRY_MINUTES}m, duplicate-task-asks=${expiredDuplicateTaskAsks.length}, cancelled-processing-agents=${cancelledProcessingAgents})`,
+        `[Manager] Query sweeper expired ${count} stale/duplicate queries (pending>${this.PENDING_QUERY_EXPIRY_MINUTES}m, processing>${this.PROCESSING_QUERY_EXPIRY_MINUTES}m, duplicate-task-asks=${expiredDuplicateTaskAsks.length}, queued-peer-wakes>${this.QUEUED_PEER_WAKE_EXPIRY_MINUTES}m=${expiredQueuedPeerWakes.length}, cancelled-processing-agents=${cancelledProcessingAgents})`,
       );
     }
     return {
       pending: expiredPending.length,
       processing: expiredProcessing.length,
       duplicateTaskAsk: expiredDuplicateTaskAsks.length,
+      queuedPeerWake: expiredQueuedPeerWakes.length,
       total: count,
     };
   }

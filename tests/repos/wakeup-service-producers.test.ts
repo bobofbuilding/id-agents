@@ -327,6 +327,39 @@ describe('event-producer: query sweeper', () => {
     expect(stillPending?.status).toBe('pending');
   });
 
+  it('expireQueuedPeerWakes only clears stale peer replies behind active work', async () => {
+    const now = Date.now();
+    const activeQueryId = `query_active_${crypto.randomUUID()}`;
+    const oldPeerWakeId = `news_old_peer_${crypto.randomUUID()}`;
+    const freshPeerWakeId = `news_fresh_peer_${crypto.randomUUID()}`;
+    const checkinWakeId = `news_checkin_${crypto.randomUUID()}`;
+    const taskAskId = `query_task_${crypto.randomUUID()}`;
+    const idleAgentId = await insertAgent(adapter, teamId, 'researcher');
+    const idlePeerWakeId = `news_idle_peer_${crypto.randomUUID()}`;
+
+    await queries.create(teamId, activeQueryId, agentId, 'task already in progress', now - 5 * 60 * 1000);
+    await adapter.query(
+      `UPDATE queries SET status = 'processing' WHERE team_id = ? AND query_id = ?`,
+      [teamId, activeQueryId],
+    );
+    await queries.create(teamId, oldPeerWakeId, agentId, '[Incoming Reply from "skill-tester"]\n\nDone.', now - 5 * 60 * 1000);
+    await queries.create(teamId, freshPeerWakeId, agentId, '[Incoming Reply from "skill-rater"]\n\nDone.', now - 10 * 1000);
+    await queries.create(teamId, checkinWakeId, agentId, '[Incoming Message from "checkin-service"]\n\nCheckin due.', now - 5 * 60 * 1000);
+    await queries.create(teamId, taskAskId, agentId, 'New task assigned: Audit skill graph', now - 5 * 60 * 1000);
+    await queries.create(teamId, idlePeerWakeId, idleAgentId, '[Incoming Reply from "analyst"]\n\nDone.', now - 5 * 60 * 1000);
+
+    const expired = await queries.expireQueuedPeerWakes(now - 2 * 60 * 1000);
+
+    expect(expired.map((row) => row.query_id)).toEqual([oldPeerWakeId]);
+    expect(expired[0].status).toBe('expired');
+
+    await expect(queries.getById(agentId, activeQueryId)).resolves.toMatchObject({ status: 'processing' });
+    await expect(queries.getById(agentId, freshPeerWakeId)).resolves.toMatchObject({ status: 'pending' });
+    await expect(queries.getById(agentId, checkinWakeId)).resolves.toMatchObject({ status: 'pending' });
+    await expect(queries.getById(agentId, taskAskId)).resolves.toMatchObject({ status: 'pending' });
+    await expect(queries.getById(idleAgentId, idlePeerWakeId)).resolves.toMatchObject({ status: 'pending' });
+  });
+
   it('emitQueryDelivered carries task and Brain source metadata when provided', async () => {
     const queryId = `query_delivered_${crypto.randomUUID()}`;
     await queries.create(teamId, queryId, agentId, 'prompt', Date.now());

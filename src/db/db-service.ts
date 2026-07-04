@@ -272,6 +272,13 @@ export interface QueriesRepository {
   expireStale(cutoffCreated: number, statuses: string[]): Promise<QueryRow[]>;
 
   /**
+   * Expire queued peer-reply wake prompts that are pending behind an already
+   * processing agent. The source reply remains in news_items; these rows only
+   * represent redundant harness turns created to process that reply.
+   */
+  expireQueuedPeerWakes(cutoffCreated: number): Promise<QueryRow[]>;
+
+  /**
    * Insert-or-update a query row (ON CONFLICT by agent_id, query_id).
    * On conflict, updates status, completed, result, error, and session_id.
    */
