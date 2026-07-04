@@ -406,6 +406,97 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('marks a task done when a delegation reply includes task done command syntax', async () => {
+    const staleTask = task();
+    const db = fakeDb({
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [staleTask]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-delegation-done-test', db, { libraryRoot: null }) as any;
+
+    await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery(staleTask.owner!, {
+        query_id: 'delegation-done',
+        prompt: 'TASK DELEGATION from manager: You are assigned task #12345678 ("Stalled work"). Start this task now.',
+        status: 'completed',
+      }),
+      { result: 'Delivered the requested artifact.\n\n/task done #12345678 --acceptance "artifact delivered"' },
+      NOW_MS,
+    );
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(staleTask.id, {
+      status: 'done',
+      completed_at: Math.floor(NOW_MS / 1000),
+      updated_at: Math.floor(NOW_MS / 1000),
+    });
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:completed',
+      subject_id: staleTask.uuid,
+    }));
+  });
+
+  it('marks a task done when a delegation reply starts with completed-task prose', async () => {
+    const staleTask = task();
+    const db = fakeDb({
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [staleTask]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-delegation-prose-done-test', db, { libraryRoot: null }) as any;
+
+    await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery(staleTask.owner!, {
+        query_id: 'delegation-prose-done',
+        prompt: 'TASK DELEGATION from manager: You are assigned task #12345678 ("Stalled work"). Start this task now.',
+        status: 'completed',
+      }),
+      { result: 'Done. Task: Stalled work (#12345678). Output: artifact delivered.' },
+      NOW_MS,
+    );
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(staleTask.id, {
+      status: 'done',
+      completed_at: Math.floor(NOW_MS / 1000),
+      updated_at: Math.floor(NOW_MS / 1000),
+    });
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:completed',
+      subject_id: staleTask.uuid,
+    }));
+  });
+
+  it('does not mark a task done when the reply reports done-blocked ambiguity', async () => {
+    const staleTask = task();
+    const db = fakeDb({
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [staleTask]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-done-blocked-test', db, { libraryRoot: null }) as any;
+
+    await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery(staleTask.owner!, {
+        query_id: 'guard-done-blocked',
+        prompt: 'Backlog guard: task #12345678 ("Stalled work") has been active 60m with no progress update.',
+        status: 'completed',
+      }),
+      { result: 'DONE, BLOCKED: no completion artifact was produced' },
+      NOW_MS,
+    );
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(staleTask.id, expect.objectContaining({
+      owner: null,
+      status: 'todo',
+      completed_at: null,
+      updated_at: Math.floor(NOW_MS / 1000),
+    }));
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:triaged',
+      subject_id: staleTask.uuid,
+    }));
+  });
+
   it('refreshes a stalled task by nudging its live owner and recording an event', async () => {
     const db = fakeDb();
     const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', db, { libraryRoot: null }) as any;

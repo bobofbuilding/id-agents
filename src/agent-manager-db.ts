@@ -2955,7 +2955,8 @@ Return this JSON shape:
   private taskControlReplyPrompt(prompt: string | null | undefined): boolean {
     const lower = String(prompt ?? '').trim().toLowerCase();
     if (!lower) return false;
-    return lower.startsWith('backlog guard:')
+    return lower.startsWith('task delegation')
+      || lower.startsWith('backlog guard:')
       || lower.startsWith('backlog guard alert:')
       || lower.startsWith('supervision:')
       || lower.startsWith('supervision routing:')
@@ -2983,13 +2984,24 @@ Return this JSON shape:
     note: string;
     target: string | null;
   } {
-    const firstLine = String(message || '')
+    const lines = String(message || '')
       .split(/\r?\n/)
       .map((line) => line.trim())
-      .find(Boolean) || '';
+      .filter(Boolean);
+    const firstLine = lines[0] || '';
     const upper = firstLine.toUpperCase();
     if (!firstLine) return { action: null, note: '', target: null };
+    if (/^DONE\s*,\s*BLOCKED\b/.test(upper)) return { action: 'blocked', note: firstLine, target: null };
+    const commandDoneLine = lines.find((line) => (
+      /(^|\s)\/task\s+done\b/i.test(line)
+        && !/\bwhen complete\b/i.test(line)
+        && !/\bmark it done with\b/i.test(line)
+    ));
+    if (commandDoneLine) return { action: 'done', note: commandDoneLine, target: null };
     if (/^(DONE\b|\/TASK\s+DONE\b|MARKED\s+DONE\b)/.test(upper)) return { action: 'done', note: firstLine, target: null };
+    if (/^TASK\b.{0,200}\b(?:IS\s+)?(?:DONE|COMPLETE|COMPLETED|CLOSED)\b/i.test(firstLine)) {
+      return { action: 'done', note: firstLine, target: null };
+    }
     if (/^TASK\b.*\b(?:MARKED|CLOSED)\b.*\bDONE\b/.test(upper)) return { action: 'done', note: firstLine, target: null };
     if (/^(IN-PROGRESS|READY-TO-RESUME)\b/.test(upper)) return { action: 'in_progress', note: firstLine, target: null };
     if (/^DELEGATED\b/.test(upper)) return { action: 'delegated', note: firstLine, target: null };
