@@ -97,6 +97,7 @@ import {
 // ES module equivalent of __dirname
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const DEFAULT_MAX_ACTIVE_QUERIES_PER_AGENT = 3;
 
 // Model alias resolution (canonical source in core/model-aliases.ts;
 // re-exported here for back-compat with existing import sites).
@@ -1329,6 +1330,17 @@ export class AgentManagerDb {
 
     const data: any = await talkRes.json();
     return { ok: true, data };
+  }
+
+  private getMaxActiveQueriesPerAgent(): number {
+    const raw = process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
+    if (raw === '0') return 0;
+    const parsed = raw ? Number(raw) : DEFAULT_MAX_ACTIVE_QUERIES_PER_AGENT;
+    return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : DEFAULT_MAX_ACTIVE_QUERIES_PER_AGENT;
+  }
+
+  private async countActiveQueries(agentId: string): Promise<number> {
+    return (await this.db.queries.getPending(agentId)).length;
   }
 
   /**
@@ -6085,6 +6097,16 @@ export class AgentManagerDb {
         }
 
         const a = matches[0];
+        const maxActiveQueries = this.getMaxActiveQueriesPerAgent();
+        if (maxActiveQueries > 0) {
+          const activeQueries = await this.countActiveQueries(a.id);
+          if (activeQueries >= maxActiveQueries) {
+            return {
+              ok: false,
+              error: `Agent "${a.name}" already has ${activeQueries} active ${activeQueries === 1 ? 'query' : 'queries'} (limit ${maxActiveQueries}). Wait for current work to finish or expire before dispatching more.`,
+            };
+          }
+        }
         // Use endpoint if set, otherwise construct from port using localhost
         const baseEndpoint = a.endpoint || `http://localhost:${a.port}`;
 
