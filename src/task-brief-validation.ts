@@ -25,6 +25,10 @@ export interface TaskBriefValidationInput {
   outOfScope?: unknown;
   backlog_policy?: unknown;
   backlogPolicy?: unknown;
+  recommendation_routing?: unknown;
+  recommendationRouting?: unknown;
+  recommendation_routing_instructions?: unknown;
+  recommendationRoutingInstructions?: unknown;
   bittrees_relevance?: unknown;
   bittreesRelevance?: unknown;
   bittrees_contributor_relevance?: unknown;
@@ -194,7 +198,10 @@ export function appendTaskBriefFieldsToDescription(
   appendIfMissing(additions, existing, 'Acceptance criteria', formatValue(input.acceptance_criteria ?? input.acceptanceCriteria));
   appendIfMissing(additions, existing, 'Validation path', formatValue(input.validation_path ?? input.validationPath));
   appendIfMissing(additions, existing, 'Out of scope', formatValue(input.out_of_scope ?? input.outOfScope));
-  appendIfMissing(additions, existing, 'Backlog policy', firstString(input.backlog_policy, input.backlogPolicy));
+  const recommendationRouting = firstRecommendationRoutingInstruction(input);
+  if (recommendationRouting && !hasRecommendationRoutingInstructionLabel(existing)) {
+    additions.push(`Backlog policy: ${recommendationRouting}`);
+  }
   appendIfMissing(
     additions,
     existing,
@@ -260,9 +267,8 @@ function hasOutOfScope(input: TaskBriefValidationInput, text: string): boolean {
 }
 
 function hasBacklogPolicy(input: TaskBriefValidationInput, text: string): boolean {
-  return hasNonEmpty(input.backlog_policy)
-    || hasNonEmpty(input.backlogPolicy)
-    || /\bbacklog policy\s*:/i.test(text);
+  return firstRecommendationRoutingInstruction(input) !== null
+    || hasRecommendationRoutingInstructionLabel(text);
 }
 
 function hasBittreesContributorRelevance(input: TaskBriefValidationInput, text: string): boolean {
@@ -312,6 +318,23 @@ function firstString(...values: unknown[]): string | null {
     if (s) return s;
   }
   return null;
+}
+
+function firstRecommendationRoutingInstruction(input: TaskBriefValidationInput): string | null {
+  return firstString(
+    input.backlog_policy,
+    input.backlogPolicy,
+    input.recommendation_routing,
+    input.recommendationRouting,
+    input.recommendation_routing_instructions,
+    input.recommendationRoutingInstructions,
+  );
+}
+
+function hasRecommendationRoutingInstructionLabel(text: string): boolean {
+  return /\bbacklog policy\s*:/i.test(text)
+    || /\brecommendation[- ]routing(?: instructions?)?\s*:/i.test(text)
+    || /\brecommendations? routing(?: instructions?)?\s*:/i.test(text);
 }
 
 function asString(value: unknown): string | null {

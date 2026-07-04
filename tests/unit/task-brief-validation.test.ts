@@ -79,6 +79,24 @@ describe('validateTaskBrief', () => {
     expect(result.dispatch_ready).toBe(false);
   });
 
+  it('accepts recommendation-routing aliases as the required backlog policy control', () => {
+    const input = { ...completeBrief };
+    delete input.backlog_policy;
+
+    const result = validateTaskBrief({
+      ...input,
+      recommendation_routing_instructions: 'Route high/medium approved follow-ups live; keep low-relevance recommendations in backlog.',
+    }, 'enforce');
+
+    expect(result).toMatchObject({
+      ok: true,
+      decision: 'accept',
+      missing: [],
+      invalid: [],
+      route: 'dispatch',
+    });
+  });
+
   it('routes a missing goal_id to goal triage', () => {
     const input = { ...completeBrief };
     delete input.goal_id;
@@ -128,6 +146,30 @@ describe('validateTaskBrief', () => {
       route: 'dispatch',
       dispatch_ready: true,
       mode: 'warn',
+    });
+  });
+
+  it('accepts recommendation-routing labels from description text', () => {
+    const result = validateTaskBrief(
+      {
+        title: 'Implement coverage for goal_implement_brief_validation',
+        description: [
+          'Expected output: unit tests are committed',
+          'Acceptance criteria: required fields and modes are tested',
+          'Validation path: coder validates implementation and researcher validates coverage',
+          'Out of scope: integration tests',
+          'Recommendation routing: low-relevance suggestions stay in backlog; approved high/medium follow-ups route through lead.',
+          'Bittrees relevance: medium - improves dispatch quality',
+        ].join('\n'),
+      },
+      'enforce',
+    );
+
+    expect(result).toMatchObject({
+      ok: true,
+      decision: 'accept',
+      route: 'dispatch',
+      dispatch_ready: true,
     });
   });
 
@@ -360,6 +402,32 @@ describe('appendTaskBriefFieldsToDescription', () => {
       bittrees_relevance: 'medium - task dispatch infrastructure',
       parent_task: '#40077396',
       validation_purpose: 'Confirm unit coverage before merge',
+    });
+
+    expect(result).toBe(existing);
+  });
+
+  it('normalizes recommendation-routing aliases into the stored backlog policy field', () => {
+    const result = appendTaskBriefFieldsToDescription('Base task description.', {
+      recommendation_routing: 'Lead routes approved high/medium follow-ups; low-relevance recommendations stay backlog.',
+    });
+
+    expect(result).toBe([
+      'Base task description.',
+      '',
+      'Backlog policy: Lead routes approved high/medium follow-ups; low-relevance recommendations stay backlog.',
+    ].join('\n'));
+  });
+
+  it('does not append backlog policy when recommendation-routing text already exists', () => {
+    const existing = [
+      'Existing task description.',
+      '',
+      'Recommendation routing: already present',
+    ].join('\n');
+
+    const result = appendTaskBriefFieldsToDescription(existing, {
+      recommendation_routing: 'Do not duplicate this value.',
     });
 
     expect(result).toBe(existing);

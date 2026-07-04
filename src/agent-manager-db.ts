@@ -2141,7 +2141,7 @@ Validation-loop guardrails:
 - Use one validator pass per parent task and at most one rework cycle.
 - If a validator stayed processing after bounded polling and one retry, treat that stalled validation as terminal evidence and close it with a failure note instead of redispatching a replacement automatically.
 - Low/backlog or generic recommendations must be routed to backlog, not live child tasks.
-- Every live follow-up recommendation must include goal_id, expected_output, acceptance_criteria, validation_path, out_of_scope, backlog_policy, and Bittrees contributor relevance.
+- Every live follow-up recommendation must include goal_id, expected_output, acceptance_criteria, validation_path, out_of_scope, backlog_policy or recommendation_routing, and Bittrees contributor relevance.
 
 Return this JSON shape:
 {
@@ -12223,7 +12223,11 @@ Return this JSON shape:
             if (token === '--acceptance' || token === '--acceptance-criteria') { acceptanceCriteria.push(rawArgs[++i]); continue; }
             if (token === '--validation-path') { validationPath = rawArgs[++i]; continue; }
             if (token === '--out-of-scope') { outOfScope = rawArgs[++i]; continue; }
-            if (token === '--backlog-policy') { backlogPolicy = rawArgs[++i]; continue; }
+            if (
+              token === '--backlog-policy'
+              || token === '--recommendation-routing'
+              || token === '--recommendation-routing-instructions'
+            ) { backlogPolicy = rawArgs[++i]; continue; }
             if (token === '--bittrees-relevance' || token === '--relevance') { bittreesRelevance = rawArgs[++i]; continue; }
             if (token === '--parent-task' || token === '--parent-ref') { parentTask = rawArgs[++i]; continue; }
             if (token === '--validation-purpose') { validationPurpose = rawArgs[++i]; continue; }

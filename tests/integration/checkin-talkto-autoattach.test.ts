@@ -1226,7 +1226,7 @@ describe('/talk-to auto-attach', () => {
         headers: adminHeaders(TEAM),
         body: JSON.stringify({
           from: 'manager',
-          command: '/task create "CLI ready task" --name cli-ready-task --goal goal_mqxibu5r_2k2my --expected-output "implementation patch and tests" --acceptance "covers CLI create" --validation-path "coder and researcher" --out-of-scope "optional recommendations" --backlog-policy "Non-required recommendations become backlog candidates." --bittrees-relevance "medium: improves validator routing reliability for Bittrees contributor work."',
+          command: '/task create "CLI ready task" --name cli-ready-task --goal goal_mqxibu5r_2k2my --expected-output "implementation patch and tests" --acceptance "covers CLI create" --validation-path "coder and researcher" --out-of-scope "optional recommendations" --recommendation-routing "Non-required recommendations become backlog candidates." --bittrees-relevance "medium: improves validator routing reliability for Bittrees contributor work."',
         }),
       });
       expect(validCreate.status).toBe(200);
