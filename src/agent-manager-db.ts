@@ -1414,7 +1414,7 @@ export class AgentManagerDb {
   }
 
   private stalledOwnerBacklogPrompt(task: TaskRow, ref: string, stalledMinutes: number): string {
-    return `Backlog guard: task ${ref} ("${task.title}") has been active ${stalledMinutes}m with no progress update. New task assignment to you is held until this task is updated, completed, or reassigned. If it is done, mark it done now with \`/task done ${ref}\`. If blocked, reply with the blocker.`;
+    return `Backlog guard: task ${ref} ("${task.title}") has been active ${stalledMinutes}m with no progress update. New task assignment to you is held until this task is updated, completed, or reassigned. Reply with one line: DONE, BLOCKED: <reason>, NEEDS-REASSIGNMENT, or IN-PROGRESS: <next update>. Do not create new tasks from this control prompt.`;
   }
 
   private stalledTaskManagerFallbackPrompt(params: {
@@ -1423,17 +1423,21 @@ export class AgentManagerDb {
     ref: string;
     stalledMinutes: number;
     ownerName: string;
-    reason: 'no_live_lead' | 'lead_busy' | 'owner_busy';
+    reason: 'no_live_lead' | 'lead_busy' | 'owner_busy' | 'lead_delegation_required';
     leadName?: string;
   }): string {
     const ownerState = params.reason === 'owner_busy'
       ? `owner ${params.ownerName} already has another active query`
-      : `owner ${params.ownerName} is not live`;
+      : params.reason === 'lead_delegation_required'
+        ? `team lead ${params.ownerName} owns a parent objective without member-owned child tasks`
+        : `owner ${params.ownerName} is not live`;
     const leadState = params.reason === 'lead_busy'
       ? `team lead ${params.leadName || 'lead'} is busy with another active query`
       : params.reason === 'no_live_lead'
         ? 'there is no live team lead'
-        : 'manual jumpstart was requested';
+        : params.reason === 'lead_delegation_required'
+          ? 'task-manager delegation is required'
+          : 'manual jumpstart was requested';
     return `Backlog guard: ${params.teamName} task ${params.ref} ("${params.task.title}") has been active ${params.stalledMinutes}m, ${ownerState}, and ${leadState}. New task assignment to that owner is held until this is triaged. Please route it through the task-manager flow: restart or replace the owner, reassign the task, split it into member-owned work, or park it as todo with a clear blocker.`;
   }
 
@@ -1448,7 +1452,7 @@ export class AgentManagerDb {
     renudgeMs: number;
     maxProbes: number;
     force?: boolean;
-    reason: 'no_live_lead' | 'lead_busy' | 'owner_busy';
+    reason: 'no_live_lead' | 'lead_busy' | 'owner_busy' | 'lead_delegation_required';
     eventReason: 'owner_unavailable' | 'owner_busy' | 'lead_delegation_required' | 'probe_limit_reached' | 'unclaimed';
     leadName?: string;
   }): Promise<{ status: string; taskRef: string; actor?: string; actorTeam?: string; attempt?: number } | null> {
@@ -2120,7 +2124,7 @@ export class AgentManagerDb {
   ): Promise<string | null> {
     const audit = await this.buildDelegationAudit(task, teamId, teamName, owner);
     if (!audit || audit.status !== 'needs-delegation') return null;
-    return `Supervision: team-lead task ${ref} ("${task.title}") has no detected member-owned child tasks after ${Math.round(Number(audit.ageSeconds || 0) / 60)}m (delegation probe ${attempt}/${maxProbes}). Create member-owned child tasks with \`/task create ... --owner <teammate>\`, reassign/split the work, or if this is truly advisory close it with \`/task done ${ref} --no-delegation-reason "..." --failure-note "..."\`. Current stalled time: ${stalledMinutes}m.`;
+    return `Supervision: team-lead task ${ref} ("${task.title}") has no detected member-owned child tasks after ${Math.round(Number(audit.ageSeconds || 0) / 60)}m (delegation probe ${attempt}/${maxProbes}). Reply with one line: DELEGATED, NEEDS-TASK-MANAGER, ADVISORY: <reason>, or BLOCKED: <reason>. Do not create child tasks from this control prompt. Current stalled time: ${stalledMinutes}m.`;
   }
 
   private async sendInternalNewsTo(teamName: string, to: string, message: string, from: string): Promise<void> {
@@ -13976,6 +13980,27 @@ Return this JSON shape:
           );
           if (msg) {
             if (canEscalate) this.markStalledProbeEscalated(nudgeKey, now);
+            const taskManagerFallback = await this.routeStalledTaskToTaskManagerFallback({
+              teamId: teamRow.id,
+              teamName,
+              task: t,
+              ref,
+              stalledMinutes: mins,
+              ownerName,
+              nowMs: now,
+              renudgeMs: RENUDGE_MS,
+              maxProbes: MAX_PROBES,
+              reason: 'lead_delegation_required',
+              eventReason: canEscalate ? 'probe_limit_reached' : 'lead_delegation_required',
+              leadName: ownerName,
+            });
+            if (taskManagerFallback?.status === 'sent_task_manager') {
+              nudged++;
+              continue;
+            }
+            if (taskManagerFallback?.status === 'task_manager_busy' || taskManagerFallback?.status === 'throttled') {
+              continue;
+            }
             if (await this.sendSupervisionAsk(teamName, ownerName, msg)) {
               await this.recordTaskSupervision(
                 t,
@@ -14054,7 +14079,7 @@ Return this JSON shape:
           this.markStalledProbe(wakeKey, now);
           const wake = await this.wakeAssignedTaskOwner(teamRow.id, teamName, t, ownerAgent, 'stalled-owner');
           if (wake.status === 'started') {
-            const msg = `Supervision: task ${ref} ("${t.title}") was stalled for ${mins}m while you were offline. You have been restarted for this task. If the work is done, mark it done now with \`/task done ${ref}\`. If blocked, reply briefly with what's blocking it. If it isn't started, start and finish it.`;
+            const msg = `Supervision: task ${ref} ("${t.title}") was stalled for ${mins}m while you were offline. You have been restarted for this task. Reply with one line: READY-TO-RESUME, DONE, BLOCKED: <reason>, or NEEDS-REASSIGNMENT. Do not create new tasks from this control prompt.`;
             if (await this.sendSupervisionAsk(teamName, ownerName, msg)) {
               await this.recordTaskSupervision(t, teamRow.id, ownerAgent.id, 'owner_refresh', mins, now);
               markSupervisionSentTo(ownerAgent);
@@ -14089,7 +14114,7 @@ Return this JSON shape:
               if (leadProbeState.hasActiveSupervisionAsk || leadProbeState.hasAnyActiveQuery) continue;
               const prevProbe = this.stalledNudges.get(nudgeKey);
               this.markStalledProbeEscalated(nudgeKey, now);
-              const msg = `Supervision: task ${ref} ("${t.title}") is still in progress after ${MAX_PROBES} stalled owner probes over ${mins}m. Please triage it: close it if finished, unblock it, reassign it, or split it into a new tracked task.`;
+              const msg = `Supervision: task ${ref} ("${t.title}") is still in progress after ${MAX_PROBES} stalled owner probes over ${mins}m. Reply with one line: CLOSE, UNBLOCK: <need>, REASSIGN: <owner>, SPLIT, or BLOCKED: <reason>. Do not create new tasks from this control prompt.`;
               if (await this.sendSupervisionAsk(teamRow.name, lead.name, msg)) {
                 await this.recordTaskSupervision(t, teamRow.id, lead.id, 'probe_limit_reached', mins, now);
                 markSupervisionSentTo(lead);
@@ -14104,7 +14129,7 @@ Return this JSON shape:
         if (ownerProbeState.hasActiveSupervisionAsk || ownerProbeState.hasAnyActiveQuery) continue;
         const prevProbe = this.stalledNudges.get(nudgeKey);
         const attempt = this.markStalledProbe(nudgeKey, now);
-        const msg = `Supervision: task ${ref} ("${t.title}") has been in progress ${mins}m with no completion (probe ${attempt}/${MAX_PROBES}). If the work is done, mark it done now with \`/task done ${ref}\`. If you're blocked, reply briefly with what's blocking it. If it isn't started, start and finish it.`;
+        const msg = `Supervision: task ${ref} ("${t.title}") has been in progress ${mins}m with no completion (probe ${attempt}/${MAX_PROBES}). Reply with one line: DONE, BLOCKED: <reason>, NEEDS-REASSIGNMENT, or IN-PROGRESS: <next update>. Do not create new tasks from this control prompt.`;
         if (await this.sendSupervisionAsk(teamName, ownerName, msg)) {
           await this.recordTaskSupervision(t, teamRow.id, ownerAgent.id, 'owner_refresh', mins, now);
           markSupervisionSentTo(ownerAgent);
@@ -14160,7 +14185,7 @@ Return this JSON shape:
       }
       const prevProbe = this.stalledNudges.get(nudgeKey);
       const attempt = this.markStalledProbe(nudgeKey, now);
-      const msg = `Supervision: task ${ref} ("${t.title}") has been in progress ${mins}m, but ${unavailable} (triage probe ${attempt}/${MAX_PROBES}). Please triage it: claim it, reassign it, or route it to the right teammate.`;
+      const msg = `Supervision: task ${ref} ("${t.title}") has been in progress ${mins}m, but ${unavailable} (triage probe ${attempt}/${MAX_PROBES}). Reply with one line: CLAIM, REASSIGN: <owner>, ROUTE: <team/agent>, or BLOCKED: <reason>. Do not create new tasks from this control prompt.`;
       if (await this.sendSupervisionAsk(teamRow.name, lead.name, msg)) {
         await this.recordTaskSupervision(t, teamRow.id, lead.id, 'owner_unavailable', mins, now);
         markSupervisionSentTo(lead);
@@ -14216,7 +14241,7 @@ Return this JSON shape:
       if (leadProbeState.hasActiveSupervisionAsk || leadProbeState.hasAnyActiveQuery) continue;
       const prevProbe = this.stalledNudges.get(nudgeKey);
       const attempt = this.markStalledProbe(nudgeKey, now);
-      const msg = `Supervision: unclaimed task ${ref} ("${t.title}") has been waiting ${mins}m with no owner (triage probe ${attempt}/${MAX_PROBES}). Please claim it if it is yours, or route it to the right teammate.`;
+      const msg = `Supervision: unclaimed task ${ref} ("${t.title}") has been waiting ${mins}m with no owner (triage probe ${attempt}/${MAX_PROBES}). Reply with one line: CLAIM, ROUTE: <team/agent>, or BLOCKED: <reason>. Do not create new tasks from this control prompt.`;
       if (await this.sendSupervisionAsk(teamRow.name, lead.name, msg)) {
         await this.recordTaskSupervision(t, teamRow.id, lead.id, 'unclaimed', mins, now);
         markSupervisionSentTo(lead);
@@ -14248,7 +14273,7 @@ Return this JSON shape:
           const prompt = q.prompt ? ` ("${q.prompt.slice(0, 120)}${q.prompt.length > 120 ? '...' : ''}")` : '';
           const prevProbe = this.stalledNudges.get(nudgeKey);
           const attempt = this.markStalledProbe(nudgeKey, now);
-          const msg = `Supervision: manager inbox request ${q.query_id}${prompt} has been pending ${mins}m (triage probe ${attempt}/${MAX_PROBES}). Please answer it, claim it, or route it to the right teammate.`;
+          const msg = `Supervision: manager inbox request ${q.query_id}${prompt} has been pending ${mins}m (triage probe ${attempt}/${MAX_PROBES}). Reply with one line: ANSWERED, CLAIM, ROUTE: <team/agent>, or BLOCKED: <reason>. Do not create new tasks from this control prompt.`;
           if (await this.sendSupervisionAsk(team.name, lead.name, msg)) {
             markSupervisionSentTo(lead);
             nudged++;
