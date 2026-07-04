@@ -1041,6 +1041,16 @@ export class AgentRestServer {
           return res.status(400).json({ error: 'Missing message' });
         }
 
+        const deferReason = from ? await this.getPeerBusyDeferReason(from) : undefined;
+        if (deferReason) {
+          console.log(`${logTime()} [Agent] Rejected peer /talk from ${from} while busy: ${message.substring(0, 80)}...`);
+          return res.status(429).json({
+            error: deferReason,
+            status: 'busy',
+            message: `${this.getDisplayId()} is already processing work. Retry later or use fire-and-forget /news-to for non-blocking updates.`,
+          });
+        }
+
         const queryId = `query_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
 
         // Pre-write a pending row so concurrent GET /query/:id pollers don't see 404
@@ -1344,7 +1354,7 @@ export class AgentRestServer {
 
         // If trigger is true, process the message with the LLM
         if (trigger && from) {
-          const deferReason = await this.getTriggeredNewsWakeDeferReason(from);
+          const deferReason = await this.getPeerBusyDeferReason(from);
           if (deferReason) {
             console.log(`${logTime()} [Agent] Deferred triggered news wake from ${from}: ${newsMessage.substring(0, 80)}...`);
             return res.status(202).json({
@@ -1927,7 +1937,7 @@ What would you like to do with this information?`;
     return this.isPrimaryLeadIdentity() || this.isAgentBusy();
   }
 
-  private async getTriggeredNewsWakeDeferReason(from: string): Promise<'agent_busy' | 'primary_lead_busy' | undefined> {
+  private async getPeerBusyDeferReason(from: string): Promise<'agent_busy' | 'primary_lead_busy' | undefined> {
     const sender = from.trim().toLowerCase();
     if (sender === 'manager' || sender === 'remote' || sender === 'operator' || sender === 'checkin-service') return undefined;
     if (!this.isAgentBusy() && !(await this.hasDbActiveQuery())) return undefined;

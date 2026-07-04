@@ -307,6 +307,64 @@ describe('agent query queue priority', () => {
       await server.stop();
     }
   });
+
+  it('rejects peer /talk while DB-visible active work is running', async () => {
+    const harness = new RecordingHarness();
+    let checkedDb = false;
+    const db = {
+      queries: {
+        getPending: async (agentId: string) => {
+          checkedDb = true;
+          return [{
+            team_id: 'team-default',
+            agent_id: agentId,
+            query_id: 'active-validator-work',
+            status: 'processing',
+            prompt: 'current validation',
+            created: Date.now(),
+            completed: null,
+            result: null,
+            error: null,
+            session_id: null,
+            owner_kind: 'agent',
+            owner_id: agentId,
+            metadata: null,
+          }];
+        },
+      },
+    };
+    const server = new AgentRestServer({
+      agentName: 'researcher',
+      agentIdentity: { name: 'researcher', team: 'default' },
+      harness,
+      db: { db: db as any, teamId: 'team-default', agentId: 'agent-researcher' },
+    });
+
+    try {
+      await server.start(0);
+      const port = ((server as any).httpServer.address() as AddressInfo).port;
+
+      const res = await fetch(`http://127.0.0.1:${port}/talk`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          from: 'skillmesh-ops-lead',
+          message: 'Please validate another task while you are still busy.',
+        }),
+      });
+
+      expect(res.status).toBe(429);
+      await expect(res.json()).resolves.toMatchObject({
+        error: 'agent_busy',
+        status: 'busy',
+      });
+      expect(checkedDb).toBe(true);
+      await sleep(20);
+      expect(harness.prompts).toHaveLength(0);
+    } finally {
+      await server.stop();
+    }
+  });
 });
 
 async function viWaitFor(assertion: () => void): Promise<void> {
