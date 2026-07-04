@@ -13042,6 +13042,14 @@ Return this JSON shape:
   private exactControlPromptDedupKey(prompt: string | null | undefined): string | null {
     const text = String(prompt ?? '').trim().replace(/\s+/g, ' ');
     const lower = text.toLowerCase();
+    const assignmentSweep = lower.startsWith('assignment sweep complete')
+      || lower.startsWith('ack on the sweep')
+      || lower.startsWith('re your assignment sweep')
+      || lower.startsWith('task assignment sweep:');
+    if (assignmentSweep) {
+      const assignment = lower.match(/\b([a-z0-9][a-z0-9_-]+)\s*->\s*([a-z0-9][a-z0-9_-]+)\b/);
+      if (assignment) return `assignment-sweep:${assignment[1]}->${assignment[2]}`;
+    }
     const dedupePrefixes = [
       'assignment sweep complete',
       'ack on the sweep',
