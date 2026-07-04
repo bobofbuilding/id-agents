@@ -128,6 +128,8 @@ describe('validator recommendation loop idempotency', () => {
     expect(prompt).toContain('Do not call /news-to, /talk-to, /ask, inter-agent tools, task creation tools, or assignment commands');
     expect(prompt).toContain('Do not send direct handoffs to team leads');
     expect(prompt).toContain('lead is the sole router for approved high/medium recommendations');
+    expect(prompt).toContain('Failed current-task validation is rework evidence for the existing task');
+    expect(prompt).toContain('For needs-revision or blocked, the packet is recorded as task-local validation evidence');
     expect(prompt).toContain('Do not turn draft proposals into live tasks or assignments');
     expect(prompt).toContain('return next_step_recommendations: [] and do not notify anyone else');
   });

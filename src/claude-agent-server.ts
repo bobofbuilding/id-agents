@@ -523,6 +523,7 @@ export function shouldSuppressPrimaryLeadValidatorNoopWake(params: {
 
 export type PrimaryLeadValidatorWakeSuppressionReason =
   | 'validator_approved_no_dispatch_ready_recommendations'
+  | 'validator_needs_revision_no_dispatch_ready_recommendations'
   | 'validator_blocked_no_dispatch_ready_recommendations';
 
 export function classifyPrimaryLeadValidatorWakeSuppression(params: {
@@ -542,10 +543,11 @@ export function classifyPrimaryLeadValidatorWakeSuppression(params: {
   const packet = parseJsonObjectMessage(params.message);
   if (!packet) return null;
 
-  const status = String(packet.validation_status || '').trim().toLowerCase();
+  const status = String(packet.validation_status || '').trim().toLowerCase().replace(/[_\s]+/g, '-');
   if (hasHighOrMediumRecommendation(packet)) return null;
 
   if (status === 'approved') return 'validator_approved_no_dispatch_ready_recommendations';
+  if (status === 'needs-revision') return 'validator_needs_revision_no_dispatch_ready_recommendations';
   if (status === 'blocked') return 'validator_blocked_no_dispatch_ready_recommendations';
 
   return null;

@@ -477,6 +477,55 @@ Team objective: Decompose this objective into member-owned work.`,
     }
   });
 
+  it('suppresses needs-revision validator packets with no dispatch-ready recommendations for the primary lead', async () => {
+    const harness = new RecordingHarness();
+    const server = new AgentRestServer({
+      agentName: 'lead',
+      agentIdentity: { name: 'lead', team: 'default' },
+      harness,
+    });
+
+    try {
+      await server.start(0);
+      const port = ((server as any).httpServer.address() as AddressInfo).port;
+
+      const res = await fetch(`http://127.0.0.1:${port}/news`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: 'reply',
+          from: 'researcher',
+          in_reply_to: 'query_validator_packet_revision',
+          message: JSON.stringify({
+            validation_status: 'needs-revision',
+            summary: 'Validation did not pass; the existing task needs rework.',
+            validation_budget: {
+              validator_passes_allowed: 1,
+              rework_cycles_allowed: 1,
+              validator_tasks_may_create_validator_tasks: false,
+            },
+            validator_findings: {
+              researcher: 'REVISE: fix the evidence accounting on the current task.',
+            },
+            next_step_recommendations: [],
+            lead_routing_instruction: 'Lead should dispatch only high/medium approved recommendation objectives.',
+          }),
+        }),
+      });
+
+      expect(res.status).toBe(202);
+      await expect(res.json()).resolves.toMatchObject({
+        triggered: false,
+        suppressed: true,
+        reason: 'validator_needs_revision_no_dispatch_ready_recommendations',
+      });
+      await sleep(20);
+      expect(harness.prompts).toHaveLength(0);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it('records triggered peer replies for busy agents without queueing another turn', async () => {
     const harness = new RecordingHarness(true);
     const server = new AgentRestServer({
@@ -643,18 +692,7 @@ Team objective: Decompose this objective into member-owned work.`,
 });
 
 describe('validator recommendation lead wake suppression', () => {
-  it('does not suppress needs-revision or dispatch-ready recommendation packets', () => {
-    expect(shouldSuppressPrimaryLeadValidatorNoopWake({
-      isPrimaryLead: true,
-      newsType: 'reply',
-      from: 'researcher',
-      inReplyTo: 'query_1',
-      message: JSON.stringify({
-        validation_status: 'needs-revision',
-        next_step_recommendations: [],
-      }),
-    })).toBe(false);
-
+  it('does not suppress dispatch-ready recommendation packets', () => {
     expect(shouldSuppressPrimaryLeadValidatorNoopWake({
       isPrimaryLead: true,
       newsType: 'reply',
@@ -669,7 +707,7 @@ describe('validator recommendation lead wake suppression', () => {
     })).toBe(false);
   });
 
-  it('classifies approved and blocked no-op packets with distinct suppression reasons', () => {
+  it('classifies approved, needs-revision, and blocked no-op packets with distinct suppression reasons', () => {
     expect(classifyPrimaryLeadValidatorWakeSuppression({
       isPrimaryLead: true,
       newsType: 'reply',
@@ -686,6 +724,17 @@ describe('validator recommendation lead wake suppression', () => {
       newsType: 'reply',
       from: 'researcher',
       inReplyTo: 'query_2',
+      message: JSON.stringify({
+        validation_status: 'needs_revision',
+        next_step_recommendations: [],
+      }),
+    })).toBe('validator_needs_revision_no_dispatch_ready_recommendations');
+
+    expect(classifyPrimaryLeadValidatorWakeSuppression({
+      isPrimaryLead: true,
+      newsType: 'reply',
+      from: 'researcher',
+      inReplyTo: 'query_3',
       message: JSON.stringify({
         validation_status: 'blocked',
         next_step_recommendations: [],

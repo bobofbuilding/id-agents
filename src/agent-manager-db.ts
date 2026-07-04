@@ -2315,14 +2315,14 @@ Completed validation task:
 - title: ${params.task.title}
 ${params.task.description ? `- description: ${params.task.description}\n` : ''}${params.completionNote ? `- completion note: ${params.completionNote}\n` : ''}
 Required response:
-Create a concise recommendation packet for ${params.leadName}. Keep current-task approval separate from future work. If validation failed, set validation_status to needs-revision or blocked and include required fixes for the applicable team lead. If validation passed, include next_step_recommendations as separate follow-up objectives for ${params.leadName} to relay to the ideal team leads. Team leads then break those objectives into tasks for their own dependent team members.
+Create a concise recommendation packet for ${params.leadName}. Keep current-task approval separate from future work. If validation failed, set validation_status to needs-revision or blocked, put the required fixes in validator_findings, and leave next_step_recommendations empty unless there is a separate approved high/medium follow-up objective. Failed current-task validation is rework evidence for the existing task, not a request for ${params.leadName} to create or route new live tasks. If validation passed, include next_step_recommendations only as separate approved follow-up objectives for ${params.leadName} to relay to the ideal team leads. Team leads then break those objectives into tasks for their own dependent team members.
 
 Routing authority:
 - Your only action in this loop is to return the JSON packet below in your final response to ${params.leadName}.
 - Do not call /news-to, /talk-to, /ask, inter-agent tools, task creation tools, or assignment commands while preparing this packet.
-- Do not send direct handoffs to team leads, specialists, validators, or the manager. ${params.leadName} is the sole router for approved high/medium recommendations.
+- Do not send direct handoffs to team leads, specialists, validators, or the manager. ${params.leadName} is the sole router for approved high/medium recommendations, not failed-validation rework notes.
 - Do not turn draft proposals into live tasks or assignments. Drafts stay recommendations until ${params.leadName} explicitly routes them.
-- If there are no approved high/medium dispatch-ready follow-ups, return next_step_recommendations: [] and do not notify anyone else.
+- If there are no approved high/medium dispatch-ready follow-ups, return next_step_recommendations: [] and do not notify anyone else. For needs-revision or blocked, the packet is recorded as task-local validation evidence and should not wake ${params.leadName} for live task creation.
 
 Validation-loop guardrails:
 - Do not create or request validator tasks from this validator task.
