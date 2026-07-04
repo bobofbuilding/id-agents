@@ -58,6 +58,11 @@ describe('agent query queue priority', () => {
     })).toBe('delegation');
 
     expect(classifyQueryQueuePriority({
+      prompt: 'Please claim and complete task #0fcc3e2d (design-handoff-parallelization-rules).',
+      from: 'engineering-lead',
+    })).toBe('delegation');
+
+    expect(classifyQueryQueuePriority({
       prompt: `[Message from the manager (your owner/operator) | Query ID: q1]
 
 Team objective: Decompose this objective into member-owned work.`,

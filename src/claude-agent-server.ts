@@ -121,9 +121,13 @@ const DELEGATION_PROMPT_PATTERNS = [
   /^Task delegation/i,
   /^Coordinator handoff/i,
   /^Resume and complete task\b/i,
+  /^Please claim and execute\s+#/i,
+  /^Please claim and complete task\s+#/i,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nTeam objective:/,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nLead delegation kickoff:/,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nTask delegation/i,
+  /^\[Message from agent "[^"]+"\s*\|[^\n]*\]\s*\n[\s\S]*\nPlease claim and execute\s+#/i,
+  /^\[Message from agent "[^"]+"\s*\|[^\n]*\]\s*\n[\s\S]*\nPlease claim and complete task\s+#/i,
 ];
 
 function isDelegationPrompt(text: string): boolean {

@@ -4243,6 +4243,8 @@ Return this JSON shape:
       /^Assignment sweep complete\b/,
       /^No approved recommendation routed\b/,
       /^Already handled\.\s+Task\b/,
+      /^Please validate\b[\s\S]*\bagainst task\s+#?[a-z0-9_-]+/i,
+      /^AUTO-RELEASE shipped\b/i,
     ].some((pattern) => pattern.test(text));
   }
 
@@ -13270,7 +13272,9 @@ Return this JSON shape:
       || lower.startsWith('backlog guard:')
       || lower.startsWith('backlog guard alert:')
       || lower.startsWith('status check on')
-      || lower.startsWith('please claim and execute #');
+      || lower.startsWith('please claim and execute #')
+      || lower.startsWith('please claim and complete task #')
+      || (lower.startsWith('please validate ') && lower.includes(' against task #'));
     if (!managedTaskAsk) return null;
     return text.match(/#[a-z0-9][a-z0-9_-]{3,}/i)?.[0]?.toLowerCase() ?? null;
   }
@@ -13291,6 +13295,7 @@ Return this JSON shape:
       'ack on the sweep',
       're your assignment sweep',
       'task assignment sweep:',
+      'auto-release shipped',
     ];
     if (!dedupePrefixes.some((prefix) => lower.startsWith(prefix))) return null;
     return lower.slice(0, 1024);
@@ -13382,10 +13387,13 @@ Return this JSON shape:
            OR LOWER(prompt) LIKE 'backlog guard alert:%'
            OR LOWER(prompt) LIKE 'status check on%'
            OR LOWER(prompt) LIKE 'please claim and execute #%'
+           OR LOWER(prompt) LIKE 'please claim and complete task #%'
+           OR (LOWER(prompt) LIKE 'please validate %' AND LOWER(prompt) LIKE '% against task #%')
            OR LOWER(prompt) LIKE 'assignment sweep complete%'
            OR LOWER(prompt) LIKE 'ack on the sweep%'
            OR LOWER(prompt) LIKE 're your assignment sweep%'
            OR LOWER(prompt) LIKE 'task assignment sweep:%'
+           OR LOWER(prompt) LIKE 'auto-release shipped%'
          )`;
   }
 

@@ -1555,6 +1555,83 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
+  it('dedupes active validation /ask prompts by task marker before dispatching', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('legal');
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-legal-researcher',
+        name: 'legal-researcher',
+        port: 4116,
+        status: 'running',
+        endpoint: 'http://127.0.0.1:9',
+      }),
+    });
+    await db.queries.upsert(teamId, 'agent-legal-researcher', {
+      query_id: 'existing-validation-ask',
+      status: 'processing',
+      prompt: 'Please validate output/legal-routing-policy-8da84377.md against task #8da84377.',
+      created: Date.now(),
+      owner_kind: 'agent',
+      owner_id: 'agent-legal-researcher',
+    });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+    const result = await (manager as any).executeRemoteCommand(
+      '/ask legal-researcher Please validate output/legal-routing-policy-retry.md against task #8da84377.',
+      teamId,
+      'legal',
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.result?.queryId).toBe('existing-validation-ask');
+    expect(result.result?.deduped).toBe(true);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('dedupes exact active auto-release verification prompts before dispatching', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('ops-team');
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-ops-lead',
+        name: 'ops-lead',
+        port: 4116,
+        status: 'running',
+        endpoint: 'http://127.0.0.1:9',
+      }),
+    });
+    const prompt = 'AUTO-RELEASE shipped v0.1.585 (outstanding IDACC code released). Please verify the asset + self-update smoke.';
+    await db.queries.upsert(teamId, 'agent-ops-lead', {
+      query_id: 'existing-auto-release',
+      status: 'pending',
+      prompt,
+      created: Date.now(),
+      owner_kind: 'agent',
+      owner_id: 'agent-ops-lead',
+    });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+    const result = await (manager as any).executeRemoteCommand(
+      `/ask ops-lead ${prompt}`,
+      teamId,
+      'ops-team',
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.result?.queryId).toBe('existing-auto-release');
+    expect(result.result?.deduped).toBe(true);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
   it('dedupes active supervision routing /ask prompts before dispatching', async () => {
     const { manager, db, workDir } = await makeManager();
     dbs.push(db);
