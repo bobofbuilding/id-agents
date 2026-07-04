@@ -528,6 +528,21 @@ export class AgentRestServer {
     });
   }
 
+  private async dbMarkPendingQuery(
+    queryId: string,
+    prompt: string,
+    created: number,
+    sessionId?: string,
+  ) {
+    await this.dbUpsertQuery({
+      id: queryId,
+      prompt,
+      status: 'pending',
+      created,
+      sessionId,
+    });
+  }
+
   private getExternalQueryStopPollMs(): number {
     const raw = process.env.ID_AGENT_QUERY_TERMINAL_POLL_MS;
     if (raw === undefined) return 5000;
@@ -984,13 +999,7 @@ export class AgentRestServer {
         // between /talk returning queryId and executeQuery pulling the item off the
         // serialized queue. Best-effort — memory-only mode stays a no-op.
         try {
-          await this.dbUpsertQuery({
-            id: queryId,
-            prompt: message,
-            status: 'pending',
-            created: Date.now(),
-            sessionId: session_id,
-          });
+          await this.dbMarkPendingQuery(queryId, message, Date.now(), session_id);
         } catch (dbErr: any) {
           console.error(`[Agent] Warning: Failed to pre-write pending row for query ${queryId}:`, dbErr?.message || dbErr);
         }
@@ -1282,6 +1291,15 @@ export class AgentRestServer {
 
           // Craft a prompt that prevents infinite loops
           const triggerPrompt = this.craftNewsTriggerPrompt(from, newsMessage, in_reply_to);
+
+          // Mirror /talk: make triggered wake work visible before it enters the
+          // in-memory serial queue. Manager busy guards depend on pending rows
+          // to avoid stacking automated checkins/supervision behind a lead.
+          try {
+            await this.dbMarkPendingQuery(queryId, triggerPrompt, ts);
+          } catch (dbErr: any) {
+            console.error(`[Agent] Warning: Failed to pre-write pending row for triggered news query ${queryId}:`, dbErr?.message || dbErr);
+          }
 
           // Start processing in background (don't block the response)
           // Pass from so agent knows who sent it, but noAutoReply to prevent infinite loops

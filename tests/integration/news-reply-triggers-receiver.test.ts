@@ -11,9 +11,18 @@
  * `noAutoReply: true` flag the handler passes through to startQuery.
  */
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AddressInfo } from 'net';
 import { AgentRestServer } from '../../src/claude-agent-server.js';
+import type { AgentHarness, HarnessMessage, HarnessOptions, HarnessType } from '../../src/harness/index.js';
+
+class ImmediateHarness implements AgentHarness {
+  readonly type = 'claude-code-cli' as HarnessType;
+
+  async *run(_prompt: string, _options: HarnessOptions): AsyncGenerator<HarnessMessage> {
+    yield { type: 'result', result: 'processed triggered news' };
+  }
+}
 
 async function freshServer(): Promise<{ server: AgentRestServer; baseUrl: string }> {
   const server = new AgentRestServer({
@@ -86,5 +95,57 @@ describe('POST /news — trigger default for replies', () => {
     expect(res.status).toBe(201);
     const body = (await res.json()) as { triggered?: boolean };
     expect(body.triggered).toBe(false);
+  });
+
+  it('prewrites a pending query row before accepting triggered news work', async () => {
+    if (server) await server.stop();
+    server = null;
+
+    const db: any = {
+      queries: {
+        upsert: vi.fn(async () => undefined),
+      },
+      news: {
+        add: vi.fn(async () => undefined),
+      },
+    };
+    const dbServer = new AgentRestServer({
+      agentName: 'news-pending-row-test',
+      workingDirectory: process.cwd(),
+      sharedDirectory: process.cwd(),
+      db: { db, teamId: 'team-1', agentId: 'agent-1' },
+      harness: new ImmediateHarness(),
+    });
+    await dbServer.start(0);
+    server = dbServer;
+    const httpServer = (server as any).httpServer as { address: () => AddressInfo };
+    baseUrl = `http://127.0.0.1:${httpServer.address().port}`;
+
+    const res = await fetch(`${baseUrl}/news`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: 'checkin-service',
+        trigger: true,
+        skip_persist: true,
+        type: 'checkin_due',
+        message: 'Checkin due (normal) - task-a',
+      }),
+    });
+
+    expect(res.status).toBe(202);
+    const body = (await res.json()) as { triggered?: boolean; query_id?: string };
+    expect(body.triggered).toBe(true);
+    expect(body.query_id).toMatch(/^news_/);
+    expect(db.queries.upsert).toHaveBeenCalled();
+    expect(db.queries.upsert.mock.calls[0]).toEqual([
+      'team-1',
+      'agent-1',
+      expect.objectContaining({
+        query_id: body.query_id,
+        status: 'pending',
+        prompt: expect.stringContaining('[Incoming Message from "checkin-service"]'),
+      }),
+    ]);
   });
 });
