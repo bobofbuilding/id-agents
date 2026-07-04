@@ -93,6 +93,7 @@ function fakeDb(overrides: Record<string, any> = {}): any {
   return {
     teams: {
       getTeam: vi.fn(async () => team()),
+      getTeamByName: vi.fn(async (name: string) => name === 'default' ? team() : null),
       getConfig: vi.fn(async () => ({})),
       listTeams: vi.fn(async () => []),
       ...overrides.teams,
@@ -272,6 +273,106 @@ describe('stalled task sweeper', () => {
         reason: 'control_reply_reassign',
         stalled_minutes: 60,
       }),
+    }));
+  });
+
+  it('assigns a routed control reply to the named live teammate', async () => {
+    const routedTask = task({
+      status: 'todo',
+      owner: null,
+    });
+    const assignedTask = {
+      ...routedTask,
+      status: 'doing' as const,
+      owner: 'agent-1',
+      updated_at: Math.floor(NOW_MS / 1000),
+    };
+    const db = fakeDb({
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => status === 'doing' ? [] : [routedTask]),
+        getByNameForTeam: vi.fn(async () => assignedTask),
+        getByUuidPrefix: vi.fn(async () => [routedTask]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-control-route-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery('lead-agent', {
+        query_id: 'guard-route',
+        prompt: 'Supervision: unclaimed task #12345678 ("Stalled work") has been waiting 60m. Reply with one line: CLAIM, ROUTE: <team/agent>, or BLOCKED: <reason>.',
+        status: 'completed',
+      }),
+      { result: 'ROUTE: worker' },
+      NOW_MS,
+    );
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(routedTask.id, {
+      owner: 'agent-1',
+      status: 'doing',
+      completed_at: null,
+      updated_at: Math.floor(NOW_MS / 1000),
+    });
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'worker',
+      expect.stringContaining('TASK DELEGATION from manager'),
+    );
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:claimed',
+      subject_id: routedTask.uuid,
+      data: expect.objectContaining({
+        owner: 'agent-1',
+      }),
+    }));
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:refreshed',
+      subject_id: routedTask.uuid,
+      data: expect.objectContaining({
+        reason: 'control_reply_route_assigned',
+      }),
+    }));
+  });
+
+  it('extracts route targets from prose control replies without treating the task title as the target', async () => {
+    const routedTask = task({
+      status: 'todo',
+      owner: null,
+      title: 'Set governance rules',
+    });
+    const worker = agent({ id: 'counsel-1', name: 'general-counsel' });
+    const db = fakeDb({
+      agents: {
+        resolve: vi.fn(async (_teamId: string, ref: string) => ref === 'general-counsel' ? [worker] : []),
+      },
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => status === 'doing' ? [] : [routedTask]),
+        getByNameForTeam: vi.fn(async () => ({
+          ...routedTask,
+          status: 'doing' as const,
+          owner: worker.id,
+          updated_at: Math.floor(NOW_MS / 1000),
+        })),
+        getByUuidPrefix: vi.fn(async () => [routedTask]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-control-route-prose-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery('lead-agent', {
+        query_id: 'guard-route-prose',
+        prompt: 'Supervision: unclaimed task #12345678 ("Set governance rules") has been waiting 60m. Reply with one line: CLAIM, ROUTE: <team/agent>, or BLOCKED: <reason>.',
+        status: 'completed',
+      }),
+      { result: 'Route `Set governance rules` to `general-counsel`.' },
+      NOW_MS,
+    );
+
+    expect(db.agents.resolve).toHaveBeenCalledWith(TEAM_ID, 'general-counsel');
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(routedTask.id, expect.objectContaining({
+      owner: worker.id,
+      status: 'doing',
     }));
   });
 

@@ -2831,25 +2831,84 @@ Return this JSON shape:
   private parseTaskControlReply(message: string): {
     action: 'done' | 'in_progress' | 'blocked' | 'reassign' | 'claim' | 'delegated' | null;
     note: string;
+    target: string | null;
   } {
     const firstLine = String(message || '')
       .split(/\r?\n/)
       .map((line) => line.trim())
       .find(Boolean) || '';
     const upper = firstLine.toUpperCase();
-    if (!firstLine) return { action: null, note: '' };
-    if (/^(DONE\b|\/TASK\s+DONE\b|MARKED\s+DONE\b)/.test(upper)) return { action: 'done', note: firstLine };
-    if (/^TASK\b.*\b(?:MARKED|CLOSED)\b.*\bDONE\b/.test(upper)) return { action: 'done', note: firstLine };
-    if (/^(IN-PROGRESS|READY-TO-RESUME)\b/.test(upper)) return { action: 'in_progress', note: firstLine };
-    if (/^DELEGATED\b/.test(upper)) return { action: 'delegated', note: firstLine };
-    if (/^(CLAIM|CLAIMED)\b/.test(upper)) return { action: 'claim', note: firstLine };
-    if (/^(NEEDS-REASSIGNMENT|REASSIGN\b|REASSIGN:|ROUTE:|ROUTE\b)/.test(upper)) {
-      return { action: 'reassign', note: firstLine };
+    if (!firstLine) return { action: null, note: '', target: null };
+    if (/^(DONE\b|\/TASK\s+DONE\b|MARKED\s+DONE\b)/.test(upper)) return { action: 'done', note: firstLine, target: null };
+    if (/^TASK\b.*\b(?:MARKED|CLOSED)\b.*\bDONE\b/.test(upper)) return { action: 'done', note: firstLine, target: null };
+    if (/^(IN-PROGRESS|READY-TO-RESUME)\b/.test(upper)) return { action: 'in_progress', note: firstLine, target: null };
+    if (/^DELEGATED\b/.test(upper)) return { action: 'delegated', note: firstLine, target: null };
+    if (/^(CLAIM|CLAIMED)\b/.test(upper)) return { action: 'claim', note: firstLine, target: null };
+    if (
+      /^(NEEDS-REASSIGNMENT|REASSIGN\b|REASSIGN:|ROUTE:|ROUTE\b)/.test(upper)
+      || /\b(?:REASSIGN|ROUTE)\b.{0,160}\bTO\b/.test(upper)
+    ) {
+      return { action: 'reassign', note: firstLine, target: this.extractTaskControlRouteTarget(firstLine) };
     }
     if (/^(BLOCKED|BLOCKER|UNBLOCK:|UNBLOCK\b)/.test(upper)) {
-      return { action: 'blocked', note: firstLine };
+      return { action: 'blocked', note: firstLine, target: null };
     }
-    return { action: null, note: firstLine };
+    return { action: null, note: firstLine, target: null };
+  }
+
+  private cleanTaskControlRouteTarget(raw: string | null | undefined): string | null {
+    if (!raw) return null;
+    const cleaned = raw
+      .trim()
+      .replace(/^[@#]+/, '')
+      .replace(/^[`'"]+|[`'",.;:)\]]+$/g, '')
+      .trim();
+    if (!cleaned || /^<[^>]+>$/.test(cleaned)) return null;
+    if (/^(owner|agent|teammate|team\/agent|team|lead)$/i.test(cleaned)) return null;
+    return cleaned;
+  }
+
+  private extractTaskControlRouteTarget(firstLine: string): string | null {
+    const text = firstLine.trim();
+    const toTarget = text.match(/\b(?:REASSIGN|ROUTE)\b.{0,160}?\bTO\s+`([^`]+)`/i)
+      ?? text.match(/\b(?:REASSIGN|ROUTE)\b.{0,160}?\bTO\s+([@#]?[a-z0-9][a-z0-9._/-]*)/i);
+    const cleanedToTarget = this.cleanTaskControlRouteTarget(toTarget?.[1]);
+    if (cleanedToTarget) return cleanedToTarget;
+
+    const direct = text.match(/^(?:REASSIGN|ROUTE)\s*:?\s+(.+)$/i);
+    if (direct) {
+      const rest = direct[1].trim().replace(/^to\s+/i, '');
+      const backticked = rest.match(/^`([^`]+)`/);
+      const token = backticked?.[1] ?? rest.split(/\s+/)[0];
+      const cleaned = this.cleanTaskControlRouteTarget(token);
+      if (cleaned) return cleaned;
+    }
+
+    return null;
+  }
+
+  private async resolveControlReplyRouteTarget(
+    taskTeamId: string,
+    targetRef: string | null,
+  ): Promise<{ team: TeamRow; agent: AgentRow } | null> {
+    if (!targetRef) return null;
+    const currentTeam = await this.db.teams.getTeam(taskTeamId).catch(() => null);
+    if (!currentTeam) return null;
+
+    let targetTeam = currentTeam;
+    let agentRef = targetRef;
+    const slash = targetRef.indexOf('/');
+    if (slash > 0 && slash < targetRef.length - 1) {
+      const teamRef = targetRef.slice(0, slash);
+      agentRef = targetRef.slice(slash + 1);
+      const resolvedTeam = await this.db.teams.getTeamByName(teamRef).catch(() => null);
+      if (!resolvedTeam) return null;
+      targetTeam = resolvedTeam;
+    }
+
+    const { agent } = await this.resolveSingleAgentForCommand(targetTeam.id, agentRef);
+    if (!agent) return null;
+    return { team: targetTeam, agent };
   }
 
   private appendTaskTriageNote(description: string | null, reason: string, note: string, occurredAt: number): string {
@@ -2990,16 +3049,98 @@ Return this JSON shape:
       return { applied: true, action: parsed.action, task: task.name };
     }
 
+    const taskTeamId = task.team_id || queryRow.team_id;
+    const taskTeamRow = await this.db.teams.getTeam(taskTeamId).catch(() => null);
+    let fallbackNote = parsed.note;
+    if (parsed.action === 'reassign' && parsed.target) {
+      const route = await this.resolveControlReplyRouteTarget(taskTeamId, parsed.target);
+      const routeBlock = (reason: string): void => {
+        fallbackNote = `${parsed.note} (route target "${parsed.target}" not assigned: ${reason})`;
+      };
+
+      if (!route) {
+        routeBlock('target_not_found');
+      } else if (route.team.id !== taskTeamId) {
+        routeBlock(`cross_team_route_to_${route.team.name}_not_applied`);
+      } else if (!/running|online|ok/i.test(route.agent.status || '')) {
+        routeBlock(`target_${route.agent.name}_not_live`);
+      } else if (task.status !== 'doing' && !(await this.hasDoingTaskRoom(taskTeamId))) {
+        routeBlock('doing_limit_full');
+      } else {
+        const leadBacklog = await this.leadDelegationBacklogGuard({
+          teamId: taskTeamId,
+          teamName: route.team.name,
+          owner: route.agent,
+          excludeTaskId: task.id,
+        });
+        const stalledBacklog = leadBacklog ? null : await this.stalledOwnerBacklogGuard({
+          teamId: taskTeamId,
+          teamName: route.team.name,
+          owner: route.agent,
+          excludeTaskId: task.id,
+        });
+        if (leadBacklog) {
+          routeBlock('lead_delegation_backlog');
+        } else if (stalledBacklog) {
+          routeBlock('stalled_task_backlog');
+        } else if (await this.hasAnyActiveQuery(route.agent)) {
+          routeBlock('target_has_active_query');
+        } else {
+          await this.db.tasks.updateFields(task.id, {
+            owner: route.agent.id,
+            status: 'doing',
+            completed_at: null,
+            updated_at: nowSec,
+          });
+          const routedTask = await this.db.tasks.getByNameForTeam(task.name, taskTeamId).catch(() => null) ?? {
+            ...task,
+            owner: route.agent.id,
+            status: 'doing' as const,
+            completed_at: null,
+            updated_at: nowSec,
+          };
+          await emitTaskClaimed(this.db.events, {
+            teamId: taskTeamId,
+            taskUuid: routedTask.uuid,
+            taskName: routedTask.name,
+            title: routedTask.title,
+            ownerAgentId: route.agent.id,
+            occurredAt,
+          });
+          await this.recordTaskSupervision(
+            routedTask,
+            taskTeamId,
+            route.agent.id,
+            'control_reply_route_assigned',
+            stalledMinutes,
+            occurredAt,
+          );
+          const ref = this.taskShortRef(routedTask);
+          if (this.isConfiguredTeamLead(route.team.name, route.agent)) {
+            void this.promptLeadForDelegationKickoff(taskTeamId, route.team.name, routedTask, route.agent).catch((err) => {
+              console.warn(`[Supervision] Lead delegation kickoff failed for ${routedTask.name}: ${err?.message || err}`);
+            });
+          } else if (!(await this.hasActiveSupervisionAskForMarker(taskTeamId, route.agent, ref))) {
+            const sent = await this.sendSupervisionAsk(route.team.name, route.agent.name, this.taskDelegationPrompt(routedTask, ref));
+            if (!sent) this.managerLog(`Routed task ${routedTask.name} to ${route.agent.name}, but the delegation prompt could not be delivered`);
+          }
+          await this.markTaskControlReplyApplied({ teamId: queryRow.team_id, queryId: queryRow.query_id, agentId: actorAgentId, occurredAt, task: routedTask, action: 'route_assigned' });
+          this.managerLog(`Applied ROUTE control reply for task ${task.name} to ${route.team.name}/${route.agent.name} from query ${queryRow.query_id}`);
+          return { applied: true, action: 'route_assigned', task: task.name };
+        }
+      }
+    }
+
     await this.db.tasks.updateFields(task.id, {
       owner: null,
       status: 'todo',
       completed_at: null,
-      description: this.appendTaskTriageNote(task.description, `control_reply_${parsed.action}`, parsed.note, occurredAt),
+      description: this.appendTaskTriageNote(task.description, `control_reply_${parsed.action}`, fallbackNote, occurredAt),
       updated_at: nowSec,
     });
     await this.recordTaskSupervision(
       task,
-      queryRow.team_id,
+      taskTeamRow?.id || queryRow.team_id,
       actorAgentId,
       parsed.action === 'blocked' ? 'control_reply_blocked' : 'control_reply_reassign',
       stalledMinutes,
@@ -13895,7 +14036,7 @@ Return this JSON shape:
     task: TaskRow,
     teamId: string,
     actorAgentId: string | null,
-    reason: 'owner_refresh' | 'owner_unavailable' | 'owner_busy' | 'unclaimed' | 'checkin_heartbeat_probe' | 'probe_limit_reached' | 'validator_stalled_terminal' | 'lead_delegation_required' | 'lead_owner_unavailable' | 'control_reply_done' | 'control_reply_in_progress' | 'control_reply_delegated' | 'control_reply_claimed' | 'control_reply_blocked' | 'control_reply_reassign',
+    reason: 'owner_refresh' | 'owner_unavailable' | 'owner_busy' | 'unclaimed' | 'checkin_heartbeat_probe' | 'probe_limit_reached' | 'validator_stalled_terminal' | 'lead_delegation_required' | 'lead_owner_unavailable' | 'control_reply_done' | 'control_reply_in_progress' | 'control_reply_delegated' | 'control_reply_claimed' | 'control_reply_blocked' | 'control_reply_reassign' | 'control_reply_route_assigned',
     stalledMinutes: number,
     nowMs: number,
   ): Promise<void> {
@@ -13916,6 +14057,7 @@ Return this JSON shape:
       || reason === 'control_reply_in_progress'
       || reason === 'control_reply_delegated'
       || reason === 'control_reply_claimed'
+      || reason === 'control_reply_route_assigned'
     ) {
       await emitTaskRefreshed(this.db.events, input);
     } else {
