@@ -144,6 +144,25 @@ interface StalledProbeState {
   escalatedAt: number | null;
 }
 
+interface StalledOwnerTriageReportItem {
+  team: string;
+  owner: string;
+  ownerStatus: string | null;
+  message: string;
+  blockers: string[];
+  triage: Record<string, unknown> | null;
+}
+
+interface StalledOwnerTriageReport {
+  stallMinutes: number;
+  limit: number;
+  scannedTeams: number;
+  scannedOwners: number;
+  triagedOwners: number;
+  skippedOwners: Array<{ team: string; owner?: string; reason: string }>;
+  items: StalledOwnerTriageReportItem[];
+}
+
 function tokenizeCommand(command: string): string[] {
   const tokens: string[] = [];
   const re = /"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|(\S+)/g;
@@ -1285,7 +1304,7 @@ export class AgentManagerDb {
     owner: AgentRow;
     blocker: { task: TaskRow; ref: string; stalledMinutes: number };
     nowMs: number;
-  }): Promise<{ status: string; taskRef: string; actor?: string; attempt?: number }> {
+  }): Promise<{ status: string; taskRef: string; actor?: string; actorTeam?: string; attempt?: number }> {
     const maxProbes = this.getMaxStalledTaskProbes();
     const renudgeMs = this.getStallRenudgeMs();
     const { task, ref, stalledMinutes } = params.blocker;
@@ -1312,8 +1331,56 @@ export class AgentManagerDb {
       return { status: 'send_failed', taskRef: ref, actor: ownerName };
     }
 
-    const lead = await this.findSupervisionLead(params.teamId).catch(() => null);
-    if (!lead) return { status: 'no_lead', taskRef: ref };
+    const candidateLead = await this.findSupervisionLead(params.teamId).catch(() => null);
+    const lead = this.isConfiguredTeamLead(params.teamName, candidateLead) ? candidateLead : null;
+    if (!lead) {
+      const taskManagers = await this.findTaskManagerFallbacks().catch(() => []);
+      if (!taskManagers.length) return { status: 'no_lead', taskRef: ref };
+      let lastBlocked: { status: string; taskRef: string; actor?: string; actorTeam?: string } | null = null;
+      for (const taskManager of taskManagers) {
+        const key = `task:${task.id}:task-manager-fallback:${taskManager.agent.id}`;
+        if (!this.canRunStalledProbe(key, params.nowMs, renudgeMs, maxProbes)) {
+          lastBlocked = {
+            status: 'throttled',
+            taskRef: ref,
+            actor: taskManager.agent.name,
+            actorTeam: taskManager.team.name,
+          };
+          continue;
+        }
+        const pending = await this.loadPendingQueriesForRecipient(taskManager.agent).catch(() => [] as QueryRow[]);
+        if (this.hasAnyActiveQueryFromRows(pending)) {
+          lastBlocked = {
+            status: 'task_manager_busy',
+            taskRef: ref,
+            actor: taskManager.agent.name,
+            actorTeam: taskManager.team.name,
+          };
+          continue;
+        }
+        const prevProbe = this.stalledNudges.get(key);
+        const attempt = this.markStalledProbe(key, params.nowMs);
+        const msg = `Backlog guard: ${params.teamName} task ${ref} ("${task.title}") has been active ${stalledMinutes}m, owner ${ownerName} is not live, and there is no live team lead. New task assignment to that owner is held until this is triaged. Please route it through the task-manager flow: restart or replace the owner, reassign the task, or park it as todo with a clear blocker.`;
+        if (await this.sendSupervisionAsk(taskManager.team.name, taskManager.agent.name, msg)) {
+          await this.recordTaskSupervision(task, params.teamId, taskManager.agent.id, 'owner_unavailable', stalledMinutes, params.nowMs);
+          return {
+            status: 'sent_task_manager',
+            taskRef: ref,
+            actor: taskManager.agent.name,
+            actorTeam: taskManager.team.name,
+            attempt,
+          };
+        }
+        this.restoreStalledProbe(key, prevProbe);
+        lastBlocked = {
+          status: 'send_failed',
+          taskRef: ref,
+          actor: taskManager.agent.name,
+          actorTeam: taskManager.team.name,
+        };
+      }
+      return lastBlocked || { status: 'no_lead', taskRef: ref };
+    }
     const key = `task:${task.id}:owner-unavailable`;
     if (!this.canRunStalledProbe(key, params.nowMs, renudgeMs, maxProbes)) {
       return { status: 'throttled', taskRef: ref, actor: lead.name };
@@ -1365,6 +1432,75 @@ export class AgentManagerDb {
       blockers: blockers.map((item) => item.ref),
       triage,
     };
+  }
+
+  private async triageStalledOwnerBacklogs(params: {
+    teams: Array<{ id: string; name: string }>;
+    ownerRef?: string;
+    limit: number;
+  }): Promise<StalledOwnerTriageReport> {
+    const limit = Math.max(1, Math.min(50, Math.floor(params.limit)));
+    const report: StalledOwnerTriageReport = {
+      stallMinutes: Math.round(this.getStallSweepMs() / 60000),
+      limit,
+      scannedTeams: params.teams.length,
+      scannedOwners: 0,
+      triagedOwners: 0,
+      skippedOwners: [],
+      items: [],
+    };
+
+    for (const team of params.teams) {
+      if (report.items.length >= limit) break;
+
+      const owners = new Map<string, AgentRow | null>();
+      if (params.ownerRef) {
+        const { agent, error } = await this.resolveSingleAgentForCommand(team.id, params.ownerRef);
+        if (!agent) {
+          report.skippedOwners.push({
+            team: team.name,
+            owner: params.ownerRef,
+            reason: error || `Agent "${params.ownerRef}" not found`,
+          });
+          continue;
+        }
+        owners.set(agent.id, agent);
+      } else {
+        const doing = await this.db.tasks.list({ teamId: team.id, status: 'doing' }).catch(() => [] as TaskRow[]);
+        for (const task of doing) {
+          if (task.owner && !owners.has(task.owner)) owners.set(task.owner, null);
+        }
+      }
+
+      for (const [ownerId, knownOwner] of owners) {
+        if (report.items.length >= limit) break;
+        report.scannedOwners++;
+        const owner = knownOwner || await this.db.agents.getById(ownerId).catch(() => null);
+        if (!owner) {
+          report.skippedOwners.push({ team: team.name, owner: ownerId, reason: 'owner_missing' });
+          continue;
+        }
+
+        const guard = await this.stalledOwnerBacklogGuard({
+          teamId: team.id,
+          teamName: team.name,
+          owner,
+        });
+        if (!guard) continue;
+
+        report.items.push({
+          team: team.name,
+          owner: owner.name,
+          ownerStatus: owner.status ?? null,
+          message: guard.message,
+          blockers: guard.blockers,
+          triage: guard.triage,
+        });
+        report.triagedOwners++;
+      }
+    }
+
+    return report;
   }
 
   private async leadDelegationTaskSummary(
@@ -11972,6 +12108,52 @@ Return this JSON shape:
           return { ok: true, result: report };
         }
 
+        if (subCmd === 'triage-stalled' || subCmd === 'stalled-triage') {
+          // /task triage-stalled [--team <team>|--all] [--owner <agent>] [--limit N]
+          const rawArgs = args.slice(1);
+          let targetTeamName: string | undefined;
+          let allTeams = false;
+          let ownerRef: string | undefined;
+          let limit = 8;
+
+          for (let i = 0; i < rawArgs.length; i++) {
+            const token = rawArgs[i];
+            if (token === '--all') { allTeams = true; continue; }
+            if (token === '--team') { targetTeamName = rawArgs[++i]; continue; }
+            if (token === '--owner') { ownerRef = rawArgs[++i]; continue; }
+            if (token === '--limit') {
+              const parsed = Number(rawArgs[++i]);
+              if (!Number.isInteger(parsed) || parsed < 1 || parsed > 50) {
+                return { ok: false, error: '--limit must be an integer between 1 and 50' };
+              }
+              limit = parsed;
+              continue;
+            }
+          }
+
+          if (allTeams && targetTeamName) {
+            return { ok: false, error: 'Use either --all or --team <team>, not both' };
+          }
+
+          let teams: Array<{ id: string; name: string }>;
+          if (allTeams) {
+            teams = (await this.db.teams.listTeams()).map((team) => ({ id: team.id, name: team.name }));
+          } else if (targetTeamName) {
+            const targetTeam = await this.db.teams.getTeamByName(targetTeamName);
+            if (!targetTeam) return { ok: false, error: `Team "${targetTeamName}" not found` };
+            teams = [{ id: targetTeam.id, name: targetTeam.name }];
+          } else {
+            teams = [{ id: teamId, name: teamName }];
+          }
+
+          const report = await this.triageStalledOwnerBacklogs({
+            teams,
+            ownerRef,
+            limit,
+          });
+          return { ok: true, result: report };
+        }
+
         if (subCmd === 'prune-backlog' || subCmd === 'prune-stale-backlog') {
           // /task prune-backlog [--team <team>|--all] [--min-age-hours N] [--match generated|all] [--limit N] [--apply]
           const rawArgs = args.slice(1);
@@ -12407,7 +12589,7 @@ Return this JSON shape:
 
         return {
           ok: false,
-          error: 'Usage: /task <create|list|assign|claim|done|remove|delete> ...',
+          error: 'Usage: /task <create|list|lead-backlog|triage-stalled|prune-backlog|assign|claim|done|remove|delete> ...',
         };
       }
 
@@ -12571,6 +12753,41 @@ Return this JSON shape:
       live[0] ||
       null
     );
+  }
+
+  private async findTaskManagerFallbacks(): Promise<Array<{ team: TeamRow; agent: AgentRow }>> {
+    const preferredNames = ['task-master', 'ops-lead'];
+    const getTeamByName = this.db.teams.getTeamByName?.bind(this.db.teams);
+    const opsTeam = getTeamByName ? await getTeamByName('ops-team').catch(() => null) : null;
+    const seen = new Set<string>();
+    const out: Array<{ team: TeamRow; agent: AgentRow }> = [];
+    const add = (team: TeamRow, agent: AgentRow | null | undefined) => {
+      if (!this.isLiveForSupervision(agent)) return;
+      const key = `${team.id}:${agent.id}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push({ team, agent });
+    };
+
+    if (opsTeam) {
+      for (const name of preferredNames) {
+        const agent = await this.db.agents.getByName(opsTeam.id, name).catch(() => null);
+        add(opsTeam, agent);
+      }
+    }
+
+    const teams = await this.db.teams.listTeams().catch(() => [] as TeamRow[]);
+    for (const team of teams) {
+      const agents = await this.db.agents.list(team.id).catch(() => [] as AgentRow[]);
+      for (const agent of agents) {
+        const name = agent.name.toLowerCase();
+        if (/^(task[-_\s]?master|task[-_\s]?manager|ops[-_\s]?lead)$/.test(name)) {
+          add(team, agent);
+        }
+      }
+    }
+
+    return out;
   }
 
   private async sendSupervisionAsk(teamName: string, agentName: string, message: string): Promise<boolean> {

@@ -210,6 +210,47 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('exposes an operator command to triage stalled owner backlogs without adding work', async () => {
+    const create = vi.fn(async () => {});
+    const db = fakeDb({
+      teams: {
+        listTeams: vi.fn(async () => [team()]),
+      },
+      tasks: {
+        create,
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-owner-command-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const result = await manager.executeRemoteCommand('/task triage-stalled --all --limit 5', TEAM_ID, 'default');
+
+    expect(result).toMatchObject({
+      ok: true,
+      result: {
+        stallMinutes: 45,
+        scannedTeams: 1,
+        scannedOwners: 1,
+        triagedOwners: 1,
+        items: [
+          {
+            team: 'default',
+            owner: 'worker',
+            blockers: ['#12345678'],
+            triage: { status: 'sent_owner', taskRef: '#12345678', actor: 'worker' },
+          },
+        ],
+      },
+    });
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'worker',
+      expect.stringContaining('New task assignment to you is held'),
+    );
+    expect(create).not.toHaveBeenCalled();
+    expect(db.tasks.claim).not.toHaveBeenCalled();
+  });
+
   it('starts the stalled-task probe reads in parallel before sending a nudge', async () => {
     let releaseEvent!: () => void;
     let releasePending!: () => void;
@@ -913,6 +954,130 @@ describe('stalled task sweeper', () => {
         stalled_minutes: 60,
       }),
     }));
+  });
+
+  it('routes stalled-owner triage to task-master when the team lead is offline', async () => {
+    const unavailableOwner = agent({ status: 'stopped' });
+    const liveNonLead = agent({ id: 'risk-id', name: 'risk-analyst', port: 4211, status: 'running' });
+    const opsTeam = team({ id: 'ops-team-id', name: 'ops-team' });
+    const taskMaster = agent({
+      id: 'task-master-id',
+      team_id: opsTeam.id,
+      name: 'task-master',
+      status: 'running',
+    });
+    const db = fakeDb({
+      teams: {
+        getTeamByName: vi.fn(async (name: string) => name === 'ops-team' ? opsTeam : null),
+      },
+      agents: {
+        getById: vi.fn(async (id: string) => id === unavailableOwner.id ? unavailableOwner : null),
+        getByName: vi.fn(async (teamId: string, name: string) =>
+          teamId === opsTeam.id && name === 'task-master' ? taskMaster : null,
+        ),
+        list: vi.fn(async (teamId: string) => teamId === opsTeam.id ? [taskMaster] : [unavailableOwner, liveNonLead]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-task-master-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const guard = await manager.stalledOwnerBacklogGuard({
+      teamId: TEAM_ID,
+      teamName: 'default',
+      owner: unavailableOwner,
+    });
+
+    expect(guard?.triage).toMatchObject({
+      status: 'sent_task_manager',
+      taskRef: '#12345678',
+      actor: 'task-master',
+      actorTeam: 'ops-team',
+    });
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'ops-team',
+      'task-master',
+      expect.stringContaining('there is no live team lead'),
+    );
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      team_id: TEAM_ID,
+      topic: 'task:triaged',
+      actor_agent_id: 'task-master-id',
+      data: expect.objectContaining({
+        reason: 'owner_unavailable',
+        stalled_minutes: 60,
+      }),
+    }));
+  });
+
+  it('falls through to ops-lead when task-master is busy', async () => {
+    const unavailableOwner = agent({ status: 'stopped' });
+    const opsTeam = team({ id: 'ops-team-id', name: 'ops-team' });
+    const taskMaster = agent({
+      id: 'task-master-id',
+      team_id: opsTeam.id,
+      name: 'task-master',
+      status: 'running',
+    });
+    const opsLead = agent({
+      id: 'ops-lead-id',
+      team_id: opsTeam.id,
+      name: 'ops-lead',
+      status: 'running',
+    });
+    const db = fakeDb({
+      teams: {
+        getTeamByName: vi.fn(async (name: string) => name === 'ops-team' ? opsTeam : null),
+      },
+      agents: {
+        getById: vi.fn(async (id: string) => id === unavailableOwner.id ? unavailableOwner : null),
+        getByName: vi.fn(async (teamId: string, name: string) => {
+          if (teamId !== opsTeam.id) return null;
+          if (name === 'task-master') return taskMaster;
+          if (name === 'ops-lead') return opsLead;
+          return null;
+        }),
+        list: vi.fn(async (teamId: string) => teamId === opsTeam.id ? [taskMaster, opsLead] : [unavailableOwner]),
+      },
+      queries: {
+        getPending: vi.fn(async (ownerId: string) => ownerId === taskMaster.id ? [{
+          team_id: opsTeam.id,
+          agent_id: taskMaster.id,
+          query_id: 'busy-task-master',
+          prompt: 'existing supervision work',
+          status: 'processing',
+          created: NOW_MS - 1000,
+          updated: NOW_MS - 1000,
+          completed: null,
+          result: null,
+          error: null,
+          session_id: null,
+          owner_kind: 'agent',
+          owner_id: taskMaster.id,
+          metadata: null,
+        }] : []),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-task-master-fallback-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const guard = await manager.stalledOwnerBacklogGuard({
+      teamId: TEAM_ID,
+      teamName: 'default',
+      owner: unavailableOwner,
+    });
+
+    expect(guard?.triage).toMatchObject({
+      status: 'sent_task_manager',
+      taskRef: '#12345678',
+      actor: 'ops-lead',
+      actorTeam: 'ops-team',
+    });
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledTimes(1);
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'ops-team',
+      'ops-lead',
+      expect.stringContaining('there is no live team lead'),
+    );
   });
 
   it('does not stack unavailable-owner triage probes while a prior task supervision ask is active', async () => {
