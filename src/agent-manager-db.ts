@@ -1298,6 +1298,10 @@ export class AgentManagerDb {
     return `stalled_task_backlog: ${teamName}/${owner.name} already has ${blockers.length} stalled active task${blockers.length === 1 ? '' : 's'} (${refs}). New work for this owner is held until the stalled task is updated, completed, or reassigned.`;
   }
 
+  private stalledOwnerBacklogPrompt(task: TaskRow, ref: string, stalledMinutes: number): string {
+    return `Backlog guard: task ${ref} ("${task.title}") has been active ${stalledMinutes}m with no progress update. New task assignment to you is held until this task is updated, completed, or reassigned. If it is done, mark it done now with \`/task done ${ref}\`. If blocked, reply with the blocker.`;
+  }
+
   private async triageStalledOwnerBacklog(params: {
     teamId: string;
     teamName: string;
@@ -1323,7 +1327,7 @@ export class AgentManagerDb {
       }
       const prevProbe = this.stalledNudges.get(key);
       const attempt = this.markStalledProbe(key, params.nowMs);
-      const msg = `Backlog guard: task ${ref} ("${task.title}") has been active ${stalledMinutes}m with no progress update. New task assignment to you is held until this task is updated, completed, or reassigned. If it is done, mark it done now with \`/task done ${ref}\`. If blocked, reply with the blocker.`;
+      const msg = this.stalledOwnerBacklogPrompt(task, ref, stalledMinutes);
       if (await this.sendSupervisionAsk(params.teamName, ownerName, msg)) {
         await this.recordTaskSupervision(task, params.teamId, params.owner.id, 'owner_refresh', stalledMinutes, params.nowMs);
         return { status: 'sent_owner', taskRef: ref, actor: ownerName, attempt };
@@ -1335,8 +1339,12 @@ export class AgentManagerDb {
     if (this.canWakeAssignedTaskOwner(params.owner)) {
       const wake = await this.wakeAssignedTaskOwner(params.teamId, params.teamName, task, params.owner, 'stalled-owner');
       if (wake.status === 'started') {
-        await this.recordTaskSupervision(task, params.teamId, ownerId, 'owner_refresh', stalledMinutes, params.nowMs);
-        return { status: 'owner_wake_started', taskRef: ref, actor: ownerName };
+        const msg = this.stalledOwnerBacklogPrompt(task, ref, stalledMinutes);
+        if (await this.sendSupervisionAsk(params.teamName, ownerName, msg)) {
+          await this.recordTaskSupervision(task, params.teamId, ownerId, 'owner_refresh', stalledMinutes, params.nowMs);
+          return { status: 'owner_wake_prompt_sent', taskRef: ref, actor: ownerName };
+        }
+        return { status: 'owner_wake_prompt_failed', taskRef: ref, actor: ownerName };
       }
     }
 
@@ -12145,8 +12153,9 @@ Return this JSON shape:
           return { ok: true, result: report };
         }
 
-        if (subCmd === 'triage-stalled' || subCmd === 'stalled-triage') {
+        if (subCmd === 'triage-stalled' || subCmd === 'stalled-triage' || subCmd === 'jumpstart-stalled' || subCmd === 'jumpstart') {
           // /task triage-stalled [--team <team>|--all] [--owner <agent>] [--limit N]
+          // /task jumpstart-stalled is an alias for operators/UI callers.
           const rawArgs = args.slice(1);
           let targetTeamName: string | undefined;
           let allTeams = false;
@@ -12626,7 +12635,7 @@ Return this JSON shape:
 
         return {
           ok: false,
-          error: 'Usage: /task <create|list|lead-backlog|triage-stalled|prune-backlog|assign|claim|done|remove|delete> ...',
+          error: 'Usage: /task <create|list|lead-backlog|triage-stalled|jumpstart-stalled|prune-backlog|assign|claim|done|remove|delete> ...',
         };
       }
 
@@ -13411,8 +13420,11 @@ Return this JSON shape:
           this.markStalledProbe(wakeKey, now);
           const wake = await this.wakeAssignedTaskOwner(teamRow.id, teamName, t, ownerAgent, 'stalled-owner');
           if (wake.status === 'started') {
-            await this.recordTaskSupervision(t, teamRow.id, ownerAgent.id, 'owner_refresh', mins, now);
-            nudged++;
+            const msg = `Supervision: task ${ref} ("${t.title}") was stalled for ${mins}m while you were offline. You have been restarted for this task. If the work is done, mark it done now with \`/task done ${ref}\`. If blocked, reply briefly with what's blocking it. If it isn't started, start and finish it.`;
+            if (await this.sendSupervisionAsk(teamName, ownerName, msg)) {
+              await this.recordTaskSupervision(t, teamRow.id, ownerAgent.id, 'owner_refresh', mins, now);
+              nudged++;
+            }
             continue;
           }
           this.restoreStalledProbe(wakeKey, prevProbe);

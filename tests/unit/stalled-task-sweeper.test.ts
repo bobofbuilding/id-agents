@@ -1058,7 +1058,7 @@ describe('stalled task sweeper', () => {
     }));
   });
 
-  it('wakes a stopped local owner from the explicit stalled backlog guard', async () => {
+  it('wakes a stopped local owner and sends the stalled task prompt', async () => {
     const stoppedOwner = agent({
       status: 'stopped',
       port: 4210,
@@ -1082,7 +1082,7 @@ describe('stalled task sweeper', () => {
     });
 
     expect(guard?.triage).toMatchObject({
-      status: 'owner_wake_started',
+      status: 'owner_wake_prompt_sent',
       taskRef: '#12345678',
       actor: 'worker',
     });
@@ -1092,7 +1092,37 @@ describe('stalled task sweeper', () => {
       port: stoppedOwner.port,
     }));
     expect(db.agents.updateStatus).toHaveBeenCalledWith(stoppedOwner.id, 'running');
-    expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'worker',
+      expect.stringContaining('New task assignment to you is held'),
+    );
+  });
+
+  it('aliases jumpstart-stalled to stalled owner triage', async () => {
+    const db = fakeDb({
+      teams: {
+        listTeams: vi.fn(async () => [team()]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-owner-jumpstart-command-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const result = await manager.executeRemoteCommand('/task jumpstart-stalled --all --limit 5', TEAM_ID, 'default');
+
+    expect(result).toMatchObject({
+      ok: true,
+      result: {
+        triagedOwners: 1,
+        items: [
+          {
+            team: 'default',
+            owner: 'worker',
+            triage: { status: 'sent_owner', taskRef: '#12345678', actor: 'worker' },
+          },
+        ],
+      },
+    });
   });
 
   it('falls through to ops-lead when task-master is busy', async () => {
@@ -1665,7 +1695,7 @@ describe('stalled task sweeper', () => {
     );
   });
 
-  it('wakes a stopped local owner before routing stalled work back to a lead', async () => {
+  it('wakes a stopped local owner and sends stalled work back to that owner', async () => {
     const stoppedOwner = agent({
       id: 'worker-1',
       name: 'worker',
@@ -1700,7 +1730,11 @@ describe('stalled task sweeper', () => {
       port: 4210,
     }));
     expect(db.agents.updateStatus).toHaveBeenCalledWith('worker-1', 'running');
-    expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'worker',
+      expect.stringContaining('You have been restarted for this task'),
+    );
     expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
       topic: 'agent:started',
       actor_agent_id: 'worker-1',
