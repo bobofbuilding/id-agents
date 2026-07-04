@@ -17,6 +17,7 @@
 import { spawn, ChildProcess } from 'child_process';
 import { AgentHarness, HarnessOptions, HarnessMessage, HarnessType, McpServerSpec } from './types.js';
 import { reportTurnUsage } from './usage-report.js';
+import { terminateChildProcessTree } from './claude-code-cli.js';
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -268,6 +269,7 @@ export class CodexHarness implements AgentHarness {
       cwd: workingDir,
       env: mergedEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32',
     });
 
     this.currentProcess = proc;
@@ -608,7 +610,7 @@ export class CodexHarness implements AgentHarness {
       }
 
       if (this.cancelled) {
-        proc.kill('SIGTERM');
+        terminateChildProcessTree(proc, 'SIGTERM');
         yield { type: 'error', content: 'Cancelled' };
         break;
       }
@@ -637,9 +639,15 @@ export class CodexHarness implements AgentHarness {
   }
 
   cancel(): boolean {
-    if (this.currentProcess) {
+    if (this.currentProcess && !this.currentProcess.killed) {
       this.cancelled = true;
-      this.currentProcess.kill('SIGTERM');
+      const proc = this.currentProcess;
+      terminateChildProcessTree(proc, 'SIGTERM');
+      setTimeout(() => {
+        if (proc.exitCode === null && proc.signalCode === null) {
+          terminateChildProcessTree(proc, 'SIGKILL');
+        }
+      }, 2000).unref?.();
       this.currentProcess = null;
       return true;
     }

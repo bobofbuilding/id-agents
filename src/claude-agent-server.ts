@@ -2338,6 +2338,15 @@ ${inbound.content}`;
       // ignore
     }
 
+    // Stop any in-flight runtime before closing the HTTP listener. Manager
+    // parking/restarts SIGTERM the local-agent-server; without this, CLI
+    // harness children can be reparented to launchd and keep burning tokens.
+    try {
+      this.harness.cancel?.();
+    } catch (err: any) {
+      console.warn(`${logTime()} [Agent] Failed to cancel active harness during stop: ${err?.message || err}`);
+    }
+
     // close HTTP server
     if (!this.httpServer) return;
     await new Promise<void>((resolve, reject) => {

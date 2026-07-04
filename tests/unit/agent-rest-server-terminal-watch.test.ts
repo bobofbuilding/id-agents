@@ -114,3 +114,18 @@ describe('AgentRestServer external query terminal watcher', () => {
     }
   });
 });
+
+describe('AgentRestServer stop cleanup', () => {
+  it('cancels the active harness during shutdown', async () => {
+    const harness = new CancellableHarness();
+    const server = new AgentRestServer({
+      agentName: 'worker',
+      harness,
+    });
+
+    await server.stop();
+
+    expect(harness.cancelCalls).toBe(1);
+    expect(harness.cancelled).toBe(true);
+  });
+});
