@@ -428,6 +428,43 @@ describe('SchedulerService.tick', () => {
     expect(schedules.updateRunStatus).not.toHaveBeenCalled();
     expect(fetchSpy).not.toHaveBeenCalled();
   });
+
+  it('bounds automatic per-schedule dispatch concurrency', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1_700_000_301_000);
+    let activeFetches = 0;
+    let maxActiveFetches = 0;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      activeFetches += 1;
+      maxActiveFetches = Math.max(maxActiveFetches, activeFetches);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      activeFetches -= 1;
+      return new Response(null, { status: 200 });
+    });
+    const def = makeHeartbeatDef({
+      anchor_at: 1_700_000_000,
+      interval_seconds: 300,
+      max_runs: null,
+    });
+    const agentIds = ['agent_1', 'agent_2', 'agent_3', 'agent_4', 'agent_5'];
+    const schedules = {
+      listActiveDefinitions: vi.fn(async () => [def]),
+      listTargets: vi.fn(async () => agentIds),
+      countRuns: vi.fn(async () => 0),
+      insertRun: vi.fn(async () => true),
+      updateRunStatus: vi.fn(async () => undefined),
+    };
+    const dbStub = { schedules } as unknown as Db;
+    const service = new SchedulerService(
+      dbStub,
+      async (agentId) => makeTarget({ id: agentId, name: agentId, endpoint: `http://localhost/${agentId}` }),
+      { dispatchConcurrency: 2 },
+    );
+
+    await service.tick();
+
+    expect(fetchSpy).toHaveBeenCalledTimes(agentIds.length);
+    expect(maxActiveFetches).toBeLessThanOrEqual(2);
+  });
 });
 
 /* ------------------------------------------------------------------ */

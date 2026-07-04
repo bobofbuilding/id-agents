@@ -18,6 +18,34 @@ export interface SchedulerServiceOptions {
     def: ScheduleDefinitionRow,
     run: DueRun,
   ) => Promise<boolean> | boolean;
+  /**
+   * Upper bound for per-schedule target dispatches. Keep this small: schedule
+   * fires can wake heavyweight agent harnesses, so unbounded fanout causes
+   * local CPU/RAM spikes.
+   */
+  dispatchConcurrency?: number;
+}
+
+const DEFAULT_DISPATCH_CONCURRENCY = 2;
+
+function normalizeDispatchConcurrency(value: number | undefined): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_DISPATCH_CONCURRENCY;
+  return Math.max(1, Math.min(8, Math.floor(value)));
+}
+
+async function runBounded<T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T) => Promise<void>,
+): Promise<void> {
+  let next = 0;
+  const workerCount = Math.min(concurrency, items.length);
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (next < items.length) {
+      const item = items[next++];
+      await worker(item);
+    }
+  }));
 }
 
 export class SchedulerService {
@@ -25,6 +53,7 @@ export class SchedulerService {
   private timer: NodeJS.Timeout | null = null;
   private readonly dispatcher: ScheduleDispatcher;
   private readonly shouldDispatch: SchedulerServiceOptions['shouldDispatch'] | null;
+  private readonly dispatchConcurrency: number;
 
   constructor(
     private readonly db: Db,
@@ -33,6 +62,7 @@ export class SchedulerService {
   ) {
     this.dispatcher = new ScheduleDispatcher();
     this.shouldDispatch = opts.shouldDispatch ?? null;
+    this.dispatchConcurrency = normalizeDispatchConcurrency(opts.dispatchConcurrency);
   }
 
   start(): void {
@@ -100,7 +130,7 @@ export class SchedulerService {
           }
         }
 
-        await Promise.all(agentIds.map(async (agentId) => {
+        await runBounded(agentIds, this.dispatchConcurrency, async (agentId) => {
           const target = await this.resolveAgent(agentId);
           if (!target || target.status !== 'running') return;
 
@@ -143,7 +173,7 @@ export class SchedulerService {
             await this.db.schedules.updateRunStatus(run.scheduleId, agentId, run.scheduledKey, 'failed', result.error ?? null);
             console.log(`[Scheduler] ${def.title} -> ${target.name} FAILED: ${result.error}`);
           }
-        }));
+        });
       }
     } catch (err: any) {
       console.log(`[Scheduler] Tick error: ${err.message}`);
