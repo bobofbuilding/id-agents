@@ -13187,11 +13187,7 @@ Return this JSON shape:
   }
 
   private async expireDuplicateActiveTaskAsks(nowMs: number): Promise<QueryRow[]> {
-    const rows = await this.db.adapter.query<QueryRow>(
-      `SELECT team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id, metadata
-       FROM queries
-       WHERE status IN ('pending', 'processing')
-         AND (
+    const duplicatePromptWhere = `(
            LOWER(prompt) LIKE 'supervision:%'
            OR LOWER(prompt) LIKE 'supervision routing:%'
            OR LOWER(prompt) LIKE 'supervision probe from manager:%'
@@ -13207,9 +13203,32 @@ Return this JSON shape:
            OR LOWER(prompt) LIKE 'ack on the sweep%'
            OR LOWER(prompt) LIKE 're your assignment sweep%'
            OR LOWER(prompt) LIKE 'task assignment sweep:%'
-         )
+         )`;
+    const rows = await this.db.adapter.query<QueryRow>(
+      `SELECT team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id, metadata
+       FROM queries
+       WHERE status IN ('pending', 'processing')
+         AND ${duplicatePromptWhere}
        ORDER BY team_id ASC, owner_kind ASC, owner_id ASC, created ASC, query_id ASC`,
     ).then((r) => r.rows).catch(() => [] as QueryRow[]);
+    const dialect = this.db.adapter.dialect;
+    const terminalCutoffMs = nowMs - 60 * 60 * 1000;
+    const terminalCutoffParam = dialect === 'postgres' ? '$1' : '?';
+    const recentCompletedRows = await this.db.adapter.query<QueryRow>(
+      `SELECT team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id, metadata
+       FROM queries
+       WHERE status = 'completed'
+         AND completed >= ${terminalCutoffParam}
+         AND ${duplicatePromptWhere}
+       ORDER BY completed DESC, query_id ASC`,
+      [terminalCutoffMs],
+    ).then((r) => r.rows).catch(() => [] as QueryRow[]);
+    const completedKeys = new Set<string>();
+    for (const row of recentCompletedRows) {
+      const dedupKey = this.activeAskDedupKey(row.prompt);
+      if (!dedupKey) continue;
+      completedKeys.add(`${row.team_id}\u0001${row.owner_kind}\u0001${row.owner_id}\u0001${dedupKey}`);
+    }
     const grouped = new Map<string, QueryRow[]>();
     for (const row of rows) {
       const dedupKey = this.activeAskDedupKey(row.prompt);
@@ -13221,6 +13240,16 @@ Return this JSON shape:
     }
 
     const duplicateIds: string[] = [];
+    const duplicateIdSet = new Set<string>();
+    for (const [key, list] of grouped.entries()) {
+      if (!completedKeys.has(key)) continue;
+      for (const row of list) {
+        if (!duplicateIdSet.has(row.query_id)) {
+          duplicateIdSet.add(row.query_id);
+          duplicateIds.push(row.query_id);
+        }
+      }
+    }
     for (const list of grouped.values()) {
       if (list.length <= 1) continue;
       const sorted = [...list].sort((a, b) => {
@@ -13228,11 +13257,15 @@ Return this JSON shape:
         const bRank = b.status === 'processing' ? 0 : 1;
         return (aRank - bRank) || (a.created - b.created) || a.query_id.localeCompare(b.query_id);
       });
-      for (const row of sorted.slice(1)) duplicateIds.push(row.query_id);
+      for (const row of sorted.slice(1)) {
+        if (!duplicateIdSet.has(row.query_id)) {
+          duplicateIdSet.add(row.query_id);
+          duplicateIds.push(row.query_id);
+        }
+      }
     }
     if (!duplicateIds.length) return [];
 
-    const dialect = this.db.adapter.dialect;
     const completedParam = dialect === 'postgres' ? '$1' : '?';
     const placeholders = duplicateIds
       .map((_, i) => dialect === 'postgres' ? `$${i + 2}` : '?')

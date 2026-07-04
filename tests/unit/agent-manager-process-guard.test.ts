@@ -1208,6 +1208,49 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     expect((await db.queries.getByQueryIdForTeam(teamId, 'pending-sweep-reworded'))?.status).toBe('expired');
   });
 
+  it('expires active control prompts that duplicate a recent completed equivalent', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('ops-team');
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-task-master',
+        name: 'task-master',
+        port: 4118,
+        status: 'running',
+        endpoint: 'http://127.0.0.1:9',
+      }),
+    });
+
+    const now = Date.now();
+    await db.queries.upsert(teamId, 'agent-task-master', {
+      query_id: 'completed-sweep-ack',
+      status: 'completed',
+      prompt: 'Ack on the sweep. One flag: map-provenance-integrations -> onchain-systems-architect landed on an offline agent.',
+      created: now - 20 * 60 * 1000,
+      completed: now - 5 * 60 * 1000,
+      owner_kind: 'agent',
+      owner_id: 'agent-task-master',
+    });
+    await db.queries.upsert(teamId, 'agent-task-master', {
+      query_id: 'processing-sweep-reworded',
+      status: 'processing',
+      prompt: 'Re your assignment sweep: map-provenance-integrations -> onchain-systems-architect landed on an agent that is currently stopped/offline.',
+      created: now - 10 * 60 * 1000,
+      owner_kind: 'agent',
+      owner_id: 'agent-task-master',
+    });
+
+    const result = await (manager as any).sweepStaleQueries();
+
+    expect(result.duplicateTaskAsk).toBe(1);
+    expect((await db.queries.getByQueryIdForTeam(teamId, 'completed-sweep-ack'))?.status).toBe('completed');
+    expect((await db.queries.getByQueryIdForTeam(teamId, 'processing-sweep-reworded'))?.status).toBe('expired');
+  });
+
   it('dedupes active task delegation /ask prompts before dispatching', async () => {
     const { manager, db, workDir } = await makeManager();
     dbs.push(db);
