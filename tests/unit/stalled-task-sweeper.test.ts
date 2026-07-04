@@ -1292,6 +1292,79 @@ describe('stalled task sweeper', () => {
     );
   });
 
+  it('routes stalled wake prompt failures to task-master fallback', async () => {
+    const stoppedOwner = agent({
+      status: 'stopped',
+      port: 4210,
+      type: 'claude',
+      runtime: 'claude-code-cli',
+    });
+    const opsTeam = team({ id: 'ops-team-id', name: 'ops-team' });
+    const taskMaster = agent({
+      id: 'task-master-id',
+      team_id: opsTeam.id,
+      name: 'task-master',
+      status: 'running',
+    });
+    const db = fakeDb({
+      teams: {
+        getConfig: vi.fn(async () => ({})),
+        getTeamByName: vi.fn(async (name: string) => name === 'ops-team' ? opsTeam : null),
+        listTeams: vi.fn(async () => []),
+      },
+      agents: {
+        getById: vi.fn(async (id: string) => id === stoppedOwner.id ? stoppedOwner : null),
+        getByName: vi.fn(async (teamId: string, name: string) => {
+          if (teamId === opsTeam.id && name === 'task-master') return taskMaster;
+          return null;
+        }),
+        list: vi.fn(async (teamId: string) => teamId === opsTeam.id ? [taskMaster] : [stoppedOwner]),
+        resolve: vi.fn(async () => []),
+        updateStatus: vi.fn(async () => {}),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-owner-wake-fallback-test', db, { libraryRoot: null }) as any;
+    manager.spawnLocalAgentProcess = vi.fn(async () => ({ success: true, pid: 1234, logFile: '/tmp/worker.log' }));
+    manager.sendSupervisionAsk = vi.fn(async (teamName: string, agentName: string) => {
+      return teamName === 'ops-team' && agentName === 'task-master';
+    });
+
+    const guard = await manager.stalledOwnerBacklogGuard({
+      teamId: TEAM_ID,
+      teamName: 'default',
+      owner: stoppedOwner,
+    });
+
+    expect(guard?.triage).toMatchObject({
+      status: 'sent_task_manager',
+      taskRef: '#12345678',
+      actor: 'task-master',
+      actorTeam: 'ops-team',
+    });
+    expect(manager.spawnLocalAgentProcess).toHaveBeenCalled();
+    expect(manager.sendSupervisionAsk).toHaveBeenNthCalledWith(
+      1,
+      'default',
+      'worker',
+      expect.stringContaining('New task assignment to you is held'),
+    );
+    expect(manager.sendSupervisionAsk).toHaveBeenNthCalledWith(
+      2,
+      'ops-team',
+      'task-master',
+      expect.stringContaining('there is no live team lead'),
+    );
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      team_id: TEAM_ID,
+      topic: 'task:triaged',
+      actor_agent_id: taskMaster.id,
+      data: expect.objectContaining({
+        reason: 'owner_unavailable',
+        stalled_minutes: 60,
+      }),
+    }));
+  });
+
   it('aliases jumpstart-stalled to stalled owner triage', async () => {
     const db = fakeDb({
       teams: {

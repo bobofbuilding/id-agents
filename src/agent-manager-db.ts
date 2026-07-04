@@ -1496,6 +1496,7 @@ export class AgentManagerDb {
     const { task, ref, stalledMinutes } = params.blocker;
     const ownerName = params.owner.name;
     const ownerId = params.owner.id;
+    let ownerWakePromptFailed = false;
 
     if (this.isLiveForSupervision(params.owner)) {
       const key = `task:${task.id}:owner-refresh`;
@@ -1543,7 +1544,7 @@ export class AgentManagerDb {
           await this.recordTaskSupervision(task, params.teamId, ownerId, 'owner_refresh', stalledMinutes, params.nowMs);
           return { status: 'owner_wake_prompt_sent', taskRef: ref, actor: ownerName };
         }
-        return { status: 'owner_wake_prompt_failed', taskRef: ref, actor: ownerName };
+        ownerWakePromptFailed = true;
       }
     }
 
@@ -1564,7 +1565,11 @@ export class AgentManagerDb {
         reason: 'no_live_lead',
         eventReason: 'owner_unavailable',
       });
-      return fallback || { status: 'no_lead', taskRef: ref };
+      return fallback || {
+        status: ownerWakePromptFailed ? 'owner_wake_prompt_failed' : 'no_lead',
+        taskRef: ref,
+        actor: ownerName,
+      };
     }
     const key = `task:${task.id}:owner-unavailable`;
     if (!this.canRunStalledProbeForTriage(key, params.nowMs, renudgeMs, maxProbes, params.force)) {
@@ -13869,10 +13874,12 @@ Return this JSON shape:
               await this.recordTaskSupervision(t, teamRow.id, ownerAgent.id, 'owner_refresh', mins, now);
               markSupervisionSentTo(ownerAgent);
               nudged++;
+              continue;
             }
-            continue;
+            this.restoreStalledProbe(wakeKey, prevProbe);
+          } else {
+            this.restoreStalledProbe(wakeKey, prevProbe);
           }
-          this.restoreStalledProbe(wakeKey, prevProbe);
         }
       }
       if (this.isLiveForSupervision(ownerAgent)) {
@@ -13923,12 +13930,49 @@ Return this JSON shape:
         continue;
       }
 
-      if (!lead) continue;
+      if (!lead) {
+        const fallback = await this.routeStalledTaskToTaskManagerFallback({
+          teamId: teamRow.id,
+          teamName,
+          task: t,
+          ref,
+          stalledMinutes: mins,
+          ownerName,
+          nowMs: now,
+          renudgeMs: RENUDGE_MS,
+          maxProbes: MAX_PROBES,
+          reason: 'no_live_lead',
+          eventReason: 'owner_unavailable',
+        });
+        if (fallback?.status === 'sent_task_manager') {
+          nudged++;
+        }
+        continue;
+      }
       const nudgeKey = `task:${t.id}:owner-unavailable`;
       if (!this.canRunStalledProbe(nudgeKey, now, RENUDGE_MS, MAX_PROBES)) continue;
       const leadPendingQueries = await getPendingQueriesFor(lead);
       const leadProbeState = this.supervisionQueryStateFromRows(teamRow.id, leadPendingQueries, ref);
-      if (leadProbeState.hasActiveSupervisionAsk || leadProbeState.hasAnyActiveQuery) continue;
+      if (leadProbeState.hasActiveSupervisionAsk || leadProbeState.hasAnyActiveQuery) {
+        const fallback = await this.routeStalledTaskToTaskManagerFallback({
+          teamId: teamRow.id,
+          teamName,
+          task: t,
+          ref,
+          stalledMinutes: mins,
+          ownerName,
+          nowMs: now,
+          renudgeMs: RENUDGE_MS,
+          maxProbes: MAX_PROBES,
+          reason: 'lead_busy',
+          eventReason: 'owner_unavailable',
+          leadName: lead.name,
+        });
+        if (fallback?.status === 'sent_task_manager') {
+          nudged++;
+        }
+        continue;
+      }
       const prevProbe = this.stalledNudges.get(nudgeKey);
       const attempt = this.markStalledProbe(nudgeKey, now);
       const msg = `Supervision: task ${ref} ("${t.title}") has been in progress ${mins}m, but ${unavailable} (triage probe ${attempt}/${MAX_PROBES}). Please triage it: claim it, reassign it, or route it to the right teammate.`;
