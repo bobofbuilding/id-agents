@@ -926,16 +926,34 @@ describe('AgentManagerDb killAgentProcess guards', () => {
       owner_kind: 'agent',
       owner_id: 'agent-supervised',
     });
+    await db.queries.upsert(teamId, 'agent-supervised', {
+      query_id: 'older-supervision-routing',
+      status: 'pending',
+      prompt: 'SUPERVISION ROUTING: Task #f0b7515a (pull-heartbeat-evidence-075b8199) in ops-team has been unclaimed for 72m. Please claim and execute.',
+      created: now + 5000,
+      owner_kind: 'agent',
+      owner_id: 'agent-supervised',
+    });
+    await db.queries.upsert(teamId, 'agent-supervised', {
+      query_id: 'newer-supervision-routing',
+      status: 'pending',
+      prompt: 'SUPERVISION ROUTING: Task #f0b7515a (pull-heartbeat-evidence-075b8199) in ops-team has been unclaimed 72m. Please claim and execute.',
+      created: now + 6000,
+      owner_kind: 'agent',
+      owner_id: 'agent-supervised',
+    });
 
     const result = await (manager as any).sweepStaleQueries();
 
-    expect(result.duplicateTaskAsk).toBe(2);
-    expect(result.total).toBe(2);
+    expect(result.duplicateTaskAsk).toBe(3);
+    expect(result.total).toBe(3);
     expect((await db.queries.getByQueryIdForTeam(teamId, 'older-pending-supervision'))?.status).toBe('expired');
     expect((await db.queries.getByQueryIdForTeam(teamId, 'active-processing-supervision'))?.status).toBe('processing');
     expect((await db.queries.getByQueryIdForTeam(teamId, 'other-task-supervision'))?.status).toBe('pending');
     expect((await db.queries.getByQueryIdForTeam(teamId, 'older-task-delegation'))?.status).toBe('pending');
     expect((await db.queries.getByQueryIdForTeam(teamId, 'newer-task-delegation'))?.status).toBe('expired');
+    expect((await db.queries.getByQueryIdForTeam(teamId, 'older-supervision-routing'))?.status).toBe('pending');
+    expect((await db.queries.getByQueryIdForTeam(teamId, 'newer-supervision-routing'))?.status).toBe('expired');
   });
 
   it('dedupes active task delegation /ask prompts before dispatching', async () => {
@@ -971,6 +989,42 @@ describe('AgentManagerDb killAgentProcess guards', () => {
 
     expect(result.ok).toBe(true);
     expect(result.result?.queryId).toBe('existing-task-delegation');
+    expect(result.result?.deduped).toBe(true);
+  });
+
+  it('dedupes active supervision routing /ask prompts before dispatching', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('ops-team');
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-ops-lead',
+        name: 'ops-lead',
+        port: 4116,
+        status: 'running',
+        endpoint: 'http://127.0.0.1:9',
+      }),
+    });
+    await db.queries.upsert(teamId, 'agent-ops-lead', {
+      query_id: 'existing-supervision-routing',
+      status: 'pending',
+      prompt: 'SUPERVISION ROUTING: Task #f0b7515a (pull-heartbeat-evidence-075b8199) in ops-team has been unclaimed for 72m. Please claim and execute.',
+      created: Date.now(),
+      owner_kind: 'agent',
+      owner_id: 'agent-ops-lead',
+    });
+
+    const result = await (manager as any).executeRemoteCommand(
+      '/ask ops-lead SUPERVISION ROUTING: Task #f0b7515a (pull-heartbeat-evidence-075b8199) in ops-team has been unclaimed 72m. Please claim and execute.',
+      teamId,
+      'ops-team',
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.result?.queryId).toBe('existing-supervision-routing');
     expect(result.result?.deduped).toBe(true);
   });
 

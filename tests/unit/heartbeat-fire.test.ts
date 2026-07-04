@@ -328,6 +328,40 @@ describe('SchedulerService.tick', () => {
     expect(schedules.updateRunStatus).not.toHaveBeenCalled();
     expect(fetchSpy).not.toHaveBeenCalled();
   });
+
+  it('skips busy targets before recording automatic due runs', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1_700_000_301_000);
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response(null, { status: 200 }));
+    const def = makeHeartbeatDef({
+      anchor_at: 1_700_000_000,
+      interval_seconds: 300,
+      max_runs: null,
+    });
+    const schedules = {
+      listActiveDefinitions: vi.fn(async () => [def]),
+      listTargets: vi.fn(async () => ['agent_123']),
+      countRuns: vi.fn(async () => 0),
+      insertRun: vi.fn(async () => true),
+      updateRunStatus: vi.fn(async () => undefined),
+    };
+    const dbStub = { schedules } as unknown as Db;
+    const guard = vi.fn(async () => false);
+    const service = new SchedulerService(
+      dbStub,
+      async () => makeTarget(),
+      { shouldDispatch: guard },
+    );
+
+    await service.tick();
+
+    expect(guard).toHaveBeenCalledOnce();
+    expect(schedules.countRuns).not.toHaveBeenCalled();
+    expect(schedules.insertRun).not.toHaveBeenCalled();
+    expect(schedules.updateRunStatus).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
 });
 
 /* ------------------------------------------------------------------ */

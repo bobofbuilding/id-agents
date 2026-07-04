@@ -8493,6 +8493,8 @@ Return this JSON shape:
    * This is intentionally end-to-end: a 202 Accepted from `/talk` alone
    * is not enough because the harness can still fail later (for example,
    * when the underlying CLI returns an auth error on every dispatch).
+   * Busy agents are reported as `skipped` before `/talk` so health checks
+   * do not stack synthetic "reply with OK" work behind real user tasks.
    */
   private async probeAgentsViaTalk(
     teamName: string,
@@ -8504,9 +8506,11 @@ Return this JSON shape:
       probed: number;
       passed: number;
       failed: number;
+      skipped: number;
       results: Array<
         { name: string; status: 'ok'; duration_ms: number }
         | { name: string; status: 'failed'; error: string; duration_ms: number }
+        | { name: string; status: 'skipped'; reason: 'busy'; active_queries: number; duration_ms: number }
       >;
     };
   }> {
@@ -8516,7 +8520,8 @@ Return this JSON shape:
 
     type ProbeResult =
       | { name: string; status: 'ok'; duration_ms: number }
-      | { name: string; status: 'failed'; error: string; duration_ms: number };
+      | { name: string; status: 'failed'; error: string; duration_ms: number }
+      | { name: string; status: 'skipped'; reason: 'busy'; active_queries: number; duration_ms: number };
 
     const toErrorString = (status: number, bodyText: string): string => (
       bodyText ? `${status}: ${bodyText}` : `${status}`
@@ -8534,6 +8539,16 @@ Return this JSON shape:
       const start = Date.now();
       const base = (agent.endpoint || (agent.port ? `http://localhost:${agent.port}` : '')).replace(/\/+$/, '');
       const displayName = (agent.metadata as any)?.alias || agent.name;
+      const activeQueries = await this.db.queries.getPending(agent.id).catch(() => [] as QueryRow[]);
+      if (activeQueries.length > 0) {
+        return {
+          name: displayName,
+          status: 'skipped',
+          reason: 'busy',
+          active_queries: activeQueries.length,
+          duration_ms: Date.now() - start,
+        };
+      }
       if (!base) {
         return { name: displayName, status: 'failed', error: 'no_endpoint', duration_ms: Date.now() - start };
       }
@@ -8633,6 +8648,8 @@ Return this JSON shape:
       }
     };
 
+    await this.sweepStaleQueriesIfDue();
+
     const results: ProbeResult[] = new Array(agents.length);
     let next = 0;
     const workerCount = Math.min(CONCURRENCY, agents.length);
@@ -8646,13 +8663,15 @@ Return this JSON shape:
     await Promise.all(workers);
 
     const passed = results.filter((r) => r.status === 'ok').length;
+    const skipped = results.filter((r) => r.status === 'skipped').length;
     return {
       ok: true,
       result: {
         team: teamName,
         probed: results.length,
         passed,
-        failed: results.length - passed,
+        failed: results.length - passed - skipped,
+        skipped,
         results,
       },
     };
@@ -12070,6 +12089,7 @@ Return this JSON shape:
     const normalizedMarker = marker.trim().toLowerCase();
     if (!text || !normalizedMarker || !text.includes(normalizedMarker)) return false;
     return text.startsWith('supervision:')
+      || text.startsWith('supervision routing:')
       || text.startsWith('lead delegation kickoff:');
   }
 
@@ -12078,6 +12098,7 @@ Return this JSON shape:
     const lower = text.toLowerCase();
     const managedTaskAsk = lower.startsWith('task delegation')
       || lower.startsWith('supervision:')
+      || lower.startsWith('supervision routing:')
       || lower.startsWith('lead delegation kickoff:');
     if (!managedTaskAsk) return null;
     return text.match(/#[a-z0-9][a-z0-9_-]{3,}/i)?.[0]?.toLowerCase() ?? null;
@@ -12137,6 +12158,7 @@ Return this JSON shape:
        WHERE status IN ('pending', 'processing')
          AND (
            LOWER(prompt) LIKE 'supervision:%'
+           OR LOWER(prompt) LIKE 'supervision routing:%'
            OR LOWER(prompt) LIKE 'lead delegation kickoff:%'
            OR LOWER(prompt) LIKE 'task delegation%'
          )
@@ -12821,30 +12843,36 @@ Return this JSON shape:
         console.log(`\n`);
 
         // Initialize and start the scheduler service
-        this.schedulerService = new SchedulerService(this.db, async (agentId: string) => {
-          const agent = await this.db.agents.getById(agentId);
-          if (!agent) return null;
-          if (agent.status !== 'running') {
+        this.schedulerService = new SchedulerService(
+          this.db,
+          async (agentId: string) => {
+            const agent = await this.db.agents.getById(agentId);
+            if (!agent) return null;
+            if (agent.status !== 'running') {
+              return {
+                id: agent.id,
+                name: agent.name,
+                endpoint: agent.endpoint?.replace(/\/+$/, '') ?? '',
+                talkPath: '/talk',
+                schedulePath: null,
+                status: agent.status,
+              };
+            }
+            if (!agent.endpoint) return null;
+            const endpoints = await discoverRestAPEndpoints(agent.endpoint);
             return {
               id: agent.id,
               name: agent.name,
-              endpoint: agent.endpoint?.replace(/\/+$/, '') ?? '',
-              talkPath: '/talk',
-              schedulePath: null,
+              endpoint: agent.endpoint.replace(/\/+$/, ''),
+              talkPath: endpoints.talk || '/talk',
+              schedulePath: endpoints.schedule || null,
               status: agent.status,
             };
-          }
-          if (!agent.endpoint) return null;
-          const endpoints = await discoverRestAPEndpoints(agent.endpoint);
-          return {
-            id: agent.id,
-            name: agent.name,
-            endpoint: agent.endpoint.replace(/\/+$/, ''),
-            talkPath: endpoints.talk || '/talk',
-            schedulePath: endpoints.schedule || null,
-            status: agent.status,
-          };
-        });
+          },
+          {
+            shouldDispatch: async (target) => this.canDispatchAutomatedWake(target.id),
+          },
+        );
         this.schedulerService.start();
 
         // Seed well-known teams (idempotent — getOrCreateTeamId is safe to call repeatedly)
@@ -12875,14 +12903,16 @@ Return this JSON shape:
 
         // Start checkin due-service tick (default 30s) so active checkins
         // actually fire instead of accumulating with `next_fire_at <= now`.
-        // Wake on every fire: every priority POSTs to the owner's /news
-        // with trigger:true so the dispatcher's LLM is actually woken.
+        // Wake on every eligible fire: every priority POSTs to the owner's
+        // /news with trigger:true when the owner is not already busy, so the
+        // dispatcher's LLM is actually woken without stacking harness runs.
         // Priority is preserved on the payload as metadata (the LLM reads
-        // it to decide urgency); it does NOT gate whether the wake fires —
-        // an un-woken check-in is operationally identical to no check-in.
+        // it to decide urgency); it does NOT gate whether the wake fires.
         // Loop safety lives in the receiver's /news handler (noAutoReply on
-        // triggered queries).
+        // triggered queries) and in the manager busy guard below, which avoids
+        // waking an owner that already has active harness work.
         this.checkinService = new CheckinService(this.db, {
+          shouldDispatchWake: async (input) => this.canDispatchAutomatedWake(input.ownerAgentId),
           dispatchWake: async (input) => {
             const owner = await this.db.agents.getById(input.ownerAgentId).catch(() => null);
             if (!owner || !owner.endpoint) return;
@@ -12915,7 +12945,7 @@ Return this JSON shape:
           },
         });
         this.checkinService.start();
-        console.log('[Manager] CheckinService started (wake on every fire)');
+        console.log('[Manager] CheckinService started (wake on every eligible fire)');
 
         resolve();
       });
@@ -13841,6 +13871,11 @@ Return this JSON shape:
 
   private async countActiveQueries(agentId: string): Promise<number> {
     return (await this.db.queries.getPending(agentId)).length;
+  }
+
+  private async canDispatchAutomatedWake(agentId: string): Promise<boolean> {
+    await this.sweepStaleQueriesIfDue();
+    return (await this.countActiveQueries(agentId)) === 0;
   }
 
   private parkIdleRecentActivityMs(): number {

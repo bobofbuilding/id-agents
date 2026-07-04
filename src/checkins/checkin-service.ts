@@ -30,10 +30,10 @@ export const DEFAULT_TICK_INTERVAL_MS = 30_000;
 const DUE_BATCH_LIMIT = 200;
 
 /**
- * Input passed to the wake dispatch callback. Emitted on every fire when
- * a `dispatchWake` hook is configured — priority is preserved on the
- * payload as metadata for the receiving dispatcher's LLM, not as a gate
- * on whether the wake happens.
+ * Input passed to the wake dispatch callbacks. Emitted on every fire when
+ * a `dispatchWake` hook is configured and the optional wake guard allows it.
+ * Priority is preserved on the payload as metadata for the receiving
+ * dispatcher's LLM, not as a gate on whether the wake happens.
  */
 export interface CheckinWakeDispatchInput {
   teamId: string;
@@ -56,17 +56,24 @@ export interface CheckinServiceOptions {
   log?: (msg: string, err?: unknown) => void;
   /**
    * Wake dispatch hook. Invoked AFTER the news_item is written, on every
-   * fire (regardless of priority). The default behaviour (no hook
-   * configured) is silent inbox delivery — only the news_item lands. The
-   * manager provides an HTTP-POST dispatcher so the owner agent's LLM is
-   * actually woken instead of accumulating unread rows. Priority is
-   * preserved on the payload as metadata for the receiver, not as a gate.
+   * fire (regardless of priority) when `shouldDispatchWake` allows it. The
+   * default behaviour (no hook configured) is silent inbox delivery — only
+   * the news_item lands. The manager provides an HTTP-POST dispatcher so the
+   * owner agent's LLM is actually woken instead of accumulating unread rows.
+   * Priority is preserved on the payload as metadata for the receiver, not
+   * as a gate.
    *
    * Failures are logged and swallowed: the row state has already been
    * persisted by the time dispatch runs, and we never want an HTTP error to
    * stall the tick or roll the fire back.
    */
   dispatchWake?: (input: CheckinWakeDispatchInput) => Promise<void>;
+  /**
+   * Optional guard for automatic wake dispatch. Returning false suppresses
+   * only the live wake; the check-in row, event, and owner inbox item still
+   * advance so due-service state remains durable.
+   */
+  shouldDispatchWake?: (input: CheckinWakeDispatchInput) => Promise<boolean> | boolean;
 }
 
 export interface TickResult {
@@ -82,6 +89,7 @@ export class CheckinService {
   private readonly batchLimit: number;
   private readonly log: (msg: string, err?: unknown) => void;
   private readonly dispatchWake: ((input: CheckinWakeDispatchInput) => Promise<void>) | null;
+  private readonly shouldDispatchWake: ((input: CheckinWakeDispatchInput) => Promise<boolean> | boolean) | null;
   private running = false;
 
   constructor(private readonly db: Db, opts: CheckinServiceOptions = {}) {
@@ -89,6 +97,7 @@ export class CheckinService {
     this.batchLimit = Math.min(opts.batchLimit ?? DUE_BATCH_LIMIT, 1000);
     this.log = opts.log ?? ((msg, err) => err ? console.error(`[CheckinService] ${msg}`, err) : undefined);
     this.dispatchWake = opts.dispatchWake ?? null;
+    this.shouldDispatchWake = opts.shouldDispatchWake ?? null;
   }
 
   /** Start the tick loop. Idempotent. */
@@ -232,24 +241,33 @@ export class CheckinService {
         taskOwnerName,
       });
 
-      // Wake on every fire: the entire purpose of a check-in is to wake the
-      // dispatcher when the delegate may have stalled. A check-in that
-      // didn't wake would be operationally identical to no check-in at all
-      // — just an unread row. Priority is preserved on the news/event
-      // payload so the dispatcher's LLM can decide how urgently to react,
-      // but it does NOT gate whether the wake happens.
+      // Wake on every eligible fire: the durable row/news/event are already
+      // recorded above. The manager may suppress the live wake when the owner
+      // is already processing work, which avoids stacking harness runs while
+      // preserving the check-in history for later review.
       if (this.dispatchWake) {
+        const dispatchInput: CheckinWakeDispatchInput = {
+          teamId: row.team_id,
+          checkinId: row.id,
+          ownerAgentId: row.owner_agent_id,
+          priority: row.priority as CheckinPriority,
+          iterationCount: newIterationCount,
+          nextFireAt,
+          message: newsPayload.message,
+          data: newsPayload.data,
+        };
+        let shouldWake = true;
+        if (this.shouldDispatchWake) {
+          try {
+            shouldWake = await this.shouldDispatchWake(dispatchInput);
+          } catch (err) {
+            this.log(`wake guard failed for checkin ${row.id}`, err);
+            shouldWake = false;
+          }
+        }
+        if (!shouldWake) return;
         try {
-          await this.dispatchWake({
-            teamId: row.team_id,
-            checkinId: row.id,
-            ownerAgentId: row.owner_agent_id,
-            priority: row.priority as CheckinPriority,
-            iterationCount: newIterationCount,
-            nextFireAt,
-            message: newsPayload.message,
-            data: newsPayload.data,
-          });
+          await this.dispatchWake(dispatchInput);
         } catch (err) {
           this.log(`wake dispatch failed for checkin ${row.id}`, err);
         }

@@ -7,16 +7,32 @@ import { evaluateIntervalSchedule, evaluateCalendarSchedule } from './schedule-e
 import { ScheduleDispatcher } from './schedule-dispatcher.js';
 import { HEARTBEAT_GENERIC_MESSAGE } from './schedule-config.js';
 
+export interface SchedulerServiceOptions {
+  /**
+   * Optional guard for automatic schedule dispatch. Returning false skips the
+   * live dispatch before any schedule_run is inserted; manual fires bypass
+   * this hook.
+   */
+  shouldDispatch?: (
+    target: DispatchTarget,
+    def: ScheduleDefinitionRow,
+    run: DueRun,
+  ) => Promise<boolean> | boolean;
+}
+
 export class SchedulerService {
   private lastTickAtSec = 0;
   private timer: NodeJS.Timeout | null = null;
   private readonly dispatcher: ScheduleDispatcher;
+  private readonly shouldDispatch: SchedulerServiceOptions['shouldDispatch'] | null;
 
   constructor(
     private readonly db: Db,
     private readonly resolveAgent: (agentId: string) => Promise<DispatchTarget | null>,
+    opts: SchedulerServiceOptions = {},
   ) {
     this.dispatcher = new ScheduleDispatcher();
+    this.shouldDispatch = opts.shouldDispatch ?? null;
   }
 
   start(): void {
@@ -62,6 +78,16 @@ export class SchedulerService {
           const target = await this.resolveAgent(agentId);
           if (!target || target.status !== 'running') {
             continue;
+          }
+
+          if (this.shouldDispatch) {
+            let allowed = false;
+            try {
+              allowed = await this.shouldDispatch(target, def, run);
+            } catch (err: any) {
+              console.log(`[Scheduler] ${def.title}: dispatch guard failed for ${target.name}: ${err?.message ?? err}`);
+            }
+            if (!allowed) continue;
           }
 
           if (def.max_runs != null) {

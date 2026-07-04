@@ -22,6 +22,10 @@ import { SqliteQueriesRepo } from '../../src/db/repos/sqlite/queries-repo.js';
 import { SqliteNewsRepo } from '../../src/db/repos/sqlite/news-repo.js';
 import { SqliteSchedulesRepo } from '../../src/db/repos/sqlite/schedules-repo.js';
 import { SqliteTasksRepo } from '../../src/db/repos/sqlite/tasks-repo.js';
+import { SqliteEventsRepo } from '../../src/db/repos/sqlite/events-repo.js';
+import { SqliteSubscriptionsRepo } from '../../src/db/repos/sqlite/subscriptions-repo.js';
+import { SqliteCheckinsRepo } from '../../src/db/repos/sqlite/checkins-repo.js';
+import { SqliteRuntimeLaneCooldownsRepo } from '../../src/db/repos/sqlite/runtime-lane-cooldowns-repo.js';
 
 async function createInMemoryDb() {
   const adapter = new SqliteAdapter(':memory:');
@@ -34,6 +38,10 @@ async function createInMemoryDb() {
     news: new SqliteNewsRepo(adapter),
     schedules: new SqliteSchedulesRepo(adapter),
     tasks: new SqliteTasksRepo(adapter),
+    events: new SqliteEventsRepo(adapter),
+    subscriptions: new SqliteSubscriptionsRepo(adapter),
+    checkins: new SqliteCheckinsRepo(adapter),
+    runtimeLaneCooldowns: new SqliteRuntimeLaneCooldownsRepo(adapter),
     async close() { await adapter.close(); },
   };
 }
@@ -218,6 +226,7 @@ describe('/remote probe commands', () => {
             probed: number;
             passed: number;
             failed: number;
+            skipped: number;
             results: Array<{ name: string; status: string; duration_ms: number; error?: string }>;
           };
         };
@@ -227,6 +236,7 @@ describe('/remote probe commands', () => {
         expect(body.result.probed).toBe(2);
         expect(body.result.passed).toBe(1);
         expect(body.result.failed).toBe(1);
+        expect(body.result.skipped).toBe(0);
         const byName = Object.fromEntries(
           body.result.results.map((result) => [result.name, result]),
         );
@@ -243,6 +253,74 @@ describe('/remote probe commands', () => {
     } finally {
       await okStub.close();
       await failedStub.close();
+    }
+  }, 15000);
+
+  it('skips busy agents without enqueueing a probe query', async () => {
+    const TEAM = 'probe-busy-team';
+    const okStub = await startProbeStub('ok');
+
+    try {
+      await withManager(async ({ baseUrl, db }) => {
+        const teamId = await db.teams.getOrCreateTeamId(TEAM);
+        await db.agents.create({
+          team_id: teamId,
+          id: 'busy-agent',
+          name: 'busy-agent',
+          type: 'claude',
+          model: 'gpt-5.4',
+          status: 'running',
+          runtime: 'codex',
+          endpoint: okStub.baseUrl,
+          port: Number(new URL(okStub.baseUrl).port),
+          created_at: Date.now(),
+          metadata: { local: true },
+        });
+        await db.queries.create(
+          teamId,
+          'already-running-query',
+          'busy-agent',
+          'existing work',
+          Date.now(),
+        );
+
+        const response = await fetch(`${baseUrl}/remote`, {
+          method: 'POST',
+          headers: adminHeaders(TEAM),
+          body: JSON.stringify({ command: '/agents probe' }),
+        });
+        expect(response.ok).toBe(true);
+
+        const body = await response.json() as {
+          ok: boolean;
+          result: {
+            probed: number;
+            passed: number;
+            failed: number;
+            skipped: number;
+            results: Array<{ name: string; status: string; reason?: string; active_queries?: number }>;
+          };
+        };
+
+        expect(body.ok).toBe(true);
+        expect(body.result.probed).toBe(1);
+        expect(body.result.passed).toBe(0);
+        expect(body.result.failed).toBe(0);
+        expect(body.result.skipped).toBe(1);
+        expect(body.result.results).toEqual([
+          expect.objectContaining({
+            name: 'busy-agent',
+            status: 'skipped',
+            reason: 'busy',
+            active_queries: 1,
+          }),
+        ]);
+
+        const active = await db.queries.getPending('busy-agent');
+        expect(active.map((row) => row.query_id)).toEqual(['already-running-query']);
+      });
+    } finally {
+      await okStub.close();
     }
   }, 15000);
 
@@ -281,6 +359,7 @@ describe('/remote probe commands', () => {
             probed: number;
             passed: number;
             failed: number;
+            skipped: number;
             results: Array<{ name: string; status: string; duration_ms: number }>;
           };
         };
@@ -290,6 +369,7 @@ describe('/remote probe commands', () => {
         expect(body.result.probed).toBe(1);
         expect(body.result.passed).toBe(1);
         expect(body.result.failed).toBe(0);
+        expect(body.result.skipped).toBe(0);
         expect(body.result.results).toEqual([
           expect.objectContaining({ name: 'solo-agent', status: 'ok' }),
         ]);

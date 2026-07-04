@@ -13,8 +13,8 @@
  *
  * Current contract (this file is the regression):
  *
- *   - EVERY priority that fires invokes `dispatchWake` once when the
- *     hook is configured. Each wake POSTs to the owner agent's /news
+ *   - EVERY eligible priority that fires invokes `dispatchWake` once when
+ *     the hook is configured. Each wake POSTs to the owner agent's /news
  *     with `trigger:true` and lands the same `202 / triggered:true /
  *     query_id:/^news_/` response asserted in tests/integration/news-
  *     reply-triggers-receiver.test.ts (the LLM-wake surface).
@@ -34,16 +34,18 @@
  *      POST to the owner, both land 202+triggered, exactly one inbox
  *      row per owner. This is the case that was flipped after the gate
  *      was removed.
- *   3. Regression pin: dispatcher that omits skip_persist:true causes
+ *   3. Busy guard: durable state and inbox still advance when the live
+ *      wake is suppressed.
+ *   4. Regression pin: dispatcher that omits skip_persist:true causes
  *      duplicate rows — guards against drift.
- *   4. Stall protection: hung owner endpoint must abort, not block the
+ *   5. Stall protection: hung owner endpoint must abort, not block the
  *      tick loop.
- *   5. End-to-end against the manager-owned CheckinService: prove the
- *      production wiring (skip_persist + timeout + always-wake) yields
+ *   6. End-to-end against the manager-owned CheckinService: prove the
+ *      production wiring (skip_persist + timeout + eligible wake) yields
  *      one row and one wake.
  */
 
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AddressInfo } from 'net';
 import * as http from 'node:http';
 import crypto from 'node:crypto';
@@ -66,6 +68,7 @@ import { SqliteTasksRepo } from '../../src/db/repos/sqlite/tasks-repo.js';
 import { SqliteEventsRepo } from '../../src/db/repos/sqlite/events-repo.js';
 import { SqliteSubscriptionsRepo } from '../../src/db/repos/sqlite/subscriptions-repo.js';
 import { SqliteCheckinsRepo } from '../../src/db/repos/sqlite/checkins-repo.js';
+import { SqliteRuntimeLaneCooldownsRepo } from '../../src/db/repos/sqlite/runtime-lane-cooldowns-repo.js';
 import type { CheckinRow, CheckinPriority } from '../../src/db/types.js';
 
 async function createInMemoryDb() {
@@ -82,6 +85,7 @@ async function createInMemoryDb() {
     events: new SqliteEventsRepo(adapter),
     subscriptions: new SqliteSubscriptionsRepo(adapter),
     checkins: new SqliteCheckinsRepo(adapter),
+    runtimeLaneCooldowns: new SqliteRuntimeLaneCooldownsRepo(adapter),
     async close() { await adapter.close(); },
   };
 }
@@ -437,6 +441,38 @@ describe('CheckinService wake on every fire (priority is metadata, not a gate)',
 
     const news = await db.news.poll(normalOwnerId, 0);
     const dueNews = news.filter((n) => n.type === 'checkin_due' && (n.data as any).checkin_id === 'chk_normal_focused');
+    expect(dueNews).toHaveLength(1);
+    expect((dueNews[0].data as any).priority).toBe('normal');
+  });
+
+  it('wake guard suppresses live dispatch while durable checkin state and inbox still advance', async () => {
+    const dispatchWake = vi.fn(async () => undefined);
+    const shouldDispatchWake = vi.fn(async () => false);
+    const svc = new CheckinService(db as any, {
+      dispatchWake,
+      shouldDispatchWake,
+    });
+
+    await db.checkins.create(buildRow({
+      id: 'chk_guarded_busy',
+      team_id: teamId,
+      owner_agent_id: highOwnerId,
+      priority: 'normal',
+    }));
+
+    const result = await svc.tick(Date.now());
+    expect(result.fired).toBe(1);
+    expect(result.errors).toBe(0);
+
+    expect(shouldDispatchWake).toHaveBeenCalledOnce();
+    expect(dispatchWake).not.toHaveBeenCalled();
+
+    const updated = await db.checkins.get('chk_guarded_busy', teamId);
+    expect(updated?.iteration_count).toBe(1);
+    expect(updated?.last_fire_at).not.toBeNull();
+
+    const news = await db.news.poll(highOwnerId, 0);
+    const dueNews = news.filter((n) => n.type === 'checkin_due' && (n.data as any).checkin_id === 'chk_guarded_busy');
     expect(dueNews).toHaveLength(1);
     expect((dueNews[0].data as any).priority).toBe('normal');
   });
