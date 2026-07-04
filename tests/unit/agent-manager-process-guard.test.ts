@@ -634,6 +634,48 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     }
   });
 
+  it('defaults to a low active-query cap to avoid lead backlog fan-out', async () => {
+    const saved = process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
+    delete process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
+    try {
+      const { manager, db, workDir } = await makeManager();
+      dbs.push(db);
+      workDirs.push(workDir);
+
+      const teamId = await db.teams.getOrCreateTeamId('default');
+      await db.agents.create({
+        ...agentRow({
+          team_id: teamId,
+          id: 'agent-default-busy',
+          name: 'default-busy-lead',
+          port: 4112,
+          status: 'running',
+        }),
+      });
+      const now = Date.now();
+      for (const [idx, status] of ['processing', 'pending', 'pending'].entries()) {
+        await db.queries.upsert(teamId, 'agent-default-busy', {
+          query_id: `default-busy-${idx}`,
+          status,
+          prompt: `queued work ${idx}`,
+          created: now,
+          owner_kind: 'agent',
+          owner_id: 'agent-default-busy',
+        });
+      }
+      const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+      const result = await (manager as any).executeRemoteCommand('/ask default-busy-lead do one more thing', teamId, 'default');
+
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain('already has 3 active queries');
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      if (saved === undefined) delete process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
+      else process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT = saved;
+    }
+  });
+
   it('expires stale target queries before applying the /ask saturation guard', async () => {
     const savedEnv = {
       maxActive: process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT,
@@ -666,7 +708,7 @@ describe('AgentManagerDb killAgentProcess guards', () => {
         query_id: 'stale-pending',
         status: 'pending',
         prompt: 'stale queued work',
-        created: now - 31 * 60 * 1000,
+        created: now - 16 * 60 * 1000,
         owner_kind: 'agent',
         owner_id: 'agent-stale-busy',
       });

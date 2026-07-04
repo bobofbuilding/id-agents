@@ -136,7 +136,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DEFAULT_MAX_DOING_TASKS = 30;
 const DEFAULT_STALLED_TASK_MAX_PROBES = 3;
-const DEFAULT_MAX_ACTIVE_QUERIES_PER_AGENT = 8;
+const DEFAULT_MAX_ACTIVE_QUERIES_PER_AGENT = 3;
 
 interface StalledProbeState {
   lastAt: number;
@@ -581,7 +581,7 @@ export class AgentManagerDb {
   private readonly PENDING_QUERY_EXPIRY_MINUTES =
     positiveEnvNumber('ID_PENDING_QUERY_EXPIRY_MINUTES') ??
     positiveEnvNumber('ID_QUERY_EXPIRY_MINUTES') ??
-    30;
+    15;
   private readonly PROCESSING_QUERY_EXPIRY_MINUTES =
     positiveEnvNumber('ID_PROCESSING_QUERY_EXPIRY_MINUTES') ??
     positiveEnvNumber('ID_QUERY_EXPIRY_MINUTES') ??
