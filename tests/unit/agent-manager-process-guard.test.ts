@@ -958,11 +958,43 @@ describe('AgentManagerDb killAgentProcess guards', () => {
       owner_kind: 'agent',
       owner_id: 'agent-supervised',
     });
+    await db.queries.upsert(teamId, 'agent-supervised', {
+      query_id: 'older-urgent-delegation-probe',
+      status: 'pending',
+      prompt: 'URGENT delegation probe: task #urg12345 has no child tasks after 15m. Create child tasks NOW.',
+      created: now + 9000,
+      owner_kind: 'agent',
+      owner_id: 'agent-supervised',
+    });
+    await db.queries.upsert(teamId, 'agent-supervised', {
+      query_id: 'processing-urgent-delegation-probe',
+      status: 'processing',
+      prompt: 'URGENT delegation probe: task #urg12345 has no child tasks after 18m. Create child tasks NOW.',
+      created: now + 10000,
+      owner_kind: 'agent',
+      owner_id: 'agent-supervised',
+    });
+    await db.queries.upsert(teamId, 'agent-supervised', {
+      query_id: 'older-manager-supervision-probe',
+      status: 'pending',
+      prompt: 'Supervision probe from manager: task #mgr12345 has been in doing status for 12+ minutes with NO member-owned child tasks.',
+      created: now + 11000,
+      owner_kind: 'agent',
+      owner_id: 'agent-supervised',
+    });
+    await db.queries.upsert(teamId, 'agent-supervised', {
+      query_id: 'processing-manager-supervision-probe',
+      status: 'processing',
+      prompt: 'Supervision probe from manager: task #mgr12345 has been in doing status for 15+ minutes with NO member-owned child tasks.',
+      created: now + 12000,
+      owner_kind: 'agent',
+      owner_id: 'agent-supervised',
+    });
 
     const result = await (manager as any).sweepStaleQueries();
 
-    expect(result.duplicateTaskAsk).toBe(4);
-    expect(result.total).toBe(4);
+    expect(result.duplicateTaskAsk).toBe(6);
+    expect(result.total).toBe(6);
     expect((await db.queries.getByQueryIdForTeam(teamId, 'older-pending-supervision'))?.status).toBe('expired');
     expect((await db.queries.getByQueryIdForTeam(teamId, 'active-processing-supervision'))?.status).toBe('processing');
     expect((await db.queries.getByQueryIdForTeam(teamId, 'other-task-supervision'))?.status).toBe('pending');
@@ -972,6 +1004,10 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     expect((await db.queries.getByQueryIdForTeam(teamId, 'newer-supervision-routing'))?.status).toBe('expired');
     expect((await db.queries.getByQueryIdForTeam(teamId, 'older-resume-task'))?.status).toBe('pending');
     expect((await db.queries.getByQueryIdForTeam(teamId, 'newer-resume-task'))?.status).toBe('expired');
+    expect((await db.queries.getByQueryIdForTeam(teamId, 'older-urgent-delegation-probe'))?.status).toBe('expired');
+    expect((await db.queries.getByQueryIdForTeam(teamId, 'processing-urgent-delegation-probe'))?.status).toBe('processing');
+    expect((await db.queries.getByQueryIdForTeam(teamId, 'older-manager-supervision-probe'))?.status).toBe('expired');
+    expect((await db.queries.getByQueryIdForTeam(teamId, 'processing-manager-supervision-probe'))?.status).toBe('processing');
   });
 
   it('dedupes active task delegation /ask prompts before dispatching', async () => {
@@ -1043,6 +1079,78 @@ describe('AgentManagerDb killAgentProcess guards', () => {
 
     expect(result.ok).toBe(true);
     expect(result.result?.queryId).toBe('existing-supervision-routing');
+    expect(result.result?.deduped).toBe(true);
+  });
+
+  it('dedupes active urgent delegation probe /ask prompts before dispatching', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('engineering-team');
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-engineering-lead',
+        name: 'engineering-lead',
+        port: 4117,
+        status: 'running',
+        endpoint: 'http://127.0.0.1:9',
+      }),
+    });
+    await db.queries.upsert(teamId, 'agent-engineering-lead', {
+      query_id: 'existing-urgent-delegation-probe',
+      status: 'processing',
+      prompt: 'URGENT delegation probe: task #0776b1f6 has no child tasks after 15m. Create child tasks NOW.',
+      created: Date.now(),
+      owner_kind: 'agent',
+      owner_id: 'agent-engineering-lead',
+    });
+
+    const result = await (manager as any).executeRemoteCommand(
+      '/ask engineering-lead URGENT delegation probe: task #0776b1f6 has no child tasks after 18m. Create child tasks NOW.',
+      teamId,
+      'engineering-team',
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.result?.queryId).toBe('existing-urgent-delegation-probe');
+    expect(result.result?.deduped).toBe(true);
+  });
+
+  it('dedupes active manager supervision probe /ask prompts before dispatching', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('engineering-team');
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-engineering-lead',
+        name: 'engineering-lead',
+        port: 4118,
+        status: 'running',
+        endpoint: 'http://127.0.0.1:9',
+      }),
+    });
+    await db.queries.upsert(teamId, 'agent-engineering-lead', {
+      query_id: 'existing-manager-supervision-probe',
+      status: 'pending',
+      prompt: 'Supervision probe from manager: task #0776b1f6 has been in doing status for 12+ minutes with NO member-owned child tasks.',
+      created: Date.now(),
+      owner_kind: 'agent',
+      owner_id: 'agent-engineering-lead',
+    });
+
+    const result = await (manager as any).executeRemoteCommand(
+      '/ask engineering-lead Supervision probe from manager: task #0776b1f6 has been in doing status for 15+ minutes with NO member-owned child tasks.',
+      teamId,
+      'engineering-team',
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.result?.queryId).toBe('existing-manager-supervision-probe');
     expect(result.result?.deduped).toBe(true);
   });
 

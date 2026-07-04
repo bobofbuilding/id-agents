@@ -12150,7 +12150,9 @@ Return this JSON shape:
     if (!text || !normalizedMarker || !text.includes(normalizedMarker)) return false;
     return text.startsWith('supervision:')
       || text.startsWith('supervision routing:')
-      || text.startsWith('lead delegation kickoff:');
+      || text.startsWith('supervision probe from manager:')
+      || text.startsWith('lead delegation kickoff:')
+      || text.startsWith('urgent delegation probe:');
   }
 
   private activeTaskAskMarker(prompt: string | null | undefined): string | null {
@@ -12159,7 +12161,9 @@ Return this JSON shape:
     const managedTaskAsk = lower.startsWith('task delegation')
       || lower.startsWith('supervision:')
       || lower.startsWith('supervision routing:')
+      || lower.startsWith('supervision probe from manager:')
       || lower.startsWith('lead delegation kickoff:')
+      || lower.startsWith('urgent delegation probe:')
       || lower.startsWith('resume and complete task');
     if (!managedTaskAsk) return null;
     return text.match(/#[a-z0-9][a-z0-9_-]{3,}/i)?.[0]?.toLowerCase() ?? null;
@@ -12220,7 +12224,9 @@ Return this JSON shape:
          AND (
            LOWER(prompt) LIKE 'supervision:%'
            OR LOWER(prompt) LIKE 'supervision routing:%'
+           OR LOWER(prompt) LIKE 'supervision probe from manager:%'
            OR LOWER(prompt) LIKE 'lead delegation kickoff:%'
+           OR LOWER(prompt) LIKE 'urgent delegation probe:%'
            OR LOWER(prompt) LIKE 'task delegation%'
            OR LOWER(prompt) LIKE 'resume and complete task #%'
          )
