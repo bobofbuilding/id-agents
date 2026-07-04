@@ -564,6 +564,7 @@ export class AgentManagerDb {
   private querySweepInFlight: Promise<StaleQuerySweepResult> | null = null;
   private lastQuerySweepAt = 0;
   private stalledSweepInterval: NodeJS.Timeout | null = null;
+  private idleParkingInterval: NodeJS.Timeout | null = null;
   private runtimeLaneCooldowns: Map<string, RuntimeLaneCooldown> = new Map();
   private runtimeCredentialPoolByTeam: Map<string, RuntimeCredentialPoolConfig> = new Map();
   private defaultRuntimeCredentialPool: RuntimeCredentialPoolConfig | null = null;
@@ -12072,6 +12073,34 @@ Return this JSON shape:
     this.stalledSweepInterval = setInterval(run, intervalMs);
   }
 
+  private startIdleParkingSweeper(): void {
+    if (process.env.ID_IDLE_PARK_DISABLED === 'true') return;
+    const rawInterval = Number(process.env.ID_IDLE_PARK_INTERVAL_MS || 15 * 60 * 1000);
+    const intervalMs = Number.isFinite(rawInterval) && rawInterval > 0
+      ? Math.max(60_000, Math.floor(rawInterval))
+      : 15 * 60 * 1000;
+    const run = async () => {
+      try {
+        const result = await this.parkIdleAgents({
+          teamId: '',
+          teamName: 'all-teams',
+          confirmed: true,
+          allTeams: true,
+          includeDefault: process.env.ID_IDLE_PARK_INCLUDE_DEFAULT === 'true',
+          includeLeads: false,
+          includeScheduled: false,
+          includeActiveTeams: true,
+        });
+        if (result.result.parked > 0) {
+          console.log(`[Manager] Idle parking sweep parked ${result.result.parked} agent(s)`);
+        }
+      } catch (e) {
+        console.error('[Manager] Idle parking sweep failed:', e);
+      }
+    };
+    this.idleParkingInterval = setInterval(run, intervalMs);
+  }
+
   private isLiveForSupervision(agent: AgentRow | null | undefined): agent is AgentRow {
     return !!agent && /running|online|ok/i.test(agent.status || '');
   }
@@ -12998,6 +13027,11 @@ Return this JSON shape:
         // depends on the control center sitting on the Work board.
         this.startStalledTaskSweeper();
 
+        // Keep delegated/on-demand helper agents from accumulating after they finish.
+        // The sweep only parks non-lead agents with no active query, task, schedule,
+        // checkin, or recent query activity.
+        this.startIdleParkingSweeper();
+
         // Start event_log retention sweep (every 5 min, 7d / 100k-per-team caps)
         this.startEventLogRetentionSweep();
 
@@ -13082,6 +13116,10 @@ Return this JSON shape:
     if (this.stalledSweepInterval) {
       clearInterval(this.stalledSweepInterval);
       this.stalledSweepInterval = null;
+    }
+    if (this.idleParkingInterval) {
+      clearInterval(this.idleParkingInterval);
+      this.idleParkingInterval = null;
     }
     if (this.healthCheckInterval) {
       clearInterval(this.healthCheckInterval);
@@ -13926,7 +13964,7 @@ Return this JSON shape:
   }
 
   private isLeadLikeAgentName(name: string): boolean {
-    return /(^lead$|[-_]lead$|manager$|coordinator$|counsel$)/i.test(name);
+    return /(^lead$|[-_]lead$|manager$|coordinator$|counsel$|[-_]master$)/i.test(name);
   }
 
   private async countOpenOwnedTasks(agentId: string): Promise<number> {

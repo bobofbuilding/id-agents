@@ -541,6 +541,109 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     expect((await db.agents.getById('agent-idle-helper'))?.status).toBe('running');
   });
 
+  it('parks idle helpers in active teams when includeActiveTeams is enabled', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('research');
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-idle-helper',
+        name: 'analyst',
+        port: 4110,
+        status: 'running',
+        metadata: { runtime: 'codex', pid: 55556, processOwner: 'manager-child', processParentPid: process.pid },
+      }),
+    });
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-task-owner',
+        name: 'writer',
+        port: 4111,
+        status: 'running',
+        metadata: { runtime: 'codex', pid: 55557, processOwner: 'manager-child', processParentPid: process.pid },
+      }),
+    });
+    const now = Date.now();
+    await db.tasks.create({
+      id: 'task-open-owned',
+      name: 'open-owned-task',
+      uuid: 'open-owned-task',
+      team_id: teamId,
+      title: 'Open owned work',
+      description: null,
+      status: 'doing',
+      created_by: null,
+      owner: 'agent-task-owner',
+      created_at: now,
+      updated_at: now,
+      completed_at: null,
+    } satisfies TaskRow);
+
+    (manager as any).killAgentProcess = vi.fn(async () => ({ killed: true, pids: [55556] }));
+
+    const result = await (manager as any).parkIdleAgents({
+      teamId,
+      teamName: 'research',
+      confirmed: true,
+      allTeams: false,
+      includeDefault: false,
+      includeLeads: false,
+      includeScheduled: false,
+      includeActiveTeams: true,
+    });
+
+    expect(result.result.parked).toBe(1);
+    expect(result.result.agents).toEqual(expect.arrayContaining([
+      { team: 'research', name: 'analyst', status: 'parked', reason: 'idle', pids: [55556] },
+      { team: 'research', name: 'writer', status: 'skipped', reason: 'owns_1_open_task' },
+    ]));
+    expect((manager as any).killAgentProcess).toHaveBeenCalledTimes(1);
+    expect((await db.agents.getById('agent-idle-helper'))?.status).toBe('stopped');
+    expect((await db.agents.getById('agent-task-owner'))?.status).toBe('running');
+  });
+
+  it('treats task-master style supervisors as lead-like for idle parking', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('ops-team');
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-task-master',
+        name: 'task-master',
+        port: 4112,
+        status: 'running',
+        metadata: { runtime: 'claude-code-cli', pid: 55559, processOwner: 'manager-child', processParentPid: process.pid },
+      }),
+    });
+
+    (manager as any).killAgentProcess = vi.fn(async () => ({ killed: true, pids: [55559] }));
+
+    const result = await (manager as any).parkIdleAgents({
+      teamId,
+      teamName: 'ops-team',
+      confirmed: true,
+      allTeams: false,
+      includeDefault: false,
+      includeLeads: false,
+      includeScheduled: false,
+      includeActiveTeams: true,
+    });
+
+    expect(result.result.parked).toBe(0);
+    expect(result.result.agents).toEqual([
+      { team: 'ops-team', name: 'task-master', status: 'skipped', reason: 'lead_like_requires_--include-leads' },
+    ]);
+    expect((manager as any).killAgentProcess).not.toHaveBeenCalled();
+    expect((await db.agents.getById('agent-task-master'))?.status).toBe('running');
+  });
+
   it('prunes only stale generated unassigned todo backlog and archives applied removals', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-07-04T04:00:00Z'));
