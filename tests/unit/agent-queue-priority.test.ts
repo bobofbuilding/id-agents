@@ -117,6 +117,48 @@ describe('agent query queue priority', () => {
       await server.stop();
     }
   });
+
+  it('records triggered agent replies without stacking another primary-lead harness turn while busy', async () => {
+    const harness = new RecordingHarness(true);
+    const server = new AgentRestServer({
+      agentName: 'lead',
+      agentIdentity: { name: 'lead', metadata: { primaryLead: true } },
+      harness,
+    });
+
+    try {
+      await server.start(0);
+      const port = ((server as any).httpServer.address() as AddressInfo).port;
+
+      await (server as any).startQuery('q1', 'operator work already in progress', undefined, 'remote');
+      await viWaitFor(() => expect(harness.prompts).toHaveLength(1));
+
+      const res = await fetch(`http://127.0.0.1:${port}/news`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: 'reply',
+          from: 'researcher',
+          message: 'Validation reply landed while the lead is busy.',
+          in_reply_to: 'query_1',
+        }),
+      });
+
+      expect(res.status).toBe(202);
+      await expect(res.json()).resolves.toMatchObject({
+        triggered: false,
+        deferred: true,
+        reason: 'primary_lead_busy',
+      });
+      await sleep(20);
+      expect(harness.prompts).toHaveLength(1);
+
+      harness.release();
+      await viWaitFor(() => expect(harness.prompts).toHaveLength(1));
+    } finally {
+      await server.stop();
+    }
+  });
 });
 
 async function viWaitFor(assertion: () => void): Promise<void> {

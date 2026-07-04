@@ -1344,6 +1344,18 @@ export class AgentRestServer {
 
         // If trigger is true, process the message with the LLM
         if (trigger && from) {
+          if (this.shouldDeferTriggeredNewsWake(from)) {
+            console.log(`${logTime()} [Agent] Deferred triggered news wake from ${from}: ${newsMessage.substring(0, 80)}...`);
+            return res.status(202).json({
+              success: true,
+              type: newsType,
+              timestamp: ts,
+              triggered: false,
+              deferred: true,
+              reason: 'primary_lead_busy',
+            });
+          }
+
           const queryId = `news_${ts}_${Math.random().toString(36).substring(7)}`;
 
           // Craft a prompt that prevents infinite loops
@@ -1912,6 +1924,13 @@ What would you like to do with this information?`;
     const data = schedule as Record<string, unknown>;
     if (data.kind !== 'heartbeat' || data.manual === true) return false;
     return this.agentIdentity?.metadata?.primaryLead === true;
+  }
+
+  private shouldDeferTriggeredNewsWake(from: string): boolean {
+    if (this.agentIdentity?.metadata?.primaryLead !== true) return false;
+    const sender = from.trim().toLowerCase();
+    if (sender === 'manager' || sender === 'remote' || sender === 'operator') return false;
+    return this.isProcessingQuery || this.queryQueue.length > 0 || this.activeQueries.size > 0;
   }
 
   /**
