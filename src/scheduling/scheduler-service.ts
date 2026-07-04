@@ -74,11 +74,35 @@ export class SchedulerService {
 
         const agentIds = await this.db.schedules.listTargets(run.scheduleId);
 
-        for (const agentId of agentIds) {
-          const target = await this.resolveAgent(agentId);
-          if (!target || target.status !== 'running') {
-            continue;
+        // Load linked tasks once per run — identical for every target agent
+        let linkedTasks: LinkedTaskSummary[] | undefined;
+        if (def.kind === 'calendar') {
+          try {
+            const taskRows = await this.db.tasks.listTasksForSchedule(def.id);
+            if (taskRows.length > 0) {
+              linkedTasks = [];
+              for (const t of taskRows) {
+                let ownerName: string | null = null;
+                if (t.owner) {
+                  const ownerAgent = await this.db.agents.getById(t.owner);
+                  if (ownerAgent) ownerName = (ownerAgent.metadata as any)?.alias || ownerAgent.name;
+                }
+                let teamName: string | null = null;
+                if (t.team_id) {
+                  const teamRow = await this.db.teams.getTeam(t.team_id);
+                  if (teamRow) teamName = teamRow.name;
+                }
+                linkedTasks.push({ name: t.name, title: t.title, status: t.status, owner: ownerName, team: teamName });
+              }
+            }
+          } catch {
+            // best-effort: don't block dispatch if task lookup fails
           }
+        }
+
+        await Promise.all(agentIds.map(async (agentId) => {
+          const target = await this.resolveAgent(agentId);
+          if (!target || target.status !== 'running') return;
 
           if (this.shouldDispatch) {
             let allowed = false;
@@ -87,14 +111,14 @@ export class SchedulerService {
             } catch (err: any) {
               console.log(`[Scheduler] ${def.title}: dispatch guard failed for ${target.name}: ${err?.message ?? err}`);
             }
-            if (!allowed) continue;
+            if (!allowed) return;
           }
 
           if (def.max_runs != null) {
             const sentCount = await this.db.schedules.countRuns(run.scheduleId, agentId);
             if (sentCount >= def.max_runs) {
               console.log(`[Scheduler] ${def.title}: agent ${agentId} reached max_runs (${def.max_runs}), skipping`);
-              continue;
+              return;
             }
           }
 
@@ -109,33 +133,7 @@ export class SchedulerService {
           };
 
           const inserted = await this.db.schedules.insertRun(runRow);
-          if (!inserted) continue;
-
-          // Load linked tasks for calendar schedules
-          let linkedTasks: LinkedTaskSummary[] | undefined;
-          if (def.kind === 'calendar') {
-            try {
-              const taskRows = await this.db.tasks.listTasksForSchedule(def.id);
-              if (taskRows.length > 0) {
-                linkedTasks = [];
-                for (const t of taskRows) {
-                  let ownerName: string | null = null;
-                  if (t.owner) {
-                    const ownerAgent = await this.db.agents.getById(t.owner);
-                    if (ownerAgent) ownerName = (ownerAgent.metadata as any)?.alias || ownerAgent.name;
-                  }
-                  let teamName: string | null = null;
-                  if (t.team_id) {
-                    const teamRow = await this.db.teams.getTeam(t.team_id);
-                    if (teamRow) teamName = teamRow.name;
-                  }
-                  linkedTasks.push({ name: t.name, title: t.title, status: t.status, owner: ownerName, team: teamName });
-                }
-              }
-            } catch {
-              // best-effort: don't block dispatch if task lookup fails
-            }
-          }
+          if (!inserted) return;
 
           const result = await this.dispatcher.dispatch(def, target, run.scheduledKey, linkedTasks);
           if (result.success) {
@@ -145,7 +143,7 @@ export class SchedulerService {
             await this.db.schedules.updateRunStatus(run.scheduleId, agentId, run.scheduledKey, 'failed', result.error ?? null);
             console.log(`[Scheduler] ${def.title} -> ${target.name} FAILED: ${result.error}`);
           }
-        }
+        }));
       }
     } catch (err: any) {
       console.log(`[Scheduler] Tick error: ${err.message}`);
