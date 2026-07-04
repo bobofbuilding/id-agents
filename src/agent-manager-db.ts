@@ -3018,6 +3018,59 @@ Return this JSON shape:
     return { action: null, note: firstLine, target: null };
   }
 
+  private inferTaskDelegationArtifactReply(
+    prompt: string | null | undefined,
+    message: string,
+    task: TaskRow,
+    marker: string,
+  ): { action: 'done'; note: string; target: null } | null {
+    if (!String(prompt ?? '').trim().toLowerCase().startsWith('task delegation')) return null;
+
+    const text = String(message || '').trim();
+    if (!text) return null;
+    const firstLine = text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find(Boolean) || '';
+    if (!firstLine) return null;
+
+    const opening = text.slice(0, 700);
+    if (
+      /^(?:understood|acknowledged|received|starting|beginning|working on)\b/i.test(firstLine)
+      || /^i(?:\s+will|\s+am|'ll|’ll)\b/i.test(firstLine)
+      || /^(?:blocked|blocker|cannot|can't|unable|need\b|needs\b|no record)\b/i.test(firstLine)
+      || /\b(?:will begin|begin working|start working|no action can be taken|requires additional information)\b/i.test(opening)
+    ) {
+      return null;
+    }
+
+    const lower = text.toLowerCase();
+    const artifactSignal = /\b(?:artifact|cleanup results|complete|completed|deliverable|delivered|done|memo|output|outputs|package|recommendations|report|result|results|summary|validation|workflow)\b/i.test(text);
+    const markerBody = marker.replace(/^#/, '').toLowerCase();
+    const escapedMarker = markerBody.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const firstLineTaskRefHeading = new RegExp(`^(?:#{1,6}\\s*)?(?:\\*\\*)?\\s*task\\s+#?${escapedMarker}\\b`, 'i')
+      .test(firstLine.replace(/[`*_]/g, ''));
+
+    const titleTokens = [...this.duplicateTitleTokens(task.title)].filter((token) => token.length > 2);
+    const sharedTitleTokens = titleTokens.filter((token) => lower.includes(token));
+    const titleOverlap = titleTokens.length > 0
+      && sharedTitleTokens.length >= Math.min(2, titleTokens.length);
+    const markdownArtifactHeading = /^(?:#{1,6}\s+|\*\*)/.test(firstLine)
+      && text.length >= 240
+      && artifactSignal
+      && titleOverlap;
+
+    const memoryArtifact = /"memory_update_package"\s*:/.test(text)
+      && /\bmemor(?:y|ies)\b/i.test(`${task.title} ${task.name}`);
+
+    if (!memoryArtifact && !(artifactSignal && (firstLineTaskRefHeading || markdownArtifactHeading))) {
+      return null;
+    }
+
+    const note = `Artifact-style delegation completion: ${firstLine.slice(0, 220)}`;
+    return { action: 'done', note, target: null };
+  }
+
   private cleanTaskControlRouteTarget(raw: string | null | undefined): string | null {
     if (!raw) return null;
     const cleaned = raw
@@ -3132,17 +3185,20 @@ Return this JSON shape:
     if (!marker) return { applied: false, reason: 'no_task_marker' };
     const message = this.replyMessageFromPayload(payload);
     const parsed = this.parseTaskControlReply(message);
-    if (!parsed.action) return { applied: false, reason: 'no_control_action' };
 
     const { task } = await this.resolveTaskRef(marker, queryRow.team_id).catch(() => ({ task: undefined }));
-    if (!task) return { applied: false, action: parsed.action, reason: 'task_not_found' };
-    if (this.isTerminalTaskStatus(task.status)) return { applied: false, action: parsed.action, task: task.name, reason: 'task_terminal' };
+    if (!task) return { applied: false, action: parsed.action ?? undefined, reason: 'task_not_found' };
+    const effectiveParsed = parsed.action
+      ? parsed
+      : this.inferTaskDelegationArtifactReply(queryRow.prompt, message, task, marker) ?? parsed;
+    if (!effectiveParsed.action) return { applied: false, reason: 'no_control_action' };
+    if (this.isTerminalTaskStatus(task.status)) return { applied: false, action: effectiveParsed.action, task: task.name, reason: 'task_terminal' };
 
     const nowSec = Math.floor(occurredAt / 1000);
     const stalledMinutes = Math.max(0, Math.round((occurredAt - this.taskLastActivityMs(task)) / 60000));
     const actorAgentId = queryRow.agent_id ?? task.owner ?? null;
 
-    if (parsed.action === 'done') {
+    if (effectiveParsed.action === 'done') {
       await this.db.tasks.updateFields(task.id, {
         status: 'done',
         completed_at: nowSec,
@@ -3156,7 +3212,7 @@ Return this JSON shape:
         ownerAgentId: task.owner ?? null,
         actorAgentId,
         occurredAt,
-        failureNote: parsed.note,
+        failureNote: effectiveParsed.note,
       });
       await closeLinkedCheckinsForTerminalTask(this.db, {
         teamId: queryRow.team_id,
@@ -3166,27 +3222,27 @@ Return this JSON shape:
         occurredAt,
       });
       await this.recordTaskSupervision(task, queryRow.team_id, actorAgentId, 'control_reply_done', stalledMinutes, occurredAt);
-      await this.markTaskControlReplyApplied({ teamId: queryRow.team_id, queryId: queryRow.query_id, agentId: actorAgentId, occurredAt, task, action: parsed.action });
+      await this.markTaskControlReplyApplied({ teamId: queryRow.team_id, queryId: queryRow.query_id, agentId: actorAgentId, occurredAt, task, action: effectiveParsed.action });
       this.managerLog(`Applied DONE control reply for task ${task.name} from query ${queryRow.query_id}`);
-      return { applied: true, action: parsed.action, task: task.name };
+      return { applied: true, action: effectiveParsed.action, task: task.name };
     }
 
-    if (parsed.action === 'in_progress' || parsed.action === 'delegated') {
+    if (effectiveParsed.action === 'in_progress' || effectiveParsed.action === 'delegated') {
       await this.db.tasks.updateFields(task.id, { updated_at: nowSec });
       await this.recordTaskSupervision(
         task,
         queryRow.team_id,
         actorAgentId,
-        parsed.action === 'delegated' ? 'control_reply_delegated' : 'control_reply_in_progress',
+        effectiveParsed.action === 'delegated' ? 'control_reply_delegated' : 'control_reply_in_progress',
         stalledMinutes,
         occurredAt,
       );
-      await this.markTaskControlReplyApplied({ teamId: queryRow.team_id, queryId: queryRow.query_id, agentId: actorAgentId, occurredAt, task, action: parsed.action });
-      this.managerLog(`Applied ${parsed.action} control reply for task ${task.name} from query ${queryRow.query_id}`);
-      return { applied: true, action: parsed.action, task: task.name };
+      await this.markTaskControlReplyApplied({ teamId: queryRow.team_id, queryId: queryRow.query_id, agentId: actorAgentId, occurredAt, task, action: effectiveParsed.action });
+      this.managerLog(`Applied ${effectiveParsed.action} control reply for task ${task.name} from query ${queryRow.query_id}`);
+      return { applied: true, action: effectiveParsed.action, task: task.name };
     }
 
-    if (parsed.action === 'claim') {
+    if (effectiveParsed.action === 'claim') {
       if (task.status === 'todo' && !task.owner && actorAgentId) {
         await this.db.tasks.updateFields(task.id, {
           owner: actorAgentId,
@@ -3206,18 +3262,18 @@ Return this JSON shape:
         await this.db.tasks.updateFields(task.id, { updated_at: nowSec });
       }
       await this.recordTaskSupervision(task, queryRow.team_id, actorAgentId, 'control_reply_claimed', stalledMinutes, occurredAt);
-      await this.markTaskControlReplyApplied({ teamId: queryRow.team_id, queryId: queryRow.query_id, agentId: actorAgentId, occurredAt, task, action: parsed.action });
+      await this.markTaskControlReplyApplied({ teamId: queryRow.team_id, queryId: queryRow.query_id, agentId: actorAgentId, occurredAt, task, action: effectiveParsed.action });
       this.managerLog(`Applied CLAIM control reply for task ${task.name} from query ${queryRow.query_id}`);
-      return { applied: true, action: parsed.action, task: task.name };
+      return { applied: true, action: effectiveParsed.action, task: task.name };
     }
 
     const taskTeamId = task.team_id || queryRow.team_id;
     const taskTeamRow = await this.db.teams.getTeam(taskTeamId).catch(() => null);
-    let fallbackNote = parsed.note;
-    if (parsed.action === 'reassign' && parsed.target) {
-      const route = await this.resolveControlReplyRouteTarget(taskTeamId, parsed.target);
+    let fallbackNote = effectiveParsed.note;
+    if (effectiveParsed.action === 'reassign' && effectiveParsed.target) {
+      const route = await this.resolveControlReplyRouteTarget(taskTeamId, effectiveParsed.target);
       const routeBlock = (reason: string): void => {
-        fallbackNote = `${parsed.note} (route target "${parsed.target}" not assigned: ${reason})`;
+        fallbackNote = `${effectiveParsed.note} (route target "${effectiveParsed.target}" not assigned: ${reason})`;
       };
 
       if (!route) {
@@ -3297,20 +3353,20 @@ Return this JSON shape:
       owner: null,
       status: 'todo',
       completed_at: null,
-      description: this.appendTaskTriageNote(task.description, `control_reply_${parsed.action}`, fallbackNote, occurredAt),
+      description: this.appendTaskTriageNote(task.description, `control_reply_${effectiveParsed.action}`, fallbackNote, occurredAt),
       updated_at: nowSec,
     });
     await this.recordTaskSupervision(
       task,
       taskTeamRow?.id || queryRow.team_id,
       actorAgentId,
-      parsed.action === 'blocked' ? 'control_reply_blocked' : 'control_reply_reassign',
+      effectiveParsed.action === 'blocked' ? 'control_reply_blocked' : 'control_reply_reassign',
       stalledMinutes,
       occurredAt,
     );
-    await this.markTaskControlReplyApplied({ teamId: queryRow.team_id, queryId: queryRow.query_id, agentId: actorAgentId, occurredAt, task, action: parsed.action });
-    this.managerLog(`Applied ${parsed.action} control reply for task ${task.name} from query ${queryRow.query_id}`);
-    return { applied: true, action: parsed.action, task: task.name };
+    await this.markTaskControlReplyApplied({ teamId: queryRow.team_id, queryId: queryRow.query_id, agentId: actorAgentId, occurredAt, task, action: effectiveParsed.action });
+    this.managerLog(`Applied ${effectiveParsed.action} control reply for task ${task.name} from query ${queryRow.query_id}`);
+    return { applied: true, action: effectiveParsed.action, task: task.name };
   }
 
   private async closeQueryShadowRows(params: {

@@ -497,6 +497,124 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('marks a task done when a delegation reply returns a report artifact heading', async () => {
+    const staleTask = task({
+      name: 'publish-improvement-report',
+      title: 'Publish improvement report',
+    });
+    const db = fakeDb({
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [staleTask]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-delegation-artifact-heading-test', db, { libraryRoot: null }) as any;
+
+    await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery(staleTask.owner!, {
+        query_id: 'delegation-artifact-heading',
+        prompt: 'TASK DELEGATION from manager: You are assigned task #12345678 ("Publish improvement report"). Start this task now.',
+        status: 'completed',
+      }),
+      {
+        result: [
+          '**Task #12345678 - Publish Improvement Report**',
+          '',
+          '- **Cleanup Results:** 120 fact entries were identified and corrected.',
+          '- **Schema Adoption Status:** 85 percent of the new schema has been adopted across the report.',
+          '- **Recommendations:** Keep the report cadence active and validate source quality on each run.',
+        ].join('\n'),
+      },
+      NOW_MS,
+    );
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(staleTask.id, {
+      status: 'done',
+      completed_at: Math.floor(NOW_MS / 1000),
+      updated_at: Math.floor(NOW_MS / 1000),
+    });
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:completed',
+      subject_id: staleTask.uuid,
+    }));
+  });
+
+  it('marks a memory-writing delegation done when it returns a memory update package', async () => {
+    const staleTask = task({
+      name: 'write-memory-entries',
+      title: 'Write memory entries',
+    });
+    const db = fakeDb({
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [staleTask]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-delegation-memory-package-test', db, { libraryRoot: null }) as any;
+
+    await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery(staleTask.owner!, {
+        query_id: 'delegation-memory-package',
+        prompt: 'TASK DELEGATION from manager: You are assigned task #12345678 ("Write memory entries"). Start this task now.',
+        status: 'completed',
+      }),
+      {
+        result: JSON.stringify({
+          memory_update_package: [
+            {
+              skill_id: 's1',
+              name: 'Advanced Prompt Engineering',
+              description: 'Reusable memory entry for prompt work.',
+            },
+          ],
+        }, null, 2),
+      },
+      NOW_MS,
+    );
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(staleTask.id, {
+      status: 'done',
+      completed_at: Math.floor(NOW_MS / 1000),
+      updated_at: Math.floor(NOW_MS / 1000),
+    });
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:completed',
+      subject_id: staleTask.uuid,
+    }));
+  });
+
+  it('does not mark a delegation done when the reply is only an acknowledgement plan', async () => {
+    const staleTask = task({
+      name: 'validate-tracking-system-spec-coder',
+      title: 'Validate tracking system spec - coder',
+    });
+    const db = fakeDb({
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [staleTask]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-delegation-ack-test', db, { libraryRoot: null }) as any;
+
+    const applied = await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery(staleTask.owner!, {
+        query_id: 'delegation-ack',
+        prompt: 'TASK DELEGATION from manager: You are assigned task #12345678 ("Validate tracking system spec - coder"). Start this task now.',
+        status: 'completed',
+      }),
+      {
+        result: [
+          'Understood! I will begin working on validating the tracking system spec - coder.',
+          '',
+          '### Step 1: Review the Tracking System Spec',
+          'First, I will review the tracking-system-spec-v2.md file to understand its contents and structure.',
+        ].join('\n'),
+      },
+      NOW_MS,
+    );
+
+    expect(applied).toEqual({ applied: false, reason: 'no_control_action' });
+    expect(db.tasks.updateFields).not.toHaveBeenCalled();
+    expect(db.events.insert).not.toHaveBeenCalled();
+  });
+
   it('refreshes a stalled task by nudging its live owner and recording an event', async () => {
     const db = fakeDb();
     const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', db, { libraryRoot: null }) as any;
