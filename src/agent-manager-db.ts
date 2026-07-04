@@ -14060,6 +14060,23 @@ Return this JSON shape:
     return /(^lead$|[-_]lead$|manager$|coordinator$|counsel$|[-_]master$)/i.test(name);
   }
 
+  private isIdleParkingProtectedAgent(agent: AgentRow, teamName?: string): boolean {
+    const metadata = (agent.metadata as Record<string, unknown> | null | undefined) ?? {};
+    if (metadata.alwaysOn === true || metadata.keepAlive === true || metadata.parkIdleProtected === true) return true;
+    if (/^task[-_]master$/i.test(agent.name)) return true;
+    if (teamName === 'default' && /^(coder|researcher)$/i.test(agent.name)) return true;
+    const catalog = metadata.catalog && typeof metadata.catalog === 'object'
+      ? metadata.catalog as Record<string, unknown>
+      : {};
+    const role = String(metadata.role || catalog.role || '').toLowerCase();
+    const expertise = Array.isArray(catalog.expertise)
+      ? catalog.expertise.map((item) => String(item).toLowerCase())
+      : [];
+    return role.includes('supervisor') && expertise.some((item) =>
+      item.includes('task-management') || item.includes('agent-orchestration') || item.includes('fleet-health'),
+    );
+  }
+
   private async countOpenOwnedTasks(agentId: string): Promise<number> {
     const { rows } = await this.db.adapter.query<{ c: string | number }>(
       `SELECT COUNT(*) AS c
@@ -14169,6 +14186,10 @@ Return this JSON shape:
         }
         if (agent.type !== 'claude') {
           rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: 'unsupported_agent_type' });
+          continue;
+        }
+        if (this.isIdleParkingProtectedAgent(agent, team.name)) {
+          rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: 'idle_parking_protected' });
           continue;
         }
         if (!opts.includeLeads && this.isLeadLikeAgentName(agent.name)) {

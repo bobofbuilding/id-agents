@@ -401,7 +401,7 @@ describe('AgentManagerDb killAgentProcess guards', () => {
       ...agentRow({
         team_id: teamId,
         id: 'agent-active-query',
-        name: 'coder',
+        name: 'worker',
         port: 4109,
         status: 'running',
         metadata: { runtime: 'codex', pid: 55555, processOwner: 'manager-child', processParentPid: process.pid },
@@ -431,7 +431,7 @@ describe('AgentManagerDb killAgentProcess guards', () => {
 
     expect(result.result.parked).toBe(0);
     expect(result.result.agents).toEqual([
-      { team: 'default', name: 'coder', status: 'skipped', reason: 'has_1_active_query' },
+      { team: 'default', name: 'worker', status: 'skipped', reason: 'has_1_active_query' },
     ]);
     expect((manager as any).killAgentProcess).not.toHaveBeenCalled();
 
@@ -451,7 +451,7 @@ describe('AgentManagerDb killAgentProcess guards', () => {
       ...agentRow({
         team_id: teamId,
         id: 'agent-recent-query',
-        name: 'researcher',
+        name: 'analyst',
         port: 4118,
         status: 'running',
         metadata: { runtime: 'codex', pid: 55558, processOwner: 'manager-child', processParentPid: process.pid },
@@ -482,7 +482,7 @@ describe('AgentManagerDb killAgentProcess guards', () => {
 
     expect(result.result.parked).toBe(0);
     expect(result.result.agents).toEqual([
-      { team: 'default', name: 'researcher', status: 'skipped', reason: 'recent_query_activity_1_within_10m' },
+      { team: 'default', name: 'analyst', status: 'skipped', reason: 'recent_query_activity_1_within_10m' },
     ]);
     expect((manager as any).killAgentProcess).not.toHaveBeenCalled();
     expect((await db.agents.getById('agent-recent-query'))?.status).toBe('running');
@@ -606,7 +606,7 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     expect((await db.agents.getById('agent-task-owner'))?.status).toBe('running');
   });
 
-  it('treats task-master style supervisors as lead-like for idle parking', async () => {
+  it('protects task-master style supervisors from idle parking even in broad cleanup', async () => {
     const { manager, db, workDir } = await makeManager();
     dbs.push(db);
     workDirs.push(workDir);
@@ -631,17 +631,67 @@ describe('AgentManagerDb killAgentProcess guards', () => {
       confirmed: true,
       allTeams: false,
       includeDefault: false,
-      includeLeads: false,
+      includeLeads: true,
       includeScheduled: false,
       includeActiveTeams: true,
     });
 
     expect(result.result.parked).toBe(0);
     expect(result.result.agents).toEqual([
-      { team: 'ops-team', name: 'task-master', status: 'skipped', reason: 'lead_like_requires_--include-leads' },
+      { team: 'ops-team', name: 'task-master', status: 'skipped', reason: 'idle_parking_protected' },
     ]);
     expect((manager as any).killAgentProcess).not.toHaveBeenCalled();
     expect((await db.agents.getById('agent-task-master'))?.status).toBe('running');
+  });
+
+  it('protects default validation pair from idle parking during broad cleanup', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-default-coder',
+        name: 'coder',
+        port: 4113,
+        status: 'running',
+        metadata: { runtime: 'codex', pid: 55560, processOwner: 'manager-child', processParentPid: process.pid },
+      }),
+    });
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-default-researcher',
+        name: 'researcher',
+        port: 4114,
+        status: 'running',
+        metadata: { runtime: 'codex', pid: 55561, processOwner: 'manager-child', processParentPid: process.pid },
+      }),
+    });
+
+    (manager as any).killAgentProcess = vi.fn(async () => ({ killed: true, pids: [55560] }));
+
+    const result = await (manager as any).parkIdleAgents({
+      teamId,
+      teamName: 'default',
+      confirmed: true,
+      allTeams: false,
+      includeDefault: true,
+      includeLeads: true,
+      includeScheduled: false,
+      includeActiveTeams: true,
+    });
+
+    expect(result.result.parked).toBe(0);
+    expect(result.result.agents).toEqual([
+      { team: 'default', name: 'coder', status: 'skipped', reason: 'idle_parking_protected' },
+      { team: 'default', name: 'researcher', status: 'skipped', reason: 'idle_parking_protected' },
+    ]);
+    expect((manager as any).killAgentProcess).not.toHaveBeenCalled();
+    expect((await db.agents.getById('agent-default-coder'))?.status).toBe('running');
+    expect((await db.agents.getById('agent-default-researcher'))?.status).toBe('running');
   });
 
   it('prunes only stale generated unassigned todo backlog and archives applied removals', async () => {
