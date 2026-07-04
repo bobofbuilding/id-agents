@@ -1173,13 +1173,6 @@ describe('stalled task sweeper', () => {
       owner: staleOwner.id,
       updated_at: nowSec - 3600,
     });
-    const freshActive = task({
-      id: 'fresh-active',
-      name: 'fresh-active',
-      uuid: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
-      owner: freshOwner.id,
-      updated_at: nowSec - 60,
-    });
     const queued = task({
       id: 'queued-task',
       name: 'queued-task',
@@ -1198,8 +1191,8 @@ describe('stalled task sweeper', () => {
       tasks: {
         list: vi.fn(async ({ status, owner }: { status?: string; owner?: string } = {}) => {
           if (status === 'doing' && owner === staleOwner.id) return [staleActive];
-          if (status === 'doing' && owner === freshOwner.id) return [freshActive];
-          if (status === 'doing') return [staleActive, freshActive];
+          if (status === 'doing' && owner === freshOwner.id) return [];
+          if (status === 'doing') return [staleActive];
           return [];
         }),
         getByNameForTeam: vi.fn(async () => queued),
@@ -1213,11 +1206,7 @@ describe('stalled task sweeper', () => {
 
     expect(result).toMatchObject({ assigned: true, owner: expect.objectContaining({ id: freshOwner.id }) });
     expect(db.tasks.claim).toHaveBeenCalledWith('queued-task', freshOwner.id, nowSec, { maxDoingForTeam: expect.any(Number) });
-    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
-      'default',
-      'aaa-stalled',
-      expect.stringContaining('New task assignment to you is held'),
-    );
+    expect(db.tasks.claim).not.toHaveBeenCalledWith('queued-task', staleOwner.id, expect.any(Number), expect.any(Object));
     expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
       'default',
       'zzz-fresh',
@@ -1228,6 +1217,86 @@ describe('stalled task sweeper', () => {
       'zzz-fresh',
       expect.stringContaining('Task details:\nExpected output: produce the bounded routing checklist and cite blockers.'),
     );
+  });
+
+  it('does not auto-assign queued work to an owner that already has fresh active work', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const busyOwner = agent({ id: 'agent-1', name: 'busy-worker' });
+    const busyActive = task({
+      id: 'busy-active',
+      name: 'busy-active',
+      uuid: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      owner: busyOwner.id,
+      updated_at: nowSec - 60,
+    });
+    const queued = task({
+      id: 'queued-task',
+      name: 'queued-task',
+      uuid: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+      title: 'Queued task',
+      status: 'todo',
+      owner: null,
+      updated_at: nowSec - 900,
+    });
+    const db = fakeDb({
+      agents: {
+        list: vi.fn(async () => [busyOwner]),
+        getById: vi.fn(async (id: string) => id === busyOwner.id ? busyOwner : null),
+      },
+      tasks: {
+        list: vi.fn(async ({ status, owner }: { status?: string; owner?: string } = {}) => {
+          if (status === 'doing' && (!owner || owner === busyOwner.id)) return [busyActive];
+          return [];
+        }),
+        getByNameForTeam: vi.fn(async () => queued),
+        claim: vi.fn(async () => true),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-open-owner-autoassign-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const result = await manager.assignUnownedTodoTask(queued, team(), NOW_MS);
+
+    expect(result).toMatchObject({ assigned: false, reason: 'no_idle_live_member' });
+    expect(db.tasks.claim).not.toHaveBeenCalled();
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalledWith(
+      'default',
+      'busy-worker',
+      expect.stringContaining('TASK DELEGATION from manager'),
+    );
+  });
+
+  it('does not auto-assign executor work to protected task-manager agents', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const taskMaster = agent({ id: 'task-master-1', name: 'task-master' });
+    const queued = task({
+      id: 'queued-task',
+      name: 'queued-task',
+      uuid: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+      title: 'Queued task',
+      status: 'todo',
+      owner: null,
+      updated_at: nowSec - 900,
+    });
+    const db = fakeDb({
+      agents: {
+        list: vi.fn(async () => [taskMaster]),
+        getById: vi.fn(async (id: string) => id === taskMaster.id ? taskMaster : null),
+      },
+      tasks: {
+        list: vi.fn(async () => []),
+        getByNameForTeam: vi.fn(async () => queued),
+        claim: vi.fn(async () => true),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-protected-autoassign-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const result = await manager.assignUnownedTodoTask(queued, team(), NOW_MS);
+
+    expect(result).toMatchObject({ assigned: false, reason: 'no_idle_live_member' });
+    expect(db.tasks.claim).not.toHaveBeenCalled();
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
   });
 
   it('asks a live team lead to delegate when a lead-owned task has no real child tasks', async () => {

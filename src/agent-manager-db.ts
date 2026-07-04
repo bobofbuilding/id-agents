@@ -14630,6 +14630,7 @@ Return this JSON shape:
       .filter((agent) =>
         this.isLiveForSupervision(agent)
         && !this.isConfiguredTeamLead(teamRow.name, agent)
+        && !this.isIdleParkingProtectedAgent(agent, teamRow.name)
         && Boolean(agent.endpoint),
       )
       .sort((a, b) =>
@@ -14644,6 +14645,9 @@ Return this JSON shape:
         owner,
       });
       if (stalledBacklog) continue;
+      if ((activeByOwner.get(owner.id) ?? 0) > 0) continue;
+      if ((await this.countOpenOwnedTasks(owner.id)) > 0) continue;
+      if ((await this.countActiveCheckins(owner.id)) > 0) continue;
       if (await this.hasAnyActiveQuery(owner)) continue;
       const current = await this.db.tasks.getByNameForTeam(task.name, teamRow.id).catch(() => null);
       if (!current || current.status !== 'todo' || current.owner) {
