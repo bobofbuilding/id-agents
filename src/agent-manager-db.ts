@@ -30,7 +30,7 @@ import { LocalModelGate, isLocalModelRuntime } from './lib/local-model-gate.js';
 import { ccCapabilities } from './control-center/manifest.js';
 import { loadMasterKey, deriveKeyAtIndex } from './lib/skillmesh-key-manager.js';
 import { type Db } from './db/db-service.js';
-import type { AgentRow, QueryRow, ScheduleDefinitionRow, TaskRow, TeamRow } from './db/types.js';
+import type { AgentRow, CheckinPriority, QueryRow, ScheduleDefinitionRow, TaskRow, TeamRow } from './db/types.js';
 import fetch from 'node-fetch';
 import type { PluginConfig, DeployConfig, HeartbeatConfig, CalendarSpec, ScheduleDeliveryMode, OrgConfig, RuntimeCredentialPoolConfig } from './config-parser.js';
 import {
@@ -587,6 +587,13 @@ const TALK_TO_INITIAL_RETRY_DELAY_MS = 250;
 function positiveEnvNumber(name: string): number | null {
   const n = Number(process.env[name]);
   return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function nonNegativeEnvNumber(name: string): number | null {
+  const raw = process.env[name];
+  if (raw === undefined) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : null;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -14083,7 +14090,10 @@ Return this JSON shape:
             };
           },
           {
-            shouldDispatch: async (target) => this.canDispatchAutomatedWake(target.id),
+            shouldDispatch: async (target, def) => this.canDispatchAutomatedWake(target.id, {
+              source: 'schedule',
+              scheduleKind: def.kind,
+            }),
           },
         );
         this.schedulerService.start();
@@ -14130,7 +14140,10 @@ Return this JSON shape:
         // triggered queries) and in the manager busy guard below, which avoids
         // waking an owner that already has active harness work.
         this.checkinService = new CheckinService(this.db, {
-          shouldDispatchWake: async (input) => this.canDispatchAutomatedWake(input.ownerAgentId),
+          shouldDispatchWake: async (input) => this.canDispatchAutomatedWake(input.ownerAgentId, {
+            source: 'checkin',
+            priority: input.priority,
+          }),
           dispatchWake: async (input) => {
             const owner = await this.db.agents.getById(input.ownerAgentId).catch(() => null);
             if (!owner || !owner.endpoint) return;
@@ -15117,9 +15130,32 @@ Return this JSON shape:
     return (await this.db.queries.getPending(agentId)).length;
   }
 
-  private async canDispatchAutomatedWake(agentId: string): Promise<boolean> {
+  private automatedWakeRecentActivityMs(opts: {
+    source?: 'schedule' | 'checkin';
+    scheduleKind?: string;
+    priority?: CheckinPriority;
+  } = {}): number {
+    if (opts.priority === 'high') return 0;
+    const envValue =
+      opts.source === 'schedule' && opts.scheduleKind === 'heartbeat'
+        ? nonNegativeEnvNumber('ID_HEARTBEAT_WAKE_RECENT_ACTIVITY_MS')
+        : nonNegativeEnvNumber('ID_AUTOMATED_WAKE_RECENT_ACTIVITY_MS');
+    if (envValue !== null) return envValue;
+    if (opts.source === 'schedule' && opts.scheduleKind === 'heartbeat') return 10 * 60 * 1000;
+    if (opts.source === 'checkin') return 5 * 60 * 1000;
+    return 0;
+  }
+
+  private async canDispatchAutomatedWake(agentId: string, opts: {
+    source?: 'schedule' | 'checkin';
+    scheduleKind?: string;
+    priority?: CheckinPriority;
+  } = {}): Promise<boolean> {
     await this.sweepStaleQueriesIfDue();
-    return (await this.countActiveQueries(agentId)) === 0;
+    if ((await this.countActiveQueries(agentId)) > 0) return false;
+    const recentActivityMs = this.automatedWakeRecentActivityMs(opts);
+    if (recentActivityMs <= 0) return true;
+    return (await this.countRecentQueriesForAgent(agentId, Date.now() - recentActivityMs)) === 0;
   }
 
   private parkIdleRecentActivityMs(): number {

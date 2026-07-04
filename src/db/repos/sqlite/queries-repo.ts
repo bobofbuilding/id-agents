@@ -186,7 +186,8 @@ export class SqliteQueriesRepo implements QueriesRepository {
     const r = await this.db.query<QueryRow>(
       `SELECT team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id, metadata
        FROM queries
-       WHERE agent_id = ? AND status IN ('pending', 'processing')`,
+       WHERE agent_id = ? AND status IN ('pending', 'processing')
+       ORDER BY created ASC`,
       [agentId],
     );
     return r.rows.map((row) => this.parseQueryRow(row)!);

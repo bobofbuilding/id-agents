@@ -81,6 +81,53 @@ export function shouldSuppressMcpForPrompt(prompt: string): boolean {
   return MCP_CONTROL_PLANE_PROMPT_PATTERNS.some((pattern) => pattern.test(text));
 }
 
+export type QueryQueuePriority = 'operator' | 'delegation' | 'normal' | 'background';
+
+type QueryOptions = {
+  noAutoReply?: boolean;
+  priority?: QueryQueuePriority;
+};
+
+const QUERY_PRIORITY_RANK: Record<QueryQueuePriority, number> = {
+  operator: 30,
+  delegation: 20,
+  normal: 10,
+  background: 0,
+};
+
+const DELEGATION_PROMPT_PATTERNS = [
+  /^You are the team lead\./,
+  /^Team objective:/,
+  /^Lead delegation kickoff:/,
+  /^Task delegation/i,
+  /^Coordinator handoff/i,
+  /^Resume and complete task\b/i,
+];
+
+export function classifyQueryQueuePriority(input: {
+  prompt: string;
+  from?: string;
+  options?: QueryOptions;
+}): QueryQueuePriority {
+  if (input.options?.priority) return input.options.priority;
+
+  const text = String(input.prompt || '').trimStart();
+  if (!text) return 'normal';
+
+  if (shouldSuppressMcpForPrompt(text)) return 'background';
+  if (DELEGATION_PROMPT_PATTERNS.some((pattern) => pattern.test(text))) return 'delegation';
+
+  const from = String(input.from || '').trim().toLowerCase();
+  if (from === 'manager' || from === 'remote' || from === 'operator') return 'operator';
+
+  if (input.options?.noAutoReply) return 'background';
+  return 'normal';
+}
+
+function getQueryPriorityRank(priority: QueryQueuePriority): number {
+  return QUERY_PRIORITY_RANK[priority] ?? QUERY_PRIORITY_RANK.normal;
+}
+
 class ExternalQueryStopError extends Error {
   constructor(
     readonly queryId: string,
@@ -304,7 +351,8 @@ export class AgentRestServer {
     prompt: string;
     resume?: string;
     from?: string;
-    options?: { noAutoReply?: boolean };
+    options?: QueryOptions;
+    priority: QueryQueuePriority;
   }> = [];
   private isProcessingQuery: boolean = false;
   private currentQueryExecution: CurrentQueryExecution | undefined;
@@ -1065,7 +1113,16 @@ export class AgentRestServer {
           console.error(`[Agent] Warning: Failed to persist scheduled news item for query ${queryId}:`, newsErr?.message || newsErr);
         }
 
-        this.startQuery(queryId, message, undefined, undefined, { noAutoReply: true });
+        if (this.shouldDeferAutomaticLeadSchedule(schedule)) {
+          console.log(`${logTime()} [Agent] Deferred automatic lead schedule ${queryId}: ${message.substring(0, 80)}...`);
+          return res.status(202).json({
+            query_id: queryId,
+            status: 'deferred',
+            message: 'Automatic primary-lead heartbeat recorded without starting a harness turn.'
+          });
+        }
+
+        this.startQuery(queryId, message, undefined, undefined, { noAutoReply: true, priority: 'background' });
 
         res.status(202).json({
           query_id: queryId,
@@ -1850,6 +1907,13 @@ IMPORTANT INSTRUCTIONS:
 What would you like to do with this information?`;
   }
 
+  private shouldDeferAutomaticLeadSchedule(schedule: unknown): boolean {
+    if (!schedule || typeof schedule !== 'object') return false;
+    const data = schedule as Record<string, unknown>;
+    if (data.kind !== 'heartbeat' || data.manual === true) return false;
+    return this.agentIdentity?.metadata?.primaryLead === true;
+  }
+
   /**
    * Send a reply back to the sender agent via their /news endpoint
    */
@@ -1966,11 +2030,25 @@ What would you like to do with this information?`;
     prompt: string,
     resume?: string,
     from?: string,
-    options?: { noAutoReply?: boolean }
+    options?: QueryOptions
   ) {
-    // Add to queue and process (serializes queries to prevent concurrent execution issues)
-    this.queryQueue.push({ queryId, prompt, resume, from, options });
-    console.log(`${logTime()} [Query Queue] Added ${queryId} to queue (queue size: ${this.queryQueue.length})`);
+    const priority = classifyQueryQueuePriority({ prompt, from, options });
+    const item = {
+      queryId,
+      prompt,
+      resume,
+      from,
+      options,
+      priority,
+    };
+    const rank = getQueryPriorityRank(priority);
+    const index = this.queryQueue.findIndex((queued) => getQueryPriorityRank(queued.priority) < rank);
+    if (index === -1) {
+      this.queryQueue.push(item);
+    } else {
+      this.queryQueue.splice(index, 0, item);
+    }
+    console.log(`${logTime()} [Query Queue] Added ${queryId} to queue (priority: ${priority}, queue size: ${this.queryQueue.length})`);
     this.processQueryQueue();
   }
 
@@ -1983,10 +2061,10 @@ What would you like to do with this information?`;
     // Process all queued queries sequentially
     while (this.queryQueue.length > 0) {
       this.isProcessingQuery = true;
-      const { queryId, prompt, resume, from, options } = this.queryQueue.shift()!;
+      const { queryId, prompt, resume, from, options, priority } = this.queryQueue.shift()!;
 
       try {
-        await this.executeQuery(queryId, prompt, resume, from, options);
+        await this.executeQuery(queryId, prompt, resume, from, options, priority);
       } catch (error) {
         console.error(`[Query Queue] Error processing ${queryId}:`, error);
       }
@@ -2000,7 +2078,8 @@ What would you like to do with this information?`;
     prompt: string,
     resume?: string,
     from?: string,
-    options?: { noAutoReply?: boolean }
+    options?: QueryOptions,
+    priority: QueryQueuePriority = 'normal',
   ) {
     const query: ActiveQuery = {
       id: queryId,
@@ -2046,7 +2125,7 @@ What would you like to do with this information?`;
       let result = '';
       const messages: string[] = [];
 
-      console.log(`${logTime()} [Agent] Processing query ${queryId}${from ? ` from ${from}` : ''}${options?.noAutoReply ? ' (no auto-reply)' : ''}: ${prompt.substring(0, 60)}...`);
+      console.log(`${logTime()} [Agent] Processing query ${queryId}${from ? ` from ${from}` : ''}${options?.noAutoReply ? ' (no auto-reply)' : ''} [priority:${priority}]: ${prompt.substring(0, 60)}...`);
 
       // Prepend sender info if present so Claude knows who sent the message
       const isManager = from === 'manager' || from === 'remote';
