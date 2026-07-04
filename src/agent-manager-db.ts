@@ -1479,7 +1479,15 @@ export class AgentManagerDb {
       const prevProbe = this.stalledNudges.get(key);
       const attempt = this.markStalledProbe(key, params.nowMs);
       const msg = this.stalledTaskManagerFallbackPrompt(params);
-      if (await this.sendSupervisionAsk(taskManager.team.name, taskManager.agent.name, msg)) {
+      const sent = await this.sendRecentThrottledSupervisionAsk({
+        teamId: taskManager.team.id,
+        teamName: taskManager.team.name,
+        recipient: taskManager.agent,
+        message: msg,
+        nowMs: params.nowMs,
+        force: params.force,
+      });
+      if (sent === 'sent') {
         await this.recordTaskSupervision(params.task, params.teamId, taskManager.agent.id, params.eventReason, params.stalledMinutes, params.nowMs);
         return {
           status: 'sent_task_manager',
@@ -1491,7 +1499,7 @@ export class AgentManagerDb {
       }
       this.restoreStalledProbe(key, prevProbe);
       lastBlocked = {
-        status: 'send_failed',
+        status: sent === 'recent' ? 'throttled' : 'send_failed',
         taskRef: params.ref,
         actor: taskManager.agent.name,
         actorTeam: taskManager.team.name,
@@ -1545,22 +1553,39 @@ export class AgentManagerDb {
       const prevProbe = this.stalledNudges.get(key);
       const attempt = this.markStalledProbe(key, params.nowMs);
       const msg = this.stalledOwnerBacklogPrompt(task, ref, stalledMinutes);
-      if (await this.sendSupervisionAsk(params.teamName, ownerName, msg)) {
+      const sent = await this.sendRecentThrottledSupervisionAsk({
+        teamId: params.teamId,
+        teamName: params.teamName,
+        recipient: params.owner,
+        message: msg,
+        nowMs: params.nowMs,
+        force: params.force,
+      });
+      if (sent === 'sent') {
         await this.recordTaskSupervision(task, params.teamId, params.owner.id, 'owner_refresh', stalledMinutes, params.nowMs);
         return { status: 'sent_owner', taskRef: ref, actor: ownerName, attempt };
       }
       this.restoreStalledProbe(key, prevProbe);
-      return { status: 'send_failed', taskRef: ref, actor: ownerName };
+      return { status: sent === 'recent' ? 'throttled' : 'send_failed', taskRef: ref, actor: ownerName };
     }
 
     if (this.canWakeAssignedTaskOwner(params.owner)) {
       const wake = await this.wakeAssignedTaskOwner(params.teamId, params.teamName, task, params.owner, 'stalled-owner');
       if (wake.status === 'started') {
         const msg = this.stalledOwnerBacklogPrompt(task, ref, stalledMinutes);
-        if (await this.sendSupervisionAsk(params.teamName, ownerName, msg)) {
+        const sent = await this.sendRecentThrottledSupervisionAsk({
+          teamId: params.teamId,
+          teamName: params.teamName,
+          recipient: params.owner,
+          message: msg,
+          nowMs: params.nowMs,
+          force: params.force,
+        });
+        if (sent === 'sent') {
           await this.recordTaskSupervision(task, params.teamId, ownerId, 'owner_refresh', stalledMinutes, params.nowMs);
           return { status: 'owner_wake_prompt_sent', taskRef: ref, actor: ownerName };
         }
+        if (sent === 'recent') return { status: 'throttled', taskRef: ref, actor: ownerName };
         ownerWakePromptFailed = true;
       }
     }
@@ -1616,12 +1641,20 @@ export class AgentManagerDb {
     const prevProbe = this.stalledNudges.get(key);
     const attempt = this.markStalledProbe(key, params.nowMs);
     const msg = `Backlog guard: task ${ref} ("${task.title}") has been active ${stalledMinutes}m, but owner ${ownerName} is not live. New task assignment to that owner is held until this is triaged. Please claim it, reassign it, or route it to the right teammate.`;
-    if (await this.sendSupervisionAsk(params.teamName, lead.name, msg)) {
+    const sent = await this.sendRecentThrottledSupervisionAsk({
+      teamId: params.teamId,
+      teamName: params.teamName,
+      recipient: lead,
+      message: msg,
+      nowMs: params.nowMs,
+      force: params.force,
+    });
+    if (sent === 'sent') {
       await this.recordTaskSupervision(task, params.teamId, lead.id, 'owner_unavailable', stalledMinutes, params.nowMs);
       return { status: 'sent_lead', taskRef: ref, actor: lead.name, attempt };
     }
     this.restoreStalledProbe(key, prevProbe);
-    return { status: 'send_failed', taskRef: ref, actor: lead.name };
+    return { status: sent === 'recent' ? 'throttled' : 'send_failed', taskRef: ref, actor: lead.name };
   }
 
   private async stalledOwnerBacklogGuard(params: {
@@ -13253,6 +13286,50 @@ Return this JSON shape:
     } catch {
       return false;
     }
+  }
+
+  private supervisionWakeRecentActivityMs(): number {
+    const raw = Number(process.env.ID_SUPERVISION_WAKE_RECENT_ACTIVITY_MS || 5 * 60 * 1000);
+    return Number.isFinite(raw) && raw >= 0 ? raw : 5 * 60 * 1000;
+  }
+
+  private async hasRecentMatchingControlAsk(
+    teamId: string,
+    recipient: AgentRow | null | undefined,
+    message: string,
+    nowMs: number,
+  ): Promise<boolean> {
+    if (!recipient?.id) return false;
+    const recentMs = this.supervisionWakeRecentActivityMs();
+    if (recentMs <= 0) return false;
+    const dedupKey = this.activeAskDedupKey(message);
+    if (!dedupKey) return false;
+    const sinceMs = nowMs - recentMs;
+    const { rows } = await this.db.adapter.query<QueryRow>(
+      `SELECT team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id, metadata
+         FROM queries
+        WHERE team_id = ?
+          AND agent_id = ?
+          AND (created >= ? OR COALESCE(completed, 0) >= ?)`,
+      [teamId, recipient.id, sinceMs, sinceMs],
+    );
+    return rows.some((row) => this.activeAskDedupKey(row.prompt) === dedupKey);
+  }
+
+  private async sendRecentThrottledSupervisionAsk(params: {
+    teamId: string;
+    teamName: string;
+    recipient: AgentRow;
+    message: string;
+    nowMs: number;
+    force?: boolean;
+  }): Promise<'sent' | 'recent' | 'failed'> {
+    if (!params.force && await this.hasRecentMatchingControlAsk(params.teamId, params.recipient, params.message, params.nowMs)) {
+      return 'recent';
+    }
+    return await this.sendSupervisionAsk(params.teamName, params.recipient.name, params.message)
+      ? 'sent'
+      : 'failed';
   }
 
   private supervisionPromptMatchesMarker(prompt: string | null | undefined, marker: string): boolean {

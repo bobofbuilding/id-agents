@@ -1365,6 +1365,85 @@ describe('stalled task sweeper', () => {
     );
   });
 
+  it('does not repeat stalled owner backlog guard when a matching control query just finished', async () => {
+    const recentCompleted = activeQuery('agent-1', {
+      query_id: 'recent-backlog-guard',
+      status: 'completed',
+      prompt: 'Backlog guard: task #12345678 ("Stalled work") has been active 57m with no progress update.',
+      created: NOW_MS - 90_000,
+      completed: NOW_MS - 30_000,
+    });
+    const db = fakeDb({
+      adapter: {
+        query: vi.fn(async (sql: string) => {
+          if (sql.includes('FROM queries')) {
+            return { rows: [recentCompleted], rowCount: 1 };
+          }
+          return { rows: [], rowCount: 0 };
+        }),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-owner-recent-control-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const guard = await manager.stalledOwnerBacklogGuard({
+      teamId: TEAM_ID,
+      teamName: 'default',
+      owner: agent(),
+    });
+
+    expect(guard?.triage).toMatchObject({
+      status: 'throttled',
+      taskRef: '#12345678',
+      actor: 'worker',
+    });
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
+    expect(db.events.insert).not.toHaveBeenCalled();
+  });
+
+  it('lets forced stalled owner triage bypass the recent control-query throttle', async () => {
+    const recentCompleted = activeQuery('agent-1', {
+      query_id: 'recent-backlog-guard',
+      status: 'completed',
+      prompt: 'Backlog guard: task #12345678 ("Stalled work") has been active 57m with no progress update.',
+      created: NOW_MS - 90_000,
+      completed: NOW_MS - 30_000,
+    });
+    const db = fakeDb({
+      adapter: {
+        query: vi.fn(async (sql: string) => {
+          if (sql.includes('FROM queries')) {
+            return { rows: [recentCompleted], rowCount: 1 };
+          }
+          return { rows: [], rowCount: 0 };
+        }),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-owner-force-recent-control-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const guard = await manager.stalledOwnerBacklogGuard({
+      teamId: TEAM_ID,
+      teamName: 'default',
+      owner: agent(),
+      forceTriage: true,
+    });
+
+    expect(guard?.triage).toMatchObject({
+      status: 'sent_owner',
+      taskRef: '#12345678',
+      actor: 'worker',
+    });
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledTimes(1);
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:refreshed',
+      actor_agent_id: 'agent-1',
+      data: expect.objectContaining({
+        reason: 'owner_refresh',
+      }),
+    }));
+  });
+
   it('routes stalled wake prompt failures to task-master fallback', async () => {
     const stoppedOwner = agent({
       status: 'stopped',
