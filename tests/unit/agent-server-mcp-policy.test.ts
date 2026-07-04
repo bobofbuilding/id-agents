@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { allowedToolsForPrompt, shouldSuppressMcpForPrompt } from '../../src/claude-agent-server.js';
+import { allowedToolsForPrompt, queryExecutionTimeoutMsForPrompt, shouldSuppressMcpForPrompt } from '../../src/claude-agent-server.js';
 
 describe('agent server MCP prompt policy', () => {
   it('suppresses MCP for manager supervision and heartbeat control-plane prompts', () => {
@@ -149,5 +149,43 @@ Please inspect the repository, edit the integration, and run the test suite.`)).
       .toEqual(['Read', 'Glob', 'Grep']);
     expect(allowedToolsForPrompt('Implement a filesystem-backed MCP integration and cite the changed files.', configured))
       .toEqual(configured);
+  });
+
+  it('bounds control-plane query runtime while leaving normal work unbounded', () => {
+    const priorControl = process.env.ID_AGENT_CONTROL_QUERY_TIMEOUT_MS;
+    const priorValidation = process.env.ID_AGENT_VALIDATION_CONTROL_QUERY_TIMEOUT_MS;
+    delete process.env.ID_AGENT_CONTROL_QUERY_TIMEOUT_MS;
+    delete process.env.ID_AGENT_VALIDATION_CONTROL_QUERY_TIMEOUT_MS;
+
+    try {
+      expect(queryExecutionTimeoutMsForPrompt('Backlog guard: task #12345678 has been active 60m with no progress update.'))
+        .toBe(90_000);
+      expect(queryExecutionTimeoutMsForPrompt('Validation request for run-baseline-cycle (#784ff464), goal goal_1. Read the artifact and reply PASS or FAIL.'))
+        .toBe(180_000);
+      expect(queryExecutionTimeoutMsForPrompt('Implement a filesystem-backed MCP integration and cite the changed files.'))
+        .toBeUndefined();
+    } finally {
+      if (priorControl === undefined) delete process.env.ID_AGENT_CONTROL_QUERY_TIMEOUT_MS;
+      else process.env.ID_AGENT_CONTROL_QUERY_TIMEOUT_MS = priorControl;
+      if (priorValidation === undefined) delete process.env.ID_AGENT_VALIDATION_CONTROL_QUERY_TIMEOUT_MS;
+      else process.env.ID_AGENT_VALIDATION_CONTROL_QUERY_TIMEOUT_MS = priorValidation;
+    }
+  });
+
+  it('clamps configured control-plane query timeouts', () => {
+    const priorControl = process.env.ID_AGENT_CONTROL_QUERY_TIMEOUT_MS;
+    process.env.ID_AGENT_CONTROL_QUERY_TIMEOUT_MS = '1000';
+
+    try {
+      expect(queryExecutionTimeoutMsForPrompt('Status check on task #12345678. Reply in one sentence.'))
+        .toBe(15_000);
+
+      process.env.ID_AGENT_CONTROL_QUERY_TIMEOUT_MS = '9999999';
+      expect(queryExecutionTimeoutMsForPrompt('Status check on task #12345678. Reply in one sentence.'))
+        .toBe(600_000);
+    } finally {
+      if (priorControl === undefined) delete process.env.ID_AGENT_CONTROL_QUERY_TIMEOUT_MS;
+      else process.env.ID_AGENT_CONTROL_QUERY_TIMEOUT_MS = priorControl;
+    }
   });
 });

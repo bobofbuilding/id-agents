@@ -75,6 +75,21 @@ function summarizeTool(name: string, input: any): { kind: string; summary: strin
   }
 }
 
+export function claudeCliToolArgs(options: Pick<HarnessOptions, 'allowedTools' | 'executionPolicy'>): string[] {
+  const tools = (options.allowedTools || [])
+    .map((tool) => String(tool || '').trim())
+    .filter(Boolean);
+  if (tools.length === 0) return [];
+
+  const toolList = tools.join(',');
+  if (options.executionPolicy === 'control-plane-readonly') {
+    // Claude CLI's --allowedTools means "auto-approve", not "only expose".
+    // Use --tools for control-plane prompts so Bash/Edit/Write are unavailable.
+    return ['--tools', toolList, '--allowedTools', toolList];
+  }
+  return ['--allowedTools', toolList];
+}
+
 export class ClaudeCodeCliHarness implements AgentHarness {
   readonly type: HarnessType = 'claude-code-cli' as HarnessType;
 
@@ -148,9 +163,7 @@ export class ClaudeCodeCliHarness implements AgentHarness {
     }
 
     // Add allowed tools if specified
-    if (options.allowedTools && options.allowedTools.length > 0) {
-      args.push('--allowedTools', options.allowedTools.join(','));
-    }
+    args.push(...claudeCliToolArgs(options));
 
     // Add MCP servers if specified. The claude CLI consumes them from a
     // .mcp.json-style file via --mcp-config; --strict-mcp-config makes it use

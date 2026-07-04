@@ -8,7 +8,7 @@
 
 import express from 'express';
 import fetch from 'node-fetch';
-import { createHarness, HarnessType, AgentHarness } from './harness/index.js';
+import { createHarness, HarnessType, AgentHarness, HarnessMessage } from './harness/index.js';
 import type { RuntimeRateLimitSignal } from './harness/rate-limit.js';
 import { parseMcpServersEnv } from './harness/mcp.js';
 import { withInterAgentSkill } from './inter-agent-skill.js';
@@ -106,6 +106,18 @@ const MCP_CONTROL_PLANE_PROMPT_PATTERNS = [
 
 const DEFAULT_AGENT_ALLOWED_TOOLS = ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'WebSearch', 'WebFetch'];
 const CONTROL_PLANE_READONLY_TOOLS = new Set(['Read', 'Glob', 'Grep']);
+const DEFAULT_CONTROL_PLANE_QUERY_TIMEOUT_MS = 90_000;
+const DEFAULT_VALIDATION_CONTROL_PLANE_QUERY_TIMEOUT_MS = 180_000;
+const MIN_CONTROL_PLANE_QUERY_TIMEOUT_MS = 15_000;
+const MAX_CONTROL_PLANE_QUERY_TIMEOUT_MS = 600_000;
+
+const VALIDATION_CONTROL_PLANE_PROMPT_PATTERNS = [
+  /^Please validate\b[\s\S]*\bagainst task\s+#?[a-z0-9_-]+/i,
+  /^Validation request for\b[\s\S]*\(#[a-z0-9_-]+\)/i,
+  /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nPlease validate\b[\s\S]*\bagainst task\s+#?[a-z0-9_-]+/i,
+  /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nValidation request for\b[\s\S]*\(#[a-z0-9_-]+\)/i,
+  /^\[Message from agent "[^"]+"\s*\|[^\n]*\]\s*\n[\s\S]*\nValidation request for\b[\s\S]*\(#[a-z0-9_-]+\)/i,
+];
 
 export function shouldSuppressMcpForPrompt(prompt: string): boolean {
   const text = String(prompt || '').trimStart();
@@ -115,6 +127,88 @@ export function shouldSuppressMcpForPrompt(prompt: string): boolean {
 export function allowedToolsForPrompt(prompt: string, configuredAllowedTools: string[]): string[] {
   if (!shouldSuppressMcpForPrompt(prompt)) return configuredAllowedTools;
   return configuredAllowedTools.filter((tool) => CONTROL_PLANE_READONLY_TOOLS.has(tool));
+}
+
+function readControlPlaneTimeoutEnv(name: string, defaultMs: number): number {
+  const raw = process.env[name];
+  if (!raw) return defaultMs;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return defaultMs;
+  return Math.min(
+    MAX_CONTROL_PLANE_QUERY_TIMEOUT_MS,
+    Math.max(MIN_CONTROL_PLANE_QUERY_TIMEOUT_MS, parsed),
+  );
+}
+
+function isValidationControlPlanePrompt(prompt: string): boolean {
+  const text = String(prompt || '').trimStart();
+  return VALIDATION_CONTROL_PLANE_PROMPT_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+export function queryExecutionTimeoutMsForPrompt(prompt: string): number | undefined {
+  if (!shouldSuppressMcpForPrompt(prompt)) return undefined;
+  if (isValidationControlPlanePrompt(prompt)) {
+    return readControlPlaneTimeoutEnv(
+      'ID_AGENT_VALIDATION_CONTROL_QUERY_TIMEOUT_MS',
+      DEFAULT_VALIDATION_CONTROL_PLANE_QUERY_TIMEOUT_MS,
+    );
+  }
+  return readControlPlaneTimeoutEnv(
+    'ID_AGENT_CONTROL_QUERY_TIMEOUT_MS',
+    DEFAULT_CONTROL_PLANE_QUERY_TIMEOUT_MS,
+  );
+}
+
+class QueryExecutionTimeoutError extends Error {
+  constructor(readonly queryId: string, readonly timeoutMs: number) {
+    super(`Query ${queryId} exceeded control-plane timeout after ${Math.round(timeoutMs / 1000)}s`);
+    this.name = 'QueryExecutionTimeoutError';
+  }
+}
+
+async function* withQueryExecutionTimeout(
+  iterator: AsyncGenerator<HarnessMessage>,
+  params: {
+    queryId: string;
+    timeoutMs?: number;
+    onTimeout: () => void;
+  },
+): AsyncGenerator<HarnessMessage> {
+  if (!params.timeoutMs || params.timeoutMs <= 0) {
+    yield* iterator;
+    return;
+  }
+
+  let timedOut = false;
+  let timeoutHandle: NodeJS.Timeout | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutHandle = setTimeout(() => {
+      timedOut = true;
+      try {
+        params.onTimeout();
+      } finally {
+        reject(new QueryExecutionTimeoutError(params.queryId, params.timeoutMs!));
+      }
+    }, params.timeoutMs);
+    timeoutHandle.unref?.();
+  });
+
+  try {
+    while (true) {
+      const next = await Promise.race([iterator.next(), timeoutPromise]);
+      if (next.done) return;
+      yield next.value;
+    }
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+    if (timedOut) {
+      try {
+        void iterator.return?.(undefined as any).catch(() => {});
+      } catch {
+        // Best effort only; the harness cancel path owns process cleanup.
+      }
+    }
+  }
 }
 
 export type QueryQueuePriority = 'operator' | 'delegation' | 'normal' | 'background';
@@ -2359,12 +2453,16 @@ ${prompt}`
       if (suppressMcp) {
         console.log(`${logTime()} [Agent] Read-only control-plane tool policy for ${queryId}: ${allowedTools.join(', ') || '(none)'}`);
       }
+      const executionTimeoutMs = queryExecutionTimeoutMsForPrompt(promptWithSender);
+      if (executionTimeoutMs) {
+        console.log(`${logTime()} [Agent] Control-plane timeout for ${queryId}: ${executionTimeoutMs}ms`);
+      }
 
       stopExternalQueryWatcher = this.startExternalQueryStopWatcher(queryId, (error) => {
         externalStopError ??= error;
       });
 
-      for await (const message of this.harness.run(enhancedPrompt, {
+      const harnessMessages = this.harness.run(enhancedPrompt, {
         model: this.model,
         allowedTools,
         workingDirectory: this.workingDirectory,
@@ -2373,6 +2471,15 @@ ${prompt}`
         mcpServers: mcpServers,
         executionPolicy,
         queryId  // thread the dispatch id so live activity steps are attributable
+      });
+
+      for await (const message of withQueryExecutionTimeout(harnessMessages, {
+        queryId,
+        timeoutMs: executionTimeoutMs,
+        onTimeout: () => {
+          console.warn(`${logTime()} [Agent] Control-plane timeout hit for ${queryId}; cancelling harness`);
+          this.harness.cancel?.();
+        },
       })) {
         if (externalStopError) throw externalStopError;
 
