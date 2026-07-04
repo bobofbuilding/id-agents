@@ -112,9 +112,22 @@ describe('agent query queue priority', () => {
       });
 
       expect(res.status).toBe(202);
-      await expect(res.json()).resolves.toMatchObject({ status: 'deferred' });
+      const body = await res.json();
+      expect(body).toMatchObject({ status: 'deferred' });
       await sleep(20);
       expect(harness.prompts).toHaveLength(0);
+
+      const newsRes = await fetch(`http://127.0.0.1:${port}/news?query_id=${encodeURIComponent(body.query_id)}`);
+      expect(newsRes.status).toBe(200);
+      const newsBody = await newsRes.json();
+      expect(newsBody.items).toHaveLength(1);
+      expect(newsBody.items[0]).toMatchObject({
+        type: 'schedule.received',
+        data: {
+          query_id: body.query_id,
+          status: 'deferred',
+        },
+      });
     } finally {
       await server.stop();
     }

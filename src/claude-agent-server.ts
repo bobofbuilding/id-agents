@@ -1157,11 +1157,12 @@ export class AgentRestServer {
 
         const queryId = `query_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
 
+        const deferAutomaticSchedule = this.shouldDeferAutomaticSchedule(schedule);
         const newsData: Record<string, unknown> = {
           query_id: queryId,
           message,
           schedule,
-          status: 'processing'
+          status: deferAutomaticSchedule ? 'deferred' : 'processing'
         };
         if (Array.isArray(linkedTasks) && linkedTasks.length > 0) {
           newsData.linkedTasks = linkedTasks;
@@ -1173,7 +1174,7 @@ export class AgentRestServer {
           console.error(`[Agent] Warning: Failed to persist scheduled news item for query ${queryId}:`, newsErr?.message || newsErr);
         }
 
-        if (this.shouldDeferAutomaticSchedule(schedule)) {
+        if (deferAutomaticSchedule) {
           console.log(`${logTime()} [Agent] Deferred automatic schedule ${queryId}: ${message.substring(0, 80)}...`);
           return res.status(202).json({
             query_id: queryId,
