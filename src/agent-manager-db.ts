@@ -1309,6 +1309,7 @@ export class AgentManagerDb {
     const renudgeMs = this.getStallRenudgeMs();
     const { task, ref, stalledMinutes } = params.blocker;
     const ownerName = params.owner.name;
+    const ownerId = params.owner.id;
 
     if (this.isLiveForSupervision(params.owner)) {
       const key = `task:${task.id}:owner-refresh`;
@@ -1329,6 +1330,14 @@ export class AgentManagerDb {
       }
       this.restoreStalledProbe(key, prevProbe);
       return { status: 'send_failed', taskRef: ref, actor: ownerName };
+    }
+
+    if (this.canWakeAssignedTaskOwner(params.owner)) {
+      const wake = await this.wakeAssignedTaskOwner(params.teamId, params.teamName, task, params.owner, 'stalled-owner');
+      if (wake.status === 'started') {
+        await this.recordTaskSupervision(task, params.teamId, ownerId, 'owner_refresh', stalledMinutes, params.nowMs);
+        return { status: 'owner_wake_started', taskRef: ref, actor: ownerName };
+      }
     }
 
     const candidateLead = await this.findSupervisionLead(params.teamId).catch(() => null);

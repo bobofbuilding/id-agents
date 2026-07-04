@@ -1020,6 +1020,43 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('wakes a stopped local owner from the explicit stalled backlog guard', async () => {
+    const stoppedOwner = agent({
+      status: 'stopped',
+      port: 4210,
+      type: 'claude',
+      runtime: 'claude-code-cli',
+    });
+    const db = fakeDb({
+      agents: {
+        getById: vi.fn(async () => stoppedOwner),
+        updateStatus: vi.fn(async () => {}),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-owner-wake-guard-test', db, { libraryRoot: null }) as any;
+    manager.spawnLocalAgentProcess = vi.fn(async () => ({ success: true, pid: 1234, logFile: '/tmp/worker.log' }));
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const guard = await manager.stalledOwnerBacklogGuard({
+      teamId: TEAM_ID,
+      teamName: 'default',
+      owner: stoppedOwner,
+    });
+
+    expect(guard?.triage).toMatchObject({
+      status: 'owner_wake_started',
+      taskRef: '#12345678',
+      actor: 'worker',
+    });
+    expect(manager.spawnLocalAgentProcess).toHaveBeenCalledWith(TEAM_ID, 'default', expect.objectContaining({
+      id: stoppedOwner.id,
+      name: stoppedOwner.name,
+      port: stoppedOwner.port,
+    }));
+    expect(db.agents.updateStatus).toHaveBeenCalledWith(stoppedOwner.id, 'running');
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
+  });
+
   it('falls through to ops-lead when task-master is busy', async () => {
     const unavailableOwner = agent({ status: 'stopped' });
     const opsTeam = team({ id: 'ops-team-id', name: 'ops-team' });
