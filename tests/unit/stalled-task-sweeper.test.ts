@@ -251,6 +251,17 @@ describe('stalled task sweeper', () => {
     expect(db.tasks.claim).not.toHaveBeenCalled();
   });
 
+  it('does not attach Brain context to control-plane status prompts', async () => {
+    const manager = new AgentManagerDb('/tmp/id-agents-brain-context-control-plane-test', fakeDb(), { libraryRoot: null }) as any;
+
+    expect(manager.shouldAttachBrainContext('Backlog guard: task #12345678 is stalled.')).toBe(false);
+    expect(manager.shouldAttachBrainContext('Assignment sweep complete (Jul 4). Assigned: 0.')).toBe(false);
+    expect(manager.shouldAttachBrainContext('No approved recommendation routed. The completed result was REVISE.')).toBe(false);
+    expect(manager.shouldAttachBrainContext('Already handled. Task #12345678 is done with no active delegation.')).toBe(false);
+    expect(manager.shouldAttachBrainContext('Resume and complete task #12345678: inventory MCP servers.')).toBe(true);
+    expect(manager.shouldAttachBrainContext('Please inspect the repository and run the integration tests.')).toBe(true);
+  });
+
   it('starts the stalled-task probe reads in parallel before sending a nudge', async () => {
     let releaseEvent!: () => void;
     let releasePending!: () => void;

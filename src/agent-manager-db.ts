@@ -3948,6 +3948,20 @@ Return this JSON shape:
     return `${message}\n\n${lines.join('\n')}`;
   }
 
+  private shouldAttachBrainContext(message: string): boolean {
+    const text = String(message || '').trimStart();
+    if (!text) return false;
+    return ![
+      /^Heartbeat:/,
+      /^Supervision:/,
+      /^Supervision probe on task\b/,
+      /^Backlog guard:/,
+      /^Assignment sweep complete\b/,
+      /^No approved recommendation routed\b/,
+      /^Already handled\.\s+Task\b/,
+    ].some((pattern) => pattern.test(text));
+  }
+
   /**
    * Unified message handler for both /message and /talk-to.
    * Default: fire-and-forget. With wait:true or timeout: waits for reply.
@@ -4083,13 +4097,15 @@ Return this JSON shape:
       this.managerLog(`${shouldWait ? 'Forwarding' : 'Sending async'} message to ${targetDisplayId} at ${targetUrl}`);
       const autoAttach = (req as any)._autoAttach as { task?: TaskRow } | undefined;
       const taskIdForBrain = autoAttach?.task?.uuid ? `task:${autoAttach.task.uuid}` : null;
-      const brainContext = await this.volunteerBrainContext({
-        taskId: taskIdForBrain,
-        agentId: targetAgent.id,
-        text: String(message),
-        project: teamName,
-        sessionId: session_id || null,
-      });
+      const brainContext = this.shouldAttachBrainContext(String(message))
+        ? await this.volunteerBrainContext({
+            taskId: taskIdForBrain,
+            agentId: targetAgent.id,
+            text: String(message),
+            project: teamName,
+            sessionId: session_id || null,
+          })
+        : null;
       const outgoingMessage = this.withBrainContextAppendix(String(message), brainContext);
 
       if (shouldWait && from && String(from).toLowerCase() !== 'manager') {
@@ -10164,12 +10180,14 @@ Return this JSON shape:
         // Discover REST-AP endpoints from the agent's catalog
         const endpoints = await discoverRestAPEndpoints(baseEndpoint);
         const talkUrl = `${baseEndpoint.replace(/\/+$/, '')}${endpoints.talk}`;
-        const brainContext = await this.volunteerBrainContext({
-          agentId: a.id,
-          text: message,
-          project: teamName,
-          sessionId: callerSessionId || null,
-        });
+        const brainContext = this.shouldAttachBrainContext(message)
+          ? await this.volunteerBrainContext({
+              agentId: a.id,
+              text: message,
+              project: teamName,
+              sessionId: callerSessionId || null,
+            })
+          : null;
         const outgoingMessage = this.withBrainContextAppendix(message, brainContext);
 
         // Send message to agent's /talk endpoint
