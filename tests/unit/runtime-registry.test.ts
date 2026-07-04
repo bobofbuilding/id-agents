@@ -171,7 +171,7 @@ describe('runtime registry', () => {
   it('accepts provider-owned model strings for copilot', () => {
     expect(validateRuntimeModelCompatibility('copilot', 'default')).toEqual([]);
     expect(validateRuntimeModelCompatibility('copilot', 'gpt-5.4')).toEqual([]);
-    expect(validateRuntimeModelCompatibility('copilot', 'claude-sonnet-4-6')).toEqual([]);
+    expect(validateRuntimeModelCompatibility('copilot', 'claude-sonnet-5')).toEqual([]);
   });
 
   it('exposes the Grok Build runtime profile', () => {
@@ -187,7 +187,7 @@ describe('runtime registry', () => {
   it('accepts provider-owned model strings for grok', () => {
     expect(validateRuntimeModelCompatibility('grok', 'grok-composer-2.5-fast')).toEqual([]);
     expect(validateRuntimeModelCompatibility('grok', 'grok-build')).toEqual([]);
-    expect(validateRuntimeModelCompatibility('grok', 'claude-sonnet-4-6')).toEqual([]);
+    expect(validateRuntimeModelCompatibility('grok', 'claude-sonnet-5')).toEqual([]);
   });
 
   it('exposes the Google Antigravity runtime profile', () => {

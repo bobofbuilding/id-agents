@@ -37,7 +37,7 @@ function makeRemoteAgent(overrides: Partial<Agent> = {}): Agent {
     port: 0,
     status: 'registered',
     health: 'online',
-    model: 'claude-sonnet-4-6',
+    model: 'claude-sonnet-5',
     type: 'virtual',
     createdAt: NOW_MS - 86400 * 1000,
     metadata: {

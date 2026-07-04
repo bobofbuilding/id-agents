@@ -97,7 +97,7 @@ describe.skipIf(!process.env.ID_CONTROL_API_KEY)('Sync Command', () => {
 
       // Now write a modified config: change A's model, add C, remove B
       writeConfig([
-        { name: AGENT_A, description: 'Agent A', model: 'claude-sonnet-4-6' },
+        { name: AGENT_A, description: 'Agent A', model: 'claude-sonnet-5' },
         { name: AGENT_C, description: 'Agent C' },
       ]);
 
@@ -130,7 +130,7 @@ describe.skipIf(!process.env.ID_CONTROL_API_KEY)('Sync Command', () => {
       // At this point, agents A and B are deployed from the dry-run test.
       // Config has A (changed model) and C (new), missing B (to remove).
       writeConfig([
-        { name: AGENT_A, description: 'Agent A', model: 'claude-sonnet-4-6' },
+        { name: AGENT_A, description: 'Agent A', model: 'claude-sonnet-5' },
         { name: AGENT_C, description: 'Agent C' },
       ]);
 
@@ -165,7 +165,7 @@ describe.skipIf(!process.env.ID_CONTROL_API_KEY)('Sync Command', () => {
 
       // Sync again with a description change for A
       writeConfig([
-        { name: AGENT_A, description: 'Agent A updated again', model: 'claude-sonnet-4-6' },
+        { name: AGENT_A, description: 'Agent A updated again', model: 'claude-sonnet-5' },
         { name: AGENT_C, description: 'Agent C' },
       ]);
 

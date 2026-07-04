@@ -139,7 +139,7 @@ let failed = 0;
 
 for (const agent of filteredAgents) {
   const runtime = agent.runtime || 'claude-code-cli';
-  const model = agent.model || 'claude-sonnet-4-6';
+  const model = agent.model || 'claude-sonnet-5';
   const keyMeta = loadAgentKeyMeta(agent.name);
 
   if (DRY_RUN) {

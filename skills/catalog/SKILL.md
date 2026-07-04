@@ -41,7 +41,7 @@ curl -s -X PATCH http://localhost:$ID_AGENT_PORT/catalog \
 | `expertise` | Array of skills | ["typescript", "react", "testing"] |
 | `status` | Availability | "available", "busy", "offline" |
 | `currentTask` | What you're working on | "Implementing login flow" |
-| `model` | Underlying LLM model id | "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5-20251001" |
+| `model` | Underlying LLM model id | "claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5-20251001" |
 | `workingDirectory` | Absolute path to your agent workspace | "/Users/alice/projects/foo/workspace/agents/coder" |
 | `costTier` | Relative cost of routing work to you — `low`, `medium`, or `high` | "high" (Opus), "medium" (Sonnet), "low" (Haiku) |
 | `notSuitableFor` | Array of work patterns where the manager should route elsewhere | ["bulk data crunching", "image generation", "production deploys"] |

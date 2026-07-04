@@ -174,8 +174,8 @@ The lead agent may have any name; set `lead: true` on that agent when the name d
 
 ```
 atlas        ← claude-opus-4-7, orchestrator, lead: true
-├── dev      ← claude-sonnet-4-6, implementer
-└── scout    ← claude-sonnet-4-6, research
+├── dev      ← claude-sonnet-5, implementer
+└── scout    ← claude-sonnet-5, research
 ```
 
 Three agents. Lead's catalog: `role: lead/orchestrator, notSuitableFor: ["direct code edits"]`.

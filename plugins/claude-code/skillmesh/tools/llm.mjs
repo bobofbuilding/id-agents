@@ -4,7 +4,7 @@
  *
  * Usage:
  *   node plugins/skillmesh/tools/llm.mjs "Your prompt here"
- *   node plugins/skillmesh/tools/llm.mjs "Your prompt" --model claude-sonnet-4-6
+ *   node plugins/skillmesh/tools/llm.mjs "Your prompt" --model claude-sonnet-5
  *   echo '{"messages":[{"role":"user","content":"hello"}]}' | node plugins/skillmesh/tools/llm.mjs
  *
  * Required env:

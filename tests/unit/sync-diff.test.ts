@@ -11,7 +11,7 @@ function makeAgentRow(overrides: Partial<AgentRow> = {}): AgentRow {
     id: 'agent_123',
     name: 'alice',
     type: 'claude',
-    model: 'claude-sonnet-4-6',
+    model: 'claude-sonnet-5',
     port: 4101,
     endpoint: 'http://localhost:4101',
     working_directory: '/workspace/agents/agent_123',
@@ -38,7 +38,7 @@ function makeAgentRow(overrides: Partial<AgentRow> = {}): AgentRow {
 function makeAgentSpec(overrides: Partial<AgentSpec> = {}): AgentSpec {
   return {
     name: 'alice',
-    model: 'claude-sonnet-4-6',
+    model: 'claude-sonnet-5',
     runtime: 'claude-agent-sdk',
     description: 'A test agent',
     plugins: [],

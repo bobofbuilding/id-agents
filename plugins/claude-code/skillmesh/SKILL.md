@@ -36,7 +36,7 @@ Route your own completions through the SkillMesh BYOK gateway (uses the server-s
 node plugins/skillmesh/tools/llm.mjs "Summarise the SkillMesh marketplace in one sentence"
 
 # With model override
-node plugins/skillmesh/tools/llm.mjs "Your prompt" --model claude-sonnet-4-6
+node plugins/skillmesh/tools/llm.mjs "Your prompt" --model claude-sonnet-5
 
 # Structured input
 echo '{"messages":[{"role":"user","content":"hello"}],"systemPrompt":"You are helpful"}' \

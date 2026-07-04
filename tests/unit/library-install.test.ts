@@ -31,7 +31,7 @@ team: demo-team
 defaults:
   local: true
   runtime: claude-code-cli
-  model: claude-sonnet-4-6
+  model: claude-sonnet-5
   skills:
     - identity
     - inter-agent
