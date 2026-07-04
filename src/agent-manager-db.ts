@@ -14093,11 +14093,14 @@ Return this JSON shape:
        ORDER BY completed DESC, query_id ASC`,
       [terminalCutoffMs],
     ).then((r) => r.rows).catch(() => [] as QueryRow[]);
-    const completedKeys = new Set<string>();
+    const completedKeyLatestAt = new Map<string, number>();
     for (const row of recentCompletedRows) {
       const dedupKey = this.activeAskDedupKey(row.prompt);
       if (!dedupKey) continue;
-      completedKeys.add(`${row.team_id}\u0001${row.owner_kind}\u0001${row.owner_id}\u0001${dedupKey}`);
+      const key = `${row.team_id}\u0001${row.owner_kind}\u0001${row.owner_id}\u0001${dedupKey}`;
+      const completedAt = Number(row.completed || row.created || 0);
+      const prior = completedKeyLatestAt.get(key) ?? 0;
+      if (completedAt > prior) completedKeyLatestAt.set(key, completedAt);
     }
     const grouped = new Map<string, QueryRow[]>();
     for (const row of rows) {
@@ -14112,8 +14115,10 @@ Return this JSON shape:
     const duplicateIds: string[] = [];
     const duplicateIdSet = new Set<string>();
     for (const [key, list] of grouped.entries()) {
-      if (!completedKeys.has(key)) continue;
+      const completedAt = completedKeyLatestAt.get(key);
+      if (!completedAt) continue;
       for (const row of list) {
+        if (Number(row.created || 0) > completedAt) continue;
         if (!duplicateIdSet.has(row.query_id)) {
           duplicateIdSet.add(row.query_id);
           duplicateIds.push(row.query_id);

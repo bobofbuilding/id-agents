@@ -1680,6 +1680,58 @@ new org text from sidecar
     expect((await db.queries.getByQueryIdForTeam(teamId, 'processing-sweep-reworded'))?.status).toBe('expired');
   });
 
+  it('keeps fresh control prompts created after a completed equivalent', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('engineering-team');
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-architect',
+        name: 'architecture-engineer',
+        port: 4119,
+        status: 'running',
+        endpoint: 'http://127.0.0.1:9',
+      }),
+    });
+    await db.tasks.create(taskRow({
+      id: 'audit-hooks',
+      name: 'audit-task-data-hooks',
+      uuid: '451758d2-0000-4000-8000-000000000000',
+      team_id: teamId,
+      status: 'doing',
+      owner: 'agent-architect',
+    }));
+
+    const now = Date.now();
+    await db.queries.upsert(teamId, 'agent-architect', {
+      query_id: 'completed-backlog-guard',
+      status: 'completed',
+      prompt: 'Backlog guard: task #451758d2 ("Audit task data hooks") has been active 47m with no progress update.',
+      created: now - 20 * 60 * 1000,
+      completed: now - 10 * 60 * 1000,
+      owner_kind: 'agent',
+      owner_id: 'agent-architect',
+    });
+    await db.queries.upsert(teamId, 'agent-architect', {
+      query_id: 'fresh-backlog-guard',
+      status: 'processing',
+      prompt: 'Backlog guard: task #451758d2 ("Audit task data hooks") has been active 60m with no progress update.',
+      created: now - 30 * 1000,
+      owner_kind: 'agent',
+      owner_id: 'agent-architect',
+    });
+
+    const result = await (manager as any).sweepStaleQueries();
+
+    expect(result.duplicateTaskAsk).toBe(0);
+    expect(result.total).toBe(0);
+    expect((await db.queries.getByQueryIdForTeam(teamId, 'completed-backlog-guard'))?.status).toBe('completed');
+    expect((await db.queries.getByQueryIdForTeam(teamId, 'fresh-backlog-guard'))?.status).toBe('processing');
+  });
+
   it('dedupes active task delegation /ask prompts before dispatching', async () => {
     const { manager, db, workDir } = await makeManager();
     dbs.push(db);
