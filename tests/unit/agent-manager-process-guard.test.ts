@@ -75,6 +75,35 @@ async function startTalkServer(response: Record<string, unknown>) {
   };
 }
 
+async function startCancelServer(response: Record<string, unknown> = { cancelled: true }) {
+  const cancelBodies: string[] = [];
+  const server = http.createServer((req, res) => {
+    if (req.method === 'POST' && req.url === '/cancel') {
+      let body = '';
+      req.setEncoding('utf8');
+      req.on('data', (chunk) => { body += chunk; });
+      req.on('end', () => {
+        cancelBodies.push(body);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(response));
+      });
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('cancel server failed to bind a loopback port');
+  return {
+    endpoint: `http://127.0.0.1:${address.port}`,
+    cancelBodies,
+    close: () => new Promise<void>((resolve, reject) => {
+      server.close((err) => (err ? reject(err) : resolve()));
+    }),
+  };
+}
+
 function agentRow(overrides: Partial<AgentRow> = {}): AgentRow {
   return {
     team_id: 'team-1',
@@ -625,10 +654,12 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     delete process.env.ID_PENDING_QUERY_EXPIRY_MINUTES;
     delete process.env.ID_PROCESSING_QUERY_EXPIRY_MINUTES;
 
+    let cancelServer: Awaited<ReturnType<typeof startCancelServer>> | null = null;
     try {
       const { manager, db, workDir } = await makeManager();
       dbs.push(db);
       workDirs.push(workDir);
+      cancelServer = await startCancelServer();
 
       const teamId = await db.teams.getOrCreateTeamId('ops-team');
       await db.agents.create({
@@ -637,6 +668,7 @@ describe('AgentManagerDb killAgentProcess guards', () => {
           id: 'ops-lead-agent',
           name: 'ops-lead',
           port: 4111,
+          endpoint: cancelServer.endpoint,
           status: 'running',
         }),
       });
@@ -672,10 +704,12 @@ describe('AgentManagerDb killAgentProcess guards', () => {
       expect((await db.queries.getByQueryIdForTeam(teamId, 'pending-old'))?.status).toBe('expired');
       expect((await db.queries.getByQueryIdForTeam(teamId, 'processing-moderate'))?.status).toBe('processing');
       expect((await db.queries.getByQueryIdForTeam(teamId, 'processing-old'))?.status).toBe('expired');
+      expect(cancelServer.cancelBodies).toHaveLength(1);
 
       const events = await db.events.query({ teamId, topics: ['query:expired'], limit: 10 });
       expect(events.map((event) => event.subject_id).sort()).toEqual(['pending-old', 'processing-old']);
     } finally {
+      await cancelServer?.close();
       if (savedEnv.legacy === undefined) delete process.env.ID_QUERY_EXPIRY_MINUTES;
       else process.env.ID_QUERY_EXPIRY_MINUTES = savedEnv.legacy;
       if (savedEnv.pending === undefined) delete process.env.ID_PENDING_QUERY_EXPIRY_MINUTES;

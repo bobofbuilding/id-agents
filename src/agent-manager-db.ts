@@ -12559,6 +12559,7 @@ Return this JSON shape:
       this.db.queries.expireStale(pendingCutoff, ['pending']),
       this.db.queries.expireStale(processingCutoff, ['processing']),
     ]);
+    const cancelledProcessingAgents = await this.cancelExpiredProcessingQueryAgents(expiredProcessing);
     const expiredDuplicateTaskAsks = await this.expireDuplicateActiveTaskAsks(now);
     this.lastQuerySweepAt = now;
     const expired = [...expiredPending, ...expiredProcessing, ...expiredDuplicateTaskAsks];
@@ -12576,10 +12577,10 @@ Return this JSON shape:
         });
       }
       this.managerLog(
-        `Expired ${count} stale/duplicate queries (pending>${this.PENDING_QUERY_EXPIRY_MINUTES}m, processing>${this.PROCESSING_QUERY_EXPIRY_MINUTES}m, duplicate-task-asks=${expiredDuplicateTaskAsks.length})`,
+        `Expired ${count} stale/duplicate queries (pending>${this.PENDING_QUERY_EXPIRY_MINUTES}m, processing>${this.PROCESSING_QUERY_EXPIRY_MINUTES}m, duplicate-task-asks=${expiredDuplicateTaskAsks.length}, cancelled-processing-agents=${cancelledProcessingAgents})`,
       );
       console.log(
-        `[Manager] Query sweeper expired ${count} stale/duplicate queries (pending>${this.PENDING_QUERY_EXPIRY_MINUTES}m, processing>${this.PROCESSING_QUERY_EXPIRY_MINUTES}m, duplicate-task-asks=${expiredDuplicateTaskAsks.length})`,
+        `[Manager] Query sweeper expired ${count} stale/duplicate queries (pending>${this.PENDING_QUERY_EXPIRY_MINUTES}m, processing>${this.PROCESSING_QUERY_EXPIRY_MINUTES}m, duplicate-task-asks=${expiredDuplicateTaskAsks.length}, cancelled-processing-agents=${cancelledProcessingAgents})`,
       );
     }
     return {
@@ -12588,6 +12589,43 @@ Return this JSON shape:
       duplicateTaskAsk: expiredDuplicateTaskAsks.length,
       total: count,
     };
+  }
+
+  private async cancelExpiredProcessingQueryAgents(expiredProcessing: QueryRow[]): Promise<number> {
+    const byAgent = new Map<string, QueryRow>();
+    for (const row of expiredProcessing) {
+      if (!row.agent_id || byAgent.has(row.agent_id)) continue;
+      byAgent.set(row.agent_id, row);
+    }
+    if (byAgent.size === 0) return 0;
+
+    let cancelled = 0;
+    await Promise.all([...byAgent.entries()].map(async ([agentId, row]) => {
+      const agent = await this.db.agents.getById(agentId).catch((err) => {
+        console.warn(`[Manager] Failed to load agent ${agentId} for stale query cancellation:`, err?.message || err);
+        return null;
+      });
+      if (!agent || !this.isLiveForSupervision(agent)) return;
+      if (isRemoteEndpointRuntime(agent.runtime)) return;
+      const endpoint = (agent.endpoint || (agent.port ? `http://localhost:${agent.port}` : '')).replace(/\/+$/, '');
+      if (!endpoint) return;
+
+      try {
+        const resp = await fetch(`${endpoint}/cancel`, {
+          method: 'POST',
+          signal: AbortSignal.timeout(2500),
+          headers: { 'Content-Type': 'application/json' },
+        });
+        if (!resp.ok) {
+          console.warn(`[Manager] Stale query cancellation failed for ${agent.name} (${row.query_id}): ${resp.status} ${resp.statusText}`);
+          return;
+        }
+        cancelled += 1;
+      } catch (err: any) {
+        console.warn(`[Manager] Stale query cancellation failed for ${agent.name} (${row.query_id}):`, err?.message || err);
+      }
+    }));
+    return cancelled;
   }
 
   /**
