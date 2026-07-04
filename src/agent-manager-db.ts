@@ -160,6 +160,12 @@ function tokenizeCommand(command: string): string[] {
   return tokens;
 }
 
+function quoteCommandArg(arg: string): string {
+  return /^[A-Za-z0-9_./:#=@-]+$/.test(arg)
+    ? arg
+    : `"${arg.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
 function normalizeConfigSkills(skills: unknown): string[] | undefined {
   if (!Array.isArray(skills)) return undefined;
 
@@ -588,6 +594,7 @@ export class AgentManagerDb {
   private runtimeFailoverRetryOf: Map<string, string> = new Map();
   private agentLifecycleLocks: Map<string, Promise<void>> = new Map();
   private validatorRecommendationLoopLocks: Map<string, Promise<void>> = new Map();
+  private taskOwnerWakeAttempts: Map<string, number> = new Map();
   private stalledNudges = new Map<string, StalledProbeState>(); // probe key -> throttle/count state
   private retentionService: RetentionService | null = null;
   private checkinService: CheckinService | null = null;
@@ -1501,6 +1508,69 @@ export class AgentManagerDb {
       this.markStalledProbe(key, Date.now());
       await this.recordTaskSupervision(task, teamId, owner.id, 'lead_delegation_required', 0, Date.now());
     }
+  }
+
+  private canWakeAssignedTaskOwner(agent: AgentRow | null | undefined): boolean {
+    if (!agent) return false;
+    if (agent.status === 'running' || agent.status === 'starting') return false;
+    if (isRemoteEndpointRuntime(agent.runtime)) return false;
+    if (agent.type !== 'claude') return false;
+    return Number.isInteger(agent.port) && agent.port > 0;
+  }
+
+  private async wakeAssignedTaskOwner(
+    teamId: string,
+    teamName: string,
+    task: TaskRow,
+    owner: AgentRow | null,
+    reason: 'task-create' | 'task-assign' | 'task-claim' | 'stalled-owner',
+  ): Promise<{ status: 'started' | 'skipped' | 'failed'; reason: string; pid?: number; logFile?: string }> {
+    if (!owner) return { status: 'skipped', reason: 'no_owner' };
+    if (owner.status === 'running') return { status: 'skipped', reason: 'already_running' };
+    if (owner.status === 'starting') return { status: 'skipped', reason: 'already_starting' };
+    if (!this.canWakeAssignedTaskOwner(owner)) {
+      return { status: 'skipped', reason: isRemoteEndpointRuntime(owner.runtime) ? 'remote_lifecycle' : 'unsupported_lifecycle' };
+    }
+
+    const now = Date.now();
+    const key = `${teamId}:${owner.id}:${task.id}`;
+    const previous = this.taskOwnerWakeAttempts.get(key) ?? 0;
+    if (now - previous < 5 * 60 * 1000) {
+      return { status: 'skipped', reason: 'recent_wake_attempt' };
+    }
+    this.taskOwnerWakeAttempts.set(key, now);
+
+    const spawnResult = await this.spawnLocalAgentProcess(teamId, teamName, {
+      name: owner.name,
+      id: owner.id,
+      port: owner.port,
+      model: owner.model,
+      workingDirectory: owner.working_directory ?? undefined,
+      tokenId: owner.token_id ?? undefined,
+    });
+    if (!spawnResult.success) {
+      this.managerLog(`Could not wake ${owner.name} for task ${task.name}: ${spawnResult.error || 'spawn failed'}`);
+      return { status: 'failed', reason: spawnResult.error || 'spawn_failed' };
+    }
+
+    await this.db.agents.updateStatus(owner.id, 'running');
+    await this.db.events.insert({
+      team_id: teamId,
+      topic: 'agent:started',
+      actor_agent_id: owner.id,
+      subject_kind: 'agent',
+      subject_id: owner.id,
+      occurred_at: now,
+      data: {
+        agent: owner.name,
+        task_name: task.name,
+        task_uuid: task.uuid,
+        reason,
+        pid: spawnResult.pid ?? null,
+      },
+    }).catch(() => ({ seq: 0 }));
+    this.managerLog(`Woke ${owner.name} for task ${task.name} (${reason})`);
+    return { status: 'started', reason, pid: spawnResult.pid, logFile: spawnResult.logFile };
   }
 
   private async buildLeadDelegationNudge(
@@ -7886,6 +7956,7 @@ Return this JSON shape:
             context_package_id: brainContext.context_package_id ?? brainContext.contextPackageId,
           } : null,
         });
+        const ownerWake = await this.wakeAssignedTaskOwner(teamId, teamName, updated!, agent, 'task-claim');
         void this.promptLeadForDelegationKickoff(teamId, teamName, updated!, agent).catch((err) => {
           console.warn(`[Supervision] Lead delegation kickoff failed for ${updated!.name}: ${err?.message || err}`);
         });
@@ -7897,6 +7968,7 @@ Return this JSON shape:
           bundles: brainContext.bundles,
           instructions: brainContext.instructions || [],
         };
+        (taskResult as any).owner_wake = ownerWake;
         (taskResult as any).brief_validation = claimBrief.validation;
         res.json({ ok: true, task: taskResult });
       } catch (err: any) {
@@ -8978,6 +9050,19 @@ Return this JSON shape:
     const args = parts.slice(1);
 
     switch (action) {
+      case 'tasks': {
+        const normalizedArgs = args.length === 1 && ['todo', 'doing', 'done'].includes(args[0].toLowerCase())
+          ? ['--status', args[0].toLowerCase()]
+          : args;
+        return this.executeRemoteCommand(
+          ['/task', 'list', ...normalizedArgs.map(quoteCommandArg)].join(' '),
+          teamId,
+          teamName,
+          callerFrom,
+          callerSessionId,
+        );
+      }
+
       case 'agents': {
         const sub = args[0]?.toLowerCase();
         if (sub === 'probe') {
@@ -11542,8 +11627,16 @@ Return this JSON shape:
           };
 
           await this.db.tasks.create(taskRow, eventIds.length > 0 ? eventIds : undefined);
+          let ownerWake: Awaited<ReturnType<typeof this.wakeAssignedTaskOwner>> | undefined;
           if (ownerId && ownerAgentForGuard) {
             const taskTeamRow = await this.db.teams.getTeam(taskTeamId).catch(() => null);
+            ownerWake = await this.wakeAssignedTaskOwner(
+              taskTeamId,
+              taskTeamRow?.name || teamName,
+              taskRow,
+              ownerAgentForGuard,
+              'task-create',
+            );
             void this.promptLeadForDelegationKickoff(
               taskTeamId,
               taskTeamRow?.name || teamName,
@@ -11562,6 +11655,7 @@ Return this JSON shape:
             ok: true,
             result: {
               task: await this.buildTaskResult(taskRow, teamId),
+              owner_wake: ownerWake,
               warning: warnings.length ? warnings.join(' ') : undefined,
               brief_validation: brief.validation,
             },
@@ -11788,6 +11882,9 @@ Return this JSON shape:
           });
 
           const updated = await this.db.tasks.getByNameForTeam(task.name, teamId);
+          const ownerWake = updated
+            ? await this.wakeAssignedTaskOwner(taskTeamIdForGuard, taskTeamRowForGuard?.name || teamName, updated, agent, 'task-assign')
+            : undefined;
           if (updated) {
             void this.promptLeadForDelegationKickoff(
               taskTeamIdForGuard,
@@ -11805,7 +11902,7 @@ Return this JSON shape:
             task: updated!,
             completionPayload: {},
           });
-          return { ok: true, result: { task: await this.buildTaskResult(updated!, teamId) } };
+          return { ok: true, result: { task: await this.buildTaskResult(updated!, teamId), owner_wake: ownerWake } };
         }
 
         if (subCmd === 'claim') {
@@ -11869,12 +11966,15 @@ Return this JSON shape:
           }
 
           const updated = await this.db.tasks.getByNameForTeam(task.name, teamId);
+          const ownerWake = updated
+            ? await this.wakeAssignedTaskOwner(teamId, teamName, updated, callerAgent, 'task-claim')
+            : undefined;
           if (updated) {
             void this.promptLeadForDelegationKickoff(teamId, teamName, updated, callerAgent).catch((err) => {
               console.warn(`[Supervision] Lead delegation kickoff failed for ${updated.name}: ${err?.message || err}`);
             });
           }
-          return { ok: true, result: { task: await this.buildTaskResult(updated!, teamId), brief_validation: claimBrief.validation } };
+          return { ok: true, result: { task: await this.buildTaskResult(updated!, teamId), owner_wake: ownerWake, brief_validation: claimBrief.validation } };
         }
 
         if (subCmd === 'done') {
@@ -12634,6 +12734,20 @@ Return this JSON shape:
       }
 
       const unavailable = ownerAgent ? `owner ${ownerName} is ${ownerAgent.status || 'not live'}` : `owner id ${t.owner} is missing`;
+      if (ownerAgent && this.canWakeAssignedTaskOwner(ownerAgent)) {
+        const wakeKey = `task:${t.id}:owner-wake`;
+        if (this.canRunStalledProbe(wakeKey, now, RENUDGE_MS, MAX_PROBES)) {
+          const prevProbe = this.stalledNudges.get(wakeKey);
+          this.markStalledProbe(wakeKey, now);
+          const wake = await this.wakeAssignedTaskOwner(teamRow.id, teamName, t, ownerAgent, 'stalled-owner');
+          if (wake.status === 'started') {
+            await this.recordTaskSupervision(t, teamRow.id, ownerAgent.id, 'owner_refresh', mins, now);
+            nudged++;
+            continue;
+          }
+          this.restoreStalledProbe(wakeKey, prevProbe);
+        }
+      }
       if (this.isLiveForSupervision(ownerAgent)) {
         const nudgeKey = `task:${t.id}:owner-refresh`;
         if (!this.canRunStalledProbe(nudgeKey, now, RENUDGE_MS, MAX_PROBES)) {

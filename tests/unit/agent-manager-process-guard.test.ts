@@ -1343,6 +1343,33 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     expect(result.result?.deduped).toBe(true);
   });
 
+  it('supports /tasks as a remote alias for /task list', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    await db.tasks.create({
+      ...taskRow({
+        team_id: teamId,
+        id: 'task-alias-1',
+        uuid: '11111111-1111-4111-8111-111111111111',
+        name: 'alias-visible',
+        title: 'Alias visible task',
+        status: 'todo',
+        owner: null,
+      }),
+    });
+
+    const all = await (manager as any).executeRemoteCommand('/tasks', teamId, 'default');
+    const todo = await (manager as any).executeRemoteCommand('/tasks todo', teamId, 'default');
+
+    expect(all.ok).toBe(true);
+    expect(all.result.tasks.map((t: any) => t.name)).toContain('alias-visible');
+    expect(todo.ok).toBe(true);
+    expect(todo.result.tasks.map((t: any) => t.name)).toContain('alias-visible');
+  });
+
   it('returns a concise 400 for malformed manager JSON requests', async () => {
     const { manager, db, workDir } = await makeManager();
     dbs.push(db);

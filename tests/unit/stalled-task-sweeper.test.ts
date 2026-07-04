@@ -82,6 +82,7 @@ function fakeDb(overrides: Record<string, any> = {}): any {
       getById: vi.fn(async () => agent()),
       getByName: vi.fn(async () => null),
       list: vi.fn(async () => [agent()]),
+      updateStatus: vi.fn(async () => {}),
       ...overrides.agents,
     },
     tasks: {
@@ -1094,5 +1095,50 @@ describe('stalled task sweeper', () => {
 
     expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
     expect(db.events.insert).not.toHaveBeenCalled();
+  });
+
+  it('wakes a stopped local owner before routing stalled work back to a lead', async () => {
+    const stoppedOwner = agent({
+      id: 'worker-1',
+      name: 'worker',
+      status: 'stopped',
+      port: 4210,
+      type: 'claude',
+      runtime: 'claude-code-cli',
+    });
+    const db = fakeDb({
+      agents: {
+        getById: vi.fn(async () => stoppedOwner),
+        getByName: vi.fn(async () => agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } })),
+        list: vi.fn(async () => [stoppedOwner, agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } })]),
+        updateStatus: vi.fn(async () => {}),
+      },
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => status === 'doing'
+          ? [task({ owner: 'worker-1', updated_at: Math.floor(NOW_MS / 1000) - 7200 })]
+          : []),
+        updateFields: vi.fn(async () => {}),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', db, { libraryRoot: null }) as any;
+    manager.spawnLocalAgentProcess = vi.fn(async () => ({ success: true, pid: 1234, logFile: '/tmp/worker.log' }));
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.sweepStalledTasks();
+
+    expect(manager.spawnLocalAgentProcess).toHaveBeenCalledWith(TEAM_ID, 'default', expect.objectContaining({
+      id: 'worker-1',
+      name: 'worker',
+      port: 4210,
+    }));
+    expect(db.agents.updateStatus).toHaveBeenCalledWith('worker-1', 'running');
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'agent:started',
+      actor_agent_id: 'worker-1',
+      data: expect.objectContaining({
+        reason: 'stalled-owner',
+      }),
+    }));
   });
 });
