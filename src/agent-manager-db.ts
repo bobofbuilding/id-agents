@@ -14619,6 +14619,7 @@ Return this JSON shape:
             shouldDispatch: async (target, def) => this.canDispatchAutomatedWake(target.id, {
               source: 'schedule',
               scheduleKind: def.kind,
+              scheduleMessage: def.message,
             }),
           },
         );
@@ -15672,6 +15673,23 @@ Return this JSON shape:
     return Number(rows[0]?.c ?? 0) || 0;
   }
 
+  private isTaskAssignmentSweepSchedule(message: unknown): boolean {
+    return /^Task assignment sweep:/i.test(String(message || '').trimStart());
+  }
+
+  private async countFleetStalledDoingTasks(nowMs = Date.now()): Promise<number> {
+    const stallMs = this.getStallSweepMs();
+    const teams = await this.db.teams.listTeams();
+    let count = 0;
+    for (const team of teams) {
+      const doing = await this.db.tasks.list({ teamId: team.id, status: 'doing' }).catch(() => [] as TaskRow[]);
+      for (const task of doing) {
+        if (nowMs - this.taskLastActivityMs(task) >= stallMs) count++;
+      }
+    }
+    return count;
+  }
+
   private async countActiveSchedules(agentId: string): Promise<number> {
     const { rows } = await this.db.adapter.query<{ c: string | number }>(
       `SELECT COUNT(*) AS c
@@ -15702,6 +15720,7 @@ Return this JSON shape:
   private automatedWakeRecentActivityMs(opts: {
     source?: 'schedule' | 'checkin';
     scheduleKind?: string;
+    scheduleMessage?: string | null;
     priority?: CheckinPriority;
   } = {}): number {
     if (opts.priority === 'high') return 0;
@@ -15718,10 +15737,19 @@ Return this JSON shape:
   private async canDispatchAutomatedWake(agentId: string, opts: {
     source?: 'schedule' | 'checkin';
     scheduleKind?: string;
+    scheduleMessage?: string | null;
     priority?: CheckinPriority;
   } = {}): Promise<boolean> {
     await this.sweepStaleQueriesIfDue();
     if ((await this.countActiveQueries(agentId)) > 0) return false;
+    if (opts.source === 'schedule' && this.isTaskAssignmentSweepSchedule(opts.scheduleMessage)) {
+      const [openOwnedTasks, activeCheckins, stalledDoingTasks] = await Promise.all([
+        this.countOpenOwnedTasks(agentId),
+        this.countActiveCheckins(agentId),
+        this.countFleetStalledDoingTasks(),
+      ]);
+      if (openOwnedTasks > 0 || activeCheckins > 0 || stalledDoingTasks > 0) return false;
+    }
     const recentActivityMs = this.automatedWakeRecentActivityMs(opts);
     if (recentActivityMs <= 0) return true;
     return (await this.countRecentQueriesForAgent(agentId, Date.now() - recentActivityMs)) === 0;

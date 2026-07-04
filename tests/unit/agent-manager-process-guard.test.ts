@@ -196,6 +196,68 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     expect(result).toEqual({ killed: true, pids: [agentPid] });
   });
 
+  it('holds scheduled assignment sweeps while fleet doing work is stalled', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+    const nowMs = 1_700_000_000_000;
+    const nowSec = Math.floor(nowMs / 1000);
+    vi.spyOn(Date, 'now').mockReturnValue(nowMs);
+
+    const teamId = await db.teams.getOrCreateTeamId('ops-team');
+    await db.agents.create(agentRow({ team_id: teamId, id: 'agent-task-master', name: 'task-master' }));
+    await db.agents.create(agentRow({ team_id: teamId, id: 'agent-owner', name: 'ops-lead' }));
+    await db.tasks.create(taskRow({
+      team_id: teamId,
+      id: 'task-stalled',
+      name: 'stalled-parent-work',
+      title: 'Stalled parent work',
+      status: 'doing',
+      owner: 'agent-owner',
+      created_at: nowSec - 90 * 60,
+      updated_at: nowSec - 60 * 60,
+    }));
+
+    const allowed = await (manager as any).canDispatchAutomatedWake('agent-task-master', {
+      source: 'schedule',
+      scheduleKind: 'heartbeat',
+      scheduleMessage: 'Task assignment sweep: inspect unassigned todo tasks across all teams.',
+    });
+
+    expect(allowed).toBe(false);
+  });
+
+  it('does not apply stalled-backlog assignment gating to ordinary heartbeats', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+    const nowMs = 1_700_000_000_000;
+    const nowSec = Math.floor(nowMs / 1000);
+    vi.spyOn(Date, 'now').mockReturnValue(nowMs);
+
+    const teamId = await db.teams.getOrCreateTeamId('ops-team');
+    await db.agents.create(agentRow({ team_id: teamId, id: 'agent-task-master', name: 'task-master' }));
+    await db.agents.create(agentRow({ team_id: teamId, id: 'agent-owner', name: 'ops-lead' }));
+    await db.tasks.create(taskRow({
+      team_id: teamId,
+      id: 'task-stalled',
+      name: 'stalled-parent-work',
+      title: 'Stalled parent work',
+      status: 'doing',
+      owner: 'agent-owner',
+      created_at: nowSec - 90 * 60,
+      updated_at: nowSec - 60 * 60,
+    }));
+
+    const allowed = await (manager as any).canDispatchAutomatedWake('agent-task-master', {
+      source: 'schedule',
+      scheduleKind: 'heartbeat',
+      scheduleMessage: 'Heartbeat: review your checklist and act on anything that needs attention.',
+    });
+
+    expect(allowed).toBe(true);
+  });
+
   it('skips PIDs whose command matches the manager signature', async () => {
     const { manager, db, workDir } = await makeManager();
     dbs.push(db);
