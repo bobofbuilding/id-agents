@@ -2725,8 +2725,47 @@ Return this JSON shape:
       });
     }
 
+    if (transitioned || completedRow?.status === 'completed') {
+      await this.closeQueryShadowRows({
+        teamId,
+        queryId,
+        occurredAt,
+        status: 'completed',
+        resultPayload: completionPayload,
+      });
+    }
+
     this.wakeQueryWaiters(teamId, queryId, waiterReply);
     this.releaseLocalGate(queryId); // #7: free the local-model slot on success
+  }
+
+  private async closeQueryShadowRows(params: {
+    teamId: string;
+    queryId: string;
+    occurredAt: number;
+    status: 'completed' | 'failed';
+    resultPayload?: Record<string, unknown>;
+    errorText?: string | null;
+  }): Promise<void> {
+    const { teamId, queryId, occurredAt, status, resultPayload, errorText } = params;
+    const teamIds = await this.db.queries.findTeams(queryId).catch(() => []);
+    for (const shadowTeamId of new Set(teamIds)) {
+      if (shadowTeamId === teamId) continue;
+      const row = await this.db.queries.getByQueryIdForTeam(shadowTeamId, queryId).catch(() => null);
+      if (!row || (row.status !== 'pending' && row.status !== 'processing')) continue;
+
+      const transitioned = status === 'completed'
+        ? await this.db.queries.complete(shadowTeamId, queryId, occurredAt, {
+          ...(resultPayload || {}),
+          shadow_completed_from_team_id: teamId,
+        })
+        : await this.db.queries.markFailed(shadowTeamId, queryId, occurredAt, errorText ?? null);
+
+      if (transitioned) {
+        this.notifyQueryStatusWaiters(shadowTeamId, queryId);
+        this.managerLog(`Closed ${status} shadow query ${queryId} in team ${shadowTeamId} from ${teamId}`);
+      }
+    }
   }
 
   /** Append-only JSONL log of local-model token usage (Health page). */
@@ -5967,7 +6006,10 @@ Return this JSON shape:
         // to the caller's own team (the reply will be visible there) but we do NOT
         // follow the query across the team boundary.
         if (in_reply_to) {
-          const queryTeamId = await this.db.queries.findTeam(in_reply_to);
+          const queryTeamIds = await this.db.queries.findTeams(in_reply_to);
+          const queryTeamId = queryTeamIds.includes(teamId)
+            ? teamId
+            : queryTeamIds[0] ?? null;
           const principal = (req as any).ctx?.principal || 'anon';
           if (queryTeamId && queryTeamId !== teamId) {
             if (principal === 'admin') {
@@ -6048,6 +6090,15 @@ Return this JSON shape:
                     : failedRow?.agent_id ?? null,
                 occurredAt: ts,
                 reason: errorText,
+              });
+            }
+            if (transitioned || queryRow?.status === 'failed') {
+              await this.closeQueryShadowRows({
+                teamId,
+                queryId: in_reply_to,
+                occurredAt: ts,
+                status: 'failed',
+                errorText,
               });
             }
             // Failure path still needs to wake long-poll and /talk-to waiters

@@ -65,6 +65,7 @@ import { SqliteCheckinsRepo } from '../../src/db/repos/sqlite/checkins-repo.js';
 import { SqliteRuntimeLaneCooldownsRepo } from '../../src/db/repos/sqlite/runtime-lane-cooldowns-repo.js';
 
 const TEAM = 'talkto-qid-test';
+const SOURCE_TEAM = 'talkto-qid-source-test';
 
 async function createInMemoryDb() {
   const adapter = new SqliteAdapter(':memory:');
@@ -114,6 +115,7 @@ async function insertAgentRow(
 describe('/talk-to reply: query_id populated, no duplicate, manager waiter resolves', () => {
   let db: Awaited<ReturnType<typeof createInMemoryDb>>;
   let teamId: string;
+  let sourceTeamId: string;
   let agentAId: string;
   let agentAServer: AgentRestServer;
   let agentABaseUrl: string;
@@ -126,6 +128,7 @@ describe('/talk-to reply: query_id populated, no duplicate, manager waiter resol
   beforeAll(async () => {
     db = await createInMemoryDb();
     teamId = await db.teams.getOrCreateTeamId(TEAM);
+    sourceTeamId = await db.teams.getOrCreateTeamId(SOURCE_TEAM);
     agentAId = await insertAgentRow(db, teamId, 'agent_a', null);
 
     workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'talkto-qid-test-'));
@@ -242,6 +245,76 @@ describe('/talk-to reply: query_id populated, no duplicate, manager waiter resol
       [teamId],
     ) as any;
     expect(Number(rows[0].cnt)).toBe(0);
+  });
+
+  it('manager /news completes source-team shadow rows for cross-team replies', async () => {
+    const qid = `qid_${crypto.randomUUID()}`;
+    await db.queries.create(sourceTeamId, qid, agentAId, 'source-team shadow', Date.now() - 2_000);
+    await db.queries.create(teamId, qid, agentAId, 'target-team canonical', Date.now() - 1_000);
+
+    let resolved: { from: string; message: string } | null = null;
+    (manager as any).queryWaiters.set(qid, {
+      resolve: (r: any) => { resolved = r; },
+      reject: () => {},
+      timeout: null,
+    });
+
+    const res = await fetch(`http://127.0.0.1:${managerPort}/news`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Id-Team': TEAM },
+      body: JSON.stringify({
+        type: 'reply',
+        from: 'agent_b',
+        in_reply_to: qid,
+        message: 'cross-team done',
+        skip_persist: true,
+      }),
+    });
+    expect([200, 201]).toContain(res.status);
+
+    expect(resolved).not.toBeNull();
+    expect((resolved as any).message).toBe('cross-team done');
+
+    const target = await db.queries.getByQueryIdForTeam(teamId, qid);
+    const source = await db.queries.getByQueryIdForTeam(sourceTeamId, qid);
+    expect(target?.status).toBe('completed');
+    expect(source?.status).toBe('completed');
+    expect((source?.result as any)?.shadow_completed_from_team_id).toBe(teamId);
+  });
+
+  it('manager /news fails source-team shadow rows for cross-team reply errors', async () => {
+    const qid = `qid_${crypto.randomUUID()}`;
+    await db.queries.create(sourceTeamId, qid, agentAId, 'source-team shadow', Date.now() - 2_000);
+    await db.queries.create(teamId, qid, agentAId, 'target-team canonical', Date.now() - 1_000);
+
+    let resolved: { from: string; message: string } | null = null;
+    (manager as any).queryWaiters.set(qid, {
+      resolve: (r: any) => { resolved = r; },
+      reject: () => {},
+      timeout: null,
+    });
+
+    const res = await fetch(`http://127.0.0.1:${managerPort}/news`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Id-Team': TEAM },
+      body: JSON.stringify({
+        type: 'reply.error',
+        from: 'agent_b',
+        in_reply_to: qid,
+        message: 'model unavailable',
+        skip_persist: true,
+      }),
+    });
+    expect([200, 201]).toContain(res.status);
+
+    expect(resolved).not.toBeNull();
+    expect((resolved as any).message).toBe('model unavailable');
+
+    const target = await db.queries.getByQueryIdForTeam(teamId, qid);
+    const source = await db.queries.getByQueryIdForTeam(sourceTeamId, qid);
+    expect(target?.status).toBe('failed');
+    expect(source?.status).toBe('failed');
+    expect(source?.error).toBe('model unavailable');
   });
 
   it('end-to-end: agent_a /news reply broadcasts to manager, manager waiter resolves, exactly ONE reply row in news_items', async () => {

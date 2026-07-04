@@ -327,6 +327,13 @@ export interface QueriesRepository {
   findTeam(queryId: string): Promise<string | null>;
 
   /**
+   * Look up every team row for a query_id. Cross-team dispatch can leave a
+   * source-team shadow row plus the target-team canonical row; reply routing
+   * uses this to prefer the caller's current team and close shadows.
+   */
+  findTeams(queryId: string): Promise<string[]>;
+
+  /**
    * Get all pending/processing queries for an agent, ordered by created ascending.
    */
   getPending(agentId: string): Promise<QueryRow[]>;

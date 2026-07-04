@@ -205,6 +205,17 @@ export class SqliteQueriesRepo implements QueriesRepository {
     return r.rows[0]?.team_id ?? null;
   }
 
+  async findTeams(queryId: string): Promise<string[]> {
+    const r = await this.db.query<{ team_id: string }>(
+      `SELECT team_id
+       FROM queries
+       WHERE query_id = ?
+       ORDER BY created ASC`,
+      [queryId],
+    );
+    return r.rows.map((row) => row.team_id);
+  }
+
   async getPending(agentId: string): Promise<QueryRow[]> {
     const r = await this.db.query<QueryRow>(
       `SELECT team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id, metadata

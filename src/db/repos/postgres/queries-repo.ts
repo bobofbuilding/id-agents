@@ -174,6 +174,17 @@ export class PgQueriesRepo implements QueriesRepository {
     return rows[0]?.team_id ?? null;
   }
 
+  async findTeams(queryId: string): Promise<string[]> {
+    const { rows } = await this.db.query<{ team_id: string }>(
+      `SELECT team_id
+       FROM queries
+       WHERE query_id = $1
+       ORDER BY created ASC`,
+      [queryId],
+    );
+    return rows.map((row) => row.team_id);
+  }
+
   async getPending(agentId: string): Promise<QueryRow[]> {
     const { rows } = await this.db.query<QueryRow>(
       `SELECT team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id, metadata
