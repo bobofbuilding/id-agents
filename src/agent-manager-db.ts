@@ -3400,6 +3400,10 @@ Return this JSON shape:
       runtime: runtimeDisplay,
       url,
       metadata,
+      last_seen: a.last_seen ?? null,
+      last_probed_at: a.last_probed_at ?? null,
+      last_error: a.last_error ?? null,
+      consecutive_failures: a.consecutive_failures ?? 0,
       // Identity fields
       tokenId: a.token_id,
       domain,
@@ -14951,6 +14955,9 @@ Return this JSON shape:
           // This check must come before any network I/O so remote agents can never
           // be reached from this local-heartbeat path.
           if (isRemoteEndpointRuntime(agent.runtime)) continue;
+          // Stopped local agents are intentionally parked. Probing their dead
+          // ports every tick adds avoidable desktop load and noisy failures.
+          if (agent.status === 'stopped') continue;
 
           const key = this.key(team.id, agent.id);
           const agentUrl = agent.type === 'interactive' ? agent.endpoint : `http://localhost:${agent.port}`;
@@ -14961,12 +14968,20 @@ Return this JSON shape:
           }
 
           try {
+            const checkedAtMs = Date.now();
+            const checkedAtSec = Math.floor(checkedAtMs / 1000);
             const resp = await fetch(`${agentUrl}/health`, {
               headers: { Accept: 'application/json', Connection: 'close' },
               signal: AbortSignal.timeout(3000),
             });
             const isOnline = resp.ok;
-            this.healthStatus.set(key, { status: isOnline ? 'online' : 'offline', lastCheck: Date.now() });
+            this.healthStatus.set(key, { status: isOnline ? 'online' : 'offline', lastCheck: checkedAtMs });
+            await this.db.agents.updateProbeResult(agent.id, {
+              ...(isOnline ? { last_seen: checkedAtSec } : {}),
+              last_probed_at: checkedAtSec,
+              last_error: isOnline ? null : `health ${resp.status}`,
+              consecutive_failures: isOnline ? 0 : (agent.consecutive_failures ?? 0) + 1,
+            }).catch(() => {});
 
             // Update DB status if it changed. A stale local-agent shutdown can
             // leave a replacement process labeled "stopped"; a successful
@@ -14976,8 +14991,18 @@ Return this JSON shape:
             } else if (!isOnline && agent.status === 'running') {
               await this.db.agents.updateStatus(agent.id, 'offline');
             }
-          } catch {
-            this.healthStatus.set(key, { status: 'offline', lastCheck: Date.now() });
+          } catch (err: any) {
+            const checkedAtMs = Date.now();
+            const checkedAtSec = Math.floor(checkedAtMs / 1000);
+            const lastError = err?.name === 'TimeoutError' || err?.name === 'AbortError'
+              ? 'timeout'
+              : String(err?.message || 'health probe failed').slice(0, 200);
+            this.healthStatus.set(key, { status: 'offline', lastCheck: checkedAtMs });
+            await this.db.agents.updateProbeResult(agent.id, {
+              last_probed_at: checkedAtSec,
+              last_error: lastError,
+              consecutive_failures: (agent.consecutive_failures ?? 0) + 1,
+            }).catch(() => {});
             if (agent.status === 'running') {
               await this.db.agents.updateStatus(agent.id, 'offline').catch(() => {});
             }

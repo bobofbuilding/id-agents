@@ -104,6 +104,27 @@ async function startCancelServer(response: Record<string, unknown> = { cancelled
   };
 }
 
+async function startHealthServer(status = 200) {
+  const server = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/health') {
+      res.writeHead(status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ status: status >= 200 && status < 300 ? 'ok' : 'error' }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('health server failed to bind a loopback port');
+  return {
+    port: address.port,
+    close: () => new Promise<void>((resolve, reject) => {
+      server.close((err) => (err ? reject(err) : resolve()));
+    }),
+  };
+}
+
 function agentRow(overrides: Partial<AgentRow> = {}): AgentRow {
   return {
     team_id: 'team-1',
@@ -451,6 +472,67 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     expect(stale?.metadata).not.toHaveProperty('pid');
     expect(stale?.metadata).not.toHaveProperty('processOwner');
     expect(stale?.metadata).not.toHaveProperty('processParentPid');
+  });
+
+  it('persists successful local health probes for restart-stable status surfaces', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+    const healthServer = await startHealthServer();
+    try {
+      const nowMs = 1_700_000_123_000;
+      vi.spyOn(Date, 'now').mockReturnValue(nowMs);
+
+      const teamId = await db.teams.getOrCreateTeamId('default');
+      await db.agents.create(agentRow({
+        team_id: teamId,
+        id: 'agent-local-health',
+        name: 'local-health',
+        port: healthServer.port,
+        status: 'running',
+        metadata: { runtime: 'codex', pid: 12345, processOwner: 'adopted', processParentPid: 1 },
+      }));
+
+      await (manager as any).runHealthChecks();
+
+      const row = await db.agents.getById('agent-local-health');
+      expect(row?.last_seen).toBe(Math.floor(nowMs / 1000));
+      expect(row?.last_probed_at).toBe(Math.floor(nowMs / 1000));
+      expect(row?.last_error).toBeNull();
+      expect(row?.consecutive_failures).toBe(0);
+
+      const response = (manager as any).agentToResponse(row);
+      expect(response.health).toBe('online');
+      expect(response.lastHealthCheck).toBe(nowMs);
+      expect(response.last_seen).toBe(Math.floor(nowMs / 1000));
+      expect(response.last_probed_at).toBe(Math.floor(nowMs / 1000));
+    } finally {
+      await healthServer.close();
+    }
+  });
+
+  it('does not probe stopped local agents on the periodic health loop', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    await db.agents.create(agentRow({
+      team_id: teamId,
+      id: 'agent-stopped-health',
+      name: 'stopped-health',
+      port: 49999,
+      status: 'stopped',
+      metadata: { runtime: 'codex' },
+    }));
+
+    await (manager as any).runHealthChecks();
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    const row = await db.agents.getById('agent-stopped-health');
+    expect(row?.last_probed_at).toBeNull();
+    expect((manager as any).agentToResponse(row).health).toBe('unknown');
   });
 
   it('does not park a running agent with pending or processing queries', async () => {
