@@ -29,6 +29,19 @@ Heartbeat: review your checklist and act on anything that needs attention.`)).to
 
 IMPORTANT INSTRUCTIONS:
 DO NOT send a message or reply back to "researcher"`)).toBe(true);
+
+    expect(shouldSuppressMcpForPrompt(`[Message from agent "ops-lead" | Query ID: news_456]
+[Note: ops-lead will poll for your reply for ~2 minutes.]
+
+[Incoming Message from "ops-lead"]
+
+Onchain-execution triage needed. Restart/wake the onchain-execution team and triage the stalled backlog.
+
+---
+
+IMPORTANT INSTRUCTIONS:
+1. You have received a message from agent "ops-lead".
+2. DO NOT send a message or reply back to "ops-lead" - this would create an infinite loop.`)).toBe(true);
   });
 
   it('suppresses MCP for inter-agent control-plane status relays', () => {

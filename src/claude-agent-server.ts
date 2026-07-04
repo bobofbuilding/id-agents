@@ -46,6 +46,7 @@ const EXTERNAL_STOP_QUERY_STATUSES = new Set<ExternalStopQueryStatus>(['cancelle
 
 const MCP_CONTROL_PLANE_PROMPT_PATTERNS = [
   /^\[Message from agent "[^"]+"\s*\|[^\n]*\]\s*\n[\s\S]*\n\[Incoming Reply from "[^"]+"\]/,
+  /^\[Message from agent "[^"]+"\s*\|[^\n]*\]\s*\n[\s\S]*\n\[Incoming Message from "[^"]+"\][\s\S]*\nIMPORTANT INSTRUCTIONS:[\s\S]*DO NOT send a message or reply back to "[^"]+"/,
   /^\[Message from agent "[^"]+"\s*\|[^\n]*\]\s*\n[\s\S]*\nAssignment sweep complete\b/,
   /^\[Message from agent "[^"]+"\s*\|[^\n]*\]\s*\n[\s\S]*\nNo approved recommendation routed\b/,
   /^\[Message from agent "[^"]+"\s*\|[^\n]*\]\s*\n[\s\S]*\nAlready handled\.\s+Task\b/,
