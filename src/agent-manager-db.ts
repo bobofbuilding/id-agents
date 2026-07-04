@@ -4228,6 +4228,12 @@ Return this JSON shape:
    * Unified message handler for both /message and /talk-to.
    * Default: fire-and-forget. With wait:true or timeout: waits for reply.
    */
+  private isManagerNotifyOnlyMessage(message: unknown): boolean {
+    const text = String(message ?? '').trim().toLowerCase();
+    return text.startsWith('backlog guard clear:')
+      || text.startsWith('backlog guard cleared:');
+  }
+
   private async handleMessage(req: express.Request, res: express.Response) {
     try {
       const { id: teamId, name: teamName } = await this.getTeam(req);
@@ -4252,13 +4258,18 @@ Return this JSON shape:
         const { name: teamName } = await this.getTeam(req);
         const managerInbox = this.getManagerInboxRef(teamId, teamName);
         const ts = Date.now();
+        const notifyOnly = this.isManagerNotifyOnlyMessage(message);
 
-        if (!shouldWait) {
+        if (!shouldWait || notifyOnly) {
           await this.db.news.add(teamId, null, {
             timestamp: ts,
             type: 'message',
             message: message,
-            data: { from: from || 'manager', message },
+            data: {
+              from: from || 'manager',
+              message,
+              ...(notifyOnly ? { notify_only_reason: 'manager_status_ack' } : {}),
+            },
             kind: 'notify',
             reply_expected: false,
             owner_kind: managerInbox.ownerKind,
@@ -4268,6 +4279,7 @@ Return this JSON shape:
             success: true,
             delivered_to: 'manager',
             status: 'delivered',
+            ...(notifyOnly ? { notify_only: true } : {}),
           });
         }
 
