@@ -455,6 +455,9 @@ interface BrainInstruction {
   };
 }
 
+const DEFAULT_BRAIN_CONTEXT_INSTRUCTION_CHARS = 420;
+const DEFAULT_BRAIN_CONTEXT_CANONICAL_SOURCE_LIMIT = 12;
+
 interface ProcessInspection {
   pid: number;
   ppid: number | null;
@@ -3319,6 +3322,17 @@ Return this JSON shape:
     return Number.isFinite(n) ? n : null;
   }
 
+  private positiveIntEnv(name: string, fallback: number): number {
+    const parsed = Number.parseInt(process.env[name] || '', 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+  }
+
+  private compactBrainContextText(value: unknown, maxChars: number): string {
+    const text = String(value || '').replace(/\s+/g, ' ').trim();
+    if (text.length <= maxChars) return text;
+    return `${text.slice(0, Math.max(0, maxChars - 3)).trimEnd()}...`;
+  }
+
   private async fetchBrainInstructions(input: {
     brainUrl: string;
     headers: Record<string, string>;
@@ -3506,10 +3520,12 @@ Return this JSON shape:
   private withBrainContextAppendix(message: string, context: BrainVolunteerContext | null): string {
     if (!context?.bundles?.length && !context?.instructions?.length) return message;
     const lines = ['Brain context:'];
+    const instructionChars = this.positiveIntEnv('BRAIN_CONTEXT_INSTRUCTION_CHARS', DEFAULT_BRAIN_CONTEXT_INSTRUCTION_CHARS);
+    const canonicalLimit = this.positiveIntEnv('BRAIN_CONTEXT_CANONICAL_SOURCE_LIMIT', DEFAULT_BRAIN_CONTEXT_CANONICAL_SOURCE_LIMIT);
     if (context.instructions?.length) {
       lines.push('Team instructions:');
       for (const instruction of context.instructions.slice(0, 5)) {
-        lines.push(`- ${instruction.content} [${instruction.source_id}]`);
+        lines.push(`- ${this.compactBrainContextText(instruction.content, instructionChars)} [${instruction.source_id}]`);
       }
       lines.push('Report instruction usefulness as used_instruction_ids, ignored_instruction_ids, or harmful_instruction_ids.');
     }
@@ -3528,7 +3544,11 @@ Return this JSON shape:
       }
     }
     const canonical = context.cited?.canonical_source_ids || [];
-    if (canonical.length) lines.push(`Cite used Brain sources as used_source_ids: ${canonical.join(', ')}`);
+    if (canonical.length) {
+      const shown = canonical.slice(0, canonicalLimit);
+      const more = canonical.length > shown.length ? ` (+${canonical.length - shown.length} more)` : '';
+      lines.push(`Cite used Brain sources as used_source_ids: ${shown.join(', ')}${more}`);
+    }
     return `${message}\n\n${lines.join('\n')}`;
   }
 
