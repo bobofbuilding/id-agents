@@ -10152,7 +10152,8 @@ Return this JSON shape:
   /**
    * Resolve a task reference scoped to a team. Accepts either:
    *   - the kebab-case `name` slug (existing behavior), or
-   *   - a short-uuid handle `#xxxxxxxx` (8+ hex chars after the `#`).
+   *   - a short-uuid handle `#xxxxxxxx` (8+ hex chars after the `#`), or
+   *   - the same short handle without `#` for REST callers that lose URL fragments.
    *
    * Short refs match on the dash-stripped uuid prefix. If multiple rows
    * share the prefix (within the team), returns an `error` asking the caller
@@ -10165,8 +10166,15 @@ Return this JSON shape:
     if (!ref || typeof ref !== 'string') {
       return { error: 'Task reference is required' };
     }
-    if (ref.startsWith('#')) {
-      const raw = ref.slice(1).toLowerCase();
+    const normalizedRef = ref.trim();
+    const explicitShortRef = normalizedRef.startsWith('#');
+    const rawShortRef = explicitShortRef
+      ? normalizedRef.slice(1).toLowerCase()
+      : /^[0-9a-fA-F]{4,}$/.test(normalizedRef)
+        ? normalizedRef.toLowerCase()
+        : '';
+    if (rawShortRef) {
+      const raw = rawShortRef;
       if (!/^[0-9a-f]+$/.test(raw) || raw.length < 4) {
         return { error: `Invalid short id "${ref}". Expected #<hex prefix>` };
       }
@@ -10180,23 +10188,26 @@ Return this JSON shape:
         if (teamId && t.team_id !== teamId) return false;
         return true;
       });
-      if (filtered.length === 0) return { error: `Task ${ref} not found` };
-      if (filtered.length > 1) {
-        const widened = filtered
-          .map(t => `#${(t.uuid || '').replace(/-/g, '').slice(0, raw.length + 2)} (${t.name})`)
-          .join(', ');
-        return { error: `Short id ${ref} is ambiguous (matches ${filtered.length}): ${widened}. Widen the prefix.` };
+      if (filtered.length === 0) {
+        if (explicitShortRef) return { error: `Task ${ref} not found` };
+      } else {
+        if (filtered.length > 1) {
+          const widened = filtered
+            .map(t => `#${(t.uuid || '').replace(/-/g, '').slice(0, raw.length + 2)} (${t.name})`)
+            .join(', ');
+          return { error: `Short id ${ref} is ambiguous (matches ${filtered.length}): ${widened}. Widen the prefix.` };
+        }
+        return { task: filtered[0] };
       }
-      return { task: filtered[0] };
     }
     // Name-based resolution: scope to the team when teamId is provided
     if (teamId) {
-      const task = await this.db.tasks.getByNameForTeam(ref, teamId);
-      if (!task) return { error: `Task "${ref}" not found` };
+      const task = await this.db.tasks.getByNameForTeam(normalizedRef, teamId);
+      if (!task) return { error: `Task "${normalizedRef}" not found` };
       return { task };
     }
-    const task = await this.db.tasks.getByName(ref);
-    if (!task) return { error: `Task "${ref}" not found` };
+    const task = await this.db.tasks.getByName(normalizedRef);
+    if (!task) return { error: `Task "${normalizedRef}" not found` };
     return { task };
   }
 

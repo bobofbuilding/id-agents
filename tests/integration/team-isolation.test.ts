@@ -26,6 +26,7 @@ import { SqliteSchedulesRepo } from '../../src/db/repos/sqlite/schedules-repo.js
 import { SqliteTasksRepo } from '../../src/db/repos/sqlite/tasks-repo.js';
 import { SqliteEventsRepo } from '../../src/db/repos/sqlite/events-repo.js';
 import { SqliteSubscriptionsRepo } from '../../src/db/repos/sqlite/subscriptions-repo.js';
+import { SqliteCheckinsRepo } from '../../src/db/repos/sqlite/checkins-repo.js';
 import type { AgentRow, TaskRow } from '../../src/db/types.js';
 
 // --- DB factory helper (in-memory) ---
@@ -42,6 +43,7 @@ async function createInMemoryDb() {
     tasks: new SqliteTasksRepo(adapter),
     events: new SqliteEventsRepo(adapter),
     subscriptions: new SqliteSubscriptionsRepo(adapter),
+    checkins: new SqliteCheckinsRepo(adapter),
     async close() { await adapter.close(); },
   };
 }
@@ -375,6 +377,79 @@ describe('Tasks — (team_id, name) scoped resolution', () => {
     expect(res.ok).toBe(true);
     const body = await res.json() as any;
     expect(body.task.teamName).toEqual('public');
+  });
+});
+
+describe('Tasks — short-id REST resolution', () => {
+  const taskName = `short-id-task-${Date.now()}`;
+  let bareShortId: string;
+
+  it('setup: creates an idchain task with a short id', async () => {
+    const res = await fetch(`${baseUrl}/tasks`, {
+      method: 'POST',
+      headers: adminHeaders('idchain'),
+      body: JSON.stringify({ title: 'Short ID Task', name: taskName }),
+    });
+    expect(res.ok).toBe(true);
+    const body = await res.json() as any;
+    bareShortId = String(body.task.shortId).replace(/^#/, '');
+    expect(bareShortId).toMatch(/^[0-9a-f]{8}$/);
+  });
+
+  it('GET /tasks/:ref resolves bare short ids without requiring URL-encoded #', async () => {
+    const res = await fetch(`${baseUrl}/tasks/${bareShortId}`, {
+      headers: makeHeaders('idchain'),
+    });
+    expect(res.ok).toBe(true);
+    const body = await res.json() as any;
+    expect(body.task.name).toBe(taskName);
+    expect(body.task.shortId).toBe(`#${bareShortId}`);
+  });
+
+  it('falls back to task-name lookup for hex-only slugs with no uuid match', async () => {
+    const hexTaskName = `feed${Date.now().toString(16)}`;
+    const create = await fetch(`${baseUrl}/tasks`, {
+      method: 'POST',
+      headers: adminHeaders('idchain'),
+      body: JSON.stringify({ title: 'Hex Slug Task', name: hexTaskName }),
+    });
+    expect(create.ok).toBe(true);
+
+    const res = await fetch(`${baseUrl}/tasks/${hexTaskName}`, {
+      headers: makeHeaders('idchain'),
+    });
+    expect(res.ok).toBe(true);
+    const body = await res.json() as any;
+    expect(body.task.name).toBe(hexTaskName);
+  });
+
+  it('bare short-id lookup remains scoped to the current team', async () => {
+    const res = await fetch(`${baseUrl}/tasks/${bareShortId}`, {
+      headers: makeHeaders('public'),
+    });
+    expect(res.status).toBe(404);
+  });
+
+  it('claim and done routes resolve bare short ids', async () => {
+    const claim = await fetch(`${baseUrl}/tasks/${bareShortId}/claim`, {
+      method: 'POST',
+      headers: makeHeaders('idchain'),
+      body: JSON.stringify({ agent_id: idchainAgentName }),
+    });
+    expect(claim.ok, `claim failed: ${await claim.clone().text()}`).toBe(true);
+
+    const done = await fetch(`${baseUrl}/tasks/${bareShortId}/done`, {
+      method: 'POST',
+      headers: makeHeaders('idchain'),
+      body: JSON.stringify({
+        agent_id: idchainAgentName,
+        acceptance_coverage: ['bare short-id REST resolution'],
+      }),
+    });
+    expect(done.ok, `done failed: ${await done.clone().text()}`).toBe(true);
+    const body = await done.json() as any;
+    expect(body.task.status).toBe('done');
+    expect(body.task.name).toBe(taskName);
   });
 });
 
