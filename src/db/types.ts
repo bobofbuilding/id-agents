@@ -90,6 +90,29 @@ export interface NewsItemRow {
   owner_id: string;
 }
 
+/** Bounded news metadata for health/status surfaces. Omits parsed data payloads. */
+export interface NewsItemSummaryRow {
+  id: number;
+  team_id: string;
+  /** Worker-agent FK when `owner_kind === 'agent'`; null for manager-owned inbox rows. */
+  agent_id: string | null;
+  timestamp: number;
+  type: string;
+  /** Preview text, already clamped by the repository query. */
+  message: string | null;
+  /** Full message length before preview clamping. */
+  message_length: number;
+  /** Whether the row has a data payload. The payload itself is intentionally omitted. */
+  has_data: boolean;
+  /** Serialized data length when known. */
+  data_length: number;
+  query_id: string | null;
+  kind: 'talk' | 'notify' | null;
+  reply_expected: boolean | null;
+  owner_kind: InboxOwnerKind;
+  owner_id: string;
+}
+
 /** schedule_definitions table row */
 export interface ScheduleDefinitionRow {
   id: string;

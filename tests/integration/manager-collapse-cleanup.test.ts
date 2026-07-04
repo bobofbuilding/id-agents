@@ -3,7 +3,8 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { createServer } from 'net';
+import { createServer as createNetServer, type AddressInfo } from 'net';
+import { createServer as createHttpServer, type Server as HttpServer } from 'http';
 import { InteractiveAgentServer } from '../../src/interactive-agent-server.js';
 import { AgentManagerDb } from '../../src/agent-manager-db.js';
 import { SqliteAdapter } from '../../src/db/sqlite-adapter.js';
@@ -20,7 +21,7 @@ import { SqliteCheckinsRepo } from '../../src/db/repos/sqlite/checkins-repo.js';
 
 async function findFreePort(): Promise<number> {
   return await new Promise((resolve, reject) => {
-    const server = createServer();
+    const server = createNetServer();
     server.listen(0, '127.0.0.1', () => {
       const addr = server.address() as { port: number };
       server.close(() => resolve(addr.port));
@@ -249,5 +250,87 @@ describe('manager registration cleanup', () => {
       `SELECT COUNT(*) as c FROM agents WHERE name = 'manager' AND deleted_at IS NULL`,
     );
     expect(Number(mgrByName.rows[0]?.c)).toBe(0);
+  });
+
+  it('/agents/status returns bounded news summaries by default', async () => {
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    let newsEndpointHits = 0;
+    const fakeAgent: HttpServer = createHttpServer((req, res) => {
+      if (req.url?.startsWith('/.well-known/restap.json')) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ name: 'status-worker', endpoints: { talk: '/talk', news: '/news' } }));
+        return;
+      }
+      if (req.url?.startsWith('/news')) {
+        newsEndpointHits += 1;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          items: [{
+            id: 999,
+            type: 'query.completed',
+            timestamp: Date.now(),
+            message: 'endpoint-body-should-not-be-read',
+            data: { blob: 'z'.repeat(20000) },
+          }],
+        }));
+        return;
+      }
+      res.writeHead(404).end();
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      fakeAgent.once('error', reject);
+      fakeAgent.listen(0, '127.0.0.1', () => resolve());
+    });
+
+    try {
+      const fakePort = (fakeAgent.address() as AddressInfo).port;
+      const agentId = 'agent_status_summary';
+      await db.agents.create({
+        team_id: teamId,
+        id: agentId,
+        name: 'status-worker',
+        type: 'claude',
+        model: 'test-model',
+        status: 'running',
+        created_at: Date.now(),
+        port: fakePort,
+        endpoint: `http://127.0.0.1:${fakePort}`,
+        metadata: {},
+      });
+      await db.news.add(teamId, agentId, {
+        timestamp: Date.now(),
+        type: 'query.completed',
+        message: 'm'.repeat(4000),
+        data: { blob: 'd'.repeat(20000) },
+        query_id: 'query_status_summary',
+      });
+
+      const res = await fetch(`${baseUrl}/agents/status?news_limit=1&news_message_chars=32`, {
+        headers: {
+          'X-Id-Team': 'default',
+          'X-Id-Admin': '1',
+        },
+      });
+      expect(res.ok).toBe(true);
+      const body = await res.json() as { agents: Array<any> };
+      const statusWorker = body.agents.find((agent) => agent.alias === 'status-worker' || agent.name === 'status-worker');
+      expect(statusWorker).toBeDefined();
+      expect(statusWorker.newsSummary).toMatchObject({
+        mode: 'summary',
+        included: true,
+        limit: 1,
+        messagePreviewChars: 32,
+      });
+      expect(statusWorker.newsItems).toHaveLength(1);
+      expect(statusWorker.newsItems[0].message).toHaveLength(32);
+      expect(statusWorker.newsItems[0].message_length).toBe(4000);
+      expect(statusWorker.newsItems[0].message_truncated).toBe(true);
+      expect(statusWorker.newsItems[0].has_data).toBe(true);
+      expect(statusWorker.newsItems[0].data).toBeUndefined();
+      expect(newsEndpointHits).toBe(0);
+    } finally {
+      await new Promise<void>((resolve) => fakeAgent.close(() => resolve()));
+    }
   });
 });

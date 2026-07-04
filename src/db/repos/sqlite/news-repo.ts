@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 import type { NewsRepository } from '../../db-service.js';
-import type { InboxOwnerKind, NewsItemRow } from '../../types.js';
+import type { InboxOwnerKind, NewsItemRow, NewsItemSummaryRow } from '../../types.js';
 import type { DbAdapter } from '../../db-adapter.js';
 import { parseJsonObject, stringifyJson } from '../../db-json.js';
 
@@ -51,6 +51,43 @@ export class SqliteNewsRepo implements NewsRepository {
       owner_kind,
       owner_id,
       data: parseJsonObject(row.data),
+    };
+  }
+
+  private parseSummaryRow(row: any): NewsItemSummaryRow | null {
+    if (!row) return null;
+    const agent_id =
+      row.agent_id != null && row.agent_id !== ''
+        ? String(row.agent_id)
+        : null;
+    const team_id = String(row.team_id ?? '');
+    const owner_kind: InboxOwnerKind =
+      row.owner_kind === 'manager' || row.owner_kind === 'agent'
+        ? row.owner_kind
+        : agent_id?.startsWith('manager-')
+          ? 'manager'
+          : 'agent';
+    const owner_id =
+      row.owner_id != null && String(row.owner_id) !== ''
+        ? String(row.owner_id)
+        : owner_kind === 'manager'
+          ? team_id
+          : agent_id ?? '';
+    return {
+      id: Number(row.id),
+      team_id,
+      agent_id,
+      timestamp: Number(row.timestamp),
+      type: String(row.type ?? ''),
+      message: row.message == null ? null : String(row.message),
+      message_length: Number(row.message_length ?? 0),
+      has_data: row.has_data === true || row.has_data === 1,
+      data_length: Number(row.data_length ?? 0),
+      query_id: row.query_id == null ? null : String(row.query_id),
+      kind: row.kind === 'talk' || row.kind === 'notify' ? row.kind : null,
+      reply_expected: row.reply_expected == null ? null : row.reply_expected === true || row.reply_expected === 1,
+      owner_kind,
+      owner_id,
     };
   }
 
@@ -119,6 +156,38 @@ export class SqliteNewsRepo implements NewsRepository {
 
     const r = await this.db.query<NewsItemRow>(sql, params);
     return r.rows.map((row) => this.parseNewsRow(row)!);
+  }
+
+  async pollSummary(
+    agentId: string,
+    since: number,
+    opts?: { limit?: number; queryId?: string; messagePreviewChars?: number },
+  ): Promise<NewsItemSummaryRow[]> {
+    const previewChars = Math.min(Math.max(Math.floor(opts?.messagePreviewChars ?? 160), 0), 1000);
+    let sql =
+      `SELECT id, team_id, agent_id, type, timestamp,
+              CASE WHEN message IS NULL THEN NULL ELSE substr(message, 1, ?) END AS message,
+              COALESCE(length(message), 0) AS message_length,
+              CASE WHEN data IS NULL THEN 0 ELSE 1 END AS has_data,
+              COALESCE(length(data), 0) AS data_length,
+              query_id, kind, reply_expected, owner_kind, owner_id
+       FROM news_items
+       WHERE agent_id = ? AND timestamp > ?`;
+    const params: unknown[] = [previewChars, agentId, since];
+
+    if (opts?.queryId) {
+      sql += ' AND query_id = ?';
+      params.push(opts.queryId);
+    }
+
+    sql += ' ORDER BY timestamp DESC';
+
+    const limit = opts?.limit ?? 1000;
+    sql += ' LIMIT ?';
+    params.push(limit);
+
+    const r = await this.db.query<NewsItemSummaryRow>(sql, params);
+    return r.rows.map((row) => this.parseSummaryRow(row)!);
   }
 
   async pollByOwner(

@@ -2,7 +2,7 @@
 
 import type { DbAdapter } from '../../db-adapter.js';
 import type { NewsRepository } from '../../db-service.js';
-import type { InboxOwnerKind, NewsItemRow } from '../../types.js';
+import type { InboxOwnerKind, NewsItemRow, NewsItemSummaryRow } from '../../types.js';
 
 function resolveNewsOwnership(
   teamId: string,
@@ -92,6 +92,46 @@ export class PgNewsRepo implements NewsRepository {
       params,
     );
     return rows;
+  }
+
+  async pollSummary(
+    agentId: string,
+    since: number,
+    opts?: { limit?: number; queryId?: string; messagePreviewChars?: number },
+  ): Promise<NewsItemSummaryRow[]> {
+    const previewChars = Math.min(Math.max(Math.floor(opts?.messagePreviewChars ?? 160), 0), 1000);
+    const params: unknown[] = [agentId, since, previewChars];
+    let where = `agent_id = $1 AND timestamp > $2`;
+
+    if (opts?.queryId) {
+      params.push(opts.queryId);
+      where += ` AND query_id = $${params.length}`;
+    }
+
+    const limit = opts?.limit ?? 1000;
+    params.push(limit);
+
+    const { rows } = await this.db.query<NewsItemSummaryRow>(
+      `SELECT id, team_id, agent_id, query_id, type, timestamp,
+              CASE WHEN message IS NULL THEN NULL ELSE substring(message from 1 for $3) END AS message,
+              COALESCE(char_length(message), 0) AS message_length,
+              data IS NOT NULL AS has_data,
+              COALESCE(char_length(data::text), 0) AS data_length,
+              kind, reply_expected, owner_kind, owner_id
+       FROM news_items
+       WHERE ${where}
+       ORDER BY timestamp DESC
+       LIMIT $${params.length}`,
+      params,
+    );
+    return rows.map((row: any) => ({
+      ...row,
+      id: Number(row.id),
+      timestamp: Number(row.timestamp),
+      message_length: Number(row.message_length ?? 0),
+      has_data: row.has_data === true || row.has_data === 't' || row.has_data === 1,
+      data_length: Number(row.data_length ?? 0),
+    }));
   }
 
   async pollByOwner(

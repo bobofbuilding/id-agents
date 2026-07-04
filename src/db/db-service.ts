@@ -17,6 +17,7 @@ import type {
   TeamRow,
   QueryRow,
   NewsItemRow,
+  NewsItemSummaryRow,
   InboxOwnerKind,
   ScheduleDefinitionRow,
   ScheduleRunRow,
@@ -379,6 +380,16 @@ export interface NewsRepository {
     since: number,
     opts?: { limit?: number; queryId?: string },
   ): Promise<NewsItemRow[]>;
+
+  /**
+   * Poll bounded news metadata for status/health surfaces.
+   * Ordered by timestamp descending. Does not parse or return the data payload.
+   */
+  pollSummary(
+    agentId: string,
+    since: number,
+    opts?: { limit?: number; queryId?: string; messagePreviewChars?: number },
+  ): Promise<NewsItemSummaryRow[]>;
 
   /**
    * Poll news items for a logical inbox owner since a given timestamp.

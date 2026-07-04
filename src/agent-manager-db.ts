@@ -5430,6 +5430,20 @@ Return this JSON shape:
     this.managementApp.get('/agents/status', async (req, res) => {
       const { id: teamId } = await this.getTeam(req);
       const includeAll = req.query.all === 'true' || req.query.all === '1';
+      const includeNewsRaw = Array.isArray(req.query.include_news) ? req.query.include_news[0] : req.query.include_news;
+      const newsRaw = Array.isArray(req.query.news) ? req.query.news[0] : req.query.news;
+      const includeNewsMode = String(includeNewsRaw ?? newsRaw ?? 'summary').toLowerCase();
+      const includeNews = !['0', 'false', 'none', 'off'].includes(includeNewsMode);
+      const includeFullNews = includeNewsMode === 'full';
+      const parseBoundedInt = (value: unknown, fallback: number, max: number): number => {
+        const raw = Array.isArray(value) ? value[0] : value;
+        if (raw === undefined || raw === null || raw === '') return fallback;
+        const parsed = Number(raw);
+        if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed <= 0) return fallback;
+        return Math.min(parsed, max);
+      };
+      const newsLimit = parseBoundedInt(req.query.news_limit ?? req.query.limit, includeFullNews ? 50 : 3, includeFullNews ? 50 : 10);
+      const newsMessageChars = parseBoundedInt(req.query.news_message_chars, 160, 1000);
       const agents = await this.dbListAgents(teamId, includeAll);
       const isAdmin = this.isAdminRequest(req);
 
@@ -5439,6 +5453,12 @@ Return this JSON shape:
           const isInteractive = agent.type === 'interactive';
           let isResponding = false;
           let newsItems: any[] = [];
+          const newsSummary = {
+            mode: includeFullNews ? 'full' : includeNews ? 'summary' : 'none',
+            included: false,
+            limit: newsLimit,
+            messagePreviewChars: includeFullNews || !includeNews ? null : newsMessageChars,
+          };
 
           if (isInteractive) {
             isResponding = true;
@@ -5451,14 +5471,36 @@ Return this JSON shape:
             } catch { /* not responding */ }
           }
 
-          if (isResponding && !isInteractive) {
+          if (includeNews && isResponding && !isInteractive) {
             try {
-              const newsResp = await fetch(`${agentUrl}/news?since=0&limit=50`, {
-                signal: AbortSignal.timeout(2000)
-              });
-              if (newsResp.ok) {
-                const newsData: any = await newsResp.json();
-                newsItems = newsData.items || [];
+              if (includeFullNews) {
+                const newsResp = await fetch(`${agentUrl}/news?since=0&limit=${newsLimit}`, {
+                  signal: AbortSignal.timeout(2000)
+                });
+                if (newsResp.ok) {
+                  const newsData: any = await newsResp.json();
+                  newsItems = newsData.items || [];
+                  newsSummary.included = true;
+                }
+              } else {
+                const rows = await this.db.news.pollSummary(agent.id, 0, {
+                  limit: newsLimit,
+                  messagePreviewChars: newsMessageChars,
+                });
+                newsItems = rows.map((item) => ({
+                  id: item.id,
+                  type: item.type,
+                  timestamp: item.timestamp,
+                  message: item.message || undefined,
+                  message_length: item.message_length,
+                  message_truncated: item.message != null && item.message_length > item.message.length,
+                  query_id: item.query_id,
+                  kind: item.kind,
+                  reply_expected: item.reply_expected,
+                  has_data: item.has_data,
+                  data_length: item.data_length,
+                }));
+                newsSummary.included = true;
               }
             } catch { /* news fetch failed */ }
           }
@@ -5474,6 +5516,7 @@ Return this JSON shape:
             ...this.agentToResponse(agent, { isAdmin }),
             isResponding,
             newsItems,
+            newsSummary,
             hasActiveHeartbeat
           };
         })
@@ -5481,7 +5524,18 @@ Return this JSON shape:
 
       const agentStatuses = results.map((r, i) => {
         if (r.status === 'fulfilled') return r.value;
-        return { ...this.agentToResponse(agents[i], { isAdmin }), isResponding: false, newsItems: [], hasActiveHeartbeat: false };
+        return {
+          ...this.agentToResponse(agents[i], { isAdmin }),
+          isResponding: false,
+          newsItems: [],
+          newsSummary: {
+            mode: includeFullNews ? 'full' : includeNews ? 'summary' : 'none',
+            included: false,
+            limit: newsLimit,
+            messagePreviewChars: includeFullNews || !includeNews ? null : newsMessageChars,
+          },
+          hasActiveHeartbeat: false
+        };
       });
 
       res.json({ agents: agentStatuses });
