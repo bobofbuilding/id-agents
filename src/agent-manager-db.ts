@@ -3041,26 +3041,58 @@ Return this JSON shape:
     if (entry.agent && this.localGateByAgent.get(entry.agent) === queryId) this.localGateByAgent.delete(entry.agent);
   }
 
-  private async forwardToAgent(targetUrl: string, message: string, from: string, session_id?: string): Promise<{
+  private async forwardToAgent(
+    targetUrl: string,
+    message: string,
+    from: string,
+    session_id?: string,
+    retryOptions?: ForwardToAgentRetryOptions,
+  ): Promise<{
     ok: true;
     data: any;
   } | { ok: false; status: number; error: string }> {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    const attempts = Math.max(1, Math.floor(retryOptions?.attempts ?? 1));
+    const initialDelayMs = Math.max(0, Math.floor(retryOptions?.initialDelayMs ?? 0));
+    const label = retryOptions?.label || targetUrl;
+    let delayMs = initialDelayMs;
+    let failure = 'unknown delivery failure';
+    let failureStatus = 502;
 
-    const talkRes = await fetch(`${targetUrl}/talk`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ message, from, session_id }),
-      signal: AbortSignal.timeout(30000)
-    });
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        const talkRes = await fetch(`${targetUrl}/talk`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ message, from, session_id }),
+          signal: AbortSignal.timeout(TALK_TO_DELIVERY_TIMEOUT_MS),
+        });
 
-    if (!talkRes.ok) {
-      const errorText = await talkRes.text().catch(() => talkRes.statusText);
-      return { ok: false, status: talkRes.status, error: errorText };
+        if (talkRes.ok) {
+          if (attempt > 1) {
+            this.managerLog(`/talk-to delivery to ${label} succeeded on retry ${attempt}/${attempts}`);
+          }
+          const data: any = await talkRes.json();
+          return { ok: true, data };
+        }
+
+        const errorText = await talkRes.text().catch(() => talkRes.statusText);
+        failureStatus = talkRes.status;
+        failure = `${talkRes.status} ${errorText.slice(0, 200)}`.trim();
+        if (attempt >= attempts || talkRes.status < 500) break;
+      } catch (err: any) {
+        failureStatus = 502;
+        failure = err?.message || String(err);
+        if (attempt >= attempts) break;
+      }
+
+      this.managerLog(`/talk-to delivery to ${label} failed on attempt ${attempt}/${attempts}: ${failure}. Retrying in ${delayMs}ms...`);
+      await sleep(delayMs);
+      delayMs = Math.max(delayMs * 2, 1);
     }
 
-    const data: any = await talkRes.json();
-    return { ok: true, data };
+    this.managerLog(`/talk-to delivery to ${label} failed after ${attempts} attempt(s): ${failure}`);
+    return { ok: false, status: failureStatus, error: failure };
   }
 
   private releaseLocalGateForAgent(agent?: string | null): void {
@@ -3808,7 +3840,14 @@ Return this JSON shape:
       const lmgToken = await this.acquireLocalGate(targetAgent);
 
       // Forward the message to the agent's /talk endpoint
-      const result = await this.forwardToAgent(targetUrl, outgoingMessage, from || 'manager', session_id);
+      const deliveryRetry = shouldWait
+        ? {
+            attempts: TALK_TO_MAX_ATTEMPTS,
+            initialDelayMs: TALK_TO_INITIAL_RETRY_DELAY_MS,
+            label: targetDisplayId,
+          }
+        : undefined;
+      const result = await this.forwardToAgent(targetUrl, outgoingMessage, from || 'manager', session_id, deliveryRetry);
       if (!result.ok) {
         this.bindLocalGate(lmgToken); // dispatch failed → release the slot now
         console.error(`[Manager] Failed to deliver message to ${targetDisplayId}: ${result.status}`);
@@ -12378,6 +12417,31 @@ Return this JSON shape:
     return text.match(/#[a-z0-9][a-z0-9_-]{3,}/i)?.[0]?.toLowerCase() ?? null;
   }
 
+  private async loadPendingQueriesForRecipient(recipient: AgentRow | null | undefined): Promise<QueryRow[]> {
+    if (!recipient?.id) return [];
+    await this.sweepStaleQueriesIfDue();
+    return this.db.queries.getPending(recipient.id).catch(() => [] as QueryRow[]);
+  }
+
+  private hasAnyActiveQueryFromRows(active: QueryRow[]): boolean {
+    return active.some((row) => row.status === 'pending' || row.status === 'processing');
+  }
+
+  private supervisionQueryStateFromRows(
+    teamId: string,
+    active: QueryRow[],
+    marker: string,
+  ): { hasActiveSupervisionAsk: boolean; hasAnyActiveQuery: boolean } {
+    return {
+      hasActiveSupervisionAsk: active.some((row) =>
+        row.team_id === teamId
+        && (row.status === 'pending' || row.status === 'processing')
+        && this.supervisionPromptMatchesMarker(row.prompt, marker),
+      ),
+      hasAnyActiveQuery: this.hasAnyActiveQueryFromRows(active),
+    };
+  }
+
   private supervisionPromptMarker(prompt: string | null | undefined): string | null {
     const text = String(prompt ?? '').trim();
     if (!this.supervisionPromptMatchesMarker(text, 'task') && !this.supervisionPromptMatchesMarker(text, 'request')) {
@@ -12393,20 +12457,14 @@ Return this JSON shape:
     marker: string,
   ): Promise<boolean> {
     if (!recipient?.id) return false;
-    await this.sweepStaleQueriesIfDue();
-    const active = await this.db.queries.getPending(recipient.id).catch(() => [] as QueryRow[]);
-    return active.some((row) =>
-      row.team_id === teamId
-      && (row.status === 'pending' || row.status === 'processing')
-      && this.supervisionPromptMatchesMarker(row.prompt, marker),
-    );
+    const active = await this.loadPendingQueriesForRecipient(recipient);
+    return this.supervisionQueryStateFromRows(teamId, active, marker).hasActiveSupervisionAsk;
   }
 
   private async hasAnyActiveQuery(recipient: AgentRow | null | undefined): Promise<boolean> {
     if (!recipient?.id) return false;
-    await this.sweepStaleQueriesIfDue();
-    const active = await this.db.queries.getPending(recipient.id).catch(() => [] as QueryRow[]);
-    return active.some((row) => row.status === 'pending' || row.status === 'processing');
+    const active = await this.loadPendingQueriesForRecipient(recipient);
+    return this.hasAnyActiveQueryFromRows(active);
   }
 
   private async findActiveDuplicateTaskAsk(
@@ -12416,8 +12474,7 @@ Return this JSON shape:
   ): Promise<QueryRow | null> {
     const marker = this.activeTaskAskMarker(message);
     if (!marker) return null;
-    await this.sweepStaleQueriesIfDue();
-    const active = await this.db.queries.getPending(recipient.id).catch(() => [] as QueryRow[]);
+    const active = await this.loadPendingQueriesForRecipient(recipient);
     return active.find((row) =>
       row.team_id === teamId
       && (row.status === 'pending' || row.status === 'processing')
@@ -12742,27 +12799,69 @@ Return this JSON shape:
     }
 
     const doing = await this.db.tasks.list({ status: 'doing' }).catch(() => [] as TaskRow[]);
+    const teamRowsById = new Map<string, Promise<TeamRow | null>>();
+    const ownerAgentsById = new Map<string, Promise<AgentRow | null>>();
+    const leadsByTeamId = new Map<string, Promise<AgentRow | null>>();
+    const pendingQueriesByAgentId = new Map<string, Promise<QueryRow[]>>();
+    const getTeamRow = (teamId: string | null | undefined): Promise<TeamRow | null> => {
+      if (!teamId) return Promise.resolve(null);
+      const cached = teamRowsById.get(teamId);
+      if (cached) return cached;
+      const pending = this.db.teams.getTeam(teamId).catch(() => null);
+      teamRowsById.set(teamId, pending);
+      return pending;
+    };
+    const getOwnerAgent = (ownerId: string | null | undefined): Promise<AgentRow | null> => {
+      if (!ownerId) return Promise.resolve(null);
+      const cached = ownerAgentsById.get(ownerId);
+      if (cached) return cached;
+      const pending = this.db.agents.getById(ownerId).catch(() => null);
+      ownerAgentsById.set(ownerId, pending);
+      return pending;
+    };
+    const getLeadForTeam = (teamId: string | null | undefined): Promise<AgentRow | null> => {
+      if (!teamId) return Promise.resolve(null);
+      const cached = leadsByTeamId.get(teamId);
+      if (cached) return cached;
+      const pending = this.findSupervisionLead(teamId).catch(() => null);
+      leadsByTeamId.set(teamId, pending);
+      return pending;
+    };
+    const getPendingQueriesFor = (recipient: AgentRow | null | undefined): Promise<QueryRow[]> => {
+      if (!recipient?.id) return Promise.resolve([] as QueryRow[]);
+      const cached = pendingQueriesByAgentId.get(recipient.id);
+      if (cached) return cached;
+      const pending = this.loadPendingQueriesForRecipient(recipient);
+      pendingQueriesByAgentId.set(recipient.id, pending);
+      return pending;
+    };
     for (const t of doing) {
       if (nudged >= MAX_PER_SWEEP) break;
       if (!t.owner) continue;
       const updated = this.taskLastActivityMs(t);
-      // Resolve owner id → agent name + the task's team name for the dispatch.
-      const ownerAgent = await this.db.agents.getById(t.owner).catch(() => null);
-      const ownerName = ownerAgent?.name || t.owner;
-      const teamRow = t.team_id ? await this.db.teams.getTeam(t.team_id).catch(() => null) : null;
+      const [ownerAgent, teamRow, lead] = await Promise.all([
+        getOwnerAgent(t.owner),
+        getTeamRow(t.team_id),
+        getLeadForTeam(t.team_id),
+      ]);
       if (!teamRow) continue;
-      const teamName = teamRow?.name || 'default';
+      const ownerName = ownerAgent?.name || t.owner;
+      const teamName = teamRow.name || 'default';
       const ref = this.taskShortRef(t);
       const mins = Math.round((now - updated) / 60000);
-      if (await this.hasRecentTaskSupervisionEvent(teamRow.id, t, now - RENUDGE_MS)) continue;
+      const [hasRecentSupervision, ownerPendingQueries] = await Promise.all([
+        this.hasRecentTaskSupervisionEvent(teamRow.id, t, now - RENUDGE_MS),
+        getPendingQueriesFor(ownerAgent),
+      ]);
+      if (hasRecentSupervision) continue;
+      const ownerProbeState = this.supervisionQueryStateFromRows(teamRow.id, ownerPendingQueries, ref);
 
       if (this.isLiveForSupervision(ownerAgent) && this.isConfiguredTeamLead(teamName, ownerAgent)) {
         const nudgeKey = `task:${t.id}:lead-delegation`;
         const canRun = this.canRunStalledProbe(nudgeKey, now, RENUDGE_MS, MAX_PROBES);
         const canEscalate = !canRun && this.canEscalateStalledProbe(nudgeKey, MAX_PROBES);
         if (canRun || canEscalate) {
-          if (await this.hasActiveSupervisionAskForMarker(teamRow.id, ownerAgent, ref)) continue;
-          if (await this.hasAnyActiveQuery(ownerAgent)) continue;
+          if (ownerProbeState.hasActiveSupervisionAsk || ownerProbeState.hasAnyActiveQuery) continue;
           const prevProbe = this.stalledNudges.get(nudgeKey);
           const attempt = canRun ? this.markStalledProbe(nudgeKey, now) : MAX_PROBES;
           const msg = await this.buildLeadDelegationNudge(
@@ -12877,10 +12976,10 @@ Return this JSON shape:
               nudged++;
               continue;
             }
-            const lead = await this.findSupervisionLead(teamRow.id);
             if (lead) {
-              if (await this.hasActiveSupervisionAskForMarker(teamRow.id, lead, ref)) continue;
-              if (await this.hasAnyActiveQuery(lead)) continue;
+              const leadPendingQueries = await getPendingQueriesFor(lead);
+              const leadProbeState = this.supervisionQueryStateFromRows(teamRow.id, leadPendingQueries, ref);
+              if (leadProbeState.hasActiveSupervisionAsk || leadProbeState.hasAnyActiveQuery) continue;
               const prevProbe = this.stalledNudges.get(nudgeKey);
               this.markStalledProbeEscalated(nudgeKey, now);
               const msg = `Supervision: task ${ref} ("${t.title}") is still in progress after ${MAX_PROBES} stalled owner probes over ${mins}m. Please triage it: close it if finished, unblock it, reassign it, or split it into a new tracked task.`;
@@ -12894,8 +12993,7 @@ Return this JSON shape:
           }
           continue;
         }
-        if (await this.hasActiveSupervisionAskForMarker(teamRow.id, ownerAgent, ref)) continue;
-        if (await this.hasAnyActiveQuery(ownerAgent)) continue;
+        if (ownerProbeState.hasActiveSupervisionAsk || ownerProbeState.hasAnyActiveQuery) continue;
         const prevProbe = this.stalledNudges.get(nudgeKey);
         const attempt = this.markStalledProbe(nudgeKey, now);
         const msg = `Supervision: task ${ref} ("${t.title}") has been in progress ${mins}m with no completion (probe ${attempt}/${MAX_PROBES}). If the work is done, mark it done now with \`/task done ${ref}\`. If you're blocked, reply briefly with what's blocking it. If it isn't started, start and finish it.`;
@@ -12908,12 +13006,12 @@ Return this JSON shape:
         continue;
       }
 
-      const lead = await this.findSupervisionLead(teamRow.id);
       if (!lead) continue;
       const nudgeKey = `task:${t.id}:owner-unavailable`;
       if (!this.canRunStalledProbe(nudgeKey, now, RENUDGE_MS, MAX_PROBES)) continue;
-      if (await this.hasActiveSupervisionAskForMarker(teamRow.id, lead, ref)) continue;
-      if (await this.hasAnyActiveQuery(lead)) continue;
+      const leadPendingQueries = await getPendingQueriesFor(lead);
+      const leadProbeState = this.supervisionQueryStateFromRows(teamRow.id, leadPendingQueries, ref);
+      if (leadProbeState.hasActiveSupervisionAsk || leadProbeState.hasAnyActiveQuery) continue;
       const prevProbe = this.stalledNudges.get(nudgeKey);
       const attempt = this.markStalledProbe(nudgeKey, now);
       const msg = `Supervision: task ${ref} ("${t.title}") has been in progress ${mins}m, but ${unavailable} (triage probe ${attempt}/${MAX_PROBES}). Please triage it: claim it, reassign it, or route it to the right teammate.`;
@@ -12938,7 +13036,7 @@ Return this JSON shape:
       const nudgeKey = `todo:${t.id}`;
       if (!this.canRunStalledProbe(nudgeKey, now, RENUDGE_MS, MAX_PROBES)) continue;
 
-      const teamRow = await this.db.teams.getTeam(t.team_id).catch(() => null);
+      const teamRow = await getTeamRow(t.team_id);
       if (!teamRow) continue;
       const active = await this.db.checkins
         .list({ teamId: teamRow.id, linkedTaskId: t.id, status: ['active', 'snoozed'], limit: 1 })
@@ -12958,13 +13056,17 @@ Return this JSON shape:
 
       if (unownedAgeMs < STALL_MS) continue;
 
-      const lead = await this.findSupervisionLead(teamRow.id);
+      const lead = await getLeadForTeam(teamRow.id);
       if (!lead) continue;
       const ref = this.taskShortRef(t);
       const mins = Math.round((now - updated) / 60000);
-      if (await this.hasRecentTaskSupervisionEvent(teamRow.id, t, now - RENUDGE_MS)) continue;
-      if (await this.hasActiveSupervisionAskForMarker(teamRow.id, lead, ref)) continue;
-      if (await this.hasAnyActiveQuery(lead)) continue;
+      const [hasRecentSupervision, leadPendingQueries] = await Promise.all([
+        this.hasRecentTaskSupervisionEvent(teamRow.id, t, now - RENUDGE_MS),
+        getPendingQueriesFor(lead),
+      ]);
+      if (hasRecentSupervision) continue;
+      const leadProbeState = this.supervisionQueryStateFromRows(teamRow.id, leadPendingQueries, ref);
+      if (leadProbeState.hasActiveSupervisionAsk || leadProbeState.hasAnyActiveQuery) continue;
       const prevProbe = this.stalledNudges.get(nudgeKey);
       const attempt = this.markStalledProbe(nudgeKey, now);
       const msg = `Supervision: unclaimed task ${ref} ("${t.title}") has been waiting ${mins}m with no owner (triage probe ${attempt}/${MAX_PROBES}). Please claim it if it is yours, or route it to the right teammate.`;
@@ -12989,10 +13091,11 @@ Return this JSON shape:
           if (now - q.created < STALL_MS) continue;
           const nudgeKey = `manager-query:${q.query_id}`;
           if (!this.canRunStalledProbe(nudgeKey, now, RENUDGE_MS, MAX_PROBES)) continue;
-          const lead = await this.findSupervisionLead(team.id);
+          const lead = await getLeadForTeam(team.id);
           if (!lead) continue;
-          if (await this.hasActiveSupervisionAskForMarker(team.id, lead, q.query_id)) continue;
-          if (await this.hasAnyActiveQuery(lead)) continue;
+          const leadPendingQueries = await getPendingQueriesFor(lead);
+          const leadProbeState = this.supervisionQueryStateFromRows(team.id, leadPendingQueries, q.query_id);
+          if (leadProbeState.hasActiveSupervisionAsk || leadProbeState.hasAnyActiveQuery) continue;
           const mins = Math.round((now - q.created) / 60000);
           const prompt = q.prompt ? ` ("${q.prompt.slice(0, 120)}${q.prompt.length > 120 ? '...' : ''}")` : '';
           const prevProbe = this.stalledNudges.get(nudgeKey);

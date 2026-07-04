@@ -180,6 +180,53 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('starts the stalled-task probe reads in parallel before sending a nudge', async () => {
+    let releaseEvent!: () => void;
+    let releasePending!: () => void;
+    let eventStarted = false;
+    let pendingStarted = false;
+    const eventGate = new Promise<void>((resolve) => { releaseEvent = resolve; });
+    const pendingGate = new Promise<void>((resolve) => { releasePending = resolve; });
+    const db = fakeDb({
+      adapter: {
+        query: vi.fn(async (sql: string) => {
+          if (sql.includes('FROM event_log')) {
+            eventStarted = true;
+            await eventGate;
+            return { rows: [], rowCount: 0 };
+          }
+          return { rows: [], rowCount: 0 };
+        }),
+      },
+      queries: {
+        getPending: vi.fn(async () => {
+          pendingStarted = true;
+          await pendingGate;
+          return [];
+        }),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const sweep = manager.sweepStalledTasks();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    expect(eventStarted).toBe(true);
+    expect(pendingStarted).toBe(true);
+
+    releaseEvent();
+    releasePending();
+    await sweep;
+
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledTimes(1);
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'worker',
+      expect.stringContaining('probe 1/3'),
+    );
+  });
+
   it('does not repeat owner refresh after restart when a recent supervision event exists', async () => {
     const db = fakeDb({
       adapter: {
