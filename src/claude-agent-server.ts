@@ -49,6 +49,7 @@ const MCP_CONTROL_PLANE_PROMPT_PATTERNS = [
   /^\[Message from agent "[^"]+"\s*\|[^\n]*\]\s*\n[\s\S]*\nAssignment sweep complete\b/,
   /^\[Message from agent "[^"]+"\s*\|[^\n]*\]\s*\n[\s\S]*\nNo approved recommendation routed\b/,
   /^\[Message from agent "[^"]+"\s*\|[^\n]*\]\s*\n[\s\S]*\nAlready handled\.\s+Task\b/,
+  /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nTask assignment sweep:/,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nHeartbeat:/,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nSupervision:/,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nSupervision probe on task\b/,

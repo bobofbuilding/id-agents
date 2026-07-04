@@ -3965,6 +3965,7 @@ Return this JSON shape:
       /^Supervision:/,
       /^Supervision probe on task\b/,
       /^Backlog guard:/,
+      /^Task assignment sweep:/,
       /^Assignment sweep complete\b/,
       /^No approved recommendation routed\b/,
       /^Already handled\.\s+Task\b/,
