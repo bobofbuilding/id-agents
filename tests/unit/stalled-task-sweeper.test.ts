@@ -202,6 +202,36 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('does not send automated owner refresh while the recipient already has active work', async () => {
+    const db = fakeDb({
+      queries: {
+        getPending: vi.fn(async () => [{
+          team_id: TEAM_ID,
+          agent_id: 'agent-1',
+          query_id: 'active-unrelated-work',
+          status: 'processing',
+          prompt: 'Heartbeat: review your checklist and act on anything that needs attention.',
+          created: NOW_MS - 60_000,
+          completed: null,
+          result: null,
+          error: null,
+          session_id: null,
+          owner_kind: 'agent',
+          owner_id: 'agent-1',
+          metadata: null,
+        }]),
+        getPendingByOwner: vi.fn(async () => []),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.sweepStalledTasks();
+
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
+    expect(db.events.insert).not.toHaveBeenCalled();
+  });
+
   it('asks a live team lead to delegate when a lead-owned task has no real child tasks', async () => {
     const nowSec = Math.floor(NOW_MS / 1000);
     const lead = agent({
@@ -605,6 +635,57 @@ describe('stalled task sweeper', () => {
           query_id: 'active-owner-unavailable-probe',
           status: 'processing',
           prompt: 'Supervision: task #12345678 ("Stalled work") has been in progress 60m, but owner worker is stopped (triage probe 1/3).',
+          created: NOW_MS - 60_000,
+          completed: null,
+          result: null,
+          error: null,
+          session_id: null,
+          owner_kind: 'agent',
+          owner_id: 'lead-1',
+          metadata: null,
+        }]),
+        getPendingByOwner: vi.fn(async () => []),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.sweepStalledTasks();
+
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
+    expect(db.events.insert).not.toHaveBeenCalled();
+  });
+
+  it('does not stack unclaimed-task triage on a lead that already has active work', async () => {
+    const unclaimed = task({
+      id: 'todo-1',
+      name: 'unclaimed-work',
+      uuid: '11111111-2222-4333-8444-555555555555',
+      title: 'Unclaimed work',
+      status: 'todo',
+      owner: null,
+    });
+    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
+    const db = fakeDb({
+      agents: {
+        getByName: vi.fn(async () => lead),
+        list: vi.fn(async () => [lead]),
+      },
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => {
+          if (status === 'doing') return [];
+          if (status === 'todo') return [unclaimed];
+          return [];
+        }),
+        updateFields: vi.fn(async () => {}),
+      },
+      queries: {
+        getPending: vi.fn(async () => [{
+          team_id: TEAM_ID,
+          agent_id: 'lead-1',
+          query_id: 'lead-current-work',
+          status: 'processing',
+          prompt: 'Heartbeat: review your checklist and act on anything that needs attention.',
           created: NOW_MS - 60_000,
           completed: null,
           result: null,

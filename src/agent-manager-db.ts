@@ -1473,6 +1473,7 @@ export class AgentManagerDb {
       .map((agent) => agent.name);
     const ref = this.taskShortRef(task);
     if (await this.hasActiveSupervisionAskForMarker(teamId, owner, ref)) return;
+    if (await this.hasAnyActiveQuery(owner)) return;
     const memberHint = members.length ? ` Available teammates: ${members.join(', ')}.` : '';
     const message = `Lead delegation kickoff: task ${ref} ("${task.title}") is assigned to you as the team coordinator. Do not do the whole task yourself. Immediately decompose it into member-owned child tasks with \`/task create ... --owner <teammate> --parent-task ${ref}\`, then close this parent only after child tasks are done using \`/task done ${ref} --delegated-task-names "child-a,child-b"\`. If this is truly advisory, close it with \`--no-delegation-reason\` and a failure/summary note.${memberHint}`;
     if (await this.sendSupervisionAsk(teamName, owner.name, message)) {
@@ -12106,6 +12107,13 @@ Return this JSON shape:
     );
   }
 
+  private async hasAnyActiveQuery(recipient: AgentRow | null | undefined): Promise<boolean> {
+    if (!recipient?.id) return false;
+    await this.sweepStaleQueriesIfDue();
+    const active = await this.db.queries.getPending(recipient.id).catch(() => [] as QueryRow[]);
+    return active.some((row) => row.status === 'pending' || row.status === 'processing');
+  }
+
   private async findActiveDuplicateTaskAsk(
     teamId: string,
     recipient: AgentRow,
@@ -12330,6 +12338,7 @@ Return this JSON shape:
         const canEscalate = !canRun && this.canEscalateStalledProbe(nudgeKey, MAX_PROBES);
         if (canRun || canEscalate) {
           if (await this.hasActiveSupervisionAskForMarker(teamRow.id, ownerAgent, ref)) continue;
+          if (await this.hasAnyActiveQuery(ownerAgent)) continue;
           const prevProbe = this.stalledNudges.get(nudgeKey);
           const attempt = canRun ? this.markStalledProbe(nudgeKey, now) : MAX_PROBES;
           const msg = await this.buildLeadDelegationNudge(
@@ -12433,6 +12442,7 @@ Return this JSON shape:
             const lead = await this.findSupervisionLead(teamRow.id);
             if (lead) {
               if (await this.hasActiveSupervisionAskForMarker(teamRow.id, lead, ref)) continue;
+              if (await this.hasAnyActiveQuery(lead)) continue;
               const prevProbe = this.stalledNudges.get(nudgeKey);
               this.markStalledProbeEscalated(nudgeKey, now);
               const msg = `Supervision: task ${ref} ("${t.title}") is still in progress after ${MAX_PROBES} stalled owner probes over ${mins}m. Please triage it: close it if finished, unblock it, reassign it, or split it into a new tracked task.`;
@@ -12447,6 +12457,7 @@ Return this JSON shape:
           continue;
         }
         if (await this.hasActiveSupervisionAskForMarker(teamRow.id, ownerAgent, ref)) continue;
+        if (await this.hasAnyActiveQuery(ownerAgent)) continue;
         const prevProbe = this.stalledNudges.get(nudgeKey);
         const attempt = this.markStalledProbe(nudgeKey, now);
         const msg = `Supervision: task ${ref} ("${t.title}") has been in progress ${mins}m with no completion (probe ${attempt}/${MAX_PROBES}). If the work is done, mark it done now with \`/task done ${ref}\`. If you're blocked, reply briefly with what's blocking it. If it isn't started, start and finish it.`;
@@ -12464,6 +12475,7 @@ Return this JSON shape:
       const nudgeKey = `task:${t.id}:owner-unavailable`;
       if (!this.canRunStalledProbe(nudgeKey, now, RENUDGE_MS, MAX_PROBES)) continue;
       if (await this.hasActiveSupervisionAskForMarker(teamRow.id, lead, ref)) continue;
+      if (await this.hasAnyActiveQuery(lead)) continue;
       const prevProbe = this.stalledNudges.get(nudgeKey);
       const attempt = this.markStalledProbe(nudgeKey, now);
       const msg = `Supervision: task ${ref} ("${t.title}") has been in progress ${mins}m, but ${unavailable} (triage probe ${attempt}/${MAX_PROBES}). Please triage it: claim it, reassign it, or route it to the right teammate.`;
@@ -12498,6 +12510,7 @@ Return this JSON shape:
       const ref = this.taskShortRef(t);
       const mins = Math.round((now - updated) / 60000);
       if (await this.hasActiveSupervisionAskForMarker(teamRow.id, lead, ref)) continue;
+      if (await this.hasAnyActiveQuery(lead)) continue;
       const prevProbe = this.stalledNudges.get(nudgeKey);
       const attempt = this.markStalledProbe(nudgeKey, now);
       const msg = `Supervision: unclaimed task ${ref} ("${t.title}") has been waiting ${mins}m with no owner (triage probe ${attempt}/${MAX_PROBES}). Please claim it if it is yours, or route it to the right teammate.`;
@@ -12525,6 +12538,7 @@ Return this JSON shape:
           const lead = await this.findSupervisionLead(team.id);
           if (!lead) continue;
           if (await this.hasActiveSupervisionAskForMarker(team.id, lead, q.query_id)) continue;
+          if (await this.hasAnyActiveQuery(lead)) continue;
           const mins = Math.round((now - q.created) / 60000);
           const prompt = q.prompt ? ` ("${q.prompt.slice(0, 120)}${q.prompt.length > 120 ? '...' : ''}")` : '';
           const prevProbe = this.stalledNudges.get(nudgeKey);
