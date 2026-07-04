@@ -151,12 +151,13 @@ export class SqliteQueriesRepo implements QueriesRepository {
     queryId: string,
     completed: number,
     result: Record<string, unknown> | null,
-  ): Promise<void> {
-    await this.db.query(
+  ): Promise<boolean> {
+    const r = await this.db.query(
       `UPDATE queries SET status = 'completed', completed = ?, result = ?
-       WHERE team_id = ? AND query_id = ? AND status = 'pending'`,
+       WHERE team_id = ? AND query_id = ? AND status IN ('pending', 'processing')`,
       [completed, result ? stringifyJson(result) : null, teamId, queryId],
     );
+    return (r.rowCount ?? 0) > 0;
   }
 
   async markFailed(
@@ -167,7 +168,7 @@ export class SqliteQueriesRepo implements QueriesRepository {
   ): Promise<boolean> {
     const r = await this.db.query(
       `UPDATE queries SET status = 'failed', completed = ?, error = ?
-       WHERE team_id = ? AND query_id = ? AND status = 'pending'`,
+       WHERE team_id = ? AND query_id = ? AND status IN ('pending', 'processing')`,
       [completed, error ?? null, teamId, queryId],
     );
     return (r.rowCount ?? 0) > 0;

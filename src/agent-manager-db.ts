@@ -2035,10 +2035,11 @@ Return this JSON shape:
    * `queries.markFailed` + `emitQueryFailed` and shares only the waiter
    * wakeup primitives below (which apply to any terminal transition).
    *
-   * Idempotent at the DB level: `queries.complete` is gated on `status =
-   * 'pending'`, so repeated calls for the same query are no-ops on the row.
-   * The event/waiter side effects still fire, mirroring the existing POST
-   * /news behavior (see audit finding context above).
+   * Idempotent at the lifecycle level: `queries.complete` is gated on
+   * `status IN ('pending', 'processing')` and returns whether it actually
+   * transitioned the row. Expensive/noisy side effects (Brain capture and
+   * `query:delivered`) only run for that first transition, while waiter
+   * wakeups still run for duplicate calls so blocked clients are not stranded.
    */
   private async completeQueryDelivery(params: {
     teamId: string;
@@ -2088,12 +2089,12 @@ Return this JSON shape:
       ? { ...resultPayload, learning_loop: queryLearningLoop }
       : resultPayload;
 
-    await this.db.queries.complete(teamId, queryId, occurredAt, completionPayload);
+    const transitioned = await this.db.queries.complete(teamId, queryId, occurredAt, completionPayload);
 
     const completedRow = await this.db.queries
       .getByQueryIdForTeam(teamId, queryId)
       .catch(() => null);
-    if (completedRow && completedRow.status === 'completed') {
+    if (transitioned && completedRow && completedRow.status === 'completed') {
       const brainContext = this.queryBrainContext.get(queryId)
         || ((completedRow.metadata as any)?.brain_context as BrainVolunteerContext | undefined)
         || null;

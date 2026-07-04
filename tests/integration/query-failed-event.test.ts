@@ -186,7 +186,8 @@ describe('manager /news → query:failed wiring (markFailed + emitQueryFailed)',
     await db.queries.create(teamId, queryId, agentId, 'do the thing', 1_000);
 
     const ts = 2_000;
-    await db.queries.complete(teamId, queryId, ts, { reply: 'all done' });
+    const transitioned = await db.queries.complete(teamId, queryId, ts, { reply: 'all done' });
+    expect(transitioned).toBe(true);
     const row = await db.queries.getByQueryIdForTeam(teamId, queryId);
     expect(row?.status).toBe('completed');
 
@@ -202,6 +203,62 @@ describe('manager /news → query:failed wiring (markFailed + emitQueryFailed)',
     expect(failed).toHaveLength(0);
     const delivered = await db.events.query({ teamId, topics: ['query:delivered'] });
     expect(delivered).toHaveLength(1);
+  });
+
+  it('suppresses duplicate delivered events for repeated completions', async () => {
+    const queryId = 'qid-duplicate-ok';
+    await db.queries.create(teamId, queryId, agentId, 'do the thing', 1_000);
+
+    const firstTransition = await db.queries.complete(teamId, queryId, 2_000, { reply: 'first' });
+    expect(firstTransition).toBe(true);
+    const firstRow = await db.queries.getByQueryIdForTeam(teamId, queryId);
+    if (firstTransition) {
+      await emitQueryDelivered(db.events, {
+        teamId,
+        queryId,
+        agentId: firstRow!.agent_id,
+        occurredAt: 2_000,
+        messagePreview: 'first',
+      });
+    }
+
+    const duplicateTransition = await db.queries.complete(teamId, queryId, 3_000, { reply: 'duplicate' });
+    expect(duplicateTransition).toBe(false);
+    if (duplicateTransition) {
+      await emitQueryDelivered(db.events, {
+        teamId,
+        queryId,
+        agentId: firstRow!.agent_id,
+        occurredAt: 3_000,
+        messagePreview: 'duplicate',
+      });
+    }
+
+    const row = await db.queries.getByQueryIdForTeam(teamId, queryId);
+    expect(row?.status).toBe('completed');
+    expect(row?.result).toMatchObject({ reply: 'first' });
+
+    const delivered = await db.events.query({ teamId, topics: ['query:delivered'] });
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0].data).toMatchObject({ message_preview: 'first' });
+  });
+
+  it('completes and fails processing rows as terminal transitions', async () => {
+    const completeId = 'qid-processing-complete';
+    await db.queries.create(teamId, completeId, agentId, 'complete me', 1_000);
+    await db.queries.upsert(teamId, agentId, { query_id: completeId, status: 'processing' });
+
+    const completed = await db.queries.complete(teamId, completeId, 2_000, { reply: 'done' });
+    expect(completed).toBe(true);
+    expect((await db.queries.getByQueryIdForTeam(teamId, completeId))?.status).toBe('completed');
+
+    const failId = 'qid-processing-fail';
+    await db.queries.create(teamId, failId, agentId, 'fail me', 1_000);
+    await db.queries.upsert(teamId, agentId, { query_id: failId, status: 'processing' });
+
+    const failed = await db.queries.markFailed(teamId, failId, 2_000, 'runtime failed');
+    expect(failed).toBe(true);
+    expect((await db.queries.getByQueryIdForTeam(teamId, failId))?.status).toBe('failed');
   });
 
   it('a late reply.error after a successful completion is suppressed (no event)', async () => {

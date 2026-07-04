@@ -120,12 +120,13 @@ export class PgQueriesRepo implements QueriesRepository {
     queryId: string,
     completed: number,
     result: Record<string, unknown> | null,
-  ): Promise<void> {
-    await this.db.query(
+  ): Promise<boolean> {
+    const r = await this.db.query(
       `UPDATE queries SET status = 'completed', completed = $3, result = $4
-       WHERE team_id = $1 AND query_id = $2 AND status = 'pending'`,
+       WHERE team_id = $1 AND query_id = $2 AND status IN ('pending', 'processing')`,
       [teamId, queryId, completed, result],
     );
+    return (r.rowCount ?? 0) > 0;
   }
 
   async markFailed(
@@ -136,7 +137,7 @@ export class PgQueriesRepo implements QueriesRepository {
   ): Promise<boolean> {
     const r = await this.db.query(
       `UPDATE queries SET status = 'failed', completed = $3, error = $4
-       WHERE team_id = $1 AND query_id = $2 AND status = 'pending'`,
+       WHERE team_id = $1 AND query_id = $2 AND status IN ('pending', 'processing')`,
       [teamId, queryId, completed, error ?? null],
     );
     return (r.rowCount ?? 0) > 0;

@@ -284,19 +284,23 @@ export interface QueriesRepository {
   /**
    * Mark a query as completed: set status='completed', completed timestamp,
    * and result JSON.
+   *
+   * Returns true if the row was actually transitioned. Callers use this to
+   * avoid duplicate terminal events when a retry/dual reply path repeats a
+   * completion for an already-terminal query.
    */
   complete(
     teamId: string,
     queryId: string,
     completed: number,
     result: Record<string, unknown> | null,
-  ): Promise<void>;
+  ): Promise<boolean>;
 
   /**
    * Mark a query as failed: set status='failed', completed timestamp, and
-   * an optional error string. Only transitions rows currently in 'pending'
-   * (mirrors `complete`) so a late `reply.error` after a successful reply
-   * does not flip the row backwards.
+   * an optional error string. Only transitions rows currently in 'pending' or
+   * 'processing' (mirrors `complete`) so a late `reply.error` after a
+   * successful reply does not flip the row backwards.
    *
    * Returns true if the row was actually transitioned (caller can branch
    * on whether to emit `query:failed`).
