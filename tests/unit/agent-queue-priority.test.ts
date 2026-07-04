@@ -118,6 +118,48 @@ describe('agent query queue priority', () => {
     }
   });
 
+  it('records automatic heartbeats for busy agents without stacking harness turns', async () => {
+    const harness = new RecordingHarness(true);
+    const server = new AgentRestServer({
+      agentName: 'skill-discoverer',
+      agentIdentity: { name: 'skill-discoverer', team: 'skillmesh' },
+      harness,
+    });
+
+    try {
+      await server.start(0);
+      const port = ((server as any).httpServer.address() as AddressInfo).port;
+
+      await (server as any).startQuery('q1', 'assigned task already in progress', undefined, 'manager');
+      await viWaitFor(() => expect(harness.prompts).toHaveLength(1));
+
+      const res = await fetch(`http://127.0.0.1:${port}/schedule`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: 'Heartbeat: review your checklist and act on anything that needs attention.',
+          schedule: {
+            id: 'hb-worker',
+            kind: 'heartbeat',
+            title: 'Heartbeat: skill-discoverer',
+            scheduledKey: 'interval:1',
+          },
+          mode: 'internal',
+        }),
+      });
+
+      expect(res.status).toBe(202);
+      await expect(res.json()).resolves.toMatchObject({ status: 'deferred' });
+      await sleep(20);
+      expect(harness.prompts).toHaveLength(1);
+
+      harness.release();
+      await viWaitFor(() => expect(harness.prompts).toHaveLength(1));
+    } finally {
+      await server.stop();
+    }
+  });
+
   it('records triggered agent replies without stacking another primary-lead harness turn while busy', async () => {
     const harness = new RecordingHarness(true);
     const server = new AgentRestServer({
@@ -149,6 +191,48 @@ describe('agent query queue priority', () => {
         triggered: false,
         deferred: true,
         reason: 'primary_lead_busy',
+      });
+      await sleep(20);
+      expect(harness.prompts).toHaveLength(1);
+
+      harness.release();
+      await viWaitFor(() => expect(harness.prompts).toHaveLength(1));
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('records triggered peer replies for busy agents without queueing another turn', async () => {
+    const harness = new RecordingHarness(true);
+    const server = new AgentRestServer({
+      agentName: 'skillmesh-ops-lead',
+      agentIdentity: { name: 'skillmesh-ops-lead', team: 'skillmesh' },
+      harness,
+    });
+
+    try {
+      await server.start(0);
+      const port = ((server as any).httpServer.address() as AddressInfo).port;
+
+      await (server as any).startQuery('q1', 'delegation synthesis already in progress', undefined, 'manager');
+      await viWaitFor(() => expect(harness.prompts).toHaveLength(1));
+
+      const res = await fetch(`http://127.0.0.1:${port}/news`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: 'reply',
+          from: 'skill-discoverer',
+          message: 'Task output landed while the lead is still synthesizing.',
+          in_reply_to: 'query_1',
+        }),
+      });
+
+      expect(res.status).toBe(202);
+      await expect(res.json()).resolves.toMatchObject({
+        triggered: false,
+        deferred: true,
+        reason: 'agent_busy',
       });
       await sleep(20);
       expect(harness.prompts).toHaveLength(1);

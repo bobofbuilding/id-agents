@@ -1113,12 +1113,12 @@ export class AgentRestServer {
           console.error(`[Agent] Warning: Failed to persist scheduled news item for query ${queryId}:`, newsErr?.message || newsErr);
         }
 
-        if (this.shouldDeferAutomaticLeadSchedule(schedule)) {
-          console.log(`${logTime()} [Agent] Deferred automatic lead schedule ${queryId}: ${message.substring(0, 80)}...`);
+        if (this.shouldDeferAutomaticSchedule(schedule)) {
+          console.log(`${logTime()} [Agent] Deferred automatic schedule ${queryId}: ${message.substring(0, 80)}...`);
           return res.status(202).json({
             query_id: queryId,
             status: 'deferred',
-            message: 'Automatic primary-lead heartbeat recorded without starting a harness turn.'
+            message: 'Automatic heartbeat recorded without starting a harness turn.'
           });
         }
 
@@ -1344,7 +1344,8 @@ export class AgentRestServer {
 
         // If trigger is true, process the message with the LLM
         if (trigger && from) {
-          if (this.shouldDeferTriggeredNewsWake(from)) {
+          const deferReason = this.getTriggeredNewsWakeDeferReason(from);
+          if (deferReason) {
             console.log(`${logTime()} [Agent] Deferred triggered news wake from ${from}: ${newsMessage.substring(0, 80)}...`);
             return res.status(202).json({
               success: true,
@@ -1352,7 +1353,7 @@ export class AgentRestServer {
               timestamp: ts,
               triggered: false,
               deferred: true,
-              reason: 'primary_lead_busy',
+              reason: deferReason,
             });
           }
 
@@ -1919,17 +1920,21 @@ IMPORTANT INSTRUCTIONS:
 What would you like to do with this information?`;
   }
 
-  private shouldDeferAutomaticLeadSchedule(schedule: unknown): boolean {
+  private shouldDeferAutomaticSchedule(schedule: unknown): boolean {
     if (!schedule || typeof schedule !== 'object') return false;
     const data = schedule as Record<string, unknown>;
     if (data.kind !== 'heartbeat' || data.manual === true) return false;
-    return this.isPrimaryLeadIdentity();
+    return this.isPrimaryLeadIdentity() || this.isAgentBusy();
   }
 
-  private shouldDeferTriggeredNewsWake(from: string): boolean {
-    if (!this.isPrimaryLeadIdentity()) return false;
+  private getTriggeredNewsWakeDeferReason(from: string): 'agent_busy' | 'primary_lead_busy' | undefined {
     const sender = from.trim().toLowerCase();
-    if (sender === 'manager' || sender === 'remote' || sender === 'operator') return false;
+    if (sender === 'manager' || sender === 'remote' || sender === 'operator' || sender === 'checkin-service') return undefined;
+    if (!this.isAgentBusy()) return undefined;
+    return this.isPrimaryLeadIdentity() ? 'primary_lead_busy' : 'agent_busy';
+  }
+
+  private isAgentBusy(): boolean {
     return this.isProcessingQuery || this.queryQueue.length > 0 || this.activeQueries.size > 0;
   }
 
