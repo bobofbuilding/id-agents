@@ -162,6 +162,20 @@ describe('event-producer: tasks', () => {
   it('emitTaskCompleted carries used and volunteered Brain source ids when provided', async () => {
     const taskUuid = crypto.randomUUID();
     const occurredAt = 1_777_000_001_500;
+    const learnedArtifact = {
+      summary: 'Release validation findings were approved for reuse.',
+      sources: [{
+        kind: 'task-result',
+        source_id: 'task-result:release-validation',
+        content: 'The approved validation requires a release checklist before deployment closure.',
+      }],
+      facts: [{
+        entity_id: 'project:release-validation',
+        field: 'requires_release_checklist',
+        value: true,
+        confidence: 0.91,
+      }],
+    };
 
     await emitTaskCompleted(events, {
       teamId,
@@ -173,6 +187,7 @@ describe('event-producer: tasks', () => {
       occurredAt,
       usedSourceIds: ['src-1', 'src-2'],
       volunteeredSourceIds: ['src-3'],
+      learnedArtifact,
       learningLoop: {
         schema: 'brain.learning_loop_capture.v1',
         subject: { kind: 'task', ref: `task:${taskUuid}`, route: 'manager.task_completion' },
@@ -242,6 +257,7 @@ describe('event-producer: tasks', () => {
         gap: { gap_type: 'source_recovery' },
         save_back: { decision: 'save' },
       },
+      learned_artifact: learnedArtifact,
     });
   });
 });
@@ -316,6 +332,20 @@ describe('event-producer: query sweeper', () => {
     await queries.create(teamId, queryId, agentId, 'prompt', Date.now());
 
     const occurredAt = 1_777_000_002_500;
+    const learnedArtifact = {
+      summary: 'Validated research finding should be reusable in later dispatches.',
+      sources: [{
+        kind: 'query-result',
+        source_id: 'query-result:validated-finding',
+        content: 'The validated finding is grounded in the cited Brain source.',
+      }],
+      facts: [{
+        entity_id: 'project:brain',
+        field: 'validated_finding_write_back_enabled',
+        value: true,
+        confidence: 0.88,
+      }],
+    };
     await emitQueryDelivered(events, {
       teamId,
       queryId,
@@ -325,6 +355,7 @@ describe('event-producer: query sweeper', () => {
       taskId: 'task:123',
       usedSourceIds: ['src-1'],
       volunteeredSourceIds: ['src-2', 'src-3'],
+      learnedArtifact,
       learningLoop: {
         schema: 'brain.learning_loop_capture.v1',
         subject: { kind: 'query', ref: `query:${queryId}`, route: 'manager.dispatch' },
@@ -404,6 +435,7 @@ describe('event-producer: query sweeper', () => {
           gap: { gap_type: 'validation_feedback_missing' },
           save_back: { decision: 'record-backlog' },
         },
+        learned_artifact: learnedArtifact,
         message_preview: 'done',
       },
     });

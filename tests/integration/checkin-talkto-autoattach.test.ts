@@ -1244,6 +1244,7 @@ describe('/talk-to auto-attach', () => {
           name: 'close-deployment-task',
           description: 'Finish release validation',
           from: 'manager',
+          ...validBriefFields(),
         }),
       });
       expect(created.status).toBe(201);
@@ -1282,6 +1283,9 @@ describe('/talk-to auto-attach', () => {
           injected_instruction_ids: ['memory:101'],
           used_instruction_ids: ['memory:101'],
           used_source_ids: ['memory:101'],
+          acceptance_coverage: {
+            'deployment release validation': 'Covered by cited release checklist evidence.',
+          },
           brain_context: claimBody.task.brain_context,
           learning_loop: {
             gap_type: 'source_recovery',
@@ -1294,6 +1298,20 @@ describe('/talk-to auto-attach', () => {
             backlog_rule: {
               candidate_refs: ['backlog:deployment-followup'],
             },
+          },
+          learned_artifact: {
+            summary: 'Deployment task closure requires the project release checklist.',
+            sources: [{
+              kind: 'task-result',
+              source_id: 'task-result:deployment-checklist',
+              content: 'The release checklist was used as the accepted evidence for closing deployment tasks.',
+            }],
+            facts: [{
+              entity_id: 'project:deployment',
+              field: 'release_checklist_required',
+              value: true,
+              confidence: 0.9,
+            }],
           },
         }),
       });
@@ -1344,6 +1362,14 @@ describe('/talk-to auto-attach', () => {
           owner: { owner_team: TEAM },
           save_back: { decision: 'save' },
         },
+        learned_artifact: {
+          summary: 'Deployment task closure requires the project release checklist.',
+          facts: [{
+            entity_id: 'project:deployment',
+            field: 'release_checklist_required',
+            value: true,
+          }],
+        },
       });
     } finally {
       if (previousBrainUrl === undefined) delete process.env.BRAIN_URL;
@@ -1372,6 +1398,7 @@ describe('/talk-to auto-attach', () => {
           name: 'recover-claim-context-task',
           description: 'Completion should not depend on claim response survival',
           from: 'manager',
+          ...validBriefFields(),
         }),
       });
       expect(created.status).toBe(201);
@@ -1398,6 +1425,9 @@ describe('/talk-to auto-attach', () => {
         body: JSON.stringify({
           agent_id: 'coder',
           used_source_ids: ['memory:101'],
+          acceptance_coverage: {
+            'claim context recovery': 'Covered by durable task:claimed Brain context.',
+          },
         }),
       });
       expect(done.status).toBe(200);
@@ -1464,6 +1494,20 @@ describe('/talk-to auto-attach', () => {
                 missing_source_ids: ['memory:404'],
               },
             },
+            learned_artifact: {
+              summary: 'Brain-backed query completions can write validated findings back as facts.',
+              sources: [{
+                kind: 'query-result',
+                source_id: 'query-result:brain-backed-query',
+                content: 'The cited Brain source was used to ground the completed query result.',
+              }],
+              facts: [{
+                entity_id: 'project:brain',
+                field: 'query_completion_write_back_supported',
+                value: true,
+                confidence: 0.86,
+              }],
+            },
           },
         }),
       });
@@ -1500,6 +1544,14 @@ describe('/talk-to auto-attach', () => {
             missing_source_ids: ['memory:404'],
             recovery_state: 'partial',
           },
+        },
+        learned_artifact: {
+          summary: 'Brain-backed query completions can write validated findings back as facts.',
+          facts: [{
+            entity_id: 'project:brain',
+            field: 'query_completion_write_back_supported',
+            value: true,
+          }],
         },
       });
       const completedQuery = await db.queries.getByQueryIdForTeam(teamId, delegatedBody.query_id);

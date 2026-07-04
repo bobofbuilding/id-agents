@@ -691,6 +691,11 @@ export class AgentManagerDb {
     return Number(process.env.STALL_RENUDGE_MS) || 90 * 60 * 1000;
   }
 
+  private getManualStallRenudgeMs(): number {
+    const parsed = Number(process.env.STALL_MANUAL_RENUDGE_MS || process.env.ID_STALL_MANUAL_RENUDGE_MS);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 60_000;
+  }
+
   private getMaxActiveQueriesPerAgent(): number {
     const raw = process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
     if (raw === '0') return 0;
@@ -703,6 +708,15 @@ export class AgentManagerDb {
     if (!state) return true;
     if (state.attempts >= maxProbes) return false;
     return nowMs - state.lastAt >= renudgeMs;
+  }
+
+  private canRunStalledProbeForTriage(key: string, nowMs: number, renudgeMs: number, maxProbes: number, force = false): boolean {
+    return this.canRunStalledProbe(
+      key,
+      nowMs,
+      force ? Math.min(renudgeMs, this.getManualStallRenudgeMs()) : renudgeMs,
+      maxProbes,
+    );
   }
 
   private markStalledProbe(key: string, nowMs: number): number {
@@ -1308,6 +1322,7 @@ export class AgentManagerDb {
     owner: AgentRow;
     blocker: { task: TaskRow; ref: string; stalledMinutes: number };
     nowMs: number;
+    force?: boolean;
   }): Promise<{ status: string; taskRef: string; actor?: string; actorTeam?: string; attempt?: number }> {
     const maxProbes = this.getMaxStalledTaskProbes();
     const renudgeMs = this.getStallRenudgeMs();
@@ -1317,7 +1332,7 @@ export class AgentManagerDb {
 
     if (this.isLiveForSupervision(params.owner)) {
       const key = `task:${task.id}:owner-refresh`;
-      if (!this.canRunStalledProbe(key, params.nowMs, renudgeMs, maxProbes)) {
+      if (!this.canRunStalledProbeForTriage(key, params.nowMs, renudgeMs, maxProbes, params.force)) {
         return { status: 'throttled', taskRef: ref };
       }
       const pending = await this.loadPendingQueriesForRecipient(params.owner).catch(() => [] as QueryRow[]);
@@ -1356,7 +1371,7 @@ export class AgentManagerDb {
       let lastBlocked: { status: string; taskRef: string; actor?: string; actorTeam?: string } | null = null;
       for (const taskManager of taskManagers) {
         const key = `task:${task.id}:task-manager-fallback:${taskManager.agent.id}`;
-        if (!this.canRunStalledProbe(key, params.nowMs, renudgeMs, maxProbes)) {
+        if (!this.canRunStalledProbeForTriage(key, params.nowMs, renudgeMs, maxProbes, params.force)) {
           lastBlocked = {
             status: 'throttled',
             taskRef: ref,
@@ -1399,7 +1414,7 @@ export class AgentManagerDb {
       return lastBlocked || { status: 'no_lead', taskRef: ref };
     }
     const key = `task:${task.id}:owner-unavailable`;
-    if (!this.canRunStalledProbe(key, params.nowMs, renudgeMs, maxProbes)) {
+    if (!this.canRunStalledProbeForTriage(key, params.nowMs, renudgeMs, maxProbes, params.force)) {
       return { status: 'throttled', taskRef: ref, actor: lead.name };
     }
     const pending = await this.loadPendingQueriesForRecipient(lead).catch(() => [] as QueryRow[]);
@@ -1423,6 +1438,7 @@ export class AgentManagerDb {
     teamName: string;
     owner: AgentRow | null;
     excludeTaskId?: string;
+    forceTriage?: boolean;
   }): Promise<{ message: string; blockers: string[]; triage: Record<string, unknown> | null } | null> {
     if (!params.owner) return null;
     const nowMs = Date.now();
@@ -1439,6 +1455,7 @@ export class AgentManagerDb {
       owner: params.owner,
       blocker: blockers[0],
       nowMs,
+      force: params.forceTriage === true,
     }).catch((err) => ({
       status: 'triage_error',
       taskRef: blockers[0].ref,
@@ -1455,6 +1472,7 @@ export class AgentManagerDb {
     teams: Array<{ id: string; name: string }>;
     ownerRef?: string;
     limit: number;
+    force?: boolean;
   }): Promise<StalledOwnerTriageReport> {
     const limit = Math.max(1, Math.min(50, Math.floor(params.limit)));
     const report: StalledOwnerTriageReport = {
@@ -1502,6 +1520,7 @@ export class AgentManagerDb {
           teamId: team.id,
           teamName: team.name,
           owner,
+          forceTriage: params.force === true,
         });
         if (!guard) continue;
 
@@ -2477,6 +2496,7 @@ Return this JSON shape:
     const completionPayload = queryLearningLoop
       ? { ...resultPayload, learning_loop: queryLearningLoop }
       : resultPayload;
+    const learnedArtifact = this.learnedArtifactFromPayload(completionPayload);
 
     const transitioned = await this.db.queries.complete(teamId, queryId, occurredAt, completionPayload);
 
@@ -2532,6 +2552,7 @@ Return this JSON shape:
         usedSourceIds,
         volunteeredSourceIds: brainContext?.cited?.canonical_source_ids || [],
         learningLoop: queryLearningLoop,
+        learnedArtifact,
       });
     }
 
@@ -3790,6 +3811,12 @@ Return this JSON shape:
 
   private stringArray(value: unknown): string[] {
     return Array.isArray(value) ? value.map(String).filter(Boolean) : [];
+  }
+
+  private learnedArtifactFromPayload(payload?: Record<string, unknown> | null): Record<string, unknown> | null {
+    const artifact = payload?.learned_artifact ?? payload?.learnedArtifact;
+    if (!artifact || typeof artifact !== 'object' || Array.isArray(artifact)) return null;
+    return artifact as Record<string, unknown>;
   }
 
   private async latestTaskClaimBrainContext(teamId: string, taskUuid: string): Promise<BrainVolunteerContext | null> {
@@ -8454,6 +8481,7 @@ Return this JSON shape:
           volunteeredSourceIds,
           occurredAt: completedAt,
         });
+        const learnedArtifact = this.learnedArtifactFromPayload(req.body || {});
         const feedbackContext: BrainVolunteerContext | null = {
           bundles: Array.isArray(effectiveBrainContext?.bundles) ? effectiveBrainContext.bundles : [],
           task_id: `task:${updated!.uuid}`,
@@ -8501,6 +8529,7 @@ Return this JSON shape:
           usedSourceIds,
           volunteeredSourceIds,
           learningLoop,
+          learnedArtifact,
         });
         // Auto-close any active/snoozed checkins linked to this task and
         // emit one checkin:closed event per row. Pure consumer of the
@@ -12164,12 +12193,14 @@ Return this JSON shape:
           let allTeams = false;
           let ownerRef: string | undefined;
           let limit = 8;
+          let force = false;
 
           for (let i = 0; i < rawArgs.length; i++) {
             const token = rawArgs[i];
             if (token === '--all') { allTeams = true; continue; }
             if (token === '--team') { targetTeamName = rawArgs[++i]; continue; }
             if (token === '--owner') { ownerRef = rawArgs[++i]; continue; }
+            if (token === '--force' || token === '--manual') { force = true; continue; }
             if (token === '--limit') {
               const parsed = Number(rawArgs[++i]);
               if (!Number.isInteger(parsed) || parsed < 1 || parsed > 50) {
@@ -12182,6 +12213,9 @@ Return this JSON shape:
 
           if (allTeams && targetTeamName) {
             return { ok: false, error: 'Use either --all or --team <team>, not both' };
+          }
+          if ((subCmd === 'jumpstart-stalled' || subCmd === 'jumpstart') && ownerRef && !allTeams && limit === 1) {
+            force = true;
           }
 
           let teams: Array<{ id: string; name: string }>;
@@ -12199,6 +12233,7 @@ Return this JSON shape:
             teams,
             ownerRef,
             limit,
+            force,
           });
           return { ok: true, result: report };
         }

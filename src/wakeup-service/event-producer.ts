@@ -65,6 +65,7 @@ export interface TaskCompletedInput {
   usedSourceIds?: string[];
   volunteeredSourceIds?: string[];
   learningLoop?: LearningLoopCapture | null;
+  learnedArtifact?: Record<string, unknown> | null;
   failureNote?: string | null;
 }
 
@@ -90,6 +91,7 @@ export interface QueryDeliveredInput {
   usedSourceIds?: string[];
   volunteeredSourceIds?: string[];
   learningLoop?: LearningLoopCapture | null;
+  learnedArtifact?: Record<string, unknown> | null;
 }
 
 export interface QueryFailedInput {
@@ -150,6 +152,7 @@ export async function emitTaskCompleted(
       ...(input.usedSourceIds?.length ? { used_source_ids: input.usedSourceIds } : {}),
       ...(input.volunteeredSourceIds?.length ? { volunteered_source_ids: input.volunteeredSourceIds } : {}),
       ...(input.learningLoop ? { learning_loop: input.learningLoop } : {}),
+      ...(input.learnedArtifact ? { learned_artifact: input.learnedArtifact } : {}),
       ...(input.failureNote ? { failure_note: truncate(input.failureNote) } : {}),
       ...(input.title ? { title_preview: truncate(input.title) } : {}),
     },
@@ -213,6 +216,7 @@ export async function emitQueryDelivered(
       ...(input.usedSourceIds?.length ? { used_source_ids: input.usedSourceIds } : {}),
       ...(input.volunteeredSourceIds?.length ? { volunteered_source_ids: input.volunteeredSourceIds } : {}),
       ...(input.learningLoop ? { learning_loop: input.learningLoop } : {}),
+      ...(input.learnedArtifact ? { learned_artifact: input.learnedArtifact } : {}),
       ...(input.messagePreview
         ? { message_preview: truncate(input.messagePreview) }
         : {}),

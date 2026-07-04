@@ -130,6 +130,8 @@ describe('stalled task sweeper', () => {
     vi.restoreAllMocks();
     delete process.env.STALL_SWEEP_MS;
     delete process.env.STALL_RENUDGE_MS;
+    delete process.env.STALL_MANUAL_RENUDGE_MS;
+    delete process.env.ID_STALL_MANUAL_RENUDGE_MS;
     delete process.env.STALL_SWEEP_MAX_PER_SWEEP;
     delete process.env.STALL_MAX_PROBES;
     delete process.env.ID_UNOWNED_ASSIGN_MIN_MS;
@@ -1126,6 +1128,23 @@ describe('stalled task sweeper', () => {
         ],
       },
     });
+  });
+
+  it('lets manual jump-start bypass only the renudge throttle', async () => {
+    const db = fakeDb();
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-owner-manual-jumpstart-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const first = await manager.executeRemoteCommand('/task triage-stalled --owner worker --limit 1', TEAM_ID, 'default');
+    const throttled = await manager.executeRemoteCommand('/task triage-stalled --owner worker --limit 1', TEAM_ID, 'default');
+    vi.mocked(Date.now).mockReturnValue(NOW_MS + 61_000);
+    manager.sendSupervisionAsk.mockClear();
+    const manual = await manager.executeRemoteCommand('/task jumpstart-stalled --owner worker --limit 1', TEAM_ID, 'default');
+
+    expect(first).toMatchObject({ ok: true, result: { items: [{ triage: { status: 'sent_owner' } }] } });
+    expect(throttled).toMatchObject({ ok: true, result: { items: [{ triage: { status: 'throttled' } }] } });
+    expect(manual).toMatchObject({ ok: true, result: { items: [{ triage: { status: 'sent_owner' } }] } });
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledTimes(1);
   });
 
   it('falls through to ops-lead when task-master is busy', async () => {

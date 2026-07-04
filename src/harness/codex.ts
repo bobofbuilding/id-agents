@@ -22,6 +22,99 @@ import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
 
+interface ResolvedCodexExecutable {
+  command: string;
+  display: string;
+  native: boolean;
+  managedPackageRoot?: string;
+}
+
+function isExecutable(file: string): boolean {
+  try {
+    const st = fs.statSync(file);
+    if (!st.isFile()) return false;
+    if (process.platform === 'win32') return true;
+    return (st.mode & 0o111) !== 0;
+  } catch {
+    return false;
+  }
+}
+
+function findCommandOnPath(command: string, pathEnv: string | undefined): string | undefined {
+  const pathExt = process.platform === 'win32'
+    ? (process.env.PATHEXT || '.EXE;.CMD;.BAT;.COM').split(';')
+    : [''];
+  for (const dir of (pathEnv || '').split(path.delimiter)) {
+    if (!dir) continue;
+    for (const ext of pathExt) {
+      const candidate = path.join(dir, `${command}${ext}`);
+      if (isExecutable(candidate)) return candidate;
+    }
+  }
+  return undefined;
+}
+
+function codexPlatformTarget(): { packageName: string; triple: string; binary: string } | undefined {
+  const binary = process.platform === 'win32' ? 'codex.exe' : 'codex';
+  if (process.platform === 'darwin' && process.arch === 'arm64') {
+    return { packageName: '@openai/codex-darwin-arm64', triple: 'aarch64-apple-darwin', binary };
+  }
+  if (process.platform === 'darwin' && process.arch === 'x64') {
+    return { packageName: '@openai/codex-darwin-x64', triple: 'x86_64-apple-darwin', binary };
+  }
+  if (process.platform === 'linux' && process.arch === 'arm64') {
+    return { packageName: '@openai/codex-linux-arm64', triple: 'aarch64-unknown-linux-musl', binary };
+  }
+  if (process.platform === 'linux' && process.arch === 'x64') {
+    return { packageName: '@openai/codex-linux-x64', triple: 'x86_64-unknown-linux-musl', binary };
+  }
+  if (process.platform === 'win32' && process.arch === 'x64') {
+    return { packageName: '@openai/codex-win32-x64', triple: 'x86_64-pc-windows-msvc', binary };
+  }
+  return undefined;
+}
+
+function nativeCodexFromShim(shimPath: string): ResolvedCodexExecutable | undefined {
+  const target = codexPlatformTarget();
+  if (!target) return undefined;
+
+  let realShim = shimPath;
+  try { realShim = fs.realpathSync(shimPath); } catch { /* best effort */ }
+  const packageRoot = path.resolve(path.dirname(realShim), '..');
+  const candidates = [
+    path.join(packageRoot, 'node_modules', target.packageName, 'vendor', target.triple, 'bin', target.binary),
+    path.join(packageRoot, 'vendor', target.triple, 'bin', target.binary),
+  ];
+  const command = candidates.find(isExecutable);
+  if (!command) return undefined;
+
+  return {
+    command,
+    display: command,
+    native: true,
+    managedPackageRoot: packageRoot,
+  };
+}
+
+export function resolveCodexExecutable(env: NodeJS.ProcessEnv = process.env): ResolvedCodexExecutable {
+  const override = env.ID_AGENT_CODEX_BIN || env.CODEX_BIN || env.CODEX_EXECUTABLE;
+  if (override) {
+    return {
+      command: override,
+      display: override,
+      native: path.basename(override).startsWith('codex') && override !== 'codex',
+    };
+  }
+
+  const shim = findCommandOnPath('codex', env.PATH || process.env.PATH);
+  if (shim) {
+    const native = nativeCodexFromShim(shim);
+    if (native) return native;
+  }
+
+  return { command: 'codex', display: 'codex', native: false };
+}
+
 /** TOML-encode a string scalar. */
 function tomlStr(s: string): string {
   return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
@@ -256,7 +349,11 @@ export class CodexHarness implements AgentHarness {
 
     // Fail-closed: never spawn with a credential on the command line.
     assertNoSecretsInArgv(args);
-    console.log(`[Codex] Full command: codex ${redactForLog(args.join(' '))}`);
+    const codexExecutable = resolveCodexExecutable();
+    console.log(`[Codex] Full command: ${redactForLog(codexExecutable.display)} ${redactForLog(args.join(' '))}`);
+    if (codexExecutable.native) {
+      console.log(`[Codex] Using native binary directly; bypassing the Node CLI shim`);
+    }
 
     this.cancelled = false;
 
@@ -264,8 +361,12 @@ export class CodexHarness implements AgentHarness {
     const mergedEnv = { ...process.env, ...(options.env || {}) } as NodeJS.ProcessEnv;
     // Point codex at the per-agent home (private config.toml with the MCP servers).
     if (codexHome) mergedEnv.CODEX_HOME = codexHome;
+    if (codexExecutable.managedPackageRoot) {
+      mergedEnv.CODEX_MANAGED_BY_NPM ||= '1';
+      mergedEnv.CODEX_MANAGED_PACKAGE_ROOT ||= codexExecutable.managedPackageRoot;
+    }
 
-    const proc = spawn('codex', args, {
+    const proc = spawn(codexExecutable.command, args, {
       cwd: workingDir,
       env: mergedEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
