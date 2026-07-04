@@ -277,6 +277,41 @@ describe('ScheduleDispatcher.dispatch with manual opt', () => {
     fetchSpy.mockRestore();
   });
 
+  it('does not attach Brain context to task delegation schedules', async () => {
+    delete process.env.BRAIN_CONTEXT_DISABLED;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes('/context/volunteer')) {
+        return new Response(JSON.stringify({
+          data: {
+            bundles: [{ query: 'delegation', textUnits: [{ id: 3, title: 'context', content: 'large context' }] }],
+            cited: { canonical_source_ids: ['text:3'] },
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(null, { status: 200 });
+    });
+
+    const dispatcher = new ScheduleDispatcher();
+    const def = makeHeartbeatDef({
+      kind: 'calendar',
+      delivery_mode: 'talk',
+      message: 'TASK DELEGATION from manager: You are assigned task #12345678 ("Bounded task").',
+    });
+    const target = makeTarget();
+
+    await dispatcher.dispatch(def, target, 'calendar:2026-07-04@1');
+
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('http://localhost:4135/talk');
+    const sentPayload = JSON.parse(init.body as string);
+    expect(sentPayload.message).toBe(def.message);
+    expect(sentPayload.brain_context).toBeUndefined();
+
+    fetchSpy.mockRestore();
+  });
+
   it('accepts the legacy positional linkedTasks array (backward compatibility)', async () => {
     const dispatcher = new ScheduleDispatcher();
     const def = makeHeartbeatDef({ kind: 'calendar', delivery_mode: 'talk' });

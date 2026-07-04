@@ -383,6 +383,7 @@ describe('stalled task sweeper', () => {
     const manager = new AgentManagerDb('/tmp/id-agents-brain-context-control-plane-test', fakeDb(), { libraryRoot: null }) as any;
 
     expect(manager.shouldAttachBrainContext('Backlog guard: task #12345678 is stalled.')).toBe(false);
+    expect(manager.shouldAttachBrainContext('TASK DELEGATION from manager: You are assigned task #12345678.')).toBe(false);
     expect(manager.shouldAttachBrainContext('Backlog guard alert: task #12345678 is stalled.')).toBe(false);
     expect(manager.shouldAttachBrainContext('Urgent: task #12345678 has been stalled 88+ minutes on ops-team with no progress.')).toBe(false);
     expect(manager.shouldAttachBrainContext('Status check on task #12345678. Reply in one sentence.')).toBe(false);
@@ -584,6 +585,7 @@ describe('stalled task sweeper', () => {
       name: 'queued-task',
       uuid: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
       title: 'Queued task',
+      description: 'Expected output: produce the bounded routing checklist and cite blockers.',
       status: 'todo',
       owner: null,
       updated_at: nowSec - 900,
@@ -620,6 +622,11 @@ describe('stalled task sweeper', () => {
       'default',
       'zzz-fresh',
       expect.stringContaining('TASK DELEGATION from manager'),
+    );
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'zzz-fresh',
+      expect.stringContaining('Task details:\nExpected output: produce the bounded routing checklist and cite blockers.'),
     );
   });
 

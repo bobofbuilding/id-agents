@@ -62,8 +62,11 @@ function shouldAttachBrainContext(def: ScheduleDefinitionRow, message: string): 
   if (!text) return false;
   return ![
     /^Heartbeat:/,
+    /^TASK DELEGATION\b/i,
     /^Supervision:/,
     /^Supervision probe on task\b/,
+    /^Lead delegation kickoff:/,
+    /^Team objective:/,
     /^Backlog guard:/,
     /^Backlog guard alert:/,
     /^Urgent:\s+task\b[\s\S]*\bstalled\b/i,

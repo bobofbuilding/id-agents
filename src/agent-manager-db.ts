@@ -4229,6 +4229,7 @@ Return this JSON shape:
     if (!text) return false;
     return ![
       /^Heartbeat:/,
+      /^TASK DELEGATION\b/i,
       /^Supervision:/,
       /^Supervision probe on task\b/,
       /^Backlog guard:/,
@@ -4243,6 +4244,13 @@ Return this JSON shape:
       /^No approved recommendation routed\b/,
       /^Already handled\.\s+Task\b/,
     ].some((pattern) => pattern.test(text));
+  }
+
+  private taskDelegationPrompt(task: TaskRow, ref: string): string {
+    const details = task.description
+      ? `\nTask details:\n${this.compactBrainContextText(task.description, this.positiveIntEnv('ID_TASK_DELEGATION_DESCRIPTION_CHARS', 1200))}`
+      : '';
+    return `TASK DELEGATION from manager: You are assigned task ${ref} ("${task.title}").${details}\nStart this task now. When complete, mark it done with \`/task done ${ref} --acceptance "..."\`. If blocked, reply with the blocker and do not create duplicate tasks.`;
   }
 
   /**
@@ -13722,7 +13730,7 @@ Return this JSON shape:
 
       const ref = this.taskShortRef(updated);
       if (!(await this.hasActiveSupervisionAskForMarker(teamRow.id, owner, ref))) {
-        const msg = `TASK DELEGATION from manager: You are assigned task ${ref} ("${updated.title}"). Start this task now. When complete, mark it done with \`/task done ${ref} --acceptance "..."\`. If blocked, reply with the blocker and do not create duplicate tasks.`;
+        const msg = this.taskDelegationPrompt(updated, ref);
         const sent = await this.sendSupervisionAsk(teamRow.name, owner.name, msg);
         if (!sent) this.managerLog(`Auto-assigned task ${updated.name} to ${owner.name}, but the delegation prompt could not be delivered`);
       }
