@@ -12132,7 +12132,8 @@ Return this JSON shape:
     const managedTaskAsk = lower.startsWith('task delegation')
       || lower.startsWith('supervision:')
       || lower.startsWith('supervision routing:')
-      || lower.startsWith('lead delegation kickoff:');
+      || lower.startsWith('lead delegation kickoff:')
+      || lower.startsWith('resume and complete task');
     if (!managedTaskAsk) return null;
     return text.match(/#[a-z0-9][a-z0-9_-]{3,}/i)?.[0]?.toLowerCase() ?? null;
   }
@@ -12194,6 +12195,7 @@ Return this JSON shape:
            OR LOWER(prompt) LIKE 'supervision routing:%'
            OR LOWER(prompt) LIKE 'lead delegation kickoff:%'
            OR LOWER(prompt) LIKE 'task delegation%'
+           OR LOWER(prompt) LIKE 'resume and complete task #%'
          )
        ORDER BY team_id ASC, owner_kind ASC, owner_id ASC, created ASC, query_id ASC`,
     ).then((r) => r.rows).catch(() => [] as QueryRow[]);

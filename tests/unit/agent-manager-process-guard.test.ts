@@ -942,11 +942,27 @@ describe('AgentManagerDb killAgentProcess guards', () => {
       owner_kind: 'agent',
       owner_id: 'agent-supervised',
     });
+    await db.queries.upsert(teamId, 'agent-supervised', {
+      query_id: 'older-resume-task',
+      status: 'pending',
+      prompt: 'Resume and complete task #rst12345: Produce tracking hooks implementation plan. When finished: /task done #rst12345.',
+      created: now + 7000,
+      owner_kind: 'agent',
+      owner_id: 'agent-supervised',
+    });
+    await db.queries.upsert(teamId, 'agent-supervised', {
+      query_id: 'newer-resume-task',
+      status: 'pending',
+      prompt: 'Resume and complete task #rst12345: Produce tracking hooks implementation plan. When finished: /task done #rst12345.',
+      created: now + 8000,
+      owner_kind: 'agent',
+      owner_id: 'agent-supervised',
+    });
 
     const result = await (manager as any).sweepStaleQueries();
 
-    expect(result.duplicateTaskAsk).toBe(3);
-    expect(result.total).toBe(3);
+    expect(result.duplicateTaskAsk).toBe(4);
+    expect(result.total).toBe(4);
     expect((await db.queries.getByQueryIdForTeam(teamId, 'older-pending-supervision'))?.status).toBe('expired');
     expect((await db.queries.getByQueryIdForTeam(teamId, 'active-processing-supervision'))?.status).toBe('processing');
     expect((await db.queries.getByQueryIdForTeam(teamId, 'other-task-supervision'))?.status).toBe('pending');
@@ -954,6 +970,8 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     expect((await db.queries.getByQueryIdForTeam(teamId, 'newer-task-delegation'))?.status).toBe('expired');
     expect((await db.queries.getByQueryIdForTeam(teamId, 'older-supervision-routing'))?.status).toBe('pending');
     expect((await db.queries.getByQueryIdForTeam(teamId, 'newer-supervision-routing'))?.status).toBe('expired');
+    expect((await db.queries.getByQueryIdForTeam(teamId, 'older-resume-task'))?.status).toBe('pending');
+    expect((await db.queries.getByQueryIdForTeam(teamId, 'newer-resume-task'))?.status).toBe('expired');
   });
 
   it('dedupes active task delegation /ask prompts before dispatching', async () => {
@@ -1025,6 +1043,42 @@ describe('AgentManagerDb killAgentProcess guards', () => {
 
     expect(result.ok).toBe(true);
     expect(result.result?.queryId).toBe('existing-supervision-routing');
+    expect(result.result?.deduped).toBe(true);
+  });
+
+  it('dedupes active resume-task /ask prompts before dispatching', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('engineering-team');
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-engineering-lead',
+        name: 'engineering-lead',
+        port: 4117,
+        status: 'running',
+        endpoint: 'http://127.0.0.1:9',
+      }),
+    });
+    await db.queries.upsert(teamId, 'agent-engineering-lead', {
+      query_id: 'existing-resume-task',
+      status: 'processing',
+      prompt: 'Resume and complete task #fec58ec6: Produce tracking hooks implementation plan. When finished: /task done #fec58ec6.',
+      created: Date.now(),
+      owner_kind: 'agent',
+      owner_id: 'agent-engineering-lead',
+    });
+
+    const result = await (manager as any).executeRemoteCommand(
+      '/ask engineering-lead Resume and complete task #fec58ec6: Produce tracking hooks implementation plan. When finished: /task done #fec58ec6.',
+      teamId,
+      'engineering-team',
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.result?.queryId).toBe('existing-resume-task');
     expect(result.result?.deduped).toBe(true);
   });
 
