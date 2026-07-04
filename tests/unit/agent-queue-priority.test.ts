@@ -41,6 +41,7 @@ describe('agent query queue priority', () => {
     delete process.env.MANAGER_URL;
     delete process.env.ID_TEAM;
     delete process.env.ID_AGENT_RUN_AUTOMATIC_HEARTBEATS;
+    delete process.env.ID_MCP_SERVERS;
   });
 
   it('classifies operator work ahead of delegation and background work', () => {
@@ -125,6 +126,36 @@ Team objective: Decompose this objective into member-owned work.`,
       await sleep(20);
       expect(harness.options[0]?.executionPolicy).toBe('control-plane-readonly');
       expect(harness.options[0]?.allowedTools).toEqual(['Read', 'Glob', 'Grep']);
+      expect(harness.options[0]?.mcpServers).toBeUndefined();
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('runs delegation control prompts without MCP but with delegation-capable local tools', async () => {
+    process.env.ID_MCP_SERVERS = JSON.stringify([
+      { name: 'removed-server', transport: 'stdio', command: 'node', args: ['server.js'] },
+    ]);
+    const harness = new RecordingHarness();
+    const server = new AgentRestServer({ agentName: 'engineering-lead', harness });
+
+    try {
+      await server.start(0);
+      const port = ((server as any).httpServer.address() as AddressInfo).port;
+
+      const res = await fetch(`http://127.0.0.1:${port}/talk`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          from: 'manager',
+          message: 'Lead delegation kickoff: task #12345678 is assigned to you as the team coordinator.',
+        }),
+      });
+
+      expect(res.status).toBe(202);
+      await viWaitFor(() => expect(harness.prompts).toHaveLength(1));
+      expect(harness.options[0]?.executionPolicy).toBe('default');
+      expect(harness.options[0]?.allowedTools).toEqual(['Read', 'Bash', 'Glob', 'Grep']);
       expect(harness.options[0]?.mcpServers).toBeUndefined();
     } finally {
       await server.stop();

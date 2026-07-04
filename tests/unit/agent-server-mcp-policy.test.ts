@@ -147,6 +147,10 @@ Please inspect the repository, edit the integration, and run the test suite.`)).
       .toEqual(['Read', 'Glob', 'Grep']);
     expect(allowedToolsForPrompt('[Incoming Message from "checkin-service"]\n\nCheckin due for linked task #12345678.', configured))
       .toEqual(['Read', 'Glob', 'Grep']);
+    expect(allowedToolsForPrompt('Lead delegation kickoff: task #12345678 is assigned to you as the team coordinator.', configured))
+      .toEqual(['Read', 'Bash', 'Glob', 'Grep']);
+    expect(allowedToolsForPrompt('Team objective: Decompose this objective into member-owned work.', configured))
+      .toEqual(['Read', 'Bash', 'Glob', 'Grep']);
     expect(allowedToolsForPrompt('Implement a filesystem-backed MCP integration and cite the changed files.', configured))
       .toEqual(configured);
   });
@@ -165,6 +169,10 @@ Please inspect the repository, edit the integration, and run the test suite.`)).
       expect(queryExecutionTimeoutMsForPrompt('Validation request for run-baseline-cycle (#784ff464), goal goal_1. Read the artifact and reply PASS or FAIL.'))
         .toBe(180_000);
       expect(queryExecutionTimeoutMsForPrompt('TASK DELEGATION from manager: You are assigned task #12345678 ("Bounded work").'))
+        .toBe(720_000);
+      expect(queryExecutionTimeoutMsForPrompt('Lead delegation kickoff: task #12345678 is assigned to you as the team coordinator.'))
+        .toBe(720_000);
+      expect(queryExecutionTimeoutMsForPrompt('Team objective: Decompose this objective into member-owned work.'))
         .toBe(720_000);
       expect(queryExecutionTimeoutMsForPrompt('Implement a filesystem-backed MCP integration and cite the changed files.'))
         .toBeUndefined();

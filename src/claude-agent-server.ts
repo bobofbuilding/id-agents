@@ -106,6 +106,7 @@ const MCP_CONTROL_PLANE_PROMPT_PATTERNS = [
 
 const DEFAULT_AGENT_ALLOWED_TOOLS = ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'WebSearch', 'WebFetch'];
 const CONTROL_PLANE_READONLY_TOOLS = new Set(['Read', 'Glob', 'Grep']);
+const CONTROL_PLANE_DELEGATION_TOOLS = new Set(['Read', 'Bash', 'Glob', 'Grep']);
 const DEFAULT_CONTROL_PLANE_QUERY_TIMEOUT_MS = 90_000;
 const DEFAULT_VALIDATION_CONTROL_PLANE_QUERY_TIMEOUT_MS = 180_000;
 const MIN_CONTROL_PLANE_QUERY_TIMEOUT_MS = 15_000;
@@ -128,7 +129,11 @@ export function shouldSuppressMcpForPrompt(prompt: string): boolean {
 }
 
 export function allowedToolsForPrompt(prompt: string, configuredAllowedTools: string[]): string[] {
-  if (!shouldSuppressMcpForPrompt(prompt)) return configuredAllowedTools;
+  const text = String(prompt || '').trimStart();
+  if (!shouldSuppressMcpForPrompt(text)) return configuredAllowedTools;
+  if (isDelegationPrompt(text)) {
+    return configuredAllowedTools.filter((tool) => CONTROL_PLANE_DELEGATION_TOOLS.has(tool));
+  }
   return configuredAllowedTools.filter((tool) => CONTROL_PLANE_READONLY_TOOLS.has(tool));
 }
 
@@ -160,11 +165,9 @@ function isValidationControlPlanePrompt(prompt: string): boolean {
 }
 
 export function queryExecutionTimeoutMsForPrompt(prompt: string): number | undefined {
-  if (!shouldSuppressMcpForPrompt(prompt)) {
-    return isDelegationPrompt(String(prompt || '').trimStart())
-      ? readDelegationTimeoutEnv()
-      : undefined;
-  }
+  const text = String(prompt || '').trimStart();
+  if (isDelegationPrompt(text)) return readDelegationTimeoutEnv();
+  if (!shouldSuppressMcpForPrompt(text)) return undefined;
   if (isValidationControlPlanePrompt(prompt)) {
     return readControlPlaneTimeoutEnv(
       'ID_AGENT_VALIDATION_CONTROL_QUERY_TIMEOUT_MS',
@@ -2462,13 +2465,16 @@ ${prompt}`
       // Read MCP servers from env (set by manager via buildLocalAgentEnv).
       // ID_MCP_SERVERS is a JSON array of McpServerSpec; parsing is tolerant.
       const suppressMcp = shouldSuppressMcpForPrompt(promptWithSender);
-      const executionPolicy = suppressMcp ? 'control-plane-readonly' : 'default';
+      const isDelegationControl = suppressMcp && isDelegationPrompt(promptWithSender);
+      const executionPolicy = suppressMcp && !isDelegationControl ? 'control-plane-readonly' : 'default';
       const allowedTools = allowedToolsForPrompt(promptWithSender, this.allowedTools);
       const mcpServers = suppressMcp ? undefined : parseMcpServersEnv(process.env.ID_MCP_SERVERS);
       if (suppressMcp && process.env.ID_MCP_SERVERS) {
         console.log(`${logTime()} [Agent] MCP suppressed for control-plane prompt ${queryId}`);
       }
-      if (suppressMcp) {
+      if (suppressMcp && isDelegationControl) {
+        console.log(`${logTime()} [Agent] Delegation control tool policy for ${queryId}: ${allowedTools.join(', ') || '(none)'}`);
+      } else if (suppressMcp) {
         console.log(`${logTime()} [Agent] Read-only control-plane tool policy for ${queryId}: ${allowedTools.join(', ') || '(none)'}`);
       }
       const executionTimeoutMs = queryExecutionTimeoutMsForPrompt(promptWithSender);
