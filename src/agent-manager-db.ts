@@ -237,6 +237,22 @@ const TOPIC_ALIASES: Record<string, readonly string[]> = {
   'agent:lifecycle': ['agent:started', 'agent:stopped', 'agent:rebuild'],
 };
 
+const LEAD_DELEGATION_KICKOFF_GRACE_MS = 2 * 60 * 1000;
+
+function rowTimestampMs(ts: number): number {
+  if (!Number.isFinite(ts) || ts <= 0) return 0;
+  return ts > 10_000_000_000 ? ts : ts * 1000;
+}
+
+export function shouldDelayLeadDelegationKickoffForFreshTask(
+  task: Pick<TaskRow, 'created_at' | 'updated_at'>,
+  nowMs: number = Date.now(),
+): boolean {
+  const createdMs = rowTimestampMs(task.created_at);
+  if (!createdMs) return false;
+  return Math.max(0, nowMs - createdMs) < LEAD_DELEGATION_KICKOFF_GRACE_MS;
+}
+
 function expandTopicAliases(topics: readonly string[]): string[] {
   const out = new Set<string>();
   for (const t of topics) {
@@ -1976,6 +1992,7 @@ export class AgentManagerDb {
   private async promptLeadForDelegationKickoff(teamId: string, teamName: string, task: TaskRow, owner: AgentRow | null): Promise<void> {
     if (!this.isConfiguredTeamLead(teamName, owner)) return;
     if (!this.isLiveForSupervision(owner) || !owner.endpoint) return;
+    if (shouldDelayLeadDelegationKickoffForFreshTask(task)) return;
     const key = `task:${task.id}:lead-delegation-kickoff`;
     if (this.stalledNudges.has(key)) return;
     const children = await this.findDelegatedChildTasks(task, teamId, owner);

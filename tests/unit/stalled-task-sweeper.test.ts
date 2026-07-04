@@ -2,7 +2,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { AgentManagerDb } from '../../src/agent-manager-db.js';
+import { AgentManagerDb, shouldDelayLeadDelegationKickoffForFreshTask } from '../../src/agent-manager-db.js';
 import type { AgentRow, TaskRow, TeamRow } from '../../src/db/types.js';
 
 const NOW_MS = 1_800_000_000_000;
@@ -157,6 +157,31 @@ describe('stalled task sweeper', () => {
     delete process.env.ID_UNOWNED_ASSIGN_MIN_MS;
     delete process.env.ID_UNOWNED_ASSIGN_MAX_PER_SWEEP;
     delete process.env.ID_MAX_DOING_TASKS;
+  });
+
+  it('delays immediate lead delegation kickoff for fresh second-based tasks', () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    expect(shouldDelayLeadDelegationKickoffForFreshTask(task({
+      created_at: nowSec - 30,
+      updated_at: nowSec - 30,
+    }), NOW_MS)).toBe(true);
+
+    expect(shouldDelayLeadDelegationKickoffForFreshTask(task({
+      created_at: nowSec - 180,
+      updated_at: nowSec - 180,
+    }), NOW_MS)).toBe(false);
+  });
+
+  it('delays immediate lead delegation kickoff for fresh millisecond-based tasks', () => {
+    expect(shouldDelayLeadDelegationKickoffForFreshTask(task({
+      created_at: NOW_MS - 30_000,
+      updated_at: NOW_MS - 30_000,
+    }), NOW_MS)).toBe(true);
+
+    expect(shouldDelayLeadDelegationKickoffForFreshTask(task({
+      created_at: NOW_MS - 180_000,
+      updated_at: NOW_MS - 180_000,
+    }), NOW_MS)).toBe(false);
   });
 
   it('does not treat fresh second-based task timestamps as stalled', async () => {
