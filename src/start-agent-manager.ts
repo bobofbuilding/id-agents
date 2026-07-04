@@ -66,6 +66,11 @@ async function startManagerAgent() {
   const managementPort = parseInt(process.env.AGENT_MANAGER_PORT || '4100');
   const workingDir = path.resolve(process.env.AGENT_MANAGER_WORKDIR || path.join(process.cwd(), 'workspace'));
 
+  if (process.env.ID_MANAGER_ALLOW_DUPLICATE_START !== 'true' && await existingManagerHealthy(managementPort)) {
+    console.log(`✅ ID Agent Manager is already running on http://127.0.0.1:${managementPort}; not starting a duplicate daemon.`);
+    return;
+  }
+
   // Initialize DB (required for persistence)
   const db = await createDb();
   await migrateDb(db);
@@ -93,6 +98,21 @@ async function startManagerAgent() {
   };
   process.on('SIGINT', () => { void shutdown('SIGINT'); });
   process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
+}
+
+async function existingManagerHealthy(port: number): Promise<boolean> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 750);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: controller.signal });
+    if (!res.ok) return false;
+    const body = await res.json().catch(() => null) as { status?: unknown } | null;
+    return body?.status === 'ok';
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function startWorkerAgent(agentId?: string) {

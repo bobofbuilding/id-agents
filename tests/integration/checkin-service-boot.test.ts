@@ -38,6 +38,7 @@ import { SqliteTasksRepo } from '../../src/db/repos/sqlite/tasks-repo.js';
 import { SqliteEventsRepo } from '../../src/db/repos/sqlite/events-repo.js';
 import { SqliteSubscriptionsRepo } from '../../src/db/repos/sqlite/subscriptions-repo.js';
 import { SqliteCheckinsRepo } from '../../src/db/repos/sqlite/checkins-repo.js';
+import { SqliteRuntimeLaneCooldownsRepo } from '../../src/db/repos/sqlite/runtime-lane-cooldowns-repo.js';
 import { CheckinService } from '../../src/checkins/checkin-service.js';
 import type { CheckinRow } from '../../src/db/types.js';
 
@@ -57,6 +58,7 @@ async function createInMemoryDb() {
     events: new SqliteEventsRepo(adapter),
     subscriptions: new SqliteSubscriptionsRepo(adapter),
     checkins: new SqliteCheckinsRepo(adapter),
+    runtimeLaneCooldowns: new SqliteRuntimeLaneCooldownsRepo(adapter),
     async close() { await adapter.close(); },
   };
 }

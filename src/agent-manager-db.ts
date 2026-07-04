@@ -12879,7 +12879,8 @@ Return this JSON shape:
 
   async start(port: number = 4100): Promise<void> {
     this.managementPort = port;
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
+      let settled = false;
       // Create HTTP server from Express app
       this.httpServer = createHttpServer(this.managementApp);
       const keepAliveRaw = Number(process.env.ID_MANAGER_KEEPALIVE_TIMEOUT_MS || 5_000);
@@ -12897,7 +12898,38 @@ Return this JSON shape:
         this.handleWebSocketConnection(ws, req);
       });
 
-      this.httpServer.listen(port, '127.0.0.1', async () => {
+      const cleanupListenFailure = () => {
+        if (this.wss) {
+          try { this.wss.close(); } catch { /* best effort */ }
+          this.wss = null;
+        }
+        if (this.httpServer) {
+          const server = this.httpServer;
+          this.httpServer = null;
+          try { server.close(() => {}); } catch { /* best effort */ }
+        }
+      };
+
+      const failStartup = (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        void this.shutdown().finally(() => reject(error));
+      };
+
+      const onListenError = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanupListenFailure();
+        reject(error);
+      };
+      this.httpServer.once('error', onListenError);
+      this.wss.once('error', onListenError);
+
+      this.httpServer.listen(port, '127.0.0.1', () => {
+        this.httpServer?.off('error', onListenError);
+        this.wss?.off('error', onListenError);
+        void (async () => {
+        try {
         console.log(`\n🚀 ID Agent Manager (DB-backed)`);
         console.log(`===============================`);
         console.log(`Management API: http://localhost:${port}`);
@@ -13009,7 +13041,12 @@ Return this JSON shape:
         this.checkinService.start();
         console.log('[Manager] CheckinService started (wake on every eligible fire)');
 
+        settled = true;
         resolve();
+        } catch (error) {
+          failStartup(error);
+        }
+        })();
       });
     });
   }
