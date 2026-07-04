@@ -136,7 +136,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DEFAULT_MAX_DOING_TASKS = 30;
 const DEFAULT_STALLED_TASK_MAX_PROBES = 3;
-const DEFAULT_MAX_ACTIVE_QUERIES_PER_AGENT = 2;
+const DEFAULT_MAX_ACTIVE_QUERIES_PER_AGENT = 1;
 
 interface StalledProbeState {
   lastAt: number;

@@ -937,23 +937,20 @@ describe('AgentManagerDb killAgentProcess guards', () => {
           status: 'running',
         }),
       });
-      const now = Date.now();
-      for (const [idx, status] of ['processing', 'pending'].entries()) {
-        await db.queries.upsert(teamId, 'agent-default-busy', {
-          query_id: `default-busy-${idx}`,
-          status,
-          prompt: `queued work ${idx}`,
-          created: now,
-          owner_kind: 'agent',
-          owner_id: 'agent-default-busy',
-        });
-      }
+      await db.queries.upsert(teamId, 'agent-default-busy', {
+        query_id: 'default-busy-processing',
+        status: 'processing',
+        prompt: 'current work',
+        created: Date.now(),
+        owner_kind: 'agent',
+        owner_id: 'agent-default-busy',
+      });
       const fetchSpy = vi.spyOn(globalThis, 'fetch');
 
       const result = await (manager as any).executeRemoteCommand('/ask default-busy-lead do one more thing', teamId, 'default');
 
       expect(result.ok).toBe(false);
-      expect(result.error).toContain('already has 2 active queries');
+      expect(result.error).toContain('already has 1 active query');
       expect(fetchSpy).not.toHaveBeenCalled();
     } finally {
       if (saved === undefined) delete process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
