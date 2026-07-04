@@ -20,6 +20,9 @@ Heartbeat: review your checklist and act on anything that needs attention.`)).to
 
     expect(shouldSuppressMcpForPrompt('Heartbeat: review your checklist and act on anything that needs attention.')).toBe(true);
     expect(shouldSuppressMcpForPrompt('Backlog guard: task #12345678 has been active 60m with no progress update.')).toBe(true);
+    expect(shouldSuppressMcpForPrompt('Backlog guard alert: task #12345678 has stalled and needs owner triage.')).toBe(true);
+    expect(shouldSuppressMcpForPrompt('Urgent: task #12345678 has been stalled 88+ minutes on ops-team with no progress.')).toBe(true);
+    expect(shouldSuppressMcpForPrompt('Status check on task #12345678. Reply in one sentence.')).toBe(true);
   });
 
   it('suppresses MCP for incoming-reply processing loops', () => {
@@ -72,6 +75,21 @@ Task assignment sweep: inspect unassigned todo tasks across all teams and assign
 [Respond directly and helpfully — this is the person who manages you.]
 
 You have 2 stalled doing tasks from before a team outage that need to be closed.`)).toBe(true);
+
+    expect(shouldSuppressMcpForPrompt(`[Message from agent "web-researcher" | Query ID: query_6]
+[Note: web-researcher will poll for your reply for ~2 minutes.]
+
+Backlog guard alert: task #88a70c23 ("Discover and evaluate candidate tools") has been active 142m+ with no progress update.`)).toBe(true);
+
+    expect(shouldSuppressMcpForPrompt(`[Message from the manager (your owner/operator) | Query ID: query_7]
+[Respond directly and helpfully — this is the person who manages you.]
+
+Urgent: task #0abb791f has been stalled 88+ minutes on ops-team with no progress.`)).toBe(true);
+
+    expect(shouldSuppressMcpForPrompt(`[Message from agent "research-assistant" | Query ID: query_8]
+[Note: research-assistant will poll for your reply for ~2 minutes.]
+
+Status check on task #73b71406. You are the owner. Reply in one sentence.`)).toBe(true);
   });
 
   it('keeps MCP available for normal delegated task work', () => {

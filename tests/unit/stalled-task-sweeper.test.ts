@@ -291,6 +291,9 @@ describe('stalled task sweeper', () => {
     const manager = new AgentManagerDb('/tmp/id-agents-brain-context-control-plane-test', fakeDb(), { libraryRoot: null }) as any;
 
     expect(manager.shouldAttachBrainContext('Backlog guard: task #12345678 is stalled.')).toBe(false);
+    expect(manager.shouldAttachBrainContext('Backlog guard alert: task #12345678 is stalled.')).toBe(false);
+    expect(manager.shouldAttachBrainContext('Urgent: task #12345678 has been stalled 88+ minutes on ops-team with no progress.')).toBe(false);
+    expect(manager.shouldAttachBrainContext('Status check on task #12345678. Reply in one sentence.')).toBe(false);
     expect(manager.shouldAttachBrainContext('You have 2 stalled doing tasks from before a team outage that need to be closed.')).toBe(false);
     expect(manager.shouldAttachBrainContext('Assignment sweep complete (Jul 4). Assigned: 0.')).toBe(false);
     expect(manager.shouldAttachBrainContext('Task assignment sweep: inspect unassigned todo tasks across all teams.')).toBe(false);
