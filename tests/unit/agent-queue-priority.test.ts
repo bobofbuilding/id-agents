@@ -38,6 +38,7 @@ describe('agent query queue priority', () => {
   afterEach(() => {
     delete process.env.MANAGER_URL;
     delete process.env.ID_TEAM;
+    delete process.env.ID_AGENT_RUN_AUTOMATIC_HEARTBEATS;
   });
 
   it('classifies operator work ahead of delegation and background work', () => {
@@ -114,6 +115,76 @@ describe('agent query queue priority', () => {
       await expect(res.json()).resolves.toMatchObject({ status: 'deferred' });
       await sleep(20);
       expect(harness.prompts).toHaveLength(0);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('records automatic idle-worker heartbeats without launching the harness by default', async () => {
+    const harness = new RecordingHarness();
+    const server = new AgentRestServer({
+      agentName: 'skill-discoverer',
+      agentIdentity: { name: 'skill-discoverer', team: 'skillmesh' },
+      harness,
+    });
+
+    try {
+      await server.start(0);
+      const port = ((server as any).httpServer.address() as AddressInfo).port;
+      const res = await fetch(`http://127.0.0.1:${port}/schedule`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: 'Heartbeat: review your checklist and act on anything that needs attention.',
+          schedule: {
+            id: 'hb-worker-idle',
+            kind: 'heartbeat',
+            title: 'Heartbeat: skill-discoverer',
+            scheduledKey: 'interval:1',
+          },
+          mode: 'internal',
+        }),
+      });
+
+      expect(res.status).toBe(202);
+      await expect(res.json()).resolves.toMatchObject({ status: 'deferred' });
+      await sleep(20);
+      expect(harness.prompts).toHaveLength(0);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('allows automatic idle-worker heartbeats when explicitly opted in', async () => {
+    process.env.ID_AGENT_RUN_AUTOMATIC_HEARTBEATS = '1';
+    const harness = new RecordingHarness();
+    const server = new AgentRestServer({
+      agentName: 'skill-discoverer',
+      agentIdentity: { name: 'skill-discoverer', team: 'skillmesh' },
+      harness,
+    });
+
+    try {
+      await server.start(0);
+      const port = ((server as any).httpServer.address() as AddressInfo).port;
+      const res = await fetch(`http://127.0.0.1:${port}/schedule`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: 'Heartbeat: review your checklist and act on anything that needs attention.',
+          schedule: {
+            id: 'hb-worker-idle-opt-in',
+            kind: 'heartbeat',
+            title: 'Heartbeat: skill-discoverer',
+            scheduledKey: 'interval:1',
+          },
+          mode: 'internal',
+        }),
+      });
+
+      expect(res.status).toBe(202);
+      await expect(res.json()).resolves.toMatchObject({ status: 'processing' });
+      await viWaitFor(() => expect(harness.prompts).toHaveLength(1));
     } finally {
       await server.stop();
     }

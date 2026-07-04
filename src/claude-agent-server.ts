@@ -2002,6 +2002,7 @@ What would you like to do with this information?`;
     if (!schedule || typeof schedule !== 'object') return false;
     const data = schedule as Record<string, unknown>;
     if (data.kind !== 'heartbeat' || data.manual === true) return false;
+    if (process.env.ID_AGENT_RUN_AUTOMATIC_HEARTBEATS !== '1') return true;
     return this.isPrimaryLeadIdentity() || this.isAgentBusy();
   }
 
