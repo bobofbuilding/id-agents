@@ -169,6 +169,39 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('does not consume a stalled-probe attempt when supervision dispatch is rejected', async () => {
+    const db = fakeDb();
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn()
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+
+    await manager.sweepStalledTasks();
+
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledTimes(1);
+    expect(db.events.insert).not.toHaveBeenCalled();
+
+    await manager.sweepStalledTasks();
+
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledTimes(2);
+    expect(manager.sendSupervisionAsk).toHaveBeenNthCalledWith(
+      2,
+      'default',
+      'worker',
+      expect.stringContaining('probe 1/3'),
+    );
+    expect(db.events.insert).toHaveBeenCalledTimes(1);
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      team_id: TEAM_ID,
+      topic: 'task:refreshed',
+      actor_agent_id: 'agent-1',
+      data: expect.objectContaining({
+        reason: 'owner_refresh',
+        stalled_minutes: 60,
+      }),
+    }));
+  });
+
   it('asks a live team lead to delegate when a lead-owned task has no real child tasks', async () => {
     const nowSec = Math.floor(NOW_MS / 1000);
     const lead = agent({

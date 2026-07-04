@@ -647,6 +647,11 @@ export class AgentManagerDb {
     return next.attempts;
   }
 
+  private restoreStalledProbe(key: string, prev: StalledProbeState | undefined): void {
+    if (prev) this.stalledNudges.set(key, prev);
+    else this.stalledNudges.delete(key);
+  }
+
   private canEscalateStalledProbe(key: string, maxProbes: number): boolean {
     const state = this.stalledNudges.get(key);
     return !!state && state.attempts >= maxProbes && state.escalatedAt === null;
@@ -1468,10 +1473,10 @@ export class AgentManagerDb {
       .map((agent) => agent.name);
     const ref = this.taskShortRef(task);
     if (await this.hasActiveSupervisionAskForMarker(teamId, owner, ref)) return;
-    this.markStalledProbe(key, Date.now());
     const memberHint = members.length ? ` Available teammates: ${members.join(', ')}.` : '';
     const message = `Lead delegation kickoff: task ${ref} ("${task.title}") is assigned to you as the team coordinator. Do not do the whole task yourself. Immediately decompose it into member-owned child tasks with \`/task create ... --owner <teammate> --parent-task ${ref}\`, then close this parent only after child tasks are done using \`/task done ${ref} --delegated-task-names "child-a,child-b"\`. If this is truly advisory, close it with \`--no-delegation-reason\` and a failure/summary note.${memberHint}`;
     if (await this.sendSupervisionAsk(teamName, owner.name, message)) {
+      this.markStalledProbe(key, Date.now());
       await this.recordTaskSupervision(task, teamId, owner.id, 'lead_delegation_required', 0, Date.now());
     }
   }
@@ -12051,7 +12056,9 @@ Return this JSON shape:
         body: JSON.stringify({ command: `/ask ${agentName} ${quoted}` }),
         signal: AbortSignal.timeout(20_000),
       });
-      return res.ok;
+      if (!res.ok) return false;
+      const body = await res.json().catch(() => null) as { ok?: unknown } | null;
+      return body?.ok === true;
     } catch {
       return false;
     }
@@ -12323,6 +12330,7 @@ Return this JSON shape:
         const canEscalate = !canRun && this.canEscalateStalledProbe(nudgeKey, MAX_PROBES);
         if (canRun || canEscalate) {
           if (await this.hasActiveSupervisionAskForMarker(teamRow.id, ownerAgent, ref)) continue;
+          const prevProbe = this.stalledNudges.get(nudgeKey);
           const attempt = canRun ? this.markStalledProbe(nudgeKey, now) : MAX_PROBES;
           const msg = await this.buildLeadDelegationNudge(
             t,
@@ -12346,6 +12354,8 @@ Return this JSON shape:
                 now,
               );
               nudged++;
+            } else {
+              this.restoreStalledProbe(nudgeKey, prevProbe);
             }
             continue;
           }
@@ -12423,22 +12433,28 @@ Return this JSON shape:
             const lead = await this.findSupervisionLead(teamRow.id);
             if (lead) {
               if (await this.hasActiveSupervisionAskForMarker(teamRow.id, lead, ref)) continue;
+              const prevProbe = this.stalledNudges.get(nudgeKey);
               this.markStalledProbeEscalated(nudgeKey, now);
               const msg = `Supervision: task ${ref} ("${t.title}") is still in progress after ${MAX_PROBES} stalled owner probes over ${mins}m. Please triage it: close it if finished, unblock it, reassign it, or split it into a new tracked task.`;
               if (await this.sendSupervisionAsk(teamRow.name, lead.name, msg)) {
                 await this.recordTaskSupervision(t, teamRow.id, lead.id, 'probe_limit_reached', mins, now);
                 nudged++;
+              } else {
+                this.restoreStalledProbe(nudgeKey, prevProbe);
               }
             }
           }
           continue;
         }
         if (await this.hasActiveSupervisionAskForMarker(teamRow.id, ownerAgent, ref)) continue;
+        const prevProbe = this.stalledNudges.get(nudgeKey);
         const attempt = this.markStalledProbe(nudgeKey, now);
         const msg = `Supervision: task ${ref} ("${t.title}") has been in progress ${mins}m with no completion (probe ${attempt}/${MAX_PROBES}). If the work is done, mark it done now with \`/task done ${ref}\`. If you're blocked, reply briefly with what's blocking it. If it isn't started, start and finish it.`;
         if (await this.sendSupervisionAsk(teamName, ownerName, msg)) {
           await this.recordTaskSupervision(t, teamRow.id, ownerAgent.id, 'owner_refresh', mins, now);
           nudged++;
+        } else {
+          this.restoreStalledProbe(nudgeKey, prevProbe);
         }
         continue;
       }
@@ -12448,11 +12464,14 @@ Return this JSON shape:
       const nudgeKey = `task:${t.id}:owner-unavailable`;
       if (!this.canRunStalledProbe(nudgeKey, now, RENUDGE_MS, MAX_PROBES)) continue;
       if (await this.hasActiveSupervisionAskForMarker(teamRow.id, lead, ref)) continue;
+      const prevProbe = this.stalledNudges.get(nudgeKey);
       const attempt = this.markStalledProbe(nudgeKey, now);
       const msg = `Supervision: task ${ref} ("${t.title}") has been in progress ${mins}m, but ${unavailable} (triage probe ${attempt}/${MAX_PROBES}). Please triage it: claim it, reassign it, or route it to the right teammate.`;
       if (await this.sendSupervisionAsk(teamRow.name, lead.name, msg)) {
         await this.recordTaskSupervision(t, teamRow.id, lead.id, 'owner_unavailable', mins, now);
         nudged++;
+      } else {
+        this.restoreStalledProbe(nudgeKey, prevProbe);
       }
     }
 
@@ -12479,11 +12498,14 @@ Return this JSON shape:
       const ref = this.taskShortRef(t);
       const mins = Math.round((now - updated) / 60000);
       if (await this.hasActiveSupervisionAskForMarker(teamRow.id, lead, ref)) continue;
+      const prevProbe = this.stalledNudges.get(nudgeKey);
       const attempt = this.markStalledProbe(nudgeKey, now);
       const msg = `Supervision: unclaimed task ${ref} ("${t.title}") has been waiting ${mins}m with no owner (triage probe ${attempt}/${MAX_PROBES}). Please claim it if it is yours, or route it to the right teammate.`;
       if (await this.sendSupervisionAsk(teamRow.name, lead.name, msg)) {
         await this.recordTaskSupervision(t, teamRow.id, lead.id, 'unclaimed', mins, now);
         nudged++;
+      } else {
+        this.restoreStalledProbe(nudgeKey, prevProbe);
       }
     }
 
@@ -12505,9 +12527,14 @@ Return this JSON shape:
           if (await this.hasActiveSupervisionAskForMarker(team.id, lead, q.query_id)) continue;
           const mins = Math.round((now - q.created) / 60000);
           const prompt = q.prompt ? ` ("${q.prompt.slice(0, 120)}${q.prompt.length > 120 ? '...' : ''}")` : '';
+          const prevProbe = this.stalledNudges.get(nudgeKey);
           const attempt = this.markStalledProbe(nudgeKey, now);
           const msg = `Supervision: manager inbox request ${q.query_id}${prompt} has been pending ${mins}m (triage probe ${attempt}/${MAX_PROBES}). Please answer it, claim it, or route it to the right teammate.`;
-          if (await this.sendSupervisionAsk(team.name, lead.name, msg)) nudged++;
+          if (await this.sendSupervisionAsk(team.name, lead.name, msg)) {
+            nudged++;
+          } else {
+            this.restoreStalledProbe(nudgeKey, prevProbe);
+          }
         }
       }
     }
