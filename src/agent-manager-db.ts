@@ -13416,6 +13416,7 @@ Return this JSON shape:
     const ownerAgentsById = new Map<string, Promise<AgentRow | null>>();
     const leadsByTeamId = new Map<string, Promise<AgentRow | null>>();
     const pendingQueriesByAgentId = new Map<string, Promise<QueryRow[]>>();
+    const supervisionSentToAgentIds = new Set<string>();
     const getTeamRow = (teamId: string | null | undefined): Promise<TeamRow | null> => {
       if (!teamId) return Promise.resolve(null);
       const cached = teamRowsById.get(teamId);
@@ -13442,11 +13443,33 @@ Return this JSON shape:
     };
     const getPendingQueriesFor = (recipient: AgentRow | null | undefined): Promise<QueryRow[]> => {
       if (!recipient?.id) return Promise.resolve([] as QueryRow[]);
+      if (supervisionSentToAgentIds.has(recipient.id)) {
+        return Promise.resolve([{
+          team_id: recipient.team_id || '',
+          agent_id: recipient.id,
+          query_id: `sweep-local-supervision-${recipient.id}`,
+          status: 'pending',
+          prompt: 'Supervision: sweep-local recipient guard',
+          created: now,
+          completed: null,
+          result: null,
+          error: null,
+          session_id: null,
+          owner_kind: 'agent',
+          owner_id: recipient.id,
+          metadata: { sweepLocalRecipientGuard: true },
+        }]);
+      }
       const cached = pendingQueriesByAgentId.get(recipient.id);
       if (cached) return cached;
       const pending = this.loadPendingQueriesForRecipient(recipient);
       pendingQueriesByAgentId.set(recipient.id, pending);
       return pending;
+    };
+    const markSupervisionSentTo = (recipient: AgentRow | null | undefined): void => {
+      if (!recipient?.id) return;
+      supervisionSentToAgentIds.add(recipient.id);
+      pendingQueriesByAgentId.delete(recipient.id);
     };
     for (const t of doing) {
       if (nudged >= MAX_PER_SWEEP) break;
@@ -13498,6 +13521,7 @@ Return this JSON shape:
                 mins,
                 now,
               );
+              markSupervisionSentTo(ownerAgent);
               nudged++;
             } else {
               this.restoreStalledProbe(nudgeKey, prevProbe);
@@ -13569,6 +13593,7 @@ Return this JSON shape:
             const msg = `Supervision: task ${ref} ("${t.title}") was stalled for ${mins}m while you were offline. You have been restarted for this task. If the work is done, mark it done now with \`/task done ${ref}\`. If blocked, reply briefly with what's blocking it. If it isn't started, start and finish it.`;
             if (await this.sendSupervisionAsk(teamName, ownerName, msg)) {
               await this.recordTaskSupervision(t, teamRow.id, ownerAgent.id, 'owner_refresh', mins, now);
+              markSupervisionSentTo(ownerAgent);
               nudged++;
             }
             continue;
@@ -13601,6 +13626,7 @@ Return this JSON shape:
               const msg = `Supervision: task ${ref} ("${t.title}") is still in progress after ${MAX_PROBES} stalled owner probes over ${mins}m. Please triage it: close it if finished, unblock it, reassign it, or split it into a new tracked task.`;
               if (await this.sendSupervisionAsk(teamRow.name, lead.name, msg)) {
                 await this.recordTaskSupervision(t, teamRow.id, lead.id, 'probe_limit_reached', mins, now);
+                markSupervisionSentTo(lead);
                 nudged++;
               } else {
                 this.restoreStalledProbe(nudgeKey, prevProbe);
@@ -13615,6 +13641,7 @@ Return this JSON shape:
         const msg = `Supervision: task ${ref} ("${t.title}") has been in progress ${mins}m with no completion (probe ${attempt}/${MAX_PROBES}). If the work is done, mark it done now with \`/task done ${ref}\`. If you're blocked, reply briefly with what's blocking it. If it isn't started, start and finish it.`;
         if (await this.sendSupervisionAsk(teamName, ownerName, msg)) {
           await this.recordTaskSupervision(t, teamRow.id, ownerAgent.id, 'owner_refresh', mins, now);
+          markSupervisionSentTo(ownerAgent);
           nudged++;
         } else {
           this.restoreStalledProbe(nudgeKey, prevProbe);
@@ -13633,6 +13660,7 @@ Return this JSON shape:
       const msg = `Supervision: task ${ref} ("${t.title}") has been in progress ${mins}m, but ${unavailable} (triage probe ${attempt}/${MAX_PROBES}). Please triage it: claim it, reassign it, or route it to the right teammate.`;
       if (await this.sendSupervisionAsk(teamRow.name, lead.name, msg)) {
         await this.recordTaskSupervision(t, teamRow.id, lead.id, 'owner_unavailable', mins, now);
+        markSupervisionSentTo(lead);
         nudged++;
       } else {
         this.restoreStalledProbe(nudgeKey, prevProbe);
@@ -13688,6 +13716,7 @@ Return this JSON shape:
       const msg = `Supervision: unclaimed task ${ref} ("${t.title}") has been waiting ${mins}m with no owner (triage probe ${attempt}/${MAX_PROBES}). Please claim it if it is yours, or route it to the right teammate.`;
       if (await this.sendSupervisionAsk(teamRow.name, lead.name, msg)) {
         await this.recordTaskSupervision(t, teamRow.id, lead.id, 'unclaimed', mins, now);
+        markSupervisionSentTo(lead);
         nudged++;
       } else {
         this.restoreStalledProbe(nudgeKey, prevProbe);
@@ -13718,6 +13747,7 @@ Return this JSON shape:
           const attempt = this.markStalledProbe(nudgeKey, now);
           const msg = `Supervision: manager inbox request ${q.query_id}${prompt} has been pending ${mins}m (triage probe ${attempt}/${MAX_PROBES}). Please answer it, claim it, or route it to the right teammate.`;
           if (await this.sendSupervisionAsk(team.name, lead.name, msg)) {
+            markSupervisionSentTo(lead);
             nudged++;
           } else {
             this.restoreStalledProbe(nudgeKey, prevProbe);

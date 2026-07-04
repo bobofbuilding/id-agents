@@ -183,6 +183,47 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('does not send multiple owner refresh prompts to one owner in the same sweep', async () => {
+    process.env.STALL_SWEEP_MAX_PER_SWEEP = '5';
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const first = task({
+      id: 'task-1',
+      name: 'oldest-stalled-work',
+      uuid: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      title: 'Oldest stalled work',
+      updated_at: nowSec - 7200,
+    });
+    const second = task({
+      id: 'task-2',
+      name: 'second-stalled-work',
+      uuid: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      title: 'Second stalled work',
+      updated_at: nowSec - 5400,
+    });
+    const db = fakeDb({
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => status === 'doing' ? [first, second] : []),
+        updateFields: vi.fn(async () => {}),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-owner-single-nudge-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.sweepStalledTasks();
+
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledTimes(1);
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'worker',
+      expect.stringContaining('#aaaaaaaa'),
+    );
+    expect(db.events.insert).toHaveBeenCalledTimes(1);
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      subject_id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      data: expect.objectContaining({ reason: 'owner_refresh' }),
+    }));
+  });
+
   it('blocks additional owner work and immediately bumps the stale task first', async () => {
     const db = fakeDb();
     const manager = new AgentManagerDb('/tmp/id-agents-stalled-owner-guard-test', db, { libraryRoot: null }) as any;
