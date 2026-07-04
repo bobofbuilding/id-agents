@@ -6,6 +6,8 @@
  */
 
 import 'dotenv/config';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { AgentManagerDb } from './agent-manager-db.js';
 import { createDb, migrateDb } from './db.js';
@@ -65,39 +67,140 @@ async function main() {
 async function startManagerAgent() {
   const managementPort = parseInt(process.env.AGENT_MANAGER_PORT || '4100');
   const workingDir = path.resolve(process.env.AGENT_MANAGER_WORKDIR || path.join(process.cwd(), 'workspace'));
+  const allowDuplicateStart = process.env.ID_MANAGER_ALLOW_DUPLICATE_START === 'true';
 
-  if (process.env.ID_MANAGER_ALLOW_DUPLICATE_START !== 'true' && await existingManagerHealthy(managementPort)) {
+  const runLock = allowDuplicateStart ? null : await acquireManagerRunLock(managementPort);
+  if (!allowDuplicateStart && !runLock) return;
+
+  if (!allowDuplicateStart && await existingManagerHealthy(managementPort)) {
     console.log(`✅ ID Agent Manager is already running on http://127.0.0.1:${managementPort}; not starting a duplicate daemon.`);
+    runLock?.release();
     return;
   }
 
-  // Initialize DB (required for persistence)
-  const db = await createDb();
-  await migrateDb(db);
+  try {
+    // Initialize DB (required for persistence)
+    const db = await createDb();
+    await migrateDb(db);
 
-  const manager = new AgentManagerDb(workingDir, db);
+    const manager = new AgentManagerDb(workingDir, db);
 
-  await manager.start(managementPort);
-
-  console.log('🎯 Manager agent ready - can spawn and manage local worker agents');
-  console.log('Press Ctrl+C to stop the manager\n');
-
-  // Keep the process alive
-  const heartbeat = setInterval(() => {}, 1000 * 60 * 60);
-
-  // Handle shutdown gracefully
-  const shutdown = async (signal: string) => {
-    console.log(`\n\nShutting down manager agent (${signal})...`);
-    clearInterval(heartbeat);
     try {
-      await manager.shutdown();
+      await manager.start(managementPort);
     } catch (err) {
-      console.error('Manager shutdown error:', err);
+      runLock?.release();
+      throw err;
     }
-    process.exit(0);
-  };
-  process.on('SIGINT', () => { void shutdown('SIGINT'); });
-  process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
+
+    console.log('🎯 Manager agent ready - can spawn and manage local worker agents');
+    console.log('Press Ctrl+C to stop the manager\n');
+
+    // Keep the process alive
+    const heartbeat = setInterval(() => {}, 1000 * 60 * 60);
+
+    // Handle shutdown gracefully
+    const shutdown = async (signal: string) => {
+      console.log(`\n\nShutting down manager agent (${signal})...`);
+      clearInterval(heartbeat);
+      try {
+        await manager.shutdown();
+      } catch (err) {
+        console.error('Manager shutdown error:', err);
+      } finally {
+        runLock?.release();
+      }
+      process.exit(0);
+    };
+    process.on('exit', () => { runLock?.release(); });
+    process.on('SIGINT', () => { void shutdown('SIGINT'); });
+    process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
+  } catch (err) {
+    runLock?.release();
+    throw err;
+  }
+}
+
+type ManagerRunLock = {
+  release: () => void;
+};
+
+function managerRunLockPath(port: number): string {
+  return path.join(os.tmpdir(), `id-agents-manager-${port}.lock`);
+}
+
+function parseLockPid(raw: string): number | null {
+  try {
+    const parsed = JSON.parse(raw) as { pid?: unknown };
+    const pid = Number(parsed.pid);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    const pid = Number(raw.trim());
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  }
+}
+
+function pidIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForExistingManagerHealthy(port: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await existingManagerHealthy(port)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  return false;
+}
+
+async function acquireManagerRunLock(port: number): Promise<ManagerRunLock | null> {
+  const lockPath = managerRunLockPath(port);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const fd = fs.openSync(lockPath, 'wx', 0o600);
+      fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, port, createdAt: Date.now() }));
+      fs.closeSync(fd);
+      let released = false;
+      return {
+        release: () => {
+          if (released) return;
+          released = true;
+          try {
+            const owner = parseLockPid(fs.readFileSync(lockPath, 'utf8'));
+            if (owner === process.pid) fs.rmSync(lockPath, { force: true });
+          } catch {
+            // Lock already removed or unreadable; nothing to release.
+          }
+        },
+      };
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      if (code !== 'EEXIST') throw err;
+      const ownerPid = (() => {
+        try { return parseLockPid(fs.readFileSync(lockPath, 'utf8')); }
+        catch { return null; }
+      })();
+      if (ownerPid && pidIsAlive(ownerPid)) {
+        if (await existingManagerHealthy(port) || await waitForExistingManagerHealthy(port, 5_000)) {
+          console.log(`✅ ID Agent Manager is already running on http://127.0.0.1:${port} (pid ${ownerPid}); not starting a duplicate daemon.`);
+          return null;
+        }
+        console.log(`✅ ID Agent Manager startup is already owned by live pid ${ownerPid}; not starting a duplicate daemon.`);
+        return null;
+      }
+      try { fs.rmSync(lockPath, { force: true }); }
+      catch (unlinkErr) {
+        console.warn(`⚠️  Could not remove stale manager lock ${lockPath}:`, unlinkErr);
+        return null;
+      }
+    }
+  }
+  console.log(`✅ ID Agent Manager startup lock is busy for port ${port}; not starting a duplicate daemon.`);
+  return null;
 }
 
 async function existingManagerHealthy(port: number): Promise<boolean> {
