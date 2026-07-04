@@ -163,6 +163,11 @@ interface StalledOwnerTriageReport {
   items: StalledOwnerTriageReportItem[];
 }
 
+function looksLikeShortTaskRef(value: string | undefined): boolean {
+  const trimmed = String(value || '').trim();
+  return /^#?[0-9a-fA-F]{4,}$/.test(trimmed);
+}
+
 function tokenizeCommand(command: string): string[] {
   const tokens: string[] = [];
   const re = /"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|(\S+)/g;
@@ -1394,6 +1399,7 @@ export class AgentManagerDb {
     teamId: string;
     owner: AgentRow | null;
     excludeTaskId?: string;
+    onlyTaskId?: string;
     nowMs?: number;
   }): Promise<Array<{ task: TaskRow; ref: string; stalledMinutes: number }>> {
     if (!params.owner) return [];
@@ -1404,6 +1410,7 @@ export class AgentManagerDb {
       .catch(() => [] as TaskRow[]);
     return doing
       .filter((task) => task.id !== params.excludeTaskId)
+      .filter((task) => !params.onlyTaskId || task.id === params.onlyTaskId)
       .map((task) => ({
         task,
         ref: this.taskShortRef(task),
@@ -1675,6 +1682,7 @@ export class AgentManagerDb {
     teamName: string;
     owner: AgentRow | null;
     excludeTaskId?: string;
+    onlyTaskId?: string;
     forceTriage?: boolean;
   }): Promise<{ message: string; blockers: string[]; triage: Record<string, unknown> | null } | null> {
     if (!params.owner) return null;
@@ -1683,6 +1691,7 @@ export class AgentManagerDb {
       teamId: params.teamId,
       owner: params.owner,
       excludeTaskId: params.excludeTaskId,
+      onlyTaskId: params.onlyTaskId,
       nowMs,
     });
     if (!blockers.length) return null;
@@ -1773,6 +1782,88 @@ export class AgentManagerDb {
       }
     }
 
+    return report;
+  }
+
+  private async triageStalledTaskRef(params: {
+    team: { id: string; name: string };
+    taskRef: string;
+    force?: boolean;
+  }): Promise<StalledOwnerTriageReport> {
+    const report: StalledOwnerTriageReport = {
+      stallMinutes: Math.round(this.getStallSweepMs() / 60000),
+      limit: 1,
+      scannedTeams: 1,
+      scannedOwners: 0,
+      triagedOwners: 0,
+      skippedOwners: [],
+      items: [],
+    };
+
+    const { task, error } = await this.resolveTaskRef(params.taskRef, params.team.id);
+    if (!task) {
+      report.skippedOwners.push({
+        team: params.team.name,
+        owner: params.taskRef,
+        reason: error || 'task_not_found',
+      });
+      return report;
+    }
+
+    const taskRef = this.taskShortRef(task);
+    if (task.status !== 'doing') {
+      report.skippedOwners.push({
+        team: params.team.name,
+        owner: taskRef,
+        reason: `task_not_doing:${task.status}`,
+      });
+      return report;
+    }
+    if (!task.owner) {
+      report.skippedOwners.push({
+        team: params.team.name,
+        owner: taskRef,
+        reason: 'task_has_no_owner',
+      });
+      return report;
+    }
+
+    report.scannedOwners = 1;
+    const owner = await this.db.agents.getById(task.owner).catch(() => null);
+    if (!owner) {
+      report.skippedOwners.push({
+        team: params.team.name,
+        owner: task.owner,
+        reason: 'owner_missing',
+      });
+      return report;
+    }
+
+    const guard = await this.stalledOwnerBacklogGuard({
+      teamId: params.team.id,
+      teamName: params.team.name,
+      owner,
+      onlyTaskId: task.id,
+      forceTriage: params.force === true,
+    });
+    if (!guard) {
+      report.skippedOwners.push({
+        team: params.team.name,
+        owner: owner.name,
+        reason: `task_not_stalled:${report.stallMinutes}m_threshold`,
+      });
+      return report;
+    }
+
+    report.items.push({
+      team: params.team.name,
+      owner: owner.name,
+      ownerStatus: owner.status ?? null,
+      message: guard.message,
+      blockers: guard.blockers,
+      triage: guard.triage,
+    });
+    report.triagedOwners = 1;
     return report;
   }
 
@@ -13058,11 +13149,12 @@ Return this JSON shape:
 
         if (subCmd === 'triage-stalled' || subCmd === 'stalled-triage' || subCmd === 'jumpstart-stalled' || subCmd === 'jumpstart') {
           // /task triage-stalled [--team <team>|--all] [--owner <agent>] [--limit N]
-          // /task jumpstart-stalled is an alias for operators/UI callers.
+          // /task jumpstart-stalled [#task|--task <task>] targets one stalled task.
           const rawArgs = args.slice(1);
           let targetTeamName: string | undefined;
           let allTeams = false;
           let ownerRef: string | undefined;
+          let taskRef: string | undefined;
           let limit = 8;
           let force = false;
 
@@ -13071,6 +13163,7 @@ Return this JSON shape:
             if (token === '--all') { allTeams = true; continue; }
             if (token === '--team') { targetTeamName = rawArgs[++i]; continue; }
             if (token === '--owner') { ownerRef = rawArgs[++i]; continue; }
+            if (token === '--task' || token === '--task-ref' || token === '--ref') { taskRef = rawArgs[++i]; continue; }
             if (token === '--force' || token === '--manual') { force = true; continue; }
             if (token === '--limit') {
               const parsed = Number(rawArgs[++i]);
@@ -13080,12 +13173,22 @@ Return this JSON shape:
               limit = parsed;
               continue;
             }
+            if (token.startsWith('--')) return { ok: false, error: `Unknown option ${token}` };
+            if (!taskRef) { taskRef = token; continue; }
+            return { ok: false, error: `Unexpected argument "${token}"` };
           }
 
           if (allTeams && targetTeamName) {
             return { ok: false, error: 'Use either --all or --team <team>, not both' };
           }
-          if ((subCmd === 'jumpstart-stalled' || subCmd === 'jumpstart') && ownerRef && !allTeams && limit === 1) {
+          if (!taskRef && ownerRef && looksLikeShortTaskRef(ownerRef)) {
+            taskRef = ownerRef;
+            ownerRef = undefined;
+          }
+          if (ownerRef && taskRef) {
+            return { ok: false, error: 'Use either --owner <agent> or --task <task>, not both' };
+          }
+          if ((subCmd === 'jumpstart-stalled' || subCmd === 'jumpstart') && !allTeams && (ownerRef || taskRef)) {
             force = true;
           }
 
@@ -13098,6 +13201,18 @@ Return this JSON shape:
             teams = [{ id: targetTeam.id, name: targetTeam.name }];
           } else {
             teams = [{ id: teamId, name: teamName }];
+          }
+
+          if (taskRef) {
+            if (teams.length !== 1) {
+              return { ok: false, error: 'Task-ref jumpstart must target exactly one team; use --team <team> instead of --all' };
+            }
+            const report = await this.triageStalledTaskRef({
+              team: teams[0],
+              taskRef,
+              force,
+            });
+            return { ok: true, result: report };
           }
 
           const report = await this.triageStalledOwnerBacklogs({

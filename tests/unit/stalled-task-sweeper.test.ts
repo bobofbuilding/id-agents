@@ -1851,6 +1851,89 @@ describe('stalled task sweeper', () => {
     });
   });
 
+  it('jumpstarts a specific stalled task ref instead of the owner oldest task', async () => {
+    const older = task({
+      id: 'task-old',
+      name: 'older-stalled-work',
+      uuid: '11111111-1111-4111-8111-111111111111',
+      title: 'Older stalled work',
+      updated_at: Math.floor(NOW_MS / 1000) - 7200,
+    });
+    const target = task({
+      id: 'task-target',
+      name: 'target-stalled-work',
+      uuid: '87654321-1234-4234-9234-123456789abc',
+      title: 'Target stalled work',
+      updated_at: Math.floor(NOW_MS / 1000) - 3600,
+    });
+    const db = fakeDb({
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => status === 'doing' ? [older, target] : []),
+        getByUuidPrefix: vi.fn(async (prefix: string) => prefix === '87654321' ? [target] : []),
+        getByNameForTeam: vi.fn(async () => null),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-task-ref-jumpstart-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const result = await manager.executeRemoteCommand('/task jumpstart-stalled #87654321 --limit 1', TEAM_ID, 'default');
+
+    expect(result).toMatchObject({
+      ok: true,
+      result: {
+        scannedOwners: 1,
+        triagedOwners: 1,
+        items: [
+          {
+            team: 'default',
+            owner: 'worker',
+            blockers: ['#87654321'],
+            triage: { status: 'sent_owner', taskRef: '#87654321', actor: 'worker' },
+          },
+        ],
+      },
+    });
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.stringContaining('task #87654321 ("Target stalled work")'),
+    );
+  });
+
+  it('treats an accidental --owner short task id as a task-ref jumpstart', async () => {
+    const target = task({
+      id: 'task-target',
+      name: 'target-stalled-work',
+      uuid: '87654321-1234-4234-9234-123456789abc',
+      title: 'Target stalled work',
+    });
+    const db = fakeDb({
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => status === 'doing' ? [target] : []),
+        getByUuidPrefix: vi.fn(async (prefix: string) => prefix === '87654321' ? [target] : []),
+        getByNameForTeam: vi.fn(async () => null),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-owner-short-ref-jumpstart-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const result = await manager.executeRemoteCommand('/task jumpstart-stalled --owner #87654321 --limit 1', TEAM_ID, 'default');
+
+    expect(result).toMatchObject({
+      ok: true,
+      result: {
+        triagedOwners: 1,
+        items: [
+          {
+            owner: 'worker',
+            blockers: ['#87654321'],
+            triage: { status: 'sent_owner', taskRef: '#87654321' },
+          },
+        ],
+      },
+    });
+  });
+
   it('lets manual jump-start bypass only the renudge throttle', async () => {
     const db = fakeDb();
     const manager = new AgentManagerDb('/tmp/id-agents-stalled-owner-manual-jumpstart-test', db, { libraryRoot: null }) as any;
