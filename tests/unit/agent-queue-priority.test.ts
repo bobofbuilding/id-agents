@@ -6,6 +6,7 @@ import type { AddressInfo } from 'net';
 import {
   AgentRestServer,
   classifyQueryQueuePriority,
+  shouldUseImplicitDefaultConversation,
   shouldSuppressPrimaryLeadValidatorNoopWake,
 } from '../../src/claude-agent-server.js';
 import type { AgentHarness, HarnessMessage, HarnessOptions, HarnessType } from '../../src/harness/index.js';
@@ -81,6 +82,19 @@ Team objective: Decompose this objective into member-owned work.`,
       from: 'researcher',
       options: { noAutoReply: true },
     })).toBe('background');
+  });
+
+  it('keeps automated peer/control traffic out of the implicit default session', () => {
+    expect(shouldUseImplicitDefaultConversation({})).toBe(true);
+    expect(shouldUseImplicitDefaultConversation({ from: 'operator' })).toBe(true);
+    expect(shouldUseImplicitDefaultConversation({ from: 'human' })).toBe(true);
+
+    expect(shouldUseImplicitDefaultConversation({ from: 'remote' })).toBe(false);
+    expect(shouldUseImplicitDefaultConversation({ from: 'manager' })).toBe(false);
+    expect(shouldUseImplicitDefaultConversation({ from: 'researcher' })).toBe(false);
+    expect(shouldUseImplicitDefaultConversation({ from: 'checkin-service', noAutoReply: true })).toBe(false);
+    expect(shouldUseImplicitDefaultConversation({ resumeKey: 'chat-123', from: 'operator' })).toBe(false);
+    expect(shouldUseImplicitDefaultConversation({ disableImplicitDefault: true })).toBe(false);
   });
 
   it('runs queued operator work before older queued background work', async () => {

@@ -59,6 +59,27 @@ function truncateNewsTriggerMessage(message: string): string {
   return `${text.slice(0, limit)}\n\n[message truncated: ${text.length - limit} additional chars omitted from this wake; inspect the news item or linked task only if needed]`;
 }
 
+export function shouldUseImplicitDefaultConversation(input: {
+  resumeKey?: string;
+  from?: string;
+  noAutoReply?: boolean;
+  disableImplicitDefault?: boolean;
+}): boolean {
+  if (input.resumeKey) return false;
+  if (input.disableImplicitDefault) return false;
+  if (input.noAutoReply) return false;
+
+  const from = String(input.from || '').trim().toLowerCase();
+  if (!from) return true;
+
+  // Manager/control-plane and peer-originated automation must stay fresh by default.
+  // Otherwise every triggered news wake resumes the same hidden runtime session and
+  // turns small coordination prompts into huge, slow, quota-heavy model calls.
+  if (from === 'manager' || from === 'remote') return false;
+  if (from === 'operator' || from === 'human' || from === 'user') return true;
+  return false;
+}
+
 const MCP_CONTROL_PLANE_PROMPT_PATTERNS = [
   /^Heartbeat:/,
   /^Supervision:/,
@@ -2409,14 +2430,18 @@ Produce the smallest useful action/result for this inbound wake.`;
     // NOT necessarily a runtime session id. We translate it to the runtime session id
     // this agent last minted for that conversation, so each chat resumes only its own
     // thread. A caller that passes back a runtime id we actually minted resumes it
-    // directly (back-compat for agent-to-agent talk / inbox replies). Manager-owned
-    // dispatches without an explicit session id are fresh by default; otherwise
-    // unrelated task/schedule traffic builds one giant hidden runtime session.
+    // directly. Automated peer/news/control traffic stays fresh unless it passes
+    // an explicit session id; otherwise unrelated wakes build one giant hidden
+    // runtime session and make leads slow/quota-heavy.
     const allowSessionResume = supportsSessionResume(this.harnessType);
     const resumeKey = typeof resume === 'string' && resume.trim() ? resume.trim() : undefined;
-    const managerOwnedDispatch = from === 'manager' || from === 'remote' || options?.noAutoReply === true;
     const disableImplicitDefault = process.env.ID_AGENT_DISABLE_IMPLICIT_DEFAULT_SESSION === '1';
-    const useImplicitDefault = !resumeKey && !managerOwnedDispatch && !disableImplicitDefault;
+    const useImplicitDefault = shouldUseImplicitDefaultConversation({
+      resumeKey,
+      from,
+      noAutoReply: options?.noAutoReply === true,
+      disableImplicitDefault,
+    });
     const conversationKey = resumeKey || (useImplicitDefault ? AgentRestServer.DEFAULT_CONVERSATION : undefined);
     const directRuntimeResume = resumeKey && this.mintedSessionIds.has(resumeKey) ? resumeKey : undefined;
     let sessionId = allowSessionResume
