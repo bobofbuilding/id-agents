@@ -64,6 +64,11 @@ Already handled. Task #abc12345 is done with no active delegation.`)).toBe(true)
 [Respond directly and helpfully — this is the person who manages you.]
 
 Task assignment sweep: inspect unassigned todo tasks across all teams and assign a bounded batch.`)).toBe(true);
+
+    expect(shouldSuppressMcpForPrompt(`[Message from the manager (your owner/operator) | Query ID: query_5]
+[Respond directly and helpfully — this is the person who manages you.]
+
+You have 2 stalled doing tasks from before a team outage that need to be closed.`)).toBe(true);
   });
 
   it('keeps MCP available for normal delegated task work', () => {

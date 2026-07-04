@@ -81,6 +81,7 @@ function fakeDb(overrides: Record<string, any> = {}): any {
     agents: {
       getById: vi.fn(async () => agent()),
       getByName: vi.fn(async () => null),
+      resolve: vi.fn(async () => [agent()]),
       list: vi.fn(async () => [agent()]),
       updateStatus: vi.fn(async () => {}),
       ...overrides.agents,
@@ -251,10 +252,46 @@ describe('stalled task sweeper', () => {
     expect(db.tasks.claim).not.toHaveBeenCalled();
   });
 
+  it('rejects owner-targeted task creation when that owner has stalled work', async () => {
+    const create = vi.fn(async () => {});
+    const db = fakeDb({
+      tasks: {
+        create,
+        getByNameForTeam: vi.fn(async () => null),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-owner-create-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const result = await manager.executeRemoteCommand(
+      '/task create "Follow-on work" --owner worker --goal goal_stalled_owner_guard --expected-output "A concise result." --acceptance "The stalled blocker is cleared first." --validation-path "coder,researcher" --out-of-scope "New backlog fanout." --backlog-policy "Do not create duplicate backlog." --relevance "high - keeps Bittrees task dispatch moving."',
+      TEAM_ID,
+      'default',
+    );
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: 'stalled_task_backlog',
+      result: {
+        message: expect.stringContaining('New work for this owner is held'),
+        blocking_tasks: ['#12345678'],
+        triage: { status: 'sent_owner', taskRef: '#12345678', actor: 'worker' },
+      },
+    });
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'worker',
+      expect.stringContaining('New task assignment to you is held'),
+    );
+    expect(create).not.toHaveBeenCalled();
+    expect(db.tasks.claim).not.toHaveBeenCalled();
+  });
+
   it('does not attach Brain context to control-plane status prompts', async () => {
     const manager = new AgentManagerDb('/tmp/id-agents-brain-context-control-plane-test', fakeDb(), { libraryRoot: null }) as any;
 
     expect(manager.shouldAttachBrainContext('Backlog guard: task #12345678 is stalled.')).toBe(false);
+    expect(manager.shouldAttachBrainContext('You have 2 stalled doing tasks from before a team outage that need to be closed.')).toBe(false);
     expect(manager.shouldAttachBrainContext('Assignment sweep complete (Jul 4). Assigned: 0.')).toBe(false);
     expect(manager.shouldAttachBrainContext('Task assignment sweep: inspect unassigned todo tasks across all teams.')).toBe(false);
     expect(manager.shouldAttachBrainContext('No approved recommendation routed. The completed result was REVISE.')).toBe(false);

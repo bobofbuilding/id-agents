@@ -55,6 +55,7 @@ const MCP_CONTROL_PLANE_PROMPT_PATTERNS = [
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nSupervision:/,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nSupervision probe on task\b/,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nBacklog guard:/,
+  /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nYou have \d+ stalled doing tasks\b/,
 ];
 
 export function shouldSuppressMcpForPrompt(prompt: string): boolean {

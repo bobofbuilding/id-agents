@@ -3965,6 +3965,7 @@ Return this JSON shape:
       /^Supervision:/,
       /^Supervision probe on task\b/,
       /^Backlog guard:/,
+      /^You have \d+ stalled doing tasks\b/,
       /^Task assignment sweep:/,
       /^Assignment sweep complete\b/,
       /^No approved recommendation routed\b/,
@@ -11926,8 +11927,16 @@ Return this JSON shape:
               owner: agent,
             });
             if (stalledBacklog) {
-              stalledOwnerWarning = stalledBacklog.message;
-              stalledOwnerTriage = stalledBacklog.triage;
+              return {
+                ok: false,
+                error: 'stalled_task_backlog',
+                result: {
+                  message: stalledBacklog.message,
+                  blocking_tasks: stalledBacklog.blockers,
+                  triage: stalledBacklog.triage,
+                  brief_validation: brief.validation,
+                },
+              };
             } else if (await this.hasDoingTaskRoom(taskTeamId)) {
               const leadBacklog = await this.leadDelegationBacklogGuard({
                 teamId: taskTeamId,
