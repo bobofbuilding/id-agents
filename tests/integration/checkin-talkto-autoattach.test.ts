@@ -1034,6 +1034,87 @@ describe('/talk-to auto-attach', () => {
     expect(duplicateBody.existing_task).toBe('validate-parent-alpha-coder');
   });
 
+  it('rejects duplicate goal tasks only when the objective title overlaps', async () => {
+    const releaseBrief = {
+      ...validBriefFields(),
+      goal_id: 'goal_release_id_agents_v0_1_100',
+      expected_output: 'id-agents v0.1.100 pushed to bobofbuilding/id-agents remote and GitHub release tag v0.1.100 published with release notes',
+      acceptance_criteria: [
+        'git tag v0.1.100 exists on bobofbuilding/id-agents',
+        'GitHub release page shows v0.1.100 with the release commits',
+      ],
+      backlog_policy: 'Block duplicate release work until the release is verified.',
+      bittrees_relevance: 'high: ships core ID Agents infrastructure.',
+    };
+
+    const first = await fetch(`${baseUrl}/tasks`, {
+      method: 'POST',
+      headers: adminHeaders(TEAM),
+      body: JSON.stringify({
+        title: 'Publish id-agents v0.1.100',
+        name: 'publish-id-agents-v0-1-100',
+        from: 'manager',
+        ...releaseBrief,
+      }),
+    });
+    expect(first.status).toBe(201);
+
+    const sameGoalDifferentObjective = await fetch(`${baseUrl}/tasks`, {
+      method: 'POST',
+      headers: adminHeaders(TEAM),
+      body: JSON.stringify({
+        title: 'Write release notes for id-agents v0.1.100',
+        name: 'write-release-notes-id-agents-v0-1-100',
+        from: 'manager',
+        ...releaseBrief,
+        expected_output: 'release notes draft for id-agents v0.1.100',
+        acceptance_criteria: ['release notes summarize the shipped commits'],
+      }),
+    });
+    expect(sameGoalDifferentObjective.status).toBe(201);
+
+    const duplicate = await fetch(`${baseUrl}/tasks`, {
+      method: 'POST',
+      headers: adminHeaders(TEAM),
+      body: JSON.stringify({
+        title: 'Push and publish id-agents v0.1.100 [release-id-agents-bd661c7-6db1769]',
+        name: 'push-publish-id-agents-v0-1-100',
+        from: 'manager',
+        ...releaseBrief,
+      }),
+    });
+    expect(duplicate.status).toBe(409);
+    const duplicateBody = await duplicate.json() as {
+      error: string;
+      existing_task?: string;
+      existing_task_ref?: string;
+      existing_status?: string;
+    };
+    expect(duplicateBody.error).toBe('duplicate_task_goal');
+    expect(duplicateBody.existing_task).toBe('publish-id-agents-v0-1-100');
+    expect(duplicateBody.existing_task_ref).toMatch(/^#[a-f0-9]{8}$/);
+    expect(duplicateBody.existing_status).toBe('todo');
+
+    const remoteDuplicate = await fetch(`${baseUrl}/remote`, {
+      method: 'POST',
+      headers: adminHeaders(TEAM),
+      body: JSON.stringify({
+        from: 'manager',
+        command: '/task create "Push and publish id-agents v0.1.100 [release-id-agents-bd661c7-6db1769]" --name push-publish-id-agents-v0-1-100-remote --goal goal_release_id_agents_v0_1_100 --expected-output "id-agents v0.1.100 pushed to bobofbuilding/id-agents remote; GitHub release v0.1.100 published." --acceptance "git tag v0.1.100 on bobofbuilding/id-agents remote; GitHub release page shows v0.1.100" --validation-path "coder and researcher" --out-of-scope "npm publish" --backlog-policy "block duplicate release work" --bittrees-relevance "high: release shipping work"',
+      }),
+    });
+    expect(remoteDuplicate.status).toBe(200);
+    const remoteDuplicateBody = await remoteDuplicate.json() as {
+      ok: boolean;
+      error?: string;
+      result?: { existing_task?: string; existing_status?: string };
+    };
+    expect(remoteDuplicateBody.ok).toBe(false);
+    expect(remoteDuplicateBody.error).toBe('duplicate_task_goal');
+    expect(remoteDuplicateBody.result?.existing_task).toBe('publish-id-agents-v0-1-100');
+    expect(remoteDuplicateBody.result?.existing_status).toBe('todo');
+  });
+
   it('rejects validator children created after the parent task is terminal', async () => {
     const now = Math.floor(Date.now() / 1000);
     await db.tasks.create({

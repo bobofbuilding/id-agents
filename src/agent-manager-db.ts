@@ -854,6 +854,79 @@ export class AgentManagerDb {
     return value.toLowerCase().replace(/[^a-z0-9#]+/g, '-').replace(/^-+|-+$/g, '');
   }
 
+  private taskGoalIdFromInput(input: TaskBriefValidationInput | Record<string, unknown>): string | null {
+    const explicit = this.firstBriefString(input, ['goal_id', 'goalId']);
+    const text = this.taskBriefGuardText(input);
+    const candidate = explicit
+      || this.briefLabel(text, 'Goal ID')
+      || text.match(/\bgoal_[a-z0-9_]+\b/i)?.[0]
+      || null;
+    const match = candidate?.match(/\bgoal_[a-z0-9_]+\b/i)?.[0];
+    return match ? match.toLowerCase() : null;
+  }
+
+  private duplicateTitleTokens(value: string): Set<string> {
+    const stop = new Set([
+      'a', 'an', 'and', 'by', 'for', 'from', 'in', 'of', 'on', 'or', 'the', 'to', 'via', 'with',
+      'parent', 'task', 'work',
+    ]);
+    const tokens = value
+      .toLowerCase()
+      .replace(/\[[^\]]*\]/g, ' ')
+      .replace(/\bgoal_[a-z0-9_]+\b/g, ' ')
+      .replace(/#[a-f0-9]{8}\b/g, ' ')
+      .replace(/[^a-z0-9.]+/g, ' ')
+      .split(/\s+/)
+      .map((token) => token.trim())
+      .filter((token) => token.length > 1 && !stop.has(token));
+    return new Set(tokens);
+  }
+
+  private taskTitlesLookDuplicate(a: string, b: string): boolean {
+    const normalizedA = this.normalizeGuardKey(a.replace(/\[[^\]]*\]/g, ' '));
+    const normalizedB = this.normalizeGuardKey(b.replace(/\[[^\]]*\]/g, ' '));
+    if (normalizedA && normalizedA === normalizedB) return true;
+    const aTokens = this.duplicateTitleTokens(a);
+    const bTokens = this.duplicateTitleTokens(b);
+    if (!aTokens.size || !bTokens.size) return false;
+    const shared = [...aTokens].filter((token) => bTokens.has(token));
+    if (shared.length < 3) return false;
+    const score = (shared.length * 2) / (aTokens.size + bTokens.size);
+    return score >= 0.8;
+  }
+
+  private async findDuplicateTaskByGoalSignature(
+    teamId: string,
+    input: TaskBriefValidationInput | Record<string, unknown>,
+  ): Promise<TaskRow | null> {
+    const goalId = this.taskGoalIdFromInput(input);
+    const title = this.firstBriefString(input, ['title']);
+    if (!goalId || !title) return null;
+    const allTasks = await this.db.tasks.list({ teamId }).catch(() => [] as TaskRow[]);
+    const matches = allTasks.filter((candidate) => {
+      const candidateGoal = this.taskGoalIdFromInput(this.taskBriefInputFromTask(candidate));
+      return candidateGoal === goalId && this.taskTitlesLookDuplicate(candidate.title, title);
+    });
+    if (!matches.length) return null;
+    const statusPriority: Record<TaskRow['status'], number> = { doing: 0, todo: 1, done: 2 };
+    matches.sort((a, b) => {
+      const statusDelta = statusPriority[a.status] - statusPriority[b.status];
+      if (statusDelta !== 0) return statusDelta;
+      return b.updated_at - a.updated_at;
+    });
+    return matches[0] || null;
+  }
+
+  private duplicateTaskResponse(existing: TaskRow): Record<string, unknown> {
+    return {
+      message: `Task duplicates existing ${existing.status} task ${this.taskShortRef(existing)} ("${existing.title}") with the same Goal ID and overlapping title.`,
+      existing_task: existing.name,
+      existing_task_ref: this.taskShortRef(existing),
+      existing_status: existing.status,
+      existing_title: existing.title,
+    };
+  }
+
   private defaultValidatorName(agent: AgentRow | null | undefined): string | null {
     if (!agent) return null;
     const alias = typeof (agent.metadata as any)?.alias === 'string' ? (agent.metadata as any).alias : '';
@@ -4343,6 +4416,16 @@ Return this JSON shape:
         message: validatorGuard.message,
         ...(validatorGuard.existingTask ? { existing_task: validatorGuard.existingTask } : {}),
       });
+    }
+
+    const duplicateTask = await this.findDuplicateTaskByGoalSignature(teamId, {
+      ...body,
+      ...taskSpec,
+      title: taskSpec.title,
+      description,
+    });
+    if (duplicateTask) {
+      throw makeAutoAttachError(409, 'duplicate_task_goal', this.duplicateTaskResponse(duplicateTask));
     }
 
     const leadBacklog = await this.leadDelegationBacklogGuard({
@@ -8155,6 +8238,18 @@ Return this JSON shape:
             error: validatorGuard.code,
             message: validatorGuard.message,
             ...(validatorGuard.existingTask ? { existing_task: validatorGuard.existingTask } : {}),
+          });
+        }
+
+        const duplicateTask = await this.findDuplicateTaskByGoalSignature(taskTeamId, {
+          ...body,
+          title,
+          description: taskDescription,
+        });
+        if (duplicateTask) {
+          return res.status(409).json({
+            error: 'duplicate_task_goal',
+            ...this.duplicateTaskResponse(duplicateTask),
           });
         }
 
@@ -12015,6 +12110,19 @@ Return this JSON shape:
                 message: validatorGuard.message,
                 ...(validatorGuard.existingTask ? { existing_task: validatorGuard.existingTask } : {}),
               },
+            };
+          }
+
+          const duplicateTask = await this.findDuplicateTaskByGoalSignature(taskTeamId, {
+            title,
+            description: taskDescription,
+            goal_id: goalId,
+          });
+          if (duplicateTask) {
+            return {
+              ok: false,
+              error: 'duplicate_task_goal',
+              result: this.duplicateTaskResponse(duplicateTask),
             };
           }
 
