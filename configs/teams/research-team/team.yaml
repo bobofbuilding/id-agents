@@ -32,6 +32,34 @@ agents:
       directly and delegates everything substantial. Returns substantial
       accomplishment packets through default/coder and default/researcher
       validation before default/lead treats the work as final.
+    catalog:
+      role: >
+        Coordinates the research team: decomposes research objectives,
+        delegates to analysts/researchers, and synthesizes validated findings
+        for default-team validators. Primary liaison for knowledge, sourcing,
+        and fact-checking work.
+      expertise:
+        - orchestration
+        - team-coordination
+        - research
+        - synthesis
+        - analysis
+        - brain-memory
+        - opportunity-tracking
+        - bittrees-research
+      bittreesLanes:
+        - DISCOVERY
+        - AWARENESS
+        - RESEARCH
+      bittreesContext: >
+        Research team coordination; ensures Bittrees discovery and awareness
+        tasks are sourced, verified, assigned, and delivered on cadence.
+      notSuitableFor:
+        - direct code implementation
+        - wallet or onchain execution
+        - ops coordination outside research scope
+      costTier: high
+      status: available
     # Per-agent skills MERGE with the defaults above.
     skills:
       - team-coordinator
