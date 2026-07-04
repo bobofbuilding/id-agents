@@ -3431,6 +3431,7 @@ Return this JSON shape:
     await this.cancelPendingQueriesForAgent(teamId, agent.id);
     await this.killAgentProcess(agent.port);
     await new Promise(r => setTimeout(r, 1000));
+    this.refreshPersonalityFileForRebuild(agent);
     const spawnResult = await this.spawnLocalAgentProcess(teamId, teamName, {
       name: agent.name, id: agent.id, port: agent.port,
       model: agent.model, workingDirectory: agent.working_directory ?? undefined,
@@ -3440,6 +3441,59 @@ Return this JSON shape:
       await this.db.agents.updateStatus(agent.id, 'running');
     }
     return spawnResult;
+  }
+
+  private refreshPersonalityFileForRebuild(agent: AgentRow): void {
+    const runtime = resolveRuntime(agent.runtime);
+    const workingDirectory = agent.working_directory || `${this.baseWorkDir}/agents/${agent.id}`;
+    if (!existsSync(workingDirectory)) mkdirSync(workingDirectory, { recursive: true });
+
+    const tail = this.extractPersonalityTailForRebuild(workingDirectory, runtime);
+    const parts = [PROTOCOL_DEFAULTS];
+    if (tail) parts.push(tail);
+    writePersonalityFile(workingDirectory, runtime, parts.join('\n\n'));
+  }
+
+  private extractPersonalityTailForRebuild(workingDirectory: string, runtime: HarnessType | string): string {
+    const rp = getRuntimePaths(runtime);
+    const personalityPath = path.join(workingDirectory, rp.personalityFile);
+    if (!existsSync(personalityPath)) return '';
+
+    let body = '';
+    try {
+      const existing = readFileSync(personalityPath, 'utf-8');
+      if (rp.overlayTarget === '.claude') {
+        body = existing.trim();
+      } else {
+        const begin = '<!-- BEGIN id-agents framework -->';
+        const end = '<!-- END id-agents framework -->';
+        const start = existing.indexOf(begin);
+        const finish = start >= 0 ? existing.indexOf(end, start + begin.length) : -1;
+        if (start < 0 || finish < 0) return '';
+        body = existing.slice(start + begin.length, finish).trim();
+      }
+    } catch {
+      return '';
+    }
+
+    const memoryAnchor = 'Load relevant memories at the start of any non-trivial task. Verify file paths and symbols in memories are still current before acting on them.';
+    let tail = '';
+    const memoryIdx = body.indexOf(memoryAnchor);
+    if (memoryIdx >= 0) {
+      tail = body.slice(memoryIdx + memoryAnchor.length).trim();
+    } else {
+      for (const anchor of ['## Team coordination', '## Source And Authority Guardrail', '<!-- BEGIN id-agents org -->']) {
+        const idx = body.indexOf(anchor);
+        if (idx >= 0) {
+          tail = body.slice(idx).trim();
+          break;
+        }
+      }
+    }
+
+    return tail
+      .replace(/<!-- BEGIN id-agents org -->[\s\S]*?<!-- END id-agents org -->/g, '')
+      .trim();
   }
 
   private async handleRuntimeRateLimitFailover(

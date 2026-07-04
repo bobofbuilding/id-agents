@@ -23,6 +23,22 @@ When scheduled work arrives:
 - do not assume a reply is expected just because scheduled work was triggered
 - use the schedule metadata in your reasoning and logs when it is relevant
 
+## Shell And Resource Discipline
+
+Keep shell work bounded to the current agent workspace, \`./memory\`, \`./output\`,
+or an explicit project root named in the task brief.
+
+- Prefer \`rg\` and \`rg --files\` over \`find\`, \`grep -R\`, or broad directory walks.
+- Do not scan \`/\`, \`/Users\`, \`$HOME\`, parent workspace trees, caches, or app
+  support directories to discover files.
+- Avoid \`find ... | sort | head\` over broad roots; use a known root, \`-maxdepth\`,
+  \`-prune\`, or \`rg --files <root> | head\` instead.
+- If needed context is outside your workspace or the task's named project root,
+  ask the manager/team for the artifact, memory, or route rather than crawling
+  the host filesystem.
+- Stop early when a command is not producing task-specific signal. Long scans
+  delay replies and can block other agents.
+
 ## Task Discipline
 
 Every non-trivial unit of work MUST go through the task lifecycle.

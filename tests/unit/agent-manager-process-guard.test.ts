@@ -1098,6 +1098,62 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     }
   });
 
+  it('refreshes framework instructions during agent rebuild without duplicating stale org sidecar text', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const agentDir = path.join(workDir, 'agent-refresh');
+    fs.mkdirSync(agentDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(agentDir, 'AGENTS.md'),
+      `# user notes
+
+<!-- BEGIN id-agents framework -->
+## Scheduling
+
+old protocol body
+
+### When to read
+Load relevant memories at the start of any non-trivial task. Verify file paths and symbols in memories are still current before acting on them.
+
+## Team coordination
+keep this role-specific coordination text
+
+<!-- BEGIN id-agents org -->
+old org text that should be replaced
+<!-- END id-agents org -->
+<!-- END id-agents framework -->
+
+## user tail
+preserve me
+`,
+    );
+    fs.writeFileSync(
+      path.join(agentDir, '.id-instructions.md'),
+      `<!-- BEGIN id-agents org -->
+new org text from sidecar
+<!-- END id-agents org -->
+`,
+    );
+
+    (manager as any).refreshPersonalityFileForRebuild(agentRow({
+      id: 'agent-refresh',
+      name: 'refresh-agent',
+      runtime: 'codex',
+      working_directory: agentDir,
+    }));
+
+    const out = fs.readFileSync(path.join(agentDir, 'AGENTS.md'), 'utf-8');
+    expect(out).toContain('# user notes');
+    expect(out).toContain('## Shell And Resource Discipline');
+    expect(out).toContain('keep this role-specific coordination text');
+    expect(out).toContain('new org text from sidecar');
+    expect(out).not.toContain('old protocol body');
+    expect(out).not.toContain('old org text that should be replaced');
+    expect(out).toContain('## user tail');
+  });
+
   it('rejects /ask before dispatch when the target agent queue is saturated', async () => {
     const saved = process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
     process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT = '2';

@@ -15,9 +15,10 @@
  *
  * 2. **Structural**: greps src/agent-manager-db.ts source to assert
  *    that no `writeFileSync(personalityPath, ...)` call survives, and
- *    that every personality-write path is paired with a
+ *    that every spawn/sync personality-write path is paired with a
  *    `writePersonalityFile(workingDirectory, ...)` call followed by a
- *    `appendLibraryPersonaToAgentsMd(...)` invocation. Catches a
+ *    `appendLibraryPersonaToAgentsMd(...)` invocation, and rebuild refreshes
+ *    the framework block before respawn. Catches a
  *    regression that would re-introduce the old wholesale-rewrite
  *    behavior even if the helpers themselves remain correct.
  */
@@ -171,11 +172,12 @@ describe('agent-manager-db spawn-flow wiring guard', () => {
     expect(source).not.toMatch(/writeFileSync\(\s*personalityPath/);
   });
 
-  it('all four spawn-flow paths call writePersonalityFile + appendLibraryPersonaToAgentsMd', () => {
+  it('spawn-flow paths call writePersonalityFile + appendLibraryPersonaToAgentsMd, and rebuild refreshes framework', () => {
     const writeCalls = source.match(/writePersonalityFile\(workingDirectory,/g) ?? [];
     const appendCalls = source.match(/appendLibraryPersonaToAgentsMd\(workingDirectory,/g) ?? [];
-    expect(writeCalls.length).toBe(4);
+    expect(writeCalls.length).toBeGreaterThanOrEqual(5);
     expect(appendCalls.length).toBe(4);
+    expect(source).toContain('this.refreshPersonalityFileForRebuild(agent)');
   });
 
   it('writePersonalityFile is imported from config-parser', () => {

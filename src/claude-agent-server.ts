@@ -110,6 +110,9 @@ const DEFAULT_CONTROL_PLANE_QUERY_TIMEOUT_MS = 90_000;
 const DEFAULT_VALIDATION_CONTROL_PLANE_QUERY_TIMEOUT_MS = 180_000;
 const MIN_CONTROL_PLANE_QUERY_TIMEOUT_MS = 15_000;
 const MAX_CONTROL_PLANE_QUERY_TIMEOUT_MS = 600_000;
+const DEFAULT_DELEGATION_QUERY_TIMEOUT_MS = 12 * 60_000;
+const MIN_DELEGATION_QUERY_TIMEOUT_MS = 60_000;
+const MAX_DELEGATION_QUERY_TIMEOUT_MS = 60 * 60_000;
 
 const VALIDATION_CONTROL_PLANE_PROMPT_PATTERNS = [
   /^Please validate\b[\s\S]*\bagainst task\s+#?[a-z0-9_-]+/i,
@@ -140,13 +143,28 @@ function readControlPlaneTimeoutEnv(name: string, defaultMs: number): number {
   );
 }
 
+function readDelegationTimeoutEnv(): number {
+  const raw = process.env.ID_AGENT_DELEGATION_QUERY_TIMEOUT_MS;
+  if (!raw) return DEFAULT_DELEGATION_QUERY_TIMEOUT_MS;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_DELEGATION_QUERY_TIMEOUT_MS;
+  return Math.min(
+    MAX_DELEGATION_QUERY_TIMEOUT_MS,
+    Math.max(MIN_DELEGATION_QUERY_TIMEOUT_MS, parsed),
+  );
+}
+
 function isValidationControlPlanePrompt(prompt: string): boolean {
   const text = String(prompt || '').trimStart();
   return VALIDATION_CONTROL_PLANE_PROMPT_PATTERNS.some((pattern) => pattern.test(text));
 }
 
 export function queryExecutionTimeoutMsForPrompt(prompt: string): number | undefined {
-  if (!shouldSuppressMcpForPrompt(prompt)) return undefined;
+  if (!shouldSuppressMcpForPrompt(prompt)) {
+    return isDelegationPrompt(String(prompt || '').trimStart())
+      ? readDelegationTimeoutEnv()
+      : undefined;
+  }
   if (isValidationControlPlanePrompt(prompt)) {
     return readControlPlaneTimeoutEnv(
       'ID_AGENT_VALIDATION_CONTROL_QUERY_TIMEOUT_MS',
@@ -2455,7 +2473,8 @@ ${prompt}`
       }
       const executionTimeoutMs = queryExecutionTimeoutMsForPrompt(promptWithSender);
       if (executionTimeoutMs) {
-        console.log(`${logTime()} [Agent] Control-plane timeout for ${queryId}: ${executionTimeoutMs}ms`);
+        const timeoutKind = suppressMcp ? 'Control-plane' : 'Delegation';
+        console.log(`${logTime()} [Agent] ${timeoutKind} timeout for ${queryId}: ${executionTimeoutMs}ms`);
       }
 
       stopExternalQueryWatcher = this.startExternalQueryStopWatcher(queryId, (error) => {
@@ -2477,7 +2496,7 @@ ${prompt}`
         queryId,
         timeoutMs: executionTimeoutMs,
         onTimeout: () => {
-          console.warn(`${logTime()} [Agent] Control-plane timeout hit for ${queryId}; cancelling harness`);
+          console.warn(`${logTime()} [Agent] Query timeout hit for ${queryId}; cancelling harness`);
           this.harness.cancel?.();
         },
       })) {

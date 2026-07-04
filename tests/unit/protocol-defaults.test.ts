@@ -14,6 +14,13 @@ describe('PROTOCOL_DEFAULTS', () => {
     expect(PROTOCOL_DEFAULTS).toContain('manager-owned scheduler');
   });
 
+  it('bounds shell and filesystem discovery', () => {
+    expect(PROTOCOL_DEFAULTS).toContain('## Shell And Resource Discipline');
+    expect(PROTOCOL_DEFAULTS).toContain('Prefer `rg` and `rg --files`');
+    expect(PROTOCOL_DEFAULTS).toContain('Do not scan `/`, `/Users`, `$HOME`');
+    expect(PROTOCOL_DEFAULTS).toContain('Long scans');
+  });
+
   it('contains task discipline section', () => {
     expect(PROTOCOL_DEFAULTS).toContain('## Task Discipline');
     expect(PROTOCOL_DEFAULTS).toContain('task lifecycle');

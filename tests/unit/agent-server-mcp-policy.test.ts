@@ -151,17 +151,21 @@ Please inspect the repository, edit the integration, and run the test suite.`)).
       .toEqual(configured);
   });
 
-  it('bounds control-plane query runtime while leaving normal work unbounded', () => {
+  it('bounds control-plane and delegation query runtime while leaving normal work unbounded', () => {
     const priorControl = process.env.ID_AGENT_CONTROL_QUERY_TIMEOUT_MS;
     const priorValidation = process.env.ID_AGENT_VALIDATION_CONTROL_QUERY_TIMEOUT_MS;
+    const priorDelegation = process.env.ID_AGENT_DELEGATION_QUERY_TIMEOUT_MS;
     delete process.env.ID_AGENT_CONTROL_QUERY_TIMEOUT_MS;
     delete process.env.ID_AGENT_VALIDATION_CONTROL_QUERY_TIMEOUT_MS;
+    delete process.env.ID_AGENT_DELEGATION_QUERY_TIMEOUT_MS;
 
     try {
       expect(queryExecutionTimeoutMsForPrompt('Backlog guard: task #12345678 has been active 60m with no progress update.'))
         .toBe(90_000);
       expect(queryExecutionTimeoutMsForPrompt('Validation request for run-baseline-cycle (#784ff464), goal goal_1. Read the artifact and reply PASS or FAIL.'))
         .toBe(180_000);
+      expect(queryExecutionTimeoutMsForPrompt('TASK DELEGATION from manager: You are assigned task #12345678 ("Bounded work").'))
+        .toBe(720_000);
       expect(queryExecutionTimeoutMsForPrompt('Implement a filesystem-backed MCP integration and cite the changed files.'))
         .toBeUndefined();
     } finally {
@@ -169,6 +173,8 @@ Please inspect the repository, edit the integration, and run the test suite.`)).
       else process.env.ID_AGENT_CONTROL_QUERY_TIMEOUT_MS = priorControl;
       if (priorValidation === undefined) delete process.env.ID_AGENT_VALIDATION_CONTROL_QUERY_TIMEOUT_MS;
       else process.env.ID_AGENT_VALIDATION_CONTROL_QUERY_TIMEOUT_MS = priorValidation;
+      if (priorDelegation === undefined) delete process.env.ID_AGENT_DELEGATION_QUERY_TIMEOUT_MS;
+      else process.env.ID_AGENT_DELEGATION_QUERY_TIMEOUT_MS = priorDelegation;
     }
   });
 
@@ -186,6 +192,23 @@ Please inspect the repository, edit the integration, and run the test suite.`)).
     } finally {
       if (priorControl === undefined) delete process.env.ID_AGENT_CONTROL_QUERY_TIMEOUT_MS;
       else process.env.ID_AGENT_CONTROL_QUERY_TIMEOUT_MS = priorControl;
+    }
+  });
+
+  it('clamps configured delegation query timeouts', () => {
+    const priorDelegation = process.env.ID_AGENT_DELEGATION_QUERY_TIMEOUT_MS;
+    process.env.ID_AGENT_DELEGATION_QUERY_TIMEOUT_MS = '1000';
+
+    try {
+      expect(queryExecutionTimeoutMsForPrompt('TASK DELEGATION from manager: You are assigned task #12345678 ("Bounded work").'))
+        .toBe(60_000);
+
+      process.env.ID_AGENT_DELEGATION_QUERY_TIMEOUT_MS = '999999999';
+      expect(queryExecutionTimeoutMsForPrompt('TASK DELEGATION from manager: You are assigned task #12345678 ("Bounded work").'))
+        .toBe(3_600_000);
+    } finally {
+      if (priorDelegation === undefined) delete process.env.ID_AGENT_DELEGATION_QUERY_TIMEOUT_MS;
+      else process.env.ID_AGENT_DELEGATION_QUERY_TIMEOUT_MS = priorDelegation;
     }
   });
 });
