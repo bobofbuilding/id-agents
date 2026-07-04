@@ -44,6 +44,19 @@ type ExternalStopQueryStatus = 'cancelled' | 'expired' | 'failed';
 
 const EXTERNAL_STOP_QUERY_STATUSES = new Set<ExternalStopQueryStatus>(['cancelled', 'expired', 'failed']);
 
+const MCP_CONTROL_PLANE_PROMPT_PATTERNS = [
+  /^\[Message from agent "[^"]+"\s*\|[^\n]*\]\s*\n[\s\S]*\n\[Incoming Reply from "[^"]+"\]/,
+  /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nHeartbeat:/,
+  /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nSupervision:/,
+  /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nSupervision probe on task\b/,
+  /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nBacklog guard:/,
+];
+
+export function shouldSuppressMcpForPrompt(prompt: string): boolean {
+  const text = String(prompt || '').trimStart();
+  return MCP_CONTROL_PLANE_PROMPT_PATTERNS.some((pattern) => pattern.test(text));
+}
+
 class ExternalQueryStopError extends Error {
   constructor(
     readonly queryId: string,
@@ -2021,7 +2034,11 @@ ${prompt}`
 
       // Read MCP servers from env (set by manager via buildLocalAgentEnv).
       // ID_MCP_SERVERS is a JSON array of McpServerSpec; parsing is tolerant.
-      const mcpServers = parseMcpServersEnv(process.env.ID_MCP_SERVERS);
+      const suppressMcp = shouldSuppressMcpForPrompt(promptWithSender);
+      const mcpServers = suppressMcp ? undefined : parseMcpServersEnv(process.env.ID_MCP_SERVERS);
+      if (suppressMcp && process.env.ID_MCP_SERVERS) {
+        console.log(`${logTime()} [Agent] MCP suppressed for control-plane prompt ${queryId}`);
+      }
 
       stopExternalQueryWatcher = this.startExternalQueryStopWatcher(queryId, (error) => {
         externalStopError ??= error;
