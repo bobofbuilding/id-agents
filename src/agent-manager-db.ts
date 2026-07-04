@@ -823,7 +823,22 @@ export class AgentManagerDb {
 
     const tasks = await this.db.tasks.list({ teamId: params.teamId }).catch(() => [] as TaskRow[]);
     for (const candidate of tasks) {
-      if (candidate.status === 'done') continue;
+      if (candidate.status === 'done') {
+        // Block post-terminal child creation: if this done task is the referenced
+        // parent, reject — validator tasks must be created before the parent closes.
+        const shortId = candidate.uuid ? candidate.uuid.replace(/-/g, '').slice(0, 8).toLowerCase() : '';
+        const parentRefWithoutHash = key.parentRef.replace(/^#/, '');
+        const isParent = this.normalizeGuardKey(candidate.name) === key.parentRef
+          || (shortId && (shortId === parentRefWithoutHash || this.normalizeGuardKey(`#${shortId}`) === key.parentRef));
+        if (isParent) {
+          return {
+            status: 409,
+            code: 'validator_child_post_terminal_blocked',
+            message: `Cannot create a validator child task: parent task "${candidate.name}" is already done. Create validator tasks before closing the parent.`,
+          };
+        }
+        continue;
+      }
       const owner = candidate.owner ? await this.db.agents.getById(candidate.owner).catch(() => null) : null;
       const candidateKey = this.validationChildKey(this.taskBriefInputFromTask(candidate), this.defaultValidatorName(owner));
       if (!candidateKey) continue;

@@ -1033,6 +1033,56 @@ describe('/talk-to auto-attach', () => {
     expect(duplicateBody.existing_task).toBe('validate-parent-alpha-coder');
   });
 
+  it('rejects validator children created after the parent task is terminal', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    await db.tasks.create({
+      id: 'task_terminal_parent',
+      name: 'terminal-parent',
+      uuid: '12345678-1234-4234-8234-123456789abc',
+      team_id: teamId,
+      title: 'Terminal parent',
+      description: 'Parent already closed',
+      status: 'done',
+      created_by: dispatcherId,
+      owner: dispatcherId,
+      created_at: now - 120,
+      updated_at: now - 60,
+      completed_at: now - 60,
+    });
+
+    const child = await fetch(`${baseUrl}/tasks`, {
+      method: 'POST',
+      headers: adminHeaders(TEAM),
+      body: JSON.stringify({
+        title: 'Validate terminal parent coder',
+        name: 'validate-terminal-parent-coder',
+        from: 'manager',
+        parent_task: 'terminal-parent',
+        validation_purpose: 'coder technical validation',
+        ...validBriefFields(),
+      }),
+    });
+    expect(child.status).toBe(409);
+    const childBody = await child.json() as { error: string };
+    expect(childBody.error).toBe('validator_child_post_terminal_blocked');
+
+    const childByShortId = await fetch(`${baseUrl}/tasks`, {
+      method: 'POST',
+      headers: adminHeaders(TEAM),
+      body: JSON.stringify({
+        title: 'Validate terminal parent by id coder',
+        name: 'validate-terminal-parent-by-id-coder',
+        from: 'manager',
+        parent_task: '#12345678',
+        validation_purpose: 'coder technical validation',
+        ...validBriefFields(),
+      }),
+    });
+    expect(childByShortId.status).toBe(409);
+    const childByShortIdBody = await childByShortId.json() as { error: string };
+    expect(childByShortIdBody.error).toBe('validator_child_post_terminal_blocked');
+  });
+
   it('blocks validators from creating validator tasks and routes low-relevance live dispatch to backlog', async () => {
     const recursive = await fetch(`${baseUrl}/tasks`, {
       method: 'POST',
