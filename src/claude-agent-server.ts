@@ -301,6 +301,56 @@ export function evaluateValidatorRecommendationRouteGuard(params: {
   };
 }
 
+function parseJsonObjectMessage(message: unknown): Record<string, unknown> | null {
+  if (typeof message !== 'string') return null;
+  let text = message.trim();
+  const fenced = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  if (fenced) text = fenced[1].trim();
+  if (!text.startsWith('{') || !text.endsWith('}')) return null;
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function hasHighOrMediumRecommendation(packet: Record<string, unknown>): boolean {
+  const recommendations = Array.isArray(packet.next_step_recommendations)
+    ? packet.next_step_recommendations
+    : [];
+  return recommendations.some((item) => {
+    if (!item || typeof item !== 'object') return false;
+    const priority = String((item as Record<string, unknown>).priority || '').trim().toLowerCase();
+    return /\b(high|medium)\b/.test(priority);
+  });
+}
+
+export function shouldSuppressPrimaryLeadValidatorNoopWake(params: {
+  isPrimaryLead: boolean;
+  newsType: string;
+  from?: unknown;
+  inReplyTo?: unknown;
+  message?: unknown;
+}): boolean {
+  if (!params.isPrimaryLead) return false;
+  if (params.newsType !== 'reply') return false;
+  if (typeof params.inReplyTo !== 'string' || !params.inReplyTo.trim()) return false;
+
+  const sender = typeof params.from === 'string' ? params.from.trim().toLowerCase() : '';
+  if (sender !== 'coder' && sender !== 'researcher') return false;
+
+  const packet = parseJsonObjectMessage(params.message);
+  if (!packet) return false;
+
+  const status = String(packet.validation_status || '').trim().toLowerCase();
+  if (status !== 'approved') return false;
+
+  return !hasHighOrMediumRecommendation(packet);
+}
+
 // Waiter for replies to outbound messages (used by /talk-to endpoint)
 // Waiters persist until reply arrives - timeout only affects HTTP response
 interface ReplyWaiter {
@@ -1354,6 +1404,24 @@ export class AgentRestServer {
 
         // If trigger is true, process the message with the LLM
         if (trigger && from) {
+          if (shouldSuppressPrimaryLeadValidatorNoopWake({
+            isPrimaryLead: this.isPrimaryLeadIdentity(),
+            newsType,
+            from,
+            inReplyTo: in_reply_to,
+            message: newsMessage,
+          })) {
+            console.log(`${logTime()} [Agent] Suppressed primary-lead wake for approved validator packet with no dispatch-ready recommendations from ${from}`);
+            return res.status(202).json({
+              success: true,
+              type: newsType,
+              timestamp: ts,
+              triggered: false,
+              suppressed: true,
+              reason: 'validator_approved_no_dispatch_ready_recommendations',
+            });
+          }
+
           const deferReason = await this.getPeerBusyDeferReason(from);
           if (deferReason) {
             console.log(`${logTime()} [Agent] Deferred triggered news wake from ${from}: ${newsMessage.substring(0, 80)}...`);
