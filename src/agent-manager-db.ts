@@ -1400,6 +1400,89 @@ export class AgentManagerDb {
     return `Backlog guard: task ${ref} ("${task.title}") has been active ${stalledMinutes}m with no progress update. New task assignment to you is held until this task is updated, completed, or reassigned. If it is done, mark it done now with \`/task done ${ref}\`. If blocked, reply with the blocker.`;
   }
 
+  private stalledTaskManagerFallbackPrompt(params: {
+    teamName: string;
+    task: TaskRow;
+    ref: string;
+    stalledMinutes: number;
+    ownerName: string;
+    reason: 'no_live_lead' | 'lead_busy' | 'owner_busy';
+    leadName?: string;
+  }): string {
+    const ownerState = params.reason === 'owner_busy'
+      ? `owner ${params.ownerName} already has another active query`
+      : `owner ${params.ownerName} is not live`;
+    const leadState = params.reason === 'lead_busy'
+      ? `team lead ${params.leadName || 'lead'} is busy with another active query`
+      : params.reason === 'no_live_lead'
+        ? 'there is no live team lead'
+        : 'manual jumpstart was requested';
+    return `Backlog guard: ${params.teamName} task ${params.ref} ("${params.task.title}") has been active ${params.stalledMinutes}m, ${ownerState}, and ${leadState}. New task assignment to that owner is held until this is triaged. Please route it through the task-manager flow: restart or replace the owner, reassign the task, split it into member-owned work, or park it as todo with a clear blocker.`;
+  }
+
+  private async routeStalledTaskToTaskManagerFallback(params: {
+    teamId: string;
+    teamName: string;
+    task: TaskRow;
+    ref: string;
+    stalledMinutes: number;
+    ownerName: string;
+    nowMs: number;
+    renudgeMs: number;
+    maxProbes: number;
+    force?: boolean;
+    reason: 'no_live_lead' | 'lead_busy' | 'owner_busy';
+    eventReason: 'owner_unavailable' | 'owner_busy' | 'lead_delegation_required' | 'probe_limit_reached' | 'unclaimed';
+    leadName?: string;
+  }): Promise<{ status: string; taskRef: string; actor?: string; actorTeam?: string; attempt?: number } | null> {
+    const taskManagers = await this.findTaskManagerFallbacks().catch(() => []);
+    if (!taskManagers.length) return null;
+    let lastBlocked: { status: string; taskRef: string; actor?: string; actorTeam?: string } | null = null;
+    for (const taskManager of taskManagers) {
+      const key = `task:${params.task.id}:task-manager-fallback:${params.reason}:${taskManager.agent.id}`;
+      if (!this.canRunStalledProbeForTriage(key, params.nowMs, params.renudgeMs, params.maxProbes, params.force)) {
+        lastBlocked = {
+          status: 'throttled',
+          taskRef: params.ref,
+          actor: taskManager.agent.name,
+          actorTeam: taskManager.team.name,
+        };
+        continue;
+      }
+      const pending = await this.loadPendingQueriesForRecipient(taskManager.agent).catch(() => [] as QueryRow[]);
+      if (this.hasAnyActiveQueryFromRows(pending)) {
+        lastBlocked = {
+          status: 'task_manager_busy',
+          taskRef: params.ref,
+          actor: taskManager.agent.name,
+          actorTeam: taskManager.team.name,
+        };
+        continue;
+      }
+      const prevProbe = this.stalledNudges.get(key);
+      const attempt = this.markStalledProbe(key, params.nowMs);
+      const msg = this.stalledTaskManagerFallbackPrompt(params);
+      if (await this.sendSupervisionAsk(taskManager.team.name, taskManager.agent.name, msg)) {
+        await this.recordTaskSupervision(params.task, params.teamId, taskManager.agent.id, params.eventReason, params.stalledMinutes, params.nowMs);
+        return {
+          status: 'sent_task_manager',
+          taskRef: params.ref,
+          actor: taskManager.agent.name,
+          actorTeam: taskManager.team.name,
+          attempt,
+        };
+      }
+      this.restoreStalledProbe(key, prevProbe);
+      lastBlocked = {
+        status: 'send_failed',
+        taskRef: params.ref,
+        actor: taskManager.agent.name,
+        actorTeam: taskManager.team.name,
+      };
+    }
+    return lastBlocked;
+  }
+
   private async triageStalledOwnerBacklog(params: {
     teamId: string;
     teamName: string;
@@ -1422,6 +1505,23 @@ export class AgentManagerDb {
       const pending = await this.loadPendingQueriesForRecipient(params.owner).catch(() => [] as QueryRow[]);
       const state = this.supervisionQueryStateFromRows(params.teamId, pending, ref);
       if (state.hasActiveSupervisionAsk || state.hasAnyActiveQuery) {
+        if (params.force) {
+          const fallback = await this.routeStalledTaskToTaskManagerFallback({
+            teamId: params.teamId,
+            teamName: params.teamName,
+            task,
+            ref,
+            stalledMinutes,
+            ownerName,
+            nowMs: params.nowMs,
+            renudgeMs,
+            maxProbes,
+            force: params.force,
+            reason: 'owner_busy',
+            eventReason: this.isConfiguredTeamLead(params.teamName, params.owner) ? 'lead_delegation_required' : 'owner_busy',
+          });
+          if (fallback) return fallback;
+        }
         return { status: 'owner_busy', taskRef: ref, actor: ownerName };
       }
       const prevProbe = this.stalledNudges.get(key);
@@ -1450,52 +1550,21 @@ export class AgentManagerDb {
     const candidateLead = await this.findSupervisionLead(params.teamId).catch(() => null);
     const lead = this.isConfiguredTeamLead(params.teamName, candidateLead) ? candidateLead : null;
     if (!lead) {
-      const taskManagers = await this.findTaskManagerFallbacks().catch(() => []);
-      if (!taskManagers.length) return { status: 'no_lead', taskRef: ref };
-      let lastBlocked: { status: string; taskRef: string; actor?: string; actorTeam?: string } | null = null;
-      for (const taskManager of taskManagers) {
-        const key = `task:${task.id}:task-manager-fallback:${taskManager.agent.id}`;
-        if (!this.canRunStalledProbeForTriage(key, params.nowMs, renudgeMs, maxProbes, params.force)) {
-          lastBlocked = {
-            status: 'throttled',
-            taskRef: ref,
-            actor: taskManager.agent.name,
-            actorTeam: taskManager.team.name,
-          };
-          continue;
-        }
-        const pending = await this.loadPendingQueriesForRecipient(taskManager.agent).catch(() => [] as QueryRow[]);
-        if (this.hasAnyActiveQueryFromRows(pending)) {
-          lastBlocked = {
-            status: 'task_manager_busy',
-            taskRef: ref,
-            actor: taskManager.agent.name,
-            actorTeam: taskManager.team.name,
-          };
-          continue;
-        }
-        const prevProbe = this.stalledNudges.get(key);
-        const attempt = this.markStalledProbe(key, params.nowMs);
-        const msg = `Backlog guard: ${params.teamName} task ${ref} ("${task.title}") has been active ${stalledMinutes}m, owner ${ownerName} is not live, and there is no live team lead. New task assignment to that owner is held until this is triaged. Please route it through the task-manager flow: restart or replace the owner, reassign the task, or park it as todo with a clear blocker.`;
-        if (await this.sendSupervisionAsk(taskManager.team.name, taskManager.agent.name, msg)) {
-          await this.recordTaskSupervision(task, params.teamId, taskManager.agent.id, 'owner_unavailable', stalledMinutes, params.nowMs);
-          return {
-            status: 'sent_task_manager',
-            taskRef: ref,
-            actor: taskManager.agent.name,
-            actorTeam: taskManager.team.name,
-            attempt,
-          };
-        }
-        this.restoreStalledProbe(key, prevProbe);
-        lastBlocked = {
-          status: 'send_failed',
-          taskRef: ref,
-          actor: taskManager.agent.name,
-          actorTeam: taskManager.team.name,
-        };
-      }
-      return lastBlocked || { status: 'no_lead', taskRef: ref };
+      const fallback = await this.routeStalledTaskToTaskManagerFallback({
+        teamId: params.teamId,
+        teamName: params.teamName,
+        task,
+        ref,
+        stalledMinutes,
+        ownerName,
+        nowMs: params.nowMs,
+        renudgeMs,
+        maxProbes,
+        force: params.force,
+        reason: 'no_live_lead',
+        eventReason: 'owner_unavailable',
+      });
+      return fallback || { status: 'no_lead', taskRef: ref };
     }
     const key = `task:${task.id}:owner-unavailable`;
     if (!this.canRunStalledProbeForTriage(key, params.nowMs, renudgeMs, maxProbes, params.force)) {
@@ -1504,6 +1573,22 @@ export class AgentManagerDb {
     const pending = await this.loadPendingQueriesForRecipient(lead).catch(() => [] as QueryRow[]);
     const state = this.supervisionQueryStateFromRows(params.teamId, pending, ref);
     if (state.hasActiveSupervisionAsk || state.hasAnyActiveQuery) {
+      const fallback = await this.routeStalledTaskToTaskManagerFallback({
+        teamId: params.teamId,
+        teamName: params.teamName,
+        task,
+        ref,
+        stalledMinutes,
+        ownerName,
+        nowMs: params.nowMs,
+        renudgeMs,
+        maxProbes,
+        force: params.force,
+        reason: 'lead_busy',
+        eventReason: 'owner_unavailable',
+        leadName: lead.name,
+      });
+      if (fallback) return fallback;
       return { status: 'lead_busy', taskRef: ref, actor: lead.name };
     }
     const prevProbe = this.stalledNudges.get(key);
@@ -13319,7 +13404,7 @@ Return this JSON shape:
     task: TaskRow,
     teamId: string,
     actorAgentId: string | null,
-    reason: 'owner_refresh' | 'owner_unavailable' | 'unclaimed' | 'checkin_heartbeat_probe' | 'probe_limit_reached' | 'validator_stalled_terminal' | 'lead_delegation_required' | 'lead_owner_unavailable',
+    reason: 'owner_refresh' | 'owner_unavailable' | 'owner_busy' | 'unclaimed' | 'checkin_heartbeat_probe' | 'probe_limit_reached' | 'validator_stalled_terminal' | 'lead_delegation_required' | 'lead_owner_unavailable',
     stalledMinutes: number,
     nowMs: number,
   ): Promise<void> {

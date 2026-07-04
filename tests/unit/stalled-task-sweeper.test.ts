@@ -70,6 +70,25 @@ function task(overrides: Partial<TaskRow> = {}): TaskRow {
   };
 }
 
+function activeQuery(agentId: string, overrides: Record<string, any> = {}): any {
+  return {
+    team_id: TEAM_ID,
+    agent_id: agentId,
+    query_id: `query-${agentId}`,
+    status: 'processing',
+    prompt: 'in flight',
+    created: NOW_MS - 60_000,
+    completed: null,
+    result: null,
+    error: null,
+    session_id: null,
+    owner_kind: 'agent',
+    owner_id: agentId,
+    metadata: null,
+    ...overrides,
+  };
+}
+
 function fakeDb(overrides: Record<string, any> = {}): any {
   return {
     teams: {
@@ -100,6 +119,7 @@ function fakeDb(overrides: Record<string, any> = {}): any {
     },
     queries: {
       expireStale: vi.fn(async () => []),
+      expireQueuedPeerWakes: vi.fn(async () => []),
       getPending: vi.fn(async () => []),
       getPendingByOwner: vi.fn(async () => []),
       ...overrides.queries,
@@ -1099,6 +1119,133 @@ describe('stalled task sweeper', () => {
       actor_agent_id: 'task-master-id',
       data: expect.objectContaining({
         reason: 'owner_unavailable',
+        stalled_minutes: 60,
+      }),
+    }));
+  });
+
+  it('routes stalled-owner triage to task-master when the team lead is busy', async () => {
+    const unavailableOwner = agent({ status: 'stopped', runtime: 'public-agent-remote' });
+    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
+    const opsTeam = team({ id: 'ops-team-id', name: 'ops-team' });
+    const taskMaster = agent({
+      id: 'task-master-id',
+      team_id: opsTeam.id,
+      name: 'task-master',
+      status: 'running',
+    });
+    const db = fakeDb({
+      teams: {
+        getTeamByName: vi.fn(async (name: string) => name === 'ops-team' ? opsTeam : null),
+      },
+      agents: {
+        getById: vi.fn(async (id: string) => id === unavailableOwner.id ? unavailableOwner : null),
+        getByName: vi.fn(async (teamId: string, name: string) => {
+          if (teamId === opsTeam.id && name === 'task-master') return taskMaster;
+          return null;
+        }),
+        list: vi.fn(async (teamId: string) => teamId === opsTeam.id ? [taskMaster] : [unavailableOwner, lead]),
+      },
+      queries: {
+        getPending: vi.fn(async (agentId: string) => agentId === lead.id ? [activeQuery(lead.id)] : []),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-task-master-lead-busy-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const guard = await manager.stalledOwnerBacklogGuard({
+      teamId: TEAM_ID,
+      teamName: 'default',
+      owner: unavailableOwner,
+    });
+
+    expect(guard?.triage).toMatchObject({
+      status: 'sent_task_manager',
+      taskRef: '#12345678',
+      actor: 'task-master',
+      actorTeam: 'ops-team',
+    });
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'ops-team',
+      'task-master',
+      expect.stringContaining('team lead lead is busy'),
+    );
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      team_id: TEAM_ID,
+      topic: 'task:triaged',
+      actor_agent_id: 'task-master-id',
+      data: expect.objectContaining({
+        reason: 'owner_unavailable',
+        stalled_minutes: 60,
+      }),
+    }));
+  });
+
+  it('routes manual jumpstart to task-master when the stalled owner is busy', async () => {
+    const busyOwner = agent({ id: 'busy-owner', name: 'worker' });
+    const opsTeam = team({ id: 'ops-team-id', name: 'ops-team' });
+    const taskMaster = agent({
+      id: 'task-master-id',
+      team_id: opsTeam.id,
+      name: 'task-master',
+      status: 'running',
+    });
+    const stalled = task({ owner: busyOwner.id });
+    const db = fakeDb({
+      teams: {
+        getTeamByName: vi.fn(async (name: string) => name === 'ops-team' ? opsTeam : null),
+      },
+      agents: {
+        resolve: vi.fn(async (_teamId: string, ref: string) => ref === 'worker' ? [busyOwner] : []),
+        getById: vi.fn(async (id: string) => id === busyOwner.id ? busyOwner : null),
+        getByName: vi.fn(async (teamId: string, name: string) => {
+          if (teamId === opsTeam.id && name === 'task-master') return taskMaster;
+          return null;
+        }),
+        list: vi.fn(async (teamId: string) => teamId === opsTeam.id ? [taskMaster] : [busyOwner]),
+      },
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => status === 'doing' ? [stalled] : []),
+      },
+      queries: {
+        getPending: vi.fn(async (agentId: string) => agentId === busyOwner.id ? [activeQuery(busyOwner.id)] : []),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-task-master-owner-busy-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const result = await manager.executeRemoteCommand('/task jumpstart-stalled --owner worker --limit 1', TEAM_ID, 'default');
+
+    expect(result).toMatchObject({
+      ok: true,
+      result: {
+        triagedOwners: 1,
+        items: [
+          {
+            team: 'default',
+            owner: 'worker',
+            blockers: ['#12345678'],
+            triage: {
+              status: 'sent_task_manager',
+              taskRef: '#12345678',
+              actor: 'task-master',
+              actorTeam: 'ops-team',
+            },
+          },
+        ],
+      },
+    });
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'ops-team',
+      'task-master',
+      expect.stringContaining('owner worker already has another active query'),
+    );
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      team_id: TEAM_ID,
+      topic: 'task:triaged',
+      actor_agent_id: 'task-master-id',
+      data: expect.objectContaining({
+        reason: 'owner_busy',
         stalled_minutes: 60,
       }),
     }));
