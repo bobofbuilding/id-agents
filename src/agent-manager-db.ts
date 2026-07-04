@@ -1329,6 +1329,118 @@ export class AgentManagerDb {
     };
   }
 
+  private generatedBacklogReason(task: TaskRow, match: 'generated' | 'all'): string | null {
+    if (match === 'all') return 'unassigned_todo';
+    const description = task.description || '';
+    if (/\[goal:[^\]]+\]/i.test(description)) return 'goal_bracket_description';
+    if (/^Goal ID:/im.test(description)) return 'goal_id_description';
+    if (/^Priority:\s*(?:high|medium|low\/backlog|reject)\b/im.test(description) && /^Justification:/im.test(description)) {
+      return 'recommendation_description';
+    }
+    return null;
+  }
+
+  private async writeTaskPruneArchive(
+    teamName: string,
+    payload: Record<string, unknown>,
+  ): Promise<string> {
+    const safeTeam = teamName.replace(/[^a-z0-9._-]/gi, '_') || 'team';
+    const archiveDir = path.join(this.baseWorkDir, 'teams', safeTeam, 'archives');
+    if (!existsSync(archiveDir)) mkdirSync(archiveDir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const filepath = path.join(archiveDir, `task-prune-${stamp}.json`);
+    writeFileSync(filepath, JSON.stringify(payload, null, 2));
+    return filepath;
+  }
+
+  private async pruneBacklogTasks(params: {
+    teams: Array<{ id: string; name: string }>;
+    apply: boolean;
+    minAgeHours: number;
+    match: 'generated' | 'all';
+    limit: number;
+  }): Promise<Record<string, unknown>> {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const cutoff = nowSec - Math.round(params.minAgeHours * 3600);
+    const resultTeams: Array<Record<string, unknown>> = [];
+    const totals = { teams: 0, candidates: 0, pruned: 0, skippedChanged: 0 };
+
+    for (const teamRow of params.teams) {
+      const todo = await this.db.tasks.list({ teamId: teamRow.id, status: 'todo' }).catch(() => [] as TaskRow[]);
+      const candidates = todo
+        .map((task) => ({ task, reason: this.generatedBacklogReason(task, params.match) }))
+        .filter((item): item is { task: TaskRow; reason: string } => Boolean(item.reason))
+        .filter(({ task }) => !task.owner && (task.updated_at || task.created_at || 0) <= cutoff)
+        .sort((a, b) => ((a.task.updated_at || a.task.created_at) - (b.task.updated_at || b.task.created_at)) || a.task.name.localeCompare(b.task.name))
+        .slice(0, params.limit);
+
+      const rows = candidates.map(({ task, reason }) => ({
+        ref: this.taskShortRef(task),
+        name: task.name,
+        title: task.title,
+        status: task.status,
+        owner: task.owner,
+        createdAt: task.created_at,
+        updatedAt: task.updated_at,
+        ageHours: Math.max(0, Number(((nowSec - (task.updated_at || task.created_at)) / 3600).toFixed(2))),
+        reason,
+      }));
+
+      let archivePath: string | null = null;
+      let pruned = 0;
+      let skippedChanged = 0;
+      if (params.apply && candidates.length > 0) {
+        archivePath = await this.writeTaskPruneArchive(teamRow.name, {
+          action: 'task-prune-backlog',
+          archivedAt: new Date().toISOString(),
+          team: teamRow.name,
+          options: {
+            minAgeHours: params.minAgeHours,
+            match: params.match,
+            limit: params.limit,
+          },
+          tasks: candidates.map(({ task, reason }) => ({ ...task, prune_reason: reason })),
+        });
+
+        for (const { task } of candidates) {
+          const fresh = await this.db.tasks.getByNameForTeam(task.name, teamRow.id);
+          if (!fresh || fresh.status !== 'todo' || fresh.owner || fresh.updated_at !== task.updated_at) {
+            skippedChanged += 1;
+            continue;
+          }
+          await this.db.tasks.delete(task.id);
+          pruned += 1;
+        }
+      }
+
+      if (rows.length > 0) {
+        totals.teams += 1;
+        resultTeams.push({
+          team: teamRow.name,
+          candidates: rows.length,
+          pruned,
+          skippedChanged,
+          archivePath,
+          tasks: rows,
+        });
+      }
+      totals.candidates += rows.length;
+      totals.pruned += pruned;
+      totals.skippedChanged += skippedChanged;
+    }
+
+    return {
+      ok: true,
+      dryRun: !params.apply,
+      minAgeHours: params.minAgeHours,
+      match: params.match,
+      limit: params.limit,
+      cutoff,
+      totals,
+      teams: resultTeams,
+    };
+  }
+
   private async promptLeadForDelegationKickoff(teamId: string, teamName: string, task: TaskRow, owner: AgentRow | null): Promise<void> {
     if (!this.isConfiguredTeamLead(teamName, owner)) return;
     if (!this.isLiveForSupervision(owner) || !owner.endpoint) return;
@@ -11388,6 +11500,78 @@ Return this JSON shape:
             ownerRef,
             apply,
             keepActive,
+          });
+          return { ok: true, result: report };
+        }
+
+        if (subCmd === 'prune-backlog' || subCmd === 'prune-stale-backlog') {
+          // /task prune-backlog [--team <team>|--all] [--min-age-hours N] [--match generated|all] [--limit N] [--apply]
+          const rawArgs = args.slice(1);
+          let targetTeamName: string | undefined;
+          let allTeams = false;
+          let apply = false;
+          let minAgeHours = 6;
+          let match: 'generated' | 'all' = 'generated';
+          let limit = 500;
+          let confirmAll = false;
+
+          for (let i = 0; i < rawArgs.length; i++) {
+            const token = rawArgs[i];
+            if (token === '--all') { allTeams = true; continue; }
+            if (token === '--team') { targetTeamName = rawArgs[++i]; continue; }
+            if (token === '--apply') { apply = true; continue; }
+            if (token === '--dry-run') { apply = false; continue; }
+            if (token === '--confirm-all') { confirmAll = true; continue; }
+            if (token === '--match') {
+              const value = rawArgs[++i];
+              if (value !== 'generated' && value !== 'all') {
+                return { ok: false, error: '--match must be generated or all' };
+              }
+              match = value;
+              continue;
+            }
+            if (token === '--min-age-hours' || token === '--min-age') {
+              const parsed = Number(rawArgs[++i]);
+              if (!Number.isFinite(parsed) || parsed < 0) {
+                return { ok: false, error: '--min-age-hours must be a non-negative number' };
+              }
+              minAgeHours = parsed;
+              continue;
+            }
+            if (token === '--limit') {
+              const parsed = Number(rawArgs[++i]);
+              if (!Number.isInteger(parsed) || parsed < 1 || parsed > 1000) {
+                return { ok: false, error: '--limit must be an integer between 1 and 1000' };
+              }
+              limit = parsed;
+              continue;
+            }
+          }
+
+          if (allTeams && targetTeamName) {
+            return { ok: false, error: 'Use either --all or --team <team>, not both' };
+          }
+          if (apply && match === 'all' && !confirmAll) {
+            return { ok: false, error: '--match all with --apply requires --confirm-all' };
+          }
+
+          let teams: Array<{ id: string; name: string }>;
+          if (allTeams) {
+            teams = (await this.db.teams.listTeams()).map((team) => ({ id: team.id, name: team.name }));
+          } else if (targetTeamName) {
+            const targetTeam = await this.db.teams.getTeamByName(targetTeamName);
+            if (!targetTeam) return { ok: false, error: `Team "${targetTeamName}" not found` };
+            teams = [{ id: targetTeam.id, name: targetTeam.name }];
+          } else {
+            teams = [{ id: teamId, name: teamName }];
+          }
+
+          const report = await this.pruneBacklogTasks({
+            teams,
+            apply,
+            minAgeHours,
+            match,
+            limit,
           });
           return { ok: true, result: report };
         }

@@ -106,6 +106,24 @@ function agentRow(overrides: Partial<AgentRow> = {}): AgentRow {
   };
 }
 
+function taskRow(overrides: Partial<TaskRow> = {}): TaskRow {
+  const id = overrides.id || 'task-1';
+  return {
+    id,
+    name: overrides.name || id,
+    uuid: overrides.uuid || `${id}-uuid`,
+    team_id: overrides.team_id || 'team-1',
+    title: overrides.title || 'Task',
+    description: overrides.description ?? null,
+    status: overrides.status || 'todo',
+    created_by: overrides.created_by ?? null,
+    owner: overrides.owner ?? null,
+    created_at: overrides.created_at ?? 1,
+    updated_at: overrides.updated_at ?? 1,
+    completed_at: overrides.completed_at ?? null,
+  };
+}
+
 describe('AgentManagerDb killAgentProcess guards', () => {
   const workDirs: string[] = [];
   const dbs: Array<Awaited<ReturnType<typeof createInMemoryDb>>> = [];
@@ -492,6 +510,86 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     ]);
     expect((manager as any).killAgentProcess).not.toHaveBeenCalled();
     expect((await db.agents.getById('agent-idle-helper'))?.status).toBe('running');
+  });
+
+  it('prunes only stale generated unassigned todo backlog and archives applied removals', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-04T04:00:00Z'));
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    await db.agents.create(agentRow({ team_id: teamId, id: 'agent-1', name: 'coder' }));
+    const old = Math.floor(Date.now() / 1000) - 8 * 3600;
+    const recent = Math.floor(Date.now() / 1000) - 30 * 60;
+    await db.tasks.create(taskRow({
+      id: 'old-generated',
+      name: 'old-generated',
+      uuid: '11111111-1111-4111-8111-111111111111',
+      team_id: teamId,
+      title: 'Old generated task',
+      description: '[goal:goal_1] Generated task',
+      created_at: old,
+      updated_at: old,
+    }));
+    await db.tasks.create(taskRow({
+      id: 'old-owned-generated',
+      name: 'old-owned-generated',
+      uuid: '22222222-2222-4222-8222-222222222222',
+      team_id: teamId,
+      title: 'Old owned generated task',
+      description: '[goal:goal_1] Owned task',
+      owner: 'agent-1',
+      created_at: old,
+      updated_at: old,
+    }));
+    await db.tasks.create(taskRow({
+      id: 'old-manual',
+      name: 'old-manual',
+      uuid: '33333333-3333-4333-8333-333333333333',
+      team_id: teamId,
+      title: 'Old manual task',
+      description: 'Manual operator backlog',
+      created_at: old,
+      updated_at: old,
+    }));
+    await db.tasks.create(taskRow({
+      id: 'recent-generated',
+      name: 'recent-generated',
+      uuid: '44444444-4444-4444-8444-444444444444',
+      team_id: teamId,
+      title: 'Recent generated task',
+      description: 'Goal ID: goal_1\nRecent generated task',
+      created_at: recent,
+      updated_at: recent,
+    }));
+
+    const dryRun = await (manager as any).pruneBacklogTasks({
+      teams: [{ id: teamId, name: 'default' }],
+      apply: false,
+      minAgeHours: 6,
+      match: 'generated',
+      limit: 100,
+    });
+    expect(dryRun.totals).toMatchObject({ candidates: 1, pruned: 0 });
+    expect(await db.tasks.getByNameForTeam('old-generated', teamId)).toBeTruthy();
+
+    const applied = await (manager as any).pruneBacklogTasks({
+      teams: [{ id: teamId, name: 'default' }],
+      apply: true,
+      minAgeHours: 6,
+      match: 'generated',
+      limit: 100,
+    });
+    expect(applied.totals).toMatchObject({ candidates: 1, pruned: 1, skippedChanged: 0 });
+    const archivePath = applied.teams[0].archivePath;
+    expect(typeof archivePath).toBe('string');
+    expect(fs.existsSync(archivePath)).toBe(true);
+    expect(await db.tasks.getByNameForTeam('old-generated', teamId)).toBeNull();
+    expect(await db.tasks.getByNameForTeam('old-owned-generated', teamId)).toBeTruthy();
+    expect(await db.tasks.getByNameForTeam('old-manual', teamId)).toBeTruthy();
+    expect(await db.tasks.getByNameForTeam('recent-generated', teamId)).toBeTruthy();
   });
 
   it('bounds manager shutdown when the HTTP close callback never fires', async () => {
