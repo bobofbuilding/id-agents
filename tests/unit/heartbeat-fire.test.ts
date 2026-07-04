@@ -211,6 +211,72 @@ describe('ScheduleDispatcher.dispatch with manual opt', () => {
     expect(sentPayload.schedule).not.toHaveProperty('manual');
   });
 
+  it('does not attach Brain context to heartbeat dispatches even when Brain is enabled', async () => {
+    delete process.env.BRAIN_CONTEXT_DISABLED;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes('/context/volunteer')) {
+        return new Response(JSON.stringify({
+          data: {
+            bundles: [{ query: 'heartbeat', textUnits: [{ id: 1, title: 'context', content: 'large context' }] }],
+            cited: { canonical_source_ids: ['text:1'] },
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(null, { status: 200 });
+    });
+
+    const dispatcher = new ScheduleDispatcher();
+    const def = makeHeartbeatDef();
+    const target = makeTarget();
+
+    await dispatcher.dispatch(def, target, 'interval:1700000400');
+
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('http://localhost:4135/schedule');
+    const sentPayload = JSON.parse(init.body as string);
+    expect(sentPayload.message).toBe(def.message);
+    expect(sentPayload.brain_context).toBeUndefined();
+
+    fetchSpy.mockRestore();
+  });
+
+  it('does not attach Brain context to task assignment sweep schedules', async () => {
+    delete process.env.BRAIN_CONTEXT_DISABLED;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes('/context/volunteer')) {
+        return new Response(JSON.stringify({
+          data: {
+            bundles: [{ query: 'assignment', textUnits: [{ id: 2, title: 'context', content: 'large context' }] }],
+            cited: { canonical_source_ids: ['text:2'] },
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(null, { status: 200 });
+    });
+
+    const dispatcher = new ScheduleDispatcher();
+    const def = makeHeartbeatDef({
+      kind: 'calendar',
+      delivery_mode: 'talk',
+      message: 'Task assignment sweep: inspect unassigned todo tasks across all teams.',
+    });
+    const target = makeTarget();
+
+    await dispatcher.dispatch(def, target, 'calendar:2026-07-04@0');
+
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('http://localhost:4135/talk');
+    const sentPayload = JSON.parse(init.body as string);
+    expect(sentPayload.message).toBe(def.message);
+    expect(sentPayload.brain_context).toBeUndefined();
+
+    fetchSpy.mockRestore();
+  });
+
   it('accepts the legacy positional linkedTasks array (backward compatibility)', async () => {
     const dispatcher = new ScheduleDispatcher();
     const def = makeHeartbeatDef({ kind: 'calendar', delivery_mode: 'talk' });

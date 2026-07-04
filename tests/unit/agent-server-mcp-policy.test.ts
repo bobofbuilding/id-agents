@@ -17,6 +17,9 @@ Backlog guard: task #12345678 has been active 60m with no progress update.`)).to
 [Respond directly and helpfully — this is the person who manages you.]
 
 Heartbeat: review your checklist and act on anything that needs attention.`)).toBe(true);
+
+    expect(shouldSuppressMcpForPrompt('Heartbeat: review your checklist and act on anything that needs attention.')).toBe(true);
+    expect(shouldSuppressMcpForPrompt('Backlog guard: task #12345678 has been active 60m with no progress update.')).toBe(true);
   });
 
   it('suppresses MCP for incoming-reply processing loops', () => {

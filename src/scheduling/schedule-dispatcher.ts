@@ -56,6 +56,23 @@ function formatBrainContextAppendix(context: BrainVolunteerContext | null): stri
   return lines.join('\n');
 }
 
+function shouldAttachBrainContext(def: ScheduleDefinitionRow, message: string): boolean {
+  if (def.kind === 'heartbeat') return false;
+  const text = String(message || '').trimStart();
+  if (!text) return false;
+  return ![
+    /^Heartbeat:/,
+    /^Supervision:/,
+    /^Supervision probe on task\b/,
+    /^Backlog guard:/,
+    /^Task assignment sweep:/,
+    /^Assignment sweep complete\b/,
+    /^No approved recommendation routed\b/,
+    /^Already handled\.\s+Task\b/,
+    /^You have \d+ stalled doing tasks\b/,
+  ].some((pattern) => pattern.test(text));
+}
+
 async function volunteerBrainContext(input: {
   agentId: string;
   text: string;
@@ -143,12 +160,15 @@ export class ScheduleDispatcher {
     const linkedTaskText = (opts.linkedTasks || [])
       .map((task) => `${task.title} (${task.status}${task.owner ? `, owner=${task.owner}` : ''})`)
       .join('\n');
-    const brainContext = await volunteerBrainContext({
-      agentId: target.id,
-      text: [def.message, linkedTaskText].filter(Boolean).join('\n\n'),
-      scheduleId: def.id,
-      scheduledKey,
-    });
+    const messageText = [def.message, linkedTaskText].filter(Boolean).join('\n\n');
+    const brainContext = shouldAttachBrainContext(def, def.message)
+      ? await volunteerBrainContext({
+          agentId: target.id,
+          text: messageText,
+          scheduleId: def.id,
+          scheduledKey,
+        })
+      : null;
     const appendix = formatBrainContextAppendix(brainContext);
     const payload = buildSchedulePayload(def, scheduledKey, {
       linkedTasks: opts.linkedTasks,

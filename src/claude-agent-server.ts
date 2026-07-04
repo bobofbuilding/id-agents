@@ -45,6 +45,15 @@ type ExternalStopQueryStatus = 'cancelled' | 'expired' | 'failed';
 const EXTERNAL_STOP_QUERY_STATUSES = new Set<ExternalStopQueryStatus>(['cancelled', 'expired', 'failed']);
 
 const MCP_CONTROL_PLANE_PROMPT_PATTERNS = [
+  /^Heartbeat:/,
+  /^Supervision:/,
+  /^Supervision probe on task\b/,
+  /^Backlog guard:/,
+  /^Task assignment sweep:/,
+  /^Assignment sweep complete\b/,
+  /^No approved recommendation routed\b/,
+  /^Already handled\.\s+Task\b/,
+  /^You have \d+ stalled doing tasks\b/,
   /^\[Message from agent "[^"]+"\s*\|[^\n]*\]\s*\n[\s\S]*\n\[Incoming Reply from "[^"]+"\]/,
   /^\[Message from agent "[^"]+"\s*\|[^\n]*\]\s*\n[\s\S]*\n\[Incoming Message from "[^"]+"\][\s\S]*\nIMPORTANT INSTRUCTIONS:[\s\S]*DO NOT send a message or reply back to "[^"]+"/,
   /^\[Message from agent "[^"]+"\s*\|[^\n]*\]\s*\n[\s\S]*\nAssignment sweep complete\b/,
