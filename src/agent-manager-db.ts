@@ -13273,6 +13273,75 @@ Return this JSON shape:
           return { ok: true, result: report };
         }
 
+        if (subCmd === 'assign-unowned' || subCmd === 'assign-unassigned' || subCmd === 'triage-unassigned') {
+          // /task assign-unowned [--team <team>|--all] [--limit N] [--min-age-min N] [--no-dispatch]
+          const rawArgs = args.slice(1);
+          let targetTeamName: string | undefined;
+          let allTeams = false;
+          let limit = 3;
+          let minAgeMs = 0;
+          let dispatch = true;
+          const taskRefs: string[] = [];
+
+          for (let i = 0; i < rawArgs.length; i++) {
+            const token = rawArgs[i];
+            if (token === '--all') { allTeams = true; continue; }
+            if (token === '--team') { targetTeamName = rawArgs[++i]; continue; }
+            if (token === '--task' || token === '--task-ref' || token === '--ref') {
+              const ref = rawArgs[++i];
+              if (!ref) return { ok: false, error: `${token} requires a task ref` };
+              taskRefs.push(ref);
+              continue;
+            }
+            if (token === '--dispatch') { dispatch = true; continue; }
+            if (token === '--no-dispatch') { dispatch = false; continue; }
+            if (token === '--limit') {
+              const parsed = Number(rawArgs[++i]);
+              if (!Number.isInteger(parsed) || parsed < 1 || parsed > 50) {
+                return { ok: false, error: '--limit must be an integer between 1 and 50' };
+              }
+              limit = parsed;
+              continue;
+            }
+            if (token === '--min-age-min' || token === '--min-age-minutes' || token === '--min-age') {
+              const parsed = Number(rawArgs[++i]);
+              if (!Number.isFinite(parsed) || parsed < 0) {
+                return { ok: false, error: '--min-age-min must be a non-negative number' };
+              }
+              minAgeMs = Math.floor(parsed * 60 * 1000);
+              continue;
+            }
+            return { ok: false, error: `Unknown option ${token}` };
+          }
+
+          if (allTeams && targetTeamName) {
+            return { ok: false, error: 'Use either --all or --team <team>, not both' };
+          }
+
+          let teams: Array<{ id: string; name: string }>;
+          if (allTeams) {
+            teams = (await this.db.teams.listTeams()).map((team) => ({ id: team.id, name: team.name }));
+          } else if (targetTeamName) {
+            const targetTeam = await this.db.teams.getTeamByName(targetTeamName);
+            if (!targetTeam) return { ok: false, error: `Team "${targetTeamName}" not found` };
+            teams = [{ id: targetTeam.id, name: targetTeam.name }];
+          } else {
+            teams = [{ id: teamId, name: teamName }];
+          }
+          if (taskRefs.length && teams.length !== 1) {
+            return { ok: false, error: 'Exact task refs require exactly one team; use --team <team> instead of --all' };
+          }
+
+          const report = await this.assignUnownedTodoTasks({
+            teams,
+            limit,
+            minAgeMs,
+            dispatch,
+            taskRefs,
+          });
+          return { ok: true, result: report };
+        }
+
         if (subCmd === 'prune-backlog' || subCmd === 'prune-stale-backlog') {
           // /task prune-backlog [--team <team>|--all] [--min-age-hours N] [--match generated|all] [--limit N] [--apply]
           const rawArgs = args.slice(1);
@@ -13708,7 +13777,7 @@ Return this JSON shape:
 
         return {
           ok: false,
-          error: 'Usage: /task <create|list|lead-backlog|triage-stalled|jumpstart-stalled|prune-backlog|assign|claim|done|remove|delete> ...',
+          error: 'Usage: /task <create|list|lead-backlog|triage-stalled|jumpstart-stalled|assign-unowned|prune-backlog|assign|claim|done|remove|delete> ...',
         };
       }
 
@@ -14424,7 +14493,8 @@ Return this JSON shape:
     task: TaskRow,
     teamRow: { id: string; name: string },
     nowMs: number,
-  ): Promise<{ assigned: boolean; reason: string; owner?: AgentRow }> {
+    opts: { dispatch?: boolean } = {},
+  ): Promise<{ assigned: boolean; reason: string; owner?: AgentRow; dispatched?: boolean }> {
     if (task.owner || task.status !== 'todo') return { assigned: false, reason: 'not_unowned_todo' };
     if (!(await this.hasDoingTaskRoom(teamRow.id))) return { assigned: false, reason: 'doing_limit_full' };
 
@@ -14481,15 +14551,151 @@ Return this JSON shape:
       });
 
       const ref = this.taskShortRef(updated);
-      if (!(await this.hasActiveSupervisionAskForMarker(teamRow.id, owner, ref))) {
+      let dispatched = false;
+      if (opts.dispatch !== false && !(await this.hasActiveSupervisionAskForMarker(teamRow.id, owner, ref))) {
         const msg = this.taskDelegationPrompt(updated, ref);
         const sent = await this.sendSupervisionAsk(teamRow.name, owner.name, msg);
+        dispatched = sent;
         if (!sent) this.managerLog(`Auto-assigned task ${updated.name} to ${owner.name}, but the delegation prompt could not be delivered`);
       }
-      return { assigned: true, reason: 'assigned', owner };
+      return { assigned: true, reason: 'assigned', owner, dispatched };
     }
 
     return { assigned: false, reason: 'no_idle_live_member' };
+  }
+
+  private async assignUnownedTodoTasks(params: {
+    teams: Array<{ id: string; name: string }>;
+    limit: number;
+    minAgeMs: number;
+    dispatch?: boolean;
+    taskRefs?: string[];
+  }): Promise<{
+    scannedTeams: number;
+    scannedTasks: number;
+    considered: number;
+    assignedCount: number;
+    skippedCount: number;
+    tooFresh: number;
+    checkinSupervised: number;
+    items: Array<{
+      team: string;
+      task: string;
+      title: string;
+      status: 'assigned' | 'skipped';
+      reason: string;
+      owner?: string;
+      dispatched?: boolean;
+      ageMinutes: number;
+    }>;
+  }> {
+    const now = Date.now();
+    const items: Array<{
+      team: string;
+      task: string;
+      title: string;
+      status: 'assigned' | 'skipped';
+      reason: string;
+      owner?: string;
+      dispatched?: boolean;
+      ageMinutes: number;
+    }> = [];
+    let scannedTasks = 0;
+    let considered = 0;
+    let assignedCount = 0;
+    let skippedCount = 0;
+    let tooFresh = 0;
+    let checkinSupervised = 0;
+
+    for (const teamRow of params.teams) {
+      if (assignedCount >= params.limit) break;
+      const explicitRefs = params.taskRefs?.length ? params.taskRefs : null;
+      const candidates: TaskRow[] = [];
+      if (explicitRefs) {
+        for (const ref of explicitRefs) {
+          const resolved = await this.resolveTaskRef(ref, teamRow.id).catch((err) => ({ task: null, error: err?.message || String(err) }));
+          if (!resolved.task) {
+            skippedCount++;
+            items.push({
+              team: teamRow.name,
+              task: ref,
+              title: '',
+              status: 'skipped',
+              reason: resolved.error || 'task_not_found',
+              ageMinutes: 0,
+            });
+            continue;
+          }
+          candidates.push(resolved.task);
+        }
+      } else {
+        const todo = await this.db.tasks.list({ teamId: teamRow.id, status: 'todo' }).catch(() => [] as TaskRow[]);
+        candidates.push(...todo
+          .filter((task) => !task.owner && task.status === 'todo' && (!task.team_id || task.team_id === teamRow.id))
+          .sort((a, b) =>
+            this.taskLastActivityMs(a) - this.taskLastActivityMs(b)
+            || a.name.localeCompare(b.name),
+          ));
+      }
+
+      for (const task of candidates) {
+        if (assignedCount >= params.limit) break;
+        scannedTasks++;
+        const activityMs = this.taskLastActivityMs(task);
+        const ageMs = Math.max(0, now - activityMs);
+        const ageMinutes = Math.round(ageMs / 60000);
+        if (ageMs < params.minAgeMs) {
+          tooFresh++;
+          continue;
+        }
+
+        const active = await this.db.checkins
+          .list({ teamId: teamRow.id, linkedTaskId: task.id, status: ['active', 'snoozed'], limit: 1 })
+          .catch(() => [] as CheckinRow[]);
+        if (active.length) {
+          checkinSupervised++;
+          continue;
+        }
+
+        considered++;
+        const assignment = await this.assignUnownedTodoTask(task, teamRow, now, { dispatch: params.dispatch });
+        const ref = this.taskShortRef(task);
+        if (assignment.assigned) {
+          assignedCount++;
+          items.push({
+            team: teamRow.name,
+            task: ref,
+            title: task.title,
+            status: 'assigned',
+            reason: assignment.reason,
+            owner: assignment.owner?.name,
+            dispatched: assignment.dispatched === true,
+            ageMinutes,
+          });
+        } else {
+          skippedCount++;
+          items.push({
+            team: teamRow.name,
+            task: ref,
+            title: task.title,
+            status: 'skipped',
+            reason: assignment.reason,
+            ageMinutes,
+          });
+        }
+      }
+    }
+
+    return {
+      scannedTeams: params.teams.length,
+      scannedTasks,
+      considered,
+      assignedCount,
+      skippedCount,
+      tooFresh,
+      checkinSupervised,
+      items,
+    };
   }
 
   private async sweepStalledTasks(): Promise<void> {

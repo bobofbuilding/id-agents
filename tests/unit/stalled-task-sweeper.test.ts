@@ -544,6 +544,91 @@ describe('stalled task sweeper', () => {
     expect(db.tasks.claim).not.toHaveBeenCalled();
   });
 
+  it('exposes a manager-owned command to assign exact unowned todo refs without lead planning', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const selected = task({
+      id: 'todo-exact-1',
+      name: 'exact-unowned',
+      uuid: 'abcdef12-3456-4789-8123-abcdef123456',
+      title: 'Exact unowned task',
+      status: 'todo',
+      owner: null,
+      updated_at: nowSec - 120,
+    });
+    const other = task({
+      id: 'todo-other-1',
+      name: 'other-unowned',
+      uuid: 'fedcba98-3456-4789-8123-abcdef123456',
+      title: 'Other unowned task',
+      status: 'todo',
+      owner: null,
+      updated_at: nowSec - 120,
+    });
+    const worker = agent({ id: 'worker-2', name: 'worker-b' });
+    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
+    const updated = { ...selected, owner: worker.id, status: 'doing' as const, updated_at: nowSec };
+    const create = vi.fn(async () => {});
+    let taskLookupCount = 0;
+    const db = fakeDb({
+      agents: {
+        getById: vi.fn(async () => worker),
+        getByName: vi.fn(async () => lead),
+        list: vi.fn(async () => [lead, worker]),
+      },
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => {
+          if (status === 'doing') return [];
+          if (status === 'todo') return [selected, other];
+          return [];
+        }),
+        getByUuidPrefix: vi.fn(async (prefix: string) => prefix === 'abcdef12' ? [selected] : []),
+        getByNameForTeam: vi.fn(async (name: string) => {
+          if (name !== selected.name) return null;
+          return ++taskLookupCount === 1 ? selected : updated;
+        }),
+        claim: vi.fn(async (taskId: string) => taskId === selected.id),
+        updateFields: vi.fn(async () => {}),
+        create,
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-assign-unowned-command-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const result = await manager.executeRemoteCommand('/task assign-unowned --task #abcdef12 --limit 4', TEAM_ID, 'default');
+
+    expect(result).toMatchObject({
+      ok: true,
+      result: {
+        scannedTeams: 1,
+        assignedCount: 1,
+        items: [
+          {
+            team: 'default',
+            task: '#abcdef12',
+            status: 'assigned',
+            owner: 'worker-b',
+            dispatched: true,
+          },
+        ],
+      },
+    });
+    expect(db.tasks.claim).toHaveBeenCalledWith('todo-exact-1', 'worker-2', nowSec, {
+      maxDoingForTeam: expect.any(Number),
+    });
+    expect(db.tasks.claim).not.toHaveBeenCalledWith('todo-other-1', expect.any(String), expect.any(Number), expect.any(Object));
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'worker-b',
+      expect.stringContaining('TASK DELEGATION from manager'),
+    );
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalledWith(
+      'default',
+      'lead',
+      expect.any(String),
+    );
+    expect(create).not.toHaveBeenCalled();
+  });
+
   it('rejects owner-targeted task creation when that owner has stalled work', async () => {
     const create = vi.fn(async () => {});
     const db = fakeDb({
