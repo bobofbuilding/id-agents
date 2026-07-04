@@ -1435,7 +1435,7 @@ export class AgentManagerDb {
     ref: string;
     stalledMinutes: number;
     ownerName: string;
-    reason: 'no_live_lead' | 'lead_busy' | 'owner_busy' | 'lead_delegation_required' | 'unclaimed';
+    reason: 'no_live_lead' | 'lead_busy' | 'owner_busy' | 'owner_unresponsive' | 'lead_delegation_required' | 'unclaimed';
     leadName?: string;
   }): string {
     const ownerState = params.reason === 'owner_busy'
@@ -1444,6 +1444,8 @@ export class AgentManagerDb {
         ? 'task has no owner'
       : params.reason === 'lead_delegation_required'
         ? `team lead ${params.ownerName} owns a parent objective without member-owned child tasks`
+        : params.reason === 'owner_unresponsive'
+          ? `owner ${params.ownerName} has repeated failed or expired control prompts for this task`
         : `owner ${params.ownerName} is not live`;
     const leadState = params.reason === 'lead_busy'
       ? `team lead ${params.leadName || 'lead'} is busy with another active query`
@@ -1468,7 +1470,7 @@ export class AgentManagerDb {
     renudgeMs: number;
     maxProbes: number;
     force?: boolean;
-    reason: 'no_live_lead' | 'lead_busy' | 'owner_busy' | 'lead_delegation_required' | 'unclaimed';
+    reason: 'no_live_lead' | 'lead_busy' | 'owner_busy' | 'owner_unresponsive' | 'lead_delegation_required' | 'unclaimed';
     eventReason: 'owner_unavailable' | 'owner_busy' | 'lead_delegation_required' | 'probe_limit_reached' | 'unclaimed';
     leadName?: string;
   }): Promise<{ status: string; taskRef: string; actor?: string; actorTeam?: string; attempt?: number } | null> {
@@ -1528,6 +1530,27 @@ export class AgentManagerDb {
     return lastBlocked;
   }
 
+  private async countRecentOwnerControlFailures(params: {
+    teamId: string;
+    owner: AgentRow;
+    ref: string;
+    sinceMs: number;
+  }): Promise<number> {
+    const { rows } = await this.db.adapter.query<QueryRow>(
+      `SELECT team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id, metadata
+         FROM queries
+        WHERE team_id = ?
+          AND agent_id = ?
+          AND status IN ('failed', 'expired')
+          AND (created >= ? OR COALESCE(completed, 0) >= ?)
+        ORDER BY created DESC
+        LIMIT 25`,
+      [params.teamId, params.owner.id, params.sinceMs, params.sinceMs],
+    ).catch(() => ({ rows: [] as QueryRow[] }));
+    const ref = params.ref.toLowerCase();
+    return rows.filter((row) => this.activeTaskAskMarker(row.prompt) === ref).length;
+  }
+
   private async triageStalledOwnerBacklog(params: {
     teamId: string;
     teamName: string;
@@ -1569,6 +1592,32 @@ export class AgentManagerDb {
           if (fallback) return fallback;
         }
         return { status: 'owner_busy', taskRef: ref, actor: ownerName };
+      }
+      const failureWindowMs = Math.max(renudgeMs, 2 * 60 * 60 * 1000);
+      const recentFailures = await this.countRecentOwnerControlFailures({
+        teamId: params.teamId,
+        owner: params.owner,
+        ref,
+        sinceMs: params.nowMs - failureWindowMs,
+      });
+      const failureThreshold = params.force ? 2 : maxProbes;
+      if (recentFailures >= failureThreshold) {
+        const fallback = await this.routeStalledTaskToTaskManagerFallback({
+          teamId: params.teamId,
+          teamName: params.teamName,
+          task,
+          ref,
+          stalledMinutes,
+          ownerName,
+          nowMs: params.nowMs,
+          renudgeMs,
+          maxProbes,
+          force: params.force,
+          reason: 'owner_unresponsive',
+          eventReason: 'owner_busy',
+        });
+        if (fallback) return fallback;
+        return { status: 'owner_unresponsive', taskRef: ref, actor: ownerName };
       }
       const prevProbe = this.stalledNudges.get(key);
       const attempt = this.markStalledProbe(key, params.nowMs);

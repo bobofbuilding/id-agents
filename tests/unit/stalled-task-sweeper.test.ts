@@ -1632,6 +1632,102 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('routes manual jumpstart to task-master after repeated owner control failures', async () => {
+    const owner = agent({ id: 'busy-owner', name: 'worker' });
+    const opsTeam = team({ id: 'ops-team-id', name: 'ops-team' });
+    const taskMaster = agent({
+      id: 'task-master-id',
+      team_id: opsTeam.id,
+      name: 'task-master',
+      status: 'running',
+    });
+    const stalled = task({ owner: owner.id });
+    const failedControl = (queryId: string, status: 'failed' | 'expired') => ({
+      team_id: TEAM_ID,
+      agent_id: owner.id,
+      query_id: queryId,
+      status,
+      prompt: 'Backlog guard: task #12345678 ("Stalled work") has been active 60m with no progress update.',
+      created: NOW_MS - 5 * 60_000,
+      completed: NOW_MS - 4 * 60_000,
+      result: null,
+      error: status === 'failed' ? 'Query exceeded control-plane timeout after 90s' : null,
+      session_id: null,
+      owner_kind: 'agent',
+      owner_id: owner.id,
+      metadata: null,
+    });
+    const db = fakeDb({
+      teams: {
+        getTeamByName: vi.fn(async (name: string) => name === 'ops-team' ? opsTeam : null),
+      },
+      agents: {
+        getById: vi.fn(async (id: string) => id === owner.id ? owner : null),
+        getByName: vi.fn(async (teamId: string, name: string) => {
+          if (teamId === opsTeam.id && name === 'task-master') return taskMaster;
+          return null;
+        }),
+        list: vi.fn(async (teamId: string) => teamId === opsTeam.id ? [taskMaster] : [owner]),
+      },
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => status === 'doing' ? [stalled] : []),
+        getByUuidPrefix: vi.fn(async () => [stalled]),
+      },
+      adapter: {
+        query: vi.fn(async (sql: string) => {
+          if (String(sql).includes("status IN ('failed', 'expired')")) {
+            return {
+              rows: [
+                failedControl('failed-owner-refresh', 'failed'),
+                failedControl('expired-owner-refresh', 'expired'),
+              ],
+              rowCount: 2,
+            };
+          }
+          return { rows: [], rowCount: 0 };
+        }),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-owner-unresponsive-fallback-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const result = await manager.executeRemoteCommand('/task jumpstart-stalled #12345678 --limit 1', TEAM_ID, 'default');
+
+    expect(result).toMatchObject({
+      ok: true,
+      result: {
+        triagedOwners: 1,
+        items: [
+          {
+            team: 'default',
+            owner: 'worker',
+            blockers: ['#12345678'],
+            triage: {
+              status: 'sent_task_manager',
+              taskRef: '#12345678',
+              actor: 'task-master',
+              actorTeam: 'ops-team',
+            },
+          },
+        ],
+      },
+    });
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'ops-team',
+      'task-master',
+      expect.stringContaining('repeated failed or expired control prompts'),
+    );
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      team_id: TEAM_ID,
+      topic: 'task:triaged',
+      actor_agent_id: 'task-master-id',
+      data: expect.objectContaining({
+        reason: 'owner_busy',
+        stalled_minutes: 60,
+      }),
+    }));
+  });
+
   it('wakes a stopped local owner and sends the stalled task prompt', async () => {
     const stoppedOwner = agent({
       status: 'stopped',
