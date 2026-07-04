@@ -166,6 +166,18 @@ curl -s "http://localhost:$ID_AGENT_PORT/news?since_id=$LAST_ID&limit=100" | jq
 
 The response includes `items[]` (ascending by id) and `next_since_id` when there is more to fetch. Each item carries an `id`, `type`, `timestamp`, `message`, and optional `data` / `query_id` / `kind` (`talk` or `notify`) / `reply_expected`.
 
+If you already know a `query_id`, do **not** page through the whole news feed looking for it. Use a targeted query instead:
+
+```bash
+# Preferred manager long-poll for a known dispatched query
+curl -s -H "X-Id-Team: $ID_TEAM" "$MANAGER_URL/query/$QID?wait=30" | jq
+
+# Or filter the local news feed by the known query id
+curl -s "http://localhost:$ID_AGENT_PORT/news?query_id=$QID&limit=20" | jq
+```
+
+Broad `/news?since_id=0` pagination is only for general inbox review. It is too slow for confirmation of a known dispatch and can waste minutes on agents with long histories.
+
 The older `?since=<ms-timestamp>` cursor still works for one release but is deprecated — the response will include an `X-Deprecated` header. Prefer `since_id`.
 
 Check your news feed before starting new tasks to maintain context.
@@ -331,6 +343,7 @@ curl -s "http://localhost:$ID_AGENT_PORT/news?since_id=$LAST_ID&limit=100" | jq
 ```
 
 > The live API prefers `?since_id=<id>` over the older `?since=<ms-timestamp>` cursor. Both still work; `?since_id` is the recommended form.
+> For a known `query_id`, use `$MANAGER_URL/query/<id>?wait=30` or `/news?query_id=<id>` instead of scanning every page.
 
 The fired-checkin news item carries:
 - linked task (name, status, owner)

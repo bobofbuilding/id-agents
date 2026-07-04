@@ -47,6 +47,9 @@ curl -s -X POST http://localhost:$ID_AGENT_PORT/talk-to \\
   -d '{"to": "agent-name", "message": "your question?"}'
 \`\`\`
 Use /talk-to only if you need the reply to continue your work.
+If a call returns a query_id, wait on that exact query instead of scanning news:
+\`curl -s -H "X-Id-Team: $ID_TEAM" "$MANAGER_URL/query/$QID?wait=30"\`.
+Never page through the whole /news feed looking for a known query_id.
 
 ## List Agents
 \`\`\`bash
@@ -60,6 +63,7 @@ curl -s {{MANAGER_URL}}/agents -H "X-Id-Team: $ID_TEAM" | jq '.agents[].name'
 4. Use the full agent name (e.g., "agent.20") when addressing other agents
 5. Team files: /workspace/teams/{{TEAM_NAME}}/
 6. Use the reserved manager channel directly; \`manager\` is not discovered from \`/agents\`
+7. For known query IDs, use \`/query/<id>?wait=30\` or \`/news?query_id=<id>\`, never broad \`/news\` pagination
 `;
 
 /**
