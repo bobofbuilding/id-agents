@@ -73,6 +73,8 @@ const MCP_CONTROL_PLANE_PROMPT_PATTERNS = [
   /^Assignment sweep complete\b/,
   /^No approved recommendation routed\b/,
   /^Already handled\.\s+Task\b/,
+  /^Please validate\b[\s\S]*\bagainst task\s+#?[a-z0-9_-]+/i,
+  /^AUTO-RELEASE shipped\b/i,
   /^You have \d+ stalled doing tasks\b/,
   /^\[Message from agent "[^"]+"\s*\|[^\n]*\]\s*\n[\s\S]*\n\[Incoming Reply from "[^"]+"\]/,
   /^\[Message from agent "[^"]+"\s*\|[^\n]*\]\s*\n[\s\S]*\n\[Incoming Message from "[^"]+"\][\s\S]*\nIMPORTANT INSTRUCTIONS:[\s\S]*DO NOT send a message or reply back to "[^"]+"/,
@@ -93,11 +95,21 @@ const MCP_CONTROL_PLANE_PROMPT_PATTERNS = [
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nUrgent:\s+task\b[\s\S]*\bstalled\b/i,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nStatus check on task\b/,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nYou have \d+ stalled doing tasks\b/,
+  /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nPlease validate\b[\s\S]*\bagainst task\s+#?[a-z0-9_-]+/i,
+  /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nAUTO-RELEASE shipped\b/i,
 ];
+
+const DEFAULT_AGENT_ALLOWED_TOOLS = ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'WebSearch', 'WebFetch'];
+const CONTROL_PLANE_READONLY_TOOLS = new Set(['Read', 'Glob', 'Grep']);
 
 export function shouldSuppressMcpForPrompt(prompt: string): boolean {
   const text = String(prompt || '').trimStart();
   return MCP_CONTROL_PLANE_PROMPT_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+export function allowedToolsForPrompt(prompt: string, configuredAllowedTools: string[]): string[] {
+  if (!shouldSuppressMcpForPrompt(prompt)) return configuredAllowedTools;
+  return configuredAllowedTools.filter((tool) => CONTROL_PLANE_READONLY_TOOLS.has(tool));
 }
 
 export type QueryQueuePriority = 'operator' | 'delegation' | 'normal' | 'background';
@@ -472,7 +484,7 @@ export class AgentRestServer {
     // Shared dir is team-scoped by the manager (e.g. /workspace/teams/<team>).
     // All agents in the same team share this directory.
     this.sharedDirectory = options.sharedDirectory || '/workspace/teams';
-    this.allowedTools = options.allowedTools || ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'WebSearch', 'WebFetch'];
+    this.allowedTools = options.allowedTools || DEFAULT_AGENT_ALLOWED_TOOLS;
     this.agentName = options.agentName;
     this.agentIdentity = options.agentIdentity || (this.agentName ? { name: this.agentName } : undefined);
     this.db = options.db?.db;
@@ -2333,9 +2345,14 @@ ${prompt}`
       // Read MCP servers from env (set by manager via buildLocalAgentEnv).
       // ID_MCP_SERVERS is a JSON array of McpServerSpec; parsing is tolerant.
       const suppressMcp = shouldSuppressMcpForPrompt(promptWithSender);
+      const executionPolicy = suppressMcp ? 'control-plane-readonly' : 'default';
+      const allowedTools = allowedToolsForPrompt(promptWithSender, this.allowedTools);
       const mcpServers = suppressMcp ? undefined : parseMcpServersEnv(process.env.ID_MCP_SERVERS);
       if (suppressMcp && process.env.ID_MCP_SERVERS) {
         console.log(`${logTime()} [Agent] MCP suppressed for control-plane prompt ${queryId}`);
+      }
+      if (suppressMcp) {
+        console.log(`${logTime()} [Agent] Read-only control-plane tool policy for ${queryId}: ${allowedTools.join(', ') || '(none)'}`);
       }
 
       stopExternalQueryWatcher = this.startExternalQueryStopWatcher(queryId, (error) => {
@@ -2344,11 +2361,12 @@ ${prompt}`
 
       for await (const message of this.harness.run(enhancedPrompt, {
         model: this.model,
-        allowedTools: this.allowedTools,
+        allowedTools,
         workingDirectory: this.workingDirectory,
         resume: allowSessionResume ? sessionId : undefined,
         plugins: plugins,
         mcpServers: mcpServers,
+        executionPolicy,
         queryId  // thread the dispatch id so live activity steps are attributable
       })) {
         if (externalStopError) throw externalStopError;

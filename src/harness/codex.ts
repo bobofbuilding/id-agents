@@ -29,6 +29,29 @@ interface ResolvedCodexExecutable {
   managedPackageRoot?: string;
 }
 
+export function codexPermissionArgs(input: {
+  skipPermissions: boolean;
+  resumeId?: string;
+  executionPolicy?: HarnessOptions['executionPolicy'];
+}): { args: string[]; label: string } {
+  if (input.executionPolicy === 'control-plane-readonly') {
+    return {
+      args: ['-c', 'sandbox_mode="read-only"', '-c', 'approval_policy="never"'],
+      label: 'read-only control-plane sandbox',
+    };
+  }
+  if (input.skipPermissions) {
+    return {
+      args: ['--dangerously-bypass-approvals-and-sandbox'],
+      label: '--dangerously-bypass-approvals-and-sandbox (default)',
+    };
+  }
+  if (input.resumeId) {
+    return { args: [], label: 'resumed session policy (resume has no --full-auto)' };
+  }
+  return { args: ['--full-auto'], label: '--full-auto (config opt-out)' };
+}
+
 function isExecutable(file: string): boolean {
   try {
     const st = fs.statSync(file);
@@ -293,12 +316,9 @@ export class CodexHarness implements AgentHarness {
     // agents can act without an interactive shell. The agent's
     // `dangerouslySkipPermissions: false` config opts back into --full-auto
     // (which keeps the workspace-write sandbox and on-request approval policy).
-    if (skipPermissions) {
-      args.push('--dangerously-bypass-approvals-and-sandbox');
-    } else if (!resumeId) {
-      args.push('--full-auto');
-    }
-    console.log(`[Codex] Permission mode: ${skipPermissions ? '--dangerously-bypass-approvals-and-sandbox (default)' : (resumeId ? 'resumed session policy (resume has no --full-auto)' : '--full-auto (config opt-out)')}`);
+    const permission = codexPermissionArgs({ skipPermissions, resumeId, executionPolicy: options.executionPolicy });
+    args.push(...permission.args);
+    console.log(`[Codex] Permission mode: ${permission.label}`);
 
     // Skip git repo check in case working dir isn't a git repo
     args.push('--skip-git-repo-check');

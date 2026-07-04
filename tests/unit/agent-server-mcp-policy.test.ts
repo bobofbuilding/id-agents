@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { shouldSuppressMcpForPrompt } from '../../src/claude-agent-server.js';
+import { allowedToolsForPrompt, shouldSuppressMcpForPrompt } from '../../src/claude-agent-server.js';
 
 describe('agent server MCP prompt policy', () => {
   it('suppresses MCP for manager supervision and heartbeat control-plane prompts', () => {
@@ -116,5 +116,16 @@ Resume and complete task #60c39e90: Inventory MCP servers, plugins, connectors, 
 Please inspect the repository, edit the integration, and run the test suite.`)).toBe(false);
 
     expect(shouldSuppressMcpForPrompt('Implement a filesystem-backed MCP integration and cite the changed files.')).toBe(false);
+  });
+
+  it('restricts control-plane prompts to read-only local tools', () => {
+    const configured = ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'WebSearch', 'WebFetch'];
+
+    expect(allowedToolsForPrompt('Supervision: task #12345678 has been in progress 48m.', configured))
+      .toEqual(['Read', 'Glob', 'Grep']);
+    expect(allowedToolsForPrompt('Please validate output/legal-routing-policy-8da84377.md against task #8da84377.', configured))
+      .toEqual(['Read', 'Glob', 'Grep']);
+    expect(allowedToolsForPrompt('Implement a filesystem-backed MCP integration and cite the changed files.', configured))
+      .toEqual(configured);
   });
 });

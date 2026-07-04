@@ -46,6 +46,12 @@ export interface HarnessOptions {
   /** External MCP servers to expose as tools (Claude runtimes only). */
   mcpServers?: McpServerSpec[];
   allowedTools?: string[];
+  /**
+   * Runtime permission envelope for this dispatch. `control-plane-readonly`
+   * is for manager/status/review prompts that should not edit files or run
+   * unrestricted shell commands.
+   */
+  executionPolicy?: 'default' | 'control-plane-readonly';
   resume?: string;
   env?: Record<string, string | undefined>;
   /** The originating dispatch's query id, threaded through so live activity

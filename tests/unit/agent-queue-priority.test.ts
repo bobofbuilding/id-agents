@@ -15,12 +15,14 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 class RecordingHarness implements AgentHarness {
   readonly type = 'codex' as HarnessType;
   prompts: string[] = [];
+  options: HarnessOptions[] = [];
   private releaseFirst: (() => void) | null = null;
 
   constructor(private readonly blockFirst = false) {}
 
   async *run(prompt: string, _options: HarnessOptions): AsyncGenerator<HarnessMessage> {
     this.prompts.push(prompt);
+    this.options.push(_options);
     if (this.blockFirst && this.prompts.length === 1) {
       await new Promise<void>((resolve) => {
         this.releaseFirst = resolve;
@@ -97,6 +99,33 @@ Team objective: Decompose this objective into member-owned work.`,
       expect(harness.prompts[0]).toContain('Heartbeat: first background wake');
       expect(harness.prompts[1]).toContain('operator request that should jump the background queue');
       expect(harness.prompts[2]).toContain('Heartbeat: second background wake');
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('runs control-plane prompts with read-only execution policy', async () => {
+    const harness = new RecordingHarness();
+    const server = new AgentRestServer({ agentName: 'lead', harness });
+
+    try {
+      await server.start(0);
+      const port = ((server as any).httpServer.address() as AddressInfo).port;
+
+      const res = await fetch(`http://127.0.0.1:${port}/talk`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          from: 'manager',
+          message: 'Supervision: task #12345678 has been in progress 48m with no completion.',
+        }),
+      });
+
+      expect(res.status).toBe(202);
+      await sleep(20);
+      expect(harness.options[0]?.executionPolicy).toBe('control-plane-readonly');
+      expect(harness.options[0]?.allowedTools).toEqual(['Read', 'Glob', 'Grep']);
+      expect(harness.options[0]?.mcpServers).toBeUndefined();
     } finally {
       await server.stop();
     }
