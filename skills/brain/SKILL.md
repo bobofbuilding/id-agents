@@ -249,3 +249,20 @@ curl -s "http://127.0.0.1:4200/memory/market-parser/market:ETH-USD"
 - **When building a multi-skill workflow** — use neighbors to find complementary skills.
 - **When you need cross-agent context** — read `/memory/shared` for signals other agents published.
 - **For ephemeral rate-limit / lock state** — store with `ttl` so it auto-clears.
+
+## Memory routing — Brain vs local memory
+
+Two persistent memory systems exist. Route to the right one:
+
+| Situation | Store |
+|---|---|
+| Knowledge other agents may reuse (facts, research, signals, sourced findings) | **Brain** (`POST /memory/$ID_AGENT_NAME`) |
+| Cross-agent real-time signal (price, gas, liveness) | **Brain shared** (same endpoint + `"shared": true`) |
+| Agent-private behavioral context (preferences, durable operating rules, long-term personal context) | **Local `./memory/` files** (Claude Code `Write` tool) |
+| Task noise, ephemeral state, secrets | **Neither** — do not persist |
+
+**When to pick Brain:** the knowledge is sourced from research or tooling, another agent might need the same fact, or it should survive team restructuring.
+
+**When to pick local memory:** private to this agent's behavior only — no other agent needs it, and it is not source-grounded data.
+
+**Avoid duplicate writes:** search shared memory (`GET /memory/shared?q=…`) before posting a new fact another agent may have already published. Same signal under a different key is still a duplicate.

@@ -69,6 +69,17 @@ If the user or manager says "ask coder …", "can you ask x …", or requests yo
 
 The old `/message` endpoint on the manager is **deprecated** — it responds with an `X-Deprecated` header and will be removed. Use `/talk-to` or `/news-to` on your local wrapper instead.
 
+## Transport routing — inter-agent vs xmtp
+
+Use the right transport based on who the recipient is:
+
+| Recipient | Transport |
+|---|---|
+| Same-team agent (name/alias from `GET /agents`) | **This skill** — `/talk-to` or `/news-to` |
+| External agent or user (ENS name, wallet address, off-team identity) | **`xmtp` skill** — `/xmtp/send` |
+
+**Quick rule:** if the recipient appears in `GET $MANAGER_URL/agents`, use inter-agent. If you have an ENS name like `bob.eth` or a `0x…` wallet address, use xmtp. Never use `/xmtp/send` for teammates — manager routing is faster and does not require wallet resolution.
+
 ## How replies work (automatic)
 
 **When someone sends you a message, your reply is sent automatically.** You do NOT need to run any curl command to reply.

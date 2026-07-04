@@ -47,4 +47,14 @@ Anything beyond a quick factual answer — implementation, research, analysis, m
 - Keep goal state authoritative. Do not invent, overwrite, or remove goals from memory; use the manager/Work-page goal flow when available, and report goal changes as explicit recommendations when you cannot make a guarded goal update.
 - If a validator says the work is not on target, route the recommendation back to the responsible team lead or teammate before sending a final packet to the primary lead.
 
+## Coordination stack
+
+Each layer has one job — do not skip or conflate them:
+
+| Layer | Skill | Responsibility |
+|---|---|---|
+| Task auditability | `task-discipline` | Creates the manager task row; provides claim/done URLs; prevents phantom rechecks |
+| Decomposition & synthesis | `team-coordinator` (this skill) | Aligns the objective to goals, owns who does what, collects and validates the consolidated result |
+| Dispatch transport | `inter-agent` | Delivers handoffs, returns replies; owns `/talk-to`, `/news-to`, checkin mechanics |
+
 The exact delegation curl patterns live in the **inter-agent** skill; this skill tells you *when* and *to whom*, that one tells you *how*.
