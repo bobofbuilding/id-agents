@@ -263,6 +263,11 @@ export async function startLocalAgent(config: LocalAgentConfig): Promise<{
       console.warn(`⚠️  Failed to decode ID_AGENT_CATALOG: ${err?.message || err}`);
     }
   }
+  const metadataSeed: Record<string, unknown> = {};
+  if (catalogSeed) metadataSeed.catalog = catalogSeed;
+  if (String(process.env.ID_AGENT_PRIMARY_LEAD || '').toLowerCase() === 'true') {
+    metadataSeed.primaryLead = true;
+  }
 
   // Create the server
   const server = new AgentRestServer({
@@ -274,7 +279,7 @@ export async function startLocalAgent(config: LocalAgentConfig): Promise<{
       name,
       team,
       ...(tokenId && { tokenId }),
-      ...(catalogSeed && { metadata: { catalog: catalogSeed } }),
+      ...(Object.keys(metadataSeed).length > 0 && { metadata: metadataSeed }),
     },
     ...(db && dbTeamId && { db: { db, teamId: dbTeamId, agentId } })
   });

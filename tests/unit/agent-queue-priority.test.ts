@@ -87,7 +87,7 @@ describe('agent query queue priority', () => {
     const harness = new RecordingHarness();
     const server = new AgentRestServer({
       agentName: 'lead',
-      agentIdentity: { name: 'lead', metadata: { primaryLead: true } },
+      agentIdentity: { name: 'lead', team: 'default' },
       harness,
     });
 
@@ -122,7 +122,7 @@ describe('agent query queue priority', () => {
     const harness = new RecordingHarness(true);
     const server = new AgentRestServer({
       agentName: 'lead',
-      agentIdentity: { name: 'lead', metadata: { primaryLead: true } },
+      agentIdentity: { name: 'lead', team: 'default' },
       harness,
     });
 

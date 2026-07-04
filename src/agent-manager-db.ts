@@ -14755,6 +14755,7 @@ Return this JSON shape:
       ? Buffer.from(JSON.stringify(catalogSeed), 'utf8').toString('base64')
       : undefined;
     const metadata = (agentRow?.metadata || {}) as AgentMetadata;
+    const isPrimaryLead = metadata.primaryLead === true;
 
     // Reasoning effort for cloud-subscription runtimes (codex / claude-code-cli) —
     // lower effort = fewer reasoning tokens. Read by those harnesses; n/a for ollama.
@@ -14820,6 +14821,7 @@ Return this JSON shape:
       ...(tokenId && { ID_AGENT_TOKEN_ID: tokenId }),
       ...(owsWallet && { OWS_WALLET: owsWallet }),
       ...(catalogEnv && { ID_AGENT_CATALOG: catalogEnv }),
+      ...(isPrimaryLead && { ID_AGENT_PRIMARY_LEAD: 'true' }),
       ...(effort && { ID_AGENT_EFFORT: effort }),
       ...(speed && { ID_AGENT_SPEED: speed }),
       ...(mcpEnv && { ID_MCP_SERVERS: mcpEnv }),

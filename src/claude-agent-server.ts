@@ -1923,14 +1923,29 @@ What would you like to do with this information?`;
     if (!schedule || typeof schedule !== 'object') return false;
     const data = schedule as Record<string, unknown>;
     if (data.kind !== 'heartbeat' || data.manual === true) return false;
-    return this.agentIdentity?.metadata?.primaryLead === true;
+    return this.isPrimaryLeadIdentity();
   }
 
   private shouldDeferTriggeredNewsWake(from: string): boolean {
-    if (this.agentIdentity?.metadata?.primaryLead !== true) return false;
+    if (!this.isPrimaryLeadIdentity()) return false;
     const sender = from.trim().toLowerCase();
     if (sender === 'manager' || sender === 'remote' || sender === 'operator') return false;
     return this.isProcessingQuery || this.queryQueue.length > 0 || this.activeQueries.size > 0;
+  }
+
+  private isPrimaryLeadIdentity(): boolean {
+    const metadata = this.agentIdentity?.metadata || {};
+    if (metadata.primaryLead === true) return true;
+    if (metadata.lead === true) return true;
+    if (String(process.env.ID_AGENT_PRIMARY_LEAD || '').toLowerCase() === 'true') return true;
+
+    const name = String(this.agentIdentity?.name || this.agentName || '').trim().toLowerCase();
+    const team = String(this.agentIdentity?.team || process.env.ID_TEAM || process.env.ID_PROJECT || '').trim().toLowerCase();
+
+    // Rebuilt local agents receive team/name directly, but only a catalog subset of
+    // persisted metadata. Keep default/lead protected even if the primaryLead flag
+    // was not handed to the child process.
+    return team === 'default' && name === 'lead';
   }
 
   /**
