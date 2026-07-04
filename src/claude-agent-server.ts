@@ -77,8 +77,9 @@ const MCP_CONTROL_PLANE_PROMPT_PATTERNS = [
   /^Validation request for\b[\s\S]*\(#[a-z0-9_-]+\)/i,
   /^AUTO-RELEASE shipped\b/i,
   /^You have \d+ stalled doing tasks\b/,
+  /^\[Incoming Message from "checkin-service"\]/,
   /^\[Message from agent "[^"]+"\s*\|[^\n]*\]\s*\n[\s\S]*\n\[Incoming Reply from "[^"]+"\]/,
-  /^\[Message from agent "[^"]+"\s*\|[^\n]*\]\s*\n[\s\S]*\n\[Incoming Message from "[^"]+"\][\s\S]*\nIMPORTANT INSTRUCTIONS:[\s\S]*DO NOT send a message or reply back to "[^"]+"/,
+  /^\[Message from agent "[^"]+"\s*\|[^\n]*\]\s*\n[\s\S]*\n\[Incoming Message from "[^"]+"\][\s\S]*\n\s*IMPORTANT INSTRUCTIONS:[\s\S]*DO NOT send a message or reply back to "[^"]+"/,
   /^\[Message from agent "[^"]+"\s*\|[^\n]*\]\s*\n[\s\S]*\nAssignment sweep complete\b/,
   /^\[Message from agent "[^"]+"\s*\|[^\n]*\]\s*\n[\s\S]*\nNo approved recommendation routed\b/,
   /^\[Message from agent "[^"]+"\s*\|[^\n]*\]\s*\n[\s\S]*\nAlready handled\.\s+Task\b/,
@@ -100,6 +101,7 @@ const MCP_CONTROL_PLANE_PROMPT_PATTERNS = [
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nValidation request for\b[\s\S]*\(#[a-z0-9_-]+\)/i,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nAUTO-RELEASE shipped\b/i,
   /^\[Message from agent "[^"]+"\s*\|[^\n]*\]\s*\n[\s\S]*\nValidation request for\b[\s\S]*\(#[a-z0-9_-]+\)/i,
+  /^\[Message from agent "checkin-service"\s*\|[^\n]*\]\s*\n[\s\S]*\n\[Incoming Message from "checkin-service"\]/,
 ];
 
 const DEFAULT_AGENT_ALLOWED_TOOLS = ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'WebSearch', 'WebFetch'];

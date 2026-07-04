@@ -75,6 +75,8 @@ function shouldAttachBrainContext(def: ScheduleDefinitionRow, message: string): 
     /^Assignment sweep complete\b/,
     /^No approved recommendation routed\b/,
     /^Already handled\.\s+Task\b/,
+    /^Please close your task\b[\s\S]*\(#?[a-z0-9_-]+\)\s+now\b/i,
+    /^Please mark (?:your )?task\b[\s\S]*\(#?[a-z0-9_-]+\)\s+(?:done|complete)\b/i,
     /^You have \d+ stalled doing tasks\b/,
   ].some((pattern) => pattern.test(text));
 }

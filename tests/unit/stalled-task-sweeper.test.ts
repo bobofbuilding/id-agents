@@ -394,6 +394,8 @@ describe('stalled task sweeper', () => {
     expect(manager.shouldAttachBrainContext('Task assignment sweep: inspect unassigned todo tasks across all teams.')).toBe(false);
     expect(manager.shouldAttachBrainContext('No approved recommendation routed. The completed result was REVISE.')).toBe(false);
     expect(manager.shouldAttachBrainContext('Already handled. Task #12345678 is done with no active delegation.')).toBe(false);
+    expect(manager.shouldAttachBrainContext('Please close your task confirm-release-asset-v0-1-584 (#02de8605) now - it is blocking parent #72a19716.')).toBe(false);
+    expect(manager.shouldAttachBrainContext('Please mark your task confirm-release-asset-v0-1-584 (#02de8605) done with the confirmation text.')).toBe(false);
     expect(manager.shouldAttachBrainContext('Please validate output/legal-routing-policy-8da84377.md against task #8da84377.')).toBe(false);
     expect(manager.shouldAttachBrainContext('Validation request for run-baseline-cycle (#784ff464), goal goal_mr4khc5x_lf68y. Read the artifact and reply PASS or FAIL.')).toBe(false);
     expect(manager.shouldAttachBrainContext('AUTO-RELEASE shipped v0.1.585. Please verify the asset and self-update smoke.')).toBe(false);

@@ -4243,6 +4243,8 @@ Return this JSON shape:
       /^Assignment sweep complete\b/,
       /^No approved recommendation routed\b/,
       /^Already handled\.\s+Task\b/,
+      /^Please close your task\b[\s\S]*\(#?[a-z0-9_-]+\)\s+now\b/i,
+      /^Please mark (?:your )?task\b[\s\S]*\(#?[a-z0-9_-]+\)\s+(?:done|complete)\b/i,
       /^Please validate\b[\s\S]*\bagainst task\s+#?[a-z0-9_-]+/i,
       /^Validation request for\b[\s\S]*\(#[a-z0-9_-]+\)/i,
       /^AUTO-RELEASE shipped\b/i,

@@ -47,9 +47,22 @@ Onchain-execution triage needed. Restart/wake the onchain-execution team and tri
 
 ---
 
-IMPORTANT INSTRUCTIONS:
+    IMPORTANT INSTRUCTIONS:
 1. You have received a message from agent "ops-lead".
 2. DO NOT send a message or reply back to "ops-lead" - this would create an infinite loop.`)).toBe(true);
+  });
+
+  it('suppresses MCP for check-in service wakes', () => {
+    expect(shouldSuppressMcpForPrompt(`[Incoming Message from "checkin-service"]
+
+Checkin due for linked task #12345678. Reply with a brief update or complete the task.`)).toBe(true);
+
+    expect(shouldSuppressMcpForPrompt(`[Message from agent "checkin-service" | Query ID: news_123]
+[Note: checkin-service will poll for your reply for ~2 minutes.]
+
+[Incoming Message from "checkin-service"]
+
+Checkin due for linked task #12345678. Reply with a brief update or complete the task.`)).toBe(true);
   });
 
   it('suppresses MCP for inter-agent control-plane status relays', () => {
@@ -131,6 +144,8 @@ Please inspect the repository, edit the integration, and run the test suite.`)).
     expect(allowedToolsForPrompt('Please validate output/legal-routing-policy-8da84377.md against task #8da84377.', configured))
       .toEqual(['Read', 'Glob', 'Grep']);
     expect(allowedToolsForPrompt('Validation request for run-baseline-cycle (#784ff464), goal goal_mr4khc5x_lf68y. Read the artifact and reply PASS or FAIL.', configured))
+      .toEqual(['Read', 'Glob', 'Grep']);
+    expect(allowedToolsForPrompt('[Incoming Message from "checkin-service"]\n\nCheckin due for linked task #12345678.', configured))
       .toEqual(['Read', 'Glob', 'Grep']);
     expect(allowedToolsForPrompt('Implement a filesystem-backed MCP integration and cite the changed files.', configured))
       .toEqual(configured);
