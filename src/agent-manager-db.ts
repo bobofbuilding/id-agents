@@ -8924,13 +8924,18 @@ Return this JSON shape:
         }
         if (sub === 'rebuild') {
           if (!args.includes('--confirm')) {
-            return { ok: false, error: 'Usage: /agents rebuild --confirm' };
+            return { ok: false, error: 'Usage: /agents rebuild --confirm [--running-only|--active-only]' };
           }
+          const runningOnly = args.includes('--running-only') || args.includes('--active-only');
 
           const agents = await this.dbListAgents(teamId);
           const results: Array<{ name: string; status: 'rebuilt' | 'skipped' | 'failed'; reason: string }> = [];
 
           for (const agent of agents) {
+            if (runningOnly && agent.status !== 'running') {
+              results.push({ name: agent.name, status: 'skipped', reason: 'not_running' });
+              continue;
+            }
             if (isRemoteEndpointRuntime(agent.runtime)) {
               results.push({ name: agent.name, status: 'skipped', reason: 'lifecycle_not_supported_for_remote' });
               continue;
@@ -8956,6 +8961,7 @@ Return this JSON shape:
             ok: true,
             result: {
               action: 'agents-rebuild',
+              scope: runningOnly ? 'running-only' : 'all',
               rebuilt: results.filter(r => r.status === 'rebuilt').length,
               skipped: results.filter(r => r.status === 'skipped').length,
               failed: results.filter(r => r.status === 'failed').length,

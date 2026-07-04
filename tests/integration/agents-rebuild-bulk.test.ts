@@ -127,7 +127,7 @@ describe('POST /remote agents rebuild bulk command', () => {
 
     const body = await sendRemote(team.name, 'agents rebuild');
 
-    expect(body).toEqual({ ok: false, error: 'Usage: /agents rebuild --confirm' });
+    expect(body).toEqual({ ok: false, error: 'Usage: /agents rebuild --confirm [--running-only|--active-only]' });
   });
 
   it('rebuilds one eligible claude agent', async () => {
@@ -143,6 +143,7 @@ describe('POST /remote agents rebuild bulk command', () => {
       ok: true,
       result: {
         action: 'agents-rebuild',
+        scope: 'all',
         rebuilt: 1,
         skipped: 0,
         failed: 0,
@@ -164,6 +165,7 @@ describe('POST /remote agents rebuild bulk command', () => {
       ok: true,
       result: {
         action: 'agents-rebuild',
+        scope: 'all',
         rebuilt: 0,
         skipped: 1,
         failed: 0,
@@ -189,12 +191,40 @@ describe('POST /remote agents rebuild bulk command', () => {
       ok: true,
       result: {
         action: 'agents-rebuild',
+        scope: 'all',
         rebuilt: 1,
         skipped: 0,
         failed: 1,
         agents: [
           { name: 'first-claude', status: 'failed', reason: 'spawn exploded' },
           { name: 'second-claude', status: 'rebuilt', reason: 'rebuilt' },
+        ],
+      },
+    });
+  });
+
+  it('can rebuild only agents that were already running', async () => {
+    const team = await createTeam();
+    await createAgent(team.id, { name: 'running-claude', status: 'running', port: 4501 });
+    await createAgent(team.id, { name: 'stopped-claude', status: 'stopped', port: 4502 });
+    const rebuild = vi.fn().mockResolvedValue({ success: true, pid: 12347, logFile: '/tmp/running-claude.log' });
+    (manager as any).rebuildLocalClaudeAgent = rebuild;
+
+    const body = await sendRemote(team.name, 'agents rebuild --confirm --running-only');
+
+    expect(rebuild).toHaveBeenCalledTimes(1);
+    expect(rebuild.mock.calls[0][2].name).toBe('running-claude');
+    expect(body).toEqual({
+      ok: true,
+      result: {
+        action: 'agents-rebuild',
+        scope: 'running-only',
+        rebuilt: 1,
+        skipped: 1,
+        failed: 0,
+        agents: [
+          { name: 'running-claude', status: 'rebuilt', reason: 'rebuilt' },
+          { name: 'stopped-claude', status: 'skipped', reason: 'not_running' },
         ],
       },
     });

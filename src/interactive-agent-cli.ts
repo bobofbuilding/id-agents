@@ -133,7 +133,7 @@ const HELP_ITEMS: Array<{ cmd: string; desc: string; indent?: boolean }> = [
   { cmd: '/agent <name> wallet provision', desc: 'Provision an OWS wallet for one agent' },
   { cmd: '/agents', desc: 'List all agents' },
   { cmd: '/agents probe', desc: 'End-to-end dispatch probe of every running agent' },
-  { cmd: '/agents rebuild --confirm', desc: 'Rebuild all eligible local Claude agents' },
+  { cmd: '/agents rebuild --confirm [--running-only]', desc: 'Rebuild all eligible local Claude agents, or only running agents' },
   { cmd: '/ask [/hey] <agent> <msg>', desc: 'Talk to agent (continues session)' },
   { cmd: '/ask * <msg>', desc: 'Broadcast to all agents' },
   { cmd: '/clear [agent]', desc: 'Clear session (start fresh)' },
@@ -1616,7 +1616,7 @@ async function handleLine(line: string) {
 
     if (!['start', 'stop', 'rebuild', 'save', 'reset', 'probe'].includes(action)) {
       console.log(`\n${colors.red}❌ Usage: /agents <start|stop|rebuild|reset|save|probe>${colors.reset}`);
-      console.log(`${colors.gray}  /agents rebuild --confirm [--regenerate-config]  - Rebuild all eligible local Claude agents; optionally rewrite configs/<team>.yaml from DB${colors.reset}`);
+      console.log(`${colors.gray}  /agents rebuild --confirm [--running-only|--active-only] [--regenerate-config]  - Rebuild all eligible local Claude agents, or only running agents; optionally rewrite configs/<team>.yaml from DB${colors.reset}`);
       console.log(`${colors.gray}  /agents reset [config-file]  - Reset agents with plugins from config${colors.reset}`);
       console.log(`${colors.gray}  /agents probe  - End-to-end dispatch probe of every running agent${colors.reset}\n`);
       rl.prompt();
@@ -1767,7 +1767,11 @@ async function handleLine(line: string) {
     // Rebuild: restart all local agent processes with latest code
     if (action === 'rebuild') {
       const forceRegen = parts.slice(1).includes('--regenerate-config');
-      console.log(`\n${colors.yellow}🔨 Rebuilding ${agents.length} agent(s)...${colors.reset}\n`);
+      const runningOnly = parts.slice(1).includes('--running-only') || parts.slice(1).includes('--active-only');
+      const targetCount = runningOnly
+        ? agents.filter(agent => agent.status === 'running').length
+        : agents.length;
+      console.log(`\n${colors.yellow}🔨 Rebuilding ${targetCount}${runningOnly ? ` running of ${agents.length}` : ''} agent(s)...${colors.reset}\n`);
 
       await regenerateTeamConfigIfMissing(activeTeam, forceRegen);
 
@@ -1778,6 +1782,12 @@ async function handleLine(line: string) {
       for (const agent of agents) {
         try {
           const agentType = getAgentType(agent);
+
+          if (runningOnly && agent.status !== 'running') {
+            console.log(`${colors.gray}⏭️  ${agent.name} (not running - skip)${colors.reset}`);
+            skipped++;
+            continue;
+          }
 
           if (agentType === 'local') {
             // Stop existing process
