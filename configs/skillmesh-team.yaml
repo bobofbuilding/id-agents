@@ -36,7 +36,7 @@ team: skillmesh
 defaults:
   local: true
   runtime: claude-code-cli
-  model: claude-sonnet-4-6
+  model: claude-sonnet-5
   skills:
     - identity
     - inter-agent
@@ -121,7 +121,7 @@ agents:
       failure reporting. Runs skills against sample inputs and grades output
       against declared schemas.
     runtime: claude-code-cli
-    model: claude-sonnet-4-6
+    model: claude-sonnet-5
     heartbeat: 43200
     dangerouslySkipPermissions: true
     catalog:
@@ -138,7 +138,7 @@ agents:
       Skill ratings, creator reputation, security monitoring, and anomaly
       detection. Assigns quality tiers and flags suspicious token activity.
     runtime: claude-code-cli
-    model: claude-sonnet-4-6
+    model: claude-sonnet-5
     heartbeat: 43200
     dangerouslySkipPermissions: true
     catalog:

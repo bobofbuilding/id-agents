@@ -82,7 +82,7 @@ agents:
       Dispatches incident reports and alerts to operator endpoints via webhook,
       A2A message, or structured log. Supports deduplication and rate limiting.
     runtime: claude-code-cli
-    model: claude-sonnet-4-6
+    model: claude-sonnet-5
     catalog:
       role: skill-executor
       expertise:
