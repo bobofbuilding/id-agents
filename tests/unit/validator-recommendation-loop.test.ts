@@ -114,6 +114,24 @@ function makeManager(sendInternalNewsTo = vi.fn(async () => {})) {
 }
 
 describe('validator recommendation loop idempotency', () => {
+  it('forbids validators from directly routing recommendation packets', () => {
+    const { manager } = makeManager();
+    const prompt = manager.validatorRecommendationPrompt({
+      task: makeTask(),
+      validatorName: 'researcher',
+      leadName: 'lead',
+      objective: 'Recommend only approved, dispatch-ready next steps.',
+      completionNote: 'PASS',
+    });
+
+    expect(prompt).toContain('Your only action in this loop is to return the JSON packet');
+    expect(prompt).toContain('Do not call /news-to, /talk-to, /ask, inter-agent tools, task creation tools, or assignment commands');
+    expect(prompt).toContain('Do not send direct handoffs to team leads');
+    expect(prompt).toContain('lead is the sole router for approved high/medium recommendations');
+    expect(prompt).toContain('Do not turn draft proposals into live tasks or assignments');
+    expect(prompt).toContain('return next_step_recommendations: [] and do not notify anyone else');
+  });
+
   it('dispatches only once for duplicate completion handling of the same validator task', async () => {
     const sendInternalNewsTo = vi.fn(async () => {});
     const { manager, db, events } = makeManager(sendInternalNewsTo);
