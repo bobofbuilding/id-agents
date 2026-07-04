@@ -124,6 +124,10 @@ function fakeDb(overrides: Record<string, any> = {}): any {
       getPendingByOwner: vi.fn(async () => []),
       ...overrides.queries,
     },
+    news: {
+      add: vi.fn(async () => {}),
+      ...overrides.news,
+    },
     events: {
       insert: vi.fn(async () => ({ seq: 1 })),
       ...overrides.events,
@@ -391,6 +395,36 @@ describe('stalled task sweeper', () => {
     expect(manager.shouldAttachBrainContext('Already handled. Task #12345678 is done with no active delegation.')).toBe(false);
     expect(manager.shouldAttachBrainContext('Resume and complete task #12345678: inventory MCP servers.')).toBe(true);
     expect(manager.shouldAttachBrainContext('Please inspect the repository and run the integration tests.')).toBe(true);
+  });
+
+  it('cancels active query rows before rebuilding an agent process', async () => {
+    const db = fakeDb({
+      queries: {
+        cancel: vi.fn(async () => ['query-1']),
+      },
+      news: {
+        add: vi.fn(async () => {}),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-rebuild-cancel-test', db, { libraryRoot: null }) as any;
+    manager.killAgentProcess = vi.fn(async () => ({ killed: true }));
+    manager.spawnLocalAgentProcess = vi.fn(async () => ({ success: true, pid: 123, logFile: '/tmp/agent.log' }));
+
+    const result = await manager.rebuildLocalClaudeAgent(TEAM_ID, 'default', agent());
+
+    expect(result).toMatchObject({ success: true, pid: 123 });
+    expect(db.queries.cancel).toHaveBeenCalledWith('agent-1', NOW_MS);
+    expect(db.news.add).toHaveBeenCalledWith(
+      TEAM_ID,
+      'agent-1',
+      expect.objectContaining({
+        type: 'query.cancelled',
+        query_id: 'query-1',
+      }),
+    );
+    expect(db.queries.cancel.mock.invocationCallOrder[0]).toBeLessThan(
+      manager.killAgentProcess.mock.invocationCallOrder[0],
+    );
   });
 
   it('starts the stalled-task probe reads in parallel before sending a nudge', async () => {

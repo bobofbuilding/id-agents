@@ -3035,6 +3035,7 @@ Return this JSON shape:
     teamName: string,
     agent: AgentRow,
   ): Promise<{ success: boolean; pid?: number; logFile?: string; error?: string }> {
+    await this.cancelPendingQueriesForAgent(teamId, agent.id);
     await this.killAgentProcess(agent.port);
     await new Promise(r => setTimeout(r, 1000));
     const spawnResult = await this.spawnLocalAgentProcess(teamId, teamName, {
