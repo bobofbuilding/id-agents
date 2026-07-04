@@ -159,6 +159,48 @@ interface ActiveQuery {
   completed?: number;
 }
 
+interface CurrentQueryExecution {
+  queryId: string;
+  prompt: string;
+  from?: string;
+}
+
+export interface ValidatorRecommendationRouteBlock {
+  blocked: true;
+  code: 'validator_recommendation_routing_blocked';
+  queryId: string;
+  endpoint: '/talk-to' | '/news-to';
+  target: string;
+  message: string;
+}
+
+const VALIDATOR_RECOMMENDATION_LOOP_MARKER = 'Event-driven validator recommendation loop triggered.';
+
+export function isValidatorRecommendationLoopPrompt(prompt: unknown): boolean {
+  return typeof prompt === 'string' && prompt.includes(VALIDATOR_RECOMMENDATION_LOOP_MARKER);
+}
+
+export function evaluateValidatorRecommendationRouteGuard(params: {
+  currentQuery?: CurrentQueryExecution;
+  endpoint: '/talk-to' | '/news-to';
+  target: unknown;
+}): ValidatorRecommendationRouteBlock | null {
+  const current = params.currentQuery;
+  if (!current || !isValidatorRecommendationLoopPrompt(current.prompt)) return null;
+
+  const target = typeof params.target === 'string' && params.target.trim()
+    ? params.target.trim()
+    : 'unknown';
+  return {
+    blocked: true,
+    code: 'validator_recommendation_routing_blocked',
+    queryId: current.queryId,
+    endpoint: params.endpoint,
+    target,
+    message: 'Validator recommendation loop packets must be returned as the query result; direct inter-agent routing from this loop is blocked.',
+  };
+}
+
 // Waiter for replies to outbound messages (used by /talk-to endpoint)
 // Waiters persist until reply arrives - timeout only affects HTTP response
 interface ReplyWaiter {
@@ -212,6 +254,7 @@ export class AgentRestServer {
     options?: { noAutoReply?: boolean };
   }> = [];
   private isProcessingQuery: boolean = false;
+  private currentQueryExecution: CurrentQueryExecution | undefined;
   private db: Db | undefined;
   private dbTeamId: string | undefined;
   private dbAgentId: string | undefined;
@@ -1181,6 +1224,27 @@ export class AgentRestServer {
           return res.status(400).json({ error: 'Missing "to" (agent name) or "message"' });
         }
 
+        const routingBlock = evaluateValidatorRecommendationRouteGuard({
+          currentQuery: this.currentQueryExecution,
+          endpoint: '/talk-to',
+          target: to,
+        });
+        if (routingBlock) {
+          await this.addNews('routing.blocked', routingBlock.message, {
+            query_id: routingBlock.queryId,
+            endpoint: routingBlock.endpoint,
+            to: routingBlock.target,
+            reason: routingBlock.code,
+          });
+          return res.status(409).json({
+            error: routingBlock.code,
+            message: routingBlock.message,
+            query_id: routingBlock.queryId,
+            endpoint: routingBlock.endpoint,
+            to: routingBlock.target,
+          });
+        }
+
         // Timeout: use request timeout, then agent config, then default 2 min, max 10 min
         const defaultTimeout = parseInt(process.env.ID_TALK_TIMEOUT || '120000', 10) || 120000;
         const timeoutMs = Math.min(requestTimeout || defaultTimeout, 600000);
@@ -1379,6 +1443,27 @@ export class AgentRestServer {
         const { to, message, data, trigger } = req.body || {};
         if (!to || (!message && !data)) {
           return res.status(400).json({ error: 'Missing "to" or "message"/"data"' });
+        }
+
+        const routingBlock = evaluateValidatorRecommendationRouteGuard({
+          currentQuery: this.currentQueryExecution,
+          endpoint: '/news-to',
+          target: to,
+        });
+        if (routingBlock) {
+          await this.addNews('routing.blocked', routingBlock.message, {
+            query_id: routingBlock.queryId,
+            endpoint: routingBlock.endpoint,
+            to: routingBlock.target,
+            reason: routingBlock.code,
+          });
+          return res.status(409).json({
+            error: routingBlock.code,
+            message: routingBlock.message,
+            query_id: routingBlock.queryId,
+            endpoint: routingBlock.endpoint,
+            to: routingBlock.target,
+          });
         }
 
         const myDisplayId = this.getDisplayId();
@@ -1779,6 +1864,7 @@ What would you like to do with this information?`;
 
     this.activeQueries.set(queryId, query);
     await this.dbUpsertQuery(query);
+    this.currentQueryExecution = { queryId, prompt, from };
 
     // Track whether we should send an auto-reply (default: yes if from is set)
     const shouldAutoReply = from && !options?.noAutoReply;
@@ -2091,6 +2177,9 @@ ${prompt}`
       }
     } finally {
       stopExternalQueryWatcher?.();
+      if (this.currentQueryExecution?.queryId === queryId) {
+        this.currentQueryExecution = undefined;
+      }
       if (this.db) {
         this.activeQueries.delete(queryId);
       } else {
