@@ -464,6 +464,46 @@ describe('SchedulerService.tick', () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
+  it('lets manager-owned schedules record runs without posting agent prompts', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1_700_000_301_000);
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response(null, { status: 200 }));
+    const def = makeHeartbeatDef({
+      anchor_at: 1_700_000_000,
+      interval_seconds: 300,
+      max_runs: null,
+      delivery_mode: 'talk',
+      message: 'Task assignment sweep: inspect unassigned todo tasks across all teams.',
+    });
+    const schedules = {
+      listActiveDefinitions: vi.fn(async () => [def]),
+      listTargets: vi.fn(async () => ['agent_123']),
+      countRuns: vi.fn(async () => 0),
+      insertRun: vi.fn(async () => true),
+      updateRunStatus: vi.fn(async () => undefined),
+    };
+    const managedDispatch = vi.fn(async (_target: DispatchTarget, row: ScheduleDefinitionRow, run: { scheduledKey: string }) => ({
+      scheduleId: row.id,
+      agentId: 'agent_123',
+      scheduledKey: run.scheduledKey,
+      success: true,
+    }));
+    const dbStub = { schedules } as unknown as Db;
+    const service = new SchedulerService(
+      dbStub,
+      async () => makeTarget({ schedulePath: null }),
+      { managedDispatch },
+    );
+
+    await service.tick();
+
+    expect(managedDispatch).toHaveBeenCalledOnce();
+    expect(schedules.insertRun).toHaveBeenCalledOnce();
+    expect(schedules.updateRunStatus).toHaveBeenCalledWith(def.id, 'agent_123', expect.any(String), 'sent');
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
   it('bounds automatic per-schedule dispatch concurrency', async () => {
     vi.spyOn(Date, 'now').mockReturnValue(1_700_000_301_000);
     let activeFetches = 0;

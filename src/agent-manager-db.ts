@@ -114,6 +114,7 @@ import {
 } from './core/learning-loop-capture.js';
 import type { HarnessType } from './harness/types.js';
 import { SchedulerService } from './scheduling/scheduler-service.js';
+import type { DispatchResult, DispatchTarget, DueRun } from './scheduling/schedule-types.js';
 import { heartbeatToSchedule, calendarToSchedule, validateIntervalSeconds, HEARTBEAT_GENERIC_MESSAGE } from './scheduling/schedule-config.js';
 import {
   getAvailableRuntimes,
@@ -13279,6 +13280,7 @@ Return this JSON shape:
           let targetTeamName: string | undefined;
           let allTeams = false;
           let limit = 3;
+          let perTeamLimit: number | undefined;
           let minAgeMs = 0;
           let dispatch = true;
           const taskRefs: string[] = [];
@@ -13301,6 +13303,14 @@ Return this JSON shape:
                 return { ok: false, error: '--limit must be an integer between 1 and 50' };
               }
               limit = parsed;
+              continue;
+            }
+            if (token === '--per-team-limit' || token === '--max-per-team') {
+              const parsed = Number(rawArgs[++i]);
+              if (!Number.isInteger(parsed) || parsed < 1 || parsed > 50) {
+                return { ok: false, error: '--per-team-limit must be an integer between 1 and 50' };
+              }
+              perTeamLimit = parsed;
               continue;
             }
             if (token === '--min-age-min' || token === '--min-age-minutes' || token === '--min-age') {
@@ -13335,6 +13345,7 @@ Return this JSON shape:
           const report = await this.assignUnownedTodoTasks({
             teams,
             limit,
+            perTeamLimit,
             minAgeMs,
             dispatch,
             taskRefs,
@@ -14567,6 +14578,7 @@ Return this JSON shape:
   private async assignUnownedTodoTasks(params: {
     teams: Array<{ id: string; name: string }>;
     limit: number;
+    perTeamLimit?: number;
     minAgeMs: number;
     dispatch?: boolean;
     taskRefs?: string[];
@@ -14609,6 +14621,7 @@ Return this JSON shape:
 
     for (const teamRow of params.teams) {
       if (assignedCount >= params.limit) break;
+      let assignedForTeam = 0;
       const explicitRefs = params.taskRefs?.length ? params.taskRefs : null;
       const candidates: TaskRow[] = [];
       if (explicitRefs) {
@@ -14640,6 +14653,7 @@ Return this JSON shape:
 
       for (const task of candidates) {
         if (assignedCount >= params.limit) break;
+        if (params.perTeamLimit && assignedForTeam >= params.perTeamLimit) break;
         scannedTasks++;
         const activityMs = this.taskLastActivityMs(task);
         const ageMs = Math.max(0, now - activityMs);
@@ -14662,6 +14676,7 @@ Return this JSON shape:
         const ref = this.taskShortRef(task);
         if (assignment.assigned) {
           assignedCount++;
+          assignedForTeam++;
           items.push({
             team: teamRow.name,
             task: ref,
@@ -14701,7 +14716,7 @@ Return this JSON shape:
   private async sweepStalledTasks(): Promise<void> {
     const STALL_MS = this.getStallSweepMs();       // 'doing' this long with no update
     const RENUDGE_MS = this.getStallRenudgeMs();   // don't re-nudge a task within this
-    const UNOWNED_ASSIGN_MS = Math.max(60_000, Number(process.env.ID_UNOWNED_ASSIGN_MIN_MS) || 5 * 60 * 1000);
+    const UNOWNED_ASSIGN_MS = this.unownedAssignMinMs();
     const MAX_PER_SWEEP = Math.max(1, Number(process.env.STALL_SWEEP_MAX_PER_SWEEP) || 2);
     const UNOWNED_ASSIGN_MAX_PER_SWEEP = Math.max(
       0,
@@ -15548,6 +15563,7 @@ Return this JSON shape:
               scheduleKind: def.kind,
               scheduleMessage: def.message,
             }),
+            managedDispatch: async (target, def, run) => this.dispatchManagedSchedule(target, def, run),
           },
         );
         this.schedulerService.start();
@@ -16602,6 +16618,36 @@ Return this JSON shape:
 
   private isTaskAssignmentSweepSchedule(message: unknown): boolean {
     return /^Task assignment sweep:/i.test(String(message || '').trimStart());
+  }
+
+  private unownedAssignMinMs(): number {
+    return Math.max(60_000, Number(process.env.ID_UNOWNED_ASSIGN_MIN_MS) || 5 * 60 * 1000);
+  }
+
+  private async dispatchManagedSchedule(
+    target: DispatchTarget,
+    def: ScheduleDefinitionRow,
+    run: DueRun,
+  ): Promise<DispatchResult | null> {
+    if (!this.isTaskAssignmentSweepSchedule(def.message)) return null;
+
+    const teams = (await this.db.teams.listTeams()).map((team) => ({ id: team.id, name: team.name }));
+    const report = await this.assignUnownedTodoTasks({
+      teams,
+      limit: 20,
+      perTeamLimit: 5,
+      minAgeMs: this.unownedAssignMinMs(),
+      dispatch: true,
+    });
+    this.managerLog(
+      `Managed assignment sweep ${def.id} via ${target.name}: assigned ${report.assignedCount}/${report.considered} considered task(s), skipped ${report.skippedCount}`,
+    );
+    return {
+      scheduleId: def.id,
+      agentId: target.id,
+      scheduledKey: run.scheduledKey,
+      success: true,
+    };
   }
 
   private async countFleetStalledDoingTasks(nowMs = Date.now()): Promise<number> {

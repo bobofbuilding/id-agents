@@ -19,6 +19,16 @@ export interface SchedulerServiceOptions {
     run: DueRun,
   ) => Promise<boolean> | boolean;
   /**
+   * Optional manager-owned dispatch path for schedules whose work should be
+   * handled by the manager itself instead of waking an agent conversation.
+   * Return null to fall through to the normal agent dispatcher.
+   */
+  managedDispatch?: (
+    target: DispatchTarget,
+    def: ScheduleDefinitionRow,
+    run: DueRun,
+  ) => Promise<DispatchResult | null> | DispatchResult | null;
+  /**
    * Upper bound for per-schedule target dispatches. Keep this small: schedule
    * fires can wake heavyweight agent harnesses, so unbounded fanout causes
    * local CPU/RAM spikes.
@@ -53,6 +63,7 @@ export class SchedulerService {
   private timer: NodeJS.Timeout | null = null;
   private readonly dispatcher: ScheduleDispatcher;
   private readonly shouldDispatch: SchedulerServiceOptions['shouldDispatch'] | null;
+  private readonly managedDispatch: SchedulerServiceOptions['managedDispatch'] | null;
   private readonly dispatchConcurrency: number;
 
   constructor(
@@ -62,6 +73,7 @@ export class SchedulerService {
   ) {
     this.dispatcher = new ScheduleDispatcher();
     this.shouldDispatch = opts.shouldDispatch ?? null;
+    this.managedDispatch = opts.managedDispatch ?? null;
     this.dispatchConcurrency = normalizeDispatchConcurrency(opts.dispatchConcurrency);
   }
 
@@ -165,7 +177,23 @@ export class SchedulerService {
           const inserted = await this.db.schedules.insertRun(runRow);
           if (!inserted) return;
 
-          const result = await this.dispatcher.dispatch(def, target, run.scheduledKey, linkedTasks);
+          let result: DispatchResult;
+          if (this.managedDispatch) {
+            try {
+              result = await this.managedDispatch(target, def, run)
+                ?? await this.dispatcher.dispatch(def, target, run.scheduledKey, linkedTasks);
+            } catch (err: any) {
+              result = {
+                scheduleId: run.scheduleId,
+                agentId,
+                scheduledKey: run.scheduledKey,
+                success: false,
+                error: err?.message || String(err),
+              };
+            }
+          } else {
+            result = await this.dispatcher.dispatch(def, target, run.scheduledKey, linkedTasks);
+          }
           if (result.success) {
             await this.db.schedules.updateRunStatus(run.scheduleId, agentId, run.scheduledKey, 'sent');
             console.log(`[Scheduler] ${def.title} -> ${target.name} (${run.scheduledKey})`);
