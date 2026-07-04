@@ -82,6 +82,13 @@ function adminHeaders(team: string): Record<string, string> {
   return { 'Content-Type': 'application/json', 'X-Id-Team': team, 'X-Id-Admin': '1' };
 }
 
+function doneBody(): Record<string, unknown> {
+  return {
+    agent_id: 'coder',
+    acceptance_coverage: ['checkin auto-close regression'],
+  };
+}
+
 async function insertAgentDirect(
   db: Awaited<ReturnType<typeof createInMemoryDb>>,
   teamId: string,
@@ -189,7 +196,7 @@ describe('Checkin auto-close on terminal task event', () => {
     const res = await fetch(`${baseUrl}/tasks/autoclose-active/done`, {
       method: 'POST',
       headers: adminHeaders(TEAM),
-      body: JSON.stringify({ agent_id: 'coder' }),
+      body: JSON.stringify(doneBody()),
     });
     expect(res.status).toBe(200);
 
@@ -240,7 +247,7 @@ describe('Checkin auto-close on terminal task event', () => {
     const first = await fetch(`${baseUrl}/tasks/autoclose-idempotent/done`, {
       method: 'POST',
       headers: adminHeaders(TEAM),
-      body: JSON.stringify({ agent_id: 'coder' }),
+      body: JSON.stringify(doneBody()),
     });
     expect(first.status).toBe(200);
     const firstBody = await first.json() as { ok: boolean; already_done?: boolean };
@@ -255,7 +262,7 @@ describe('Checkin auto-close on terminal task event', () => {
     const second = await fetch(`${baseUrl}/tasks/autoclose-idempotent/done`, {
       method: 'POST',
       headers: adminHeaders(TEAM),
-      body: JSON.stringify({ agent_id: 'coder' }),
+      body: JSON.stringify(doneBody()),
     });
     expect(second.status).toBe(200);
     const secondBody = await second.json() as { ok: boolean; already_done?: boolean };
@@ -296,7 +303,7 @@ describe('Checkin auto-close on terminal task event', () => {
     const res = await fetch(`${baseUrl}/tasks/autoclose-snoozed/done`, {
       method: 'POST',
       headers: adminHeaders(TEAM),
-      body: JSON.stringify({ agent_id: 'coder' }),
+      body: JSON.stringify(doneBody()),
     });
     expect(res.status).toBe(200);
 
@@ -328,7 +335,7 @@ describe('Checkin auto-close on terminal task event', () => {
     const res = await fetch(`${baseUrl}/tasks/autoclose-multi/done`, {
       method: 'POST',
       headers: adminHeaders(TEAM),
-      body: JSON.stringify({ agent_id: 'coder' }),
+      body: JSON.stringify(doneBody()),
     });
     expect(res.status).toBe(200);
 
@@ -389,7 +396,7 @@ describe('Checkin auto-close on terminal task event', () => {
     const res = await fetch(`${baseUrl}/tasks/autoclose-terminal/done`, {
       method: 'POST',
       headers: adminHeaders(TEAM),
-      body: JSON.stringify({ agent_id: 'coder' }),
+      body: JSON.stringify(doneBody()),
     });
     expect(res.status).toBe(200);
 
@@ -444,7 +451,7 @@ describe('Checkin auto-close on terminal task event', () => {
     const res = await fetch(`${baseUrl}/tasks/autoclose-isolated/done`, {
       method: 'POST',
       headers: adminHeaders(TEAM),
-      body: JSON.stringify({ agent_id: 'coder' }),
+      body: JSON.stringify(doneBody()),
     });
     expect(res.status).toBe(200);
 
