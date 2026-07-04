@@ -82,8 +82,8 @@ describe('ScheduleDispatcher Brain context', () => {
       const dispatcher = new ScheduleDispatcher();
       const def: ScheduleDefinitionRow = {
         id: 'sched-1',
-        kind: 'heartbeat',
-        title: 'Heartbeat',
+        kind: 'calendar',
+        title: 'Scheduled Digest',
         description: null,
         active: true,
         message: 'review deployment state',

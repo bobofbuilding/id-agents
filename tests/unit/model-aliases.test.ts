@@ -24,7 +24,7 @@ describe('model alias resolution', () => {
 
   it('preserves existing aliases (regression)', () => {
     expect(resolveModelAlias('haiku')).toBe('claude-haiku-4-5-20251001');
-    expect(resolveModelAlias('sonnet')).toBe('claude-sonnet-4-5-20250514');
+    expect(resolveModelAlias('sonnet')).toBe('claude-sonnet-5');
     expect(resolveModelAlias('opus')).toBe('claude-opus-4-5-20250514');
     expect(resolveModelAlias('opus-4-8')).toBe('claude-opus-4-8');
     expect(resolveModelAlias('opus-4.8')).toBe('claude-opus-4-8');
