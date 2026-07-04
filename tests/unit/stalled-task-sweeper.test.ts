@@ -87,6 +87,8 @@ function fakeDb(overrides: Record<string, any> = {}): any {
     },
     tasks: {
       list: vi.fn(async ({ status }: { status?: string } = {}) => status === 'doing' ? [task()] : []),
+      getByNameForTeam: vi.fn(async () => task()),
+      claim: vi.fn(async () => true),
       updateFields: vi.fn(async () => {}),
       ...overrides.tasks,
     },
@@ -127,7 +129,11 @@ describe('stalled task sweeper', () => {
     vi.restoreAllMocks();
     delete process.env.STALL_SWEEP_MS;
     delete process.env.STALL_RENUDGE_MS;
+    delete process.env.STALL_SWEEP_MAX_PER_SWEEP;
     delete process.env.STALL_MAX_PROBES;
+    delete process.env.ID_UNOWNED_ASSIGN_MIN_MS;
+    delete process.env.ID_UNOWNED_ASSIGN_MAX_PER_SWEEP;
+    delete process.env.ID_MAX_DOING_TASKS;
   });
 
   it('does not treat fresh second-based task timestamps as stalled', async () => {
@@ -1095,6 +1101,176 @@ describe('stalled task sweeper', () => {
 
     expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
     expect(db.events.insert).not.toHaveBeenCalled();
+  });
+
+  it('auto-assigns old unclaimed todo work to an idle live non-lead member', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const staleTodo = task({
+      id: 'todo-assign-1',
+      name: 'stale-unclaimed',
+      uuid: '99999999-8888-4777-9666-555555555555',
+      title: 'Stale unclaimed work',
+      status: 'todo',
+      owner: null,
+      updated_at: nowSec - 3600,
+    });
+    const worker = agent({ id: 'worker-2', name: 'worker-b' });
+    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
+    const updated = { ...staleTodo, owner: worker.id, status: 'doing' as const, updated_at: nowSec };
+    let taskLookupCount = 0;
+    const db = fakeDb({
+      agents: {
+        getById: vi.fn(async () => worker),
+        getByName: vi.fn(async () => lead),
+        list: vi.fn(async () => [lead, worker]),
+      },
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => {
+          if (status === 'doing') return [];
+          if (status === 'todo') return [staleTodo];
+          return [];
+        }),
+        getByNameForTeam: vi.fn(async () => (++taskLookupCount === 1 ? staleTodo : updated)),
+        claim: vi.fn(async () => true),
+        updateFields: vi.fn(async () => {}),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.sweepStalledTasks();
+
+    expect(db.tasks.claim).toHaveBeenCalledWith('todo-assign-1', 'worker-2', nowSec, {
+      maxDoingForTeam: expect.any(Number),
+    });
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'worker-b',
+      expect.stringContaining('TASK DELEGATION from manager'),
+    );
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalledWith(
+      'default',
+      'lead',
+      expect.any(String),
+    );
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      team_id: TEAM_ID,
+      topic: 'task:claimed',
+      actor_agent_id: 'worker-2',
+      subject_kind: 'task',
+      subject_id: '99999999-8888-4777-9666-555555555555',
+      data: expect.objectContaining({
+        owner: 'worker-2',
+        status: 'doing',
+      }),
+    }));
+  });
+
+  it('does not auto-assign unclaimed todo work when the doing cap is full', async () => {
+    process.env.ID_MAX_DOING_TASKS = '1';
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const activeDoing = task({
+      id: 'doing-1',
+      name: 'active-work',
+      uuid: '11111111-2222-4333-8444-555555555555',
+      title: 'Active work',
+      status: 'doing',
+      owner: 'worker-1',
+      updated_at: nowSec,
+    });
+    const staleTodo = task({
+      id: 'todo-full-1',
+      name: 'stale-unclaimed',
+      uuid: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+      title: 'Stale unclaimed work',
+      status: 'todo',
+      owner: null,
+      updated_at: nowSec - 3600,
+    });
+    const worker = agent({ id: 'worker-1', name: 'worker' });
+    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
+    const db = fakeDb({
+      agents: {
+        getById: vi.fn(async () => worker),
+        getByName: vi.fn(async () => lead),
+        list: vi.fn(async () => [lead, worker]),
+      },
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => {
+          if (status === 'doing') return [activeDoing];
+          if (status === 'todo') return [staleTodo];
+          return [];
+        }),
+        getByNameForTeam: vi.fn(async () => staleTodo),
+        claim: vi.fn(async () => true),
+        updateFields: vi.fn(async () => {}),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.sweepStalledTasks();
+
+    expect(db.tasks.claim).not.toHaveBeenCalled();
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
+    expect(db.events.insert).not.toHaveBeenCalled();
+  });
+
+  it('reserves the first sweep slot for old unclaimed todo assignment', async () => {
+    process.env.STALL_SWEEP_MAX_PER_SWEEP = '1';
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const staleDoing = task({
+      id: 'doing-stale-1',
+      name: 'already-stale',
+      uuid: 'bbbbbbbb-2222-4333-8444-555555555555',
+      title: 'Already stale work',
+      status: 'doing',
+      owner: 'busy-worker',
+      updated_at: nowSec - 7200,
+    });
+    const staleTodo = task({
+      id: 'todo-priority-1',
+      name: 'priority-unclaimed',
+      uuid: 'cccccccc-2222-4333-8444-555555555555',
+      title: 'Priority unclaimed work',
+      status: 'todo',
+      owner: null,
+      updated_at: nowSec - 3600,
+    });
+    const busyWorker = agent({ id: 'busy-worker', name: 'busy-worker' });
+    const idleWorker = agent({ id: 'idle-worker', name: 'idle-worker' });
+    const updated = { ...staleTodo, owner: idleWorker.id, status: 'doing' as const, updated_at: nowSec };
+    let taskLookupCount = 0;
+    const db = fakeDb({
+      agents: {
+        getById: vi.fn(async () => busyWorker),
+        list: vi.fn(async () => [busyWorker, idleWorker]),
+      },
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => {
+          if (status === 'doing') return [staleDoing];
+          if (status === 'todo') return [staleTodo];
+          return [];
+        }),
+        getByNameForTeam: vi.fn(async () => (++taskLookupCount === 1 ? staleTodo : updated)),
+        claim: vi.fn(async () => true),
+        updateFields: vi.fn(async () => {}),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.sweepStalledTasks();
+
+    expect(db.tasks.claim).toHaveBeenCalledWith('todo-priority-1', 'idle-worker', nowSec, {
+      maxDoingForTeam: expect.any(Number),
+    });
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledTimes(1);
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'idle-worker',
+      expect.stringContaining('TASK DELEGATION from manager'),
+    );
   });
 
   it('wakes a stopped local owner before routing stalled work back to a lead', async () => {

@@ -511,6 +511,12 @@ interface ProviderRuntimeAssignment {
   apiKey?: string;
 }
 
+interface ForwardToAgentRetryOptions {
+  attempts?: number;
+  initialDelayMs?: number;
+  label?: string;
+}
+
 function providerRuntimeErrorStatus(message: string): number {
   return /provider runtime lane|requires baseUrl/i.test(message) ? 400 : 500;
 }
@@ -555,10 +561,17 @@ const DEFAULT_VALIDATOR_RECOMMENDATION_LOOP: ValidatorRecommendationLoopConfig =
   updatedAt: null,
 };
 const MANAGER_HTTP_SHUTDOWN_TIMEOUT_MS = 3_000;
+const TALK_TO_DELIVERY_TIMEOUT_MS = 30_000;
+const TALK_TO_MAX_ATTEMPTS = 3;
+const TALK_TO_INITIAL_RETRY_DELAY_MS = 250;
 
 function positiveEnvNumber(name: string): number | null {
   const n = Number(process.env[name]);
   return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export class AgentManagerDb {
@@ -12621,14 +12634,114 @@ Return this JSON shape:
     return false;
   }
 
+  private async assignUnownedTodoTask(
+    task: TaskRow,
+    teamRow: { id: string; name: string },
+    nowMs: number,
+  ): Promise<{ assigned: boolean; reason: string; owner?: AgentRow }> {
+    if (task.owner || task.status !== 'todo') return { assigned: false, reason: 'not_unowned_todo' };
+    if (!(await this.hasDoingTaskRoom(teamRow.id))) return { assigned: false, reason: 'doing_limit_full' };
+
+    const agents = await this.db.agents.list(teamRow.id).catch(() => [] as AgentRow[]);
+    const doing = await this.db.tasks.list({ teamId: teamRow.id, status: 'doing' }).catch(() => [] as TaskRow[]);
+    const activeByOwner = new Map<string, number>();
+    for (const active of doing) {
+      if (active.owner) activeByOwner.set(active.owner, (activeByOwner.get(active.owner) ?? 0) + 1);
+    }
+
+    const candidates = agents
+      .filter((agent) =>
+        this.isLiveForSupervision(agent)
+        && !this.isConfiguredTeamLead(teamRow.name, agent)
+        && Boolean(agent.endpoint),
+      )
+      .sort((a, b) =>
+        (activeByOwner.get(a.id) ?? 0) - (activeByOwner.get(b.id) ?? 0)
+        || a.name.localeCompare(b.name),
+      );
+
+    for (const owner of candidates) {
+      if (await this.hasAnyActiveQuery(owner)) continue;
+      const current = await this.db.tasks.getByNameForTeam(task.name, teamRow.id).catch(() => null);
+      if (!current || current.status !== 'todo' || current.owner) {
+        return { assigned: false, reason: 'task_changed' };
+      }
+
+      const nowSec = Math.floor(nowMs / 1000);
+      const claimed = await this.db.tasks.claim(current.id, owner.id, nowSec, {
+        maxDoingForTeam: this.getMaxDoingTasks(),
+      });
+      if (!claimed) return { assigned: false, reason: 'claim_race_or_limit' };
+
+      const updated = await this.db.tasks.getByNameForTeam(current.name, teamRow.id).catch(() => null) ?? {
+        ...current,
+        owner: owner.id,
+        status: 'doing' as const,
+        updated_at: nowSec,
+      };
+      await emitTaskClaimed(this.db.events, {
+        teamId: teamRow.id,
+        taskUuid: updated.uuid,
+        taskName: updated.name,
+        title: updated.title,
+        ownerAgentId: owner.id,
+        occurredAt: nowMs,
+      });
+
+      const ref = this.taskShortRef(updated);
+      if (!(await this.hasActiveSupervisionAskForMarker(teamRow.id, owner, ref))) {
+        const msg = `TASK DELEGATION from manager: You are assigned task ${ref} ("${updated.title}"). Start this task now. When complete, mark it done with \`/task done ${ref} --acceptance "..."\`. If blocked, reply with the blocker and do not create duplicate tasks.`;
+        const sent = await this.sendSupervisionAsk(teamRow.name, owner.name, msg);
+        if (!sent) this.managerLog(`Auto-assigned task ${updated.name} to ${owner.name}, but the delegation prompt could not be delivered`);
+      }
+      return { assigned: true, reason: 'assigned', owner };
+    }
+
+    return { assigned: false, reason: 'no_idle_live_member' };
+  }
+
   private async sweepStalledTasks(): Promise<void> {
     const STALL_MS = Number(process.env.STALL_SWEEP_MS) || 45 * 60 * 1000;     // 'doing' this long with no update
     const RENUDGE_MS = Number(process.env.STALL_RENUDGE_MS) || 90 * 60 * 1000; // don't re-nudge a task within this
+    const UNOWNED_ASSIGN_MS = Math.max(60_000, Number(process.env.ID_UNOWNED_ASSIGN_MIN_MS) || 5 * 60 * 1000);
     const MAX_PER_SWEEP = Math.max(1, Number(process.env.STALL_SWEEP_MAX_PER_SWEEP) || 2);
+    const UNOWNED_ASSIGN_MAX_PER_SWEEP = Math.max(
+      0,
+      Math.min(MAX_PER_SWEEP, Number(process.env.ID_UNOWNED_ASSIGN_MAX_PER_SWEEP) || 1),
+    );
     const MAX_PROBES = this.getMaxStalledTaskProbes();
     const now = Date.now();
-    const doing = await this.db.tasks.list({ status: 'doing' }).catch(() => [] as TaskRow[]);
     let nudged = 0;
+    let unownedAssigned = 0;
+    const assignedTodoTaskIds = new Set<string>();
+
+    if (UNOWNED_ASSIGN_MAX_PER_SWEEP > 0) {
+      const assignableTodo = await this.db.tasks.list({ status: 'todo' }).catch(() => [] as TaskRow[]);
+      for (const t of assignableTodo) {
+        if (nudged >= MAX_PER_SWEEP || unownedAssigned >= UNOWNED_ASSIGN_MAX_PER_SWEEP) break;
+        if (t.owner || !t.team_id) continue;
+        const updated = this.taskLastActivityMs(t);
+        if (now - updated < UNOWNED_ASSIGN_MS) continue;
+        const nudgeKey = `todo-assign:${t.id}`;
+        if (!this.canRunStalledProbe(nudgeKey, now, RENUDGE_MS, MAX_PROBES)) continue;
+        const teamRow = await this.db.teams.getTeam(t.team_id).catch(() => null);
+        if (!teamRow) continue;
+        const active = await this.db.checkins
+          .list({ teamId: teamRow.id, linkedTaskId: t.id, status: ['active', 'snoozed'], limit: 1 })
+          .catch(() => [] as CheckinRow[]);
+        if (active.length) continue;
+
+        const assignment = await this.assignUnownedTodoTask(t, teamRow, now);
+        if (assignment.assigned) {
+          this.markStalledProbe(nudgeKey, now);
+          assignedTodoTaskIds.add(t.id);
+          nudged++;
+          unownedAssigned++;
+        }
+      }
+    }
+
+    const doing = await this.db.tasks.list({ status: 'doing' }).catch(() => [] as TaskRow[]);
     for (const t of doing) {
       if (nudged >= MAX_PER_SWEEP) break;
       if (!t.owner) continue;
@@ -12817,9 +12930,11 @@ Return this JSON shape:
       : [];
     for (const t of todo) {
       if (nudged >= MAX_PER_SWEEP) break;
+      if (assignedTodoTaskIds.has(t.id)) continue;
       if (t.owner || !t.team_id) continue;
       const updated = this.taskLastActivityMs(t);
-      if (now - updated < STALL_MS) continue;
+      const unownedAgeMs = now - updated;
+      if (unownedAgeMs < Math.min(UNOWNED_ASSIGN_MS, STALL_MS)) continue;
       const nudgeKey = `todo:${t.id}`;
       if (!this.canRunStalledProbe(nudgeKey, now, RENUDGE_MS, MAX_PROBES)) continue;
 
@@ -12829,6 +12944,19 @@ Return this JSON shape:
         .list({ teamId: teamRow.id, linkedTaskId: t.id, status: ['active', 'snoozed'], limit: 1 })
         .catch(() => [] as CheckinRow[]);
       if (active.length) continue;
+
+      if (unownedAgeMs >= UNOWNED_ASSIGN_MS && unownedAssigned < UNOWNED_ASSIGN_MAX_PER_SWEEP) {
+        const assignment = await this.assignUnownedTodoTask(t, teamRow, now);
+        if (assignment.assigned) {
+          assignedTodoTaskIds.add(t.id);
+          nudged++;
+          unownedAssigned++;
+          continue;
+        }
+        if (assignment.reason === 'doing_limit_full') continue;
+      }
+
+      if (unownedAgeMs < STALL_MS) continue;
 
       const lead = await this.findSupervisionLead(teamRow.id);
       if (!lead) continue;
