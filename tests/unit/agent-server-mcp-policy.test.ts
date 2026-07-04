@@ -31,11 +31,33 @@ IMPORTANT INSTRUCTIONS:
 DO NOT send a message or reply back to "researcher"`)).toBe(true);
   });
 
+  it('suppresses MCP for inter-agent control-plane status relays', () => {
+    expect(shouldSuppressMcpForPrompt(`[Message from agent "task-master" | Query ID: query_1]
+[Note: task-master will poll for your reply for ~2 minutes.]
+
+Assignment sweep complete (Jul 4). Assigned: 0. All 6 online agents across 3 teams blocked by stalled task backlogs.`)).toBe(true);
+
+    expect(shouldSuppressMcpForPrompt(`[Message from agent "lead" | Query ID: query_2]
+[Note: lead will poll for your reply for ~2 minutes.]
+
+No approved recommendation routed. The completed result was REVISE.`)).toBe(true);
+
+    expect(shouldSuppressMcpForPrompt(`[Message from agent "lead" | Query ID: query_3]
+[Note: lead will poll for your reply for ~2 minutes.]
+
+Already handled. Task #abc12345 is done with no active delegation.`)).toBe(true);
+  });
+
   it('keeps MCP available for normal delegated task work', () => {
     expect(shouldSuppressMcpForPrompt(`[Message from the manager (your owner/operator) | Query ID: q4]
 [Respond directly and helpfully — this is the person who manages you.]
 
 Resume and complete task #60c39e90: Inventory MCP servers, plugins, connectors, integrations.`)).toBe(false);
+
+    expect(shouldSuppressMcpForPrompt(`[Message from agent "researcher" | Query ID: q5]
+[Note: researcher will poll for your reply for ~2 minutes.]
+
+Please inspect the repository, edit the integration, and run the test suite.`)).toBe(false);
 
     expect(shouldSuppressMcpForPrompt('Implement a filesystem-backed MCP integration and cite the changed files.')).toBe(false);
   });
