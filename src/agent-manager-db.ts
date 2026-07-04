@@ -3169,8 +3169,11 @@ Return this JSON shape:
         this.runtimeCredentialPoolByTeam.set(team.id, pool as RuntimeCredentialPoolConfig);
       }
     }
-    await this.db.runtimeLaneCooldowns.pruneExpired(now);
-    const activeCooldowns = await this.db.runtimeLaneCooldowns.listActive(now);
+    const cooldownRepo = this.db.runtimeLaneCooldowns;
+    if (!cooldownRepo?.pruneExpired || !cooldownRepo?.listActive) return;
+
+    await cooldownRepo.pruneExpired(now);
+    const activeCooldowns = await cooldownRepo.listActive(now);
     for (const row of activeCooldowns) {
       this.runtimeLaneCooldowns.set(row.lane_id, {
         laneId: row.lane_id,
@@ -7925,6 +7928,14 @@ Return this JSON shape:
           return res.status(403).json({ error: `Agent "${callerRef}" is not the owner of task "${task.name}"` });
         }
 
+        if (this.isTerminalTaskStatus(task.status)) {
+          return res.json({
+            ok: true,
+            task: await this.buildTaskResult(task, teamId),
+            already_done: true,
+          });
+        }
+
         const completion = this.validateCompletionPayload(req.body || {});
         if (completion.blocked) {
           return res.status(422).json({
@@ -11866,6 +11877,16 @@ Return this JSON shape:
             }
           }
 
+          if (this.isTerminalTaskStatus(task.status)) {
+            return {
+              ok: true,
+              result: {
+                task: await this.buildTaskResult(task, teamId),
+                already_done: true,
+              },
+            };
+          }
+
           const completionPayload = {
             acceptance_coverage: acceptanceCoverage,
             delegated_task_names: delegatedTaskNames,
@@ -12310,6 +12331,10 @@ Return this JSON shape:
     return this.taskTimestampMs(task.updated_at || task.created_at || 0);
   }
 
+  private isTerminalTaskStatus(status: string | null | undefined): boolean {
+    return ['done', 'completed', 'archived', 'cancelled', 'canceled'].includes(String(status || '').toLowerCase());
+  }
+
   private async recordTaskSupervision(
     task: TaskRow,
     teamId: string,
@@ -12347,6 +12372,7 @@ Return this JSON shape:
     const validatorName = this.defaultValidatorName(params.ownerAgent);
     if (!validatorName) return false;
     if (!this.isValidationTask(params.task)) return false;
+    if (this.isTerminalTaskStatus(params.task.status)) return false;
 
     const nowSec = Math.floor(params.nowMs / 1000);
     const failureNote = `stalled_validation_terminal: ${validatorName} remained processing after ${params.maxProbes} bounded probe(s) and one retry over ${params.stalledMinutes}m; closed without automatic redispatch.`;

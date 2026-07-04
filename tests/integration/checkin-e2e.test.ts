@@ -111,6 +111,18 @@ function adminHeaders(team: string): Record<string, string> {
   return { 'Content-Type': 'application/json', 'X-Id-Team': team, 'X-Id-Admin': '1' };
 }
 
+function validBriefFields() {
+  return {
+    goal_id: 'goal_mqxibu5r_2k2my',
+    expected_output: 'implementation patch and tests',
+    acceptance_criteria: ['auto-attaches checkin', 'auto-closes after terminal task'],
+    validation_path: { required_default_validators: ['coder', 'researcher'] },
+    out_of_scope: ['optional recommendations'],
+    backlog_policy: 'Non-required recommendations become backlog candidates.',
+    bittrees_relevance: 'medium: improves checkin lifecycle reliability for Bittrees contributor work.',
+  };
+}
+
 describe('Checkin end-to-end: /talk-to → fire → auto-close', () => {
   let manager: AgentManagerDb;
   let db: Awaited<ReturnType<typeof createInMemoryDb>>;
@@ -158,7 +170,7 @@ describe('Checkin end-to-end: /talk-to → fire → auto-close', () => {
         from: 'cto',
         message: 'please implement the foo widget',
         wait: false,
-        task: { title: 'Build foo widget', name: 'build-foo' },
+        task: { title: 'Build foo widget', name: 'build-foo', ...validBriefFields() },
       }),
     });
     expect(dispatchRes.status).toBe(200);
@@ -177,7 +189,8 @@ describe('Checkin end-to-end: /talk-to → fire → auto-close', () => {
     expect(checkinsAfterDispatch).toHaveLength(1);
     const checkin = checkinsAfterDispatch[0];
     expect(checkin).toMatchObject({
-      owner_agent_id: ctoId,
+      owner_agent_id: coderId,
+      created_by_agent_id: ctoId,
       linked_task_id: task.id,
       interval_seconds: 600,
       status: 'active',
@@ -203,10 +216,10 @@ describe('Checkin end-to-end: /talk-to → fire → auto-close', () => {
     expect(afterFire1!.next_fire_at).toBe(t1 + DEFAULT_INTERVAL_MS);
     expect(afterFire1!.status).toBe('active');
 
-    const ctoNews1 = await db.news.poll(ctoId, 0);
-    expect(ctoNews1.length).toBe(1);
-    expect(ctoNews1[0].type).toBe('checkin_due');
-    const news1Data = ctoNews1[0].data as Record<string, any>;
+    const coderNews1 = await db.news.poll(coderId, 0);
+    expect(coderNews1.length).toBe(1);
+    expect(coderNews1[0].type).toBe('checkin_due');
+    const news1Data = coderNews1[0].data as Record<string, any>;
     expect(news1Data.checkin_id).toBe(checkin.id);
     expect(news1Data.iteration_count).toBe(1);
     expect(news1Data.linked_task).toMatchObject({
@@ -231,9 +244,9 @@ describe('Checkin end-to-end: /talk-to → fire → auto-close', () => {
     expect(afterFire2!.last_fire_at).toBe(t2);
     expect(afterFire2!.next_fire_at).toBe(t2 + DEFAULT_INTERVAL_MS);
 
-    const ctoNews2 = await db.news.poll(ctoId, 0);
-    expect(ctoNews2.length).toBe(2);
-    expect((ctoNews2[0].data as Record<string, any>).iteration_count).toBeGreaterThanOrEqual(1);
+    const coderNews2 = await db.news.poll(coderId, 0);
+    expect(coderNews2.length).toBe(2);
+    expect((coderNews2[0].data as Record<string, any>).iteration_count).toBeGreaterThanOrEqual(1);
 
     // Two checkin:due events now in the log.
     expect(await db.events.query({ teamId, topics: ['checkin:due'] })).toHaveLength(2);
@@ -245,7 +258,10 @@ describe('Checkin end-to-end: /talk-to → fire → auto-close', () => {
     const doneRes = await fetch(`${baseUrl}/tasks/${task.name}/done`, {
       method: 'POST',
       headers: adminHeaders(TEAM),
-      body: JSON.stringify({ agent_id: 'coder' }),
+      body: JSON.stringify({
+        agent_id: 'coder',
+        acceptance_coverage: ['auto-attaches checkin', 'auto-closes after terminal task'],
+      }),
     });
     expect(doneRes.status).toBe(200);
 

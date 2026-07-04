@@ -226,6 +226,59 @@ describe('Checkin auto-close on terminal task event', () => {
     expect(completed).toHaveLength(1);
   });
 
+  it('treats repeated task completion as idempotent and does not re-emit terminal events', async () => {
+    const task = await insertTaskDirect(db, teamId, 'autoclose-idempotent', coderAgentId);
+    const checkinId = `chk_${crypto.randomUUID()}`;
+    await db.checkins.create(buildCheckinRow({
+      id: checkinId,
+      team_id: teamId,
+      owner_agent_id: managerAgentId,
+      linked_task_id: task.id,
+      status: 'active',
+    }));
+
+    const first = await fetch(`${baseUrl}/tasks/autoclose-idempotent/done`, {
+      method: 'POST',
+      headers: adminHeaders(TEAM),
+      body: JSON.stringify({ agent_id: 'coder' }),
+    });
+    expect(first.status).toBe(200);
+    const firstBody = await first.json() as { ok: boolean; already_done?: boolean };
+    expect(firstBody.ok).toBe(true);
+    expect(firstBody.already_done).toBeUndefined();
+
+    const completedTask = await db.tasks.getByNameForTeam('autoclose-idempotent', teamId);
+    expect(completedTask?.status).toBe('done');
+    const completedAt = completedTask?.completed_at;
+    const updatedAt = completedTask?.updated_at;
+
+    const second = await fetch(`${baseUrl}/tasks/autoclose-idempotent/done`, {
+      method: 'POST',
+      headers: adminHeaders(TEAM),
+      body: JSON.stringify({ agent_id: 'coder' }),
+    });
+    expect(second.status).toBe(200);
+    const secondBody = await second.json() as { ok: boolean; already_done?: boolean };
+    expect(secondBody.ok).toBe(true);
+    expect(secondBody.already_done).toBe(true);
+
+    const afterRetry = await db.tasks.getByNameForTeam('autoclose-idempotent', teamId);
+    expect(afterRetry?.completed_at).toBe(completedAt);
+    expect(afterRetry?.updated_at).toBe(updatedAt);
+
+    const closed = await db.checkins.get(checkinId, teamId);
+    expect(closed?.status).toBe('closed');
+    expect(closed?.closed_reason).toBe('linked_task_terminal');
+
+    const checkinEvents = await db.events.query({ teamId, topics: [CHECKIN_CLOSED] });
+    expect(checkinEvents).toHaveLength(1);
+    expect(checkinEvents[0].subject_id).toBe(checkinId);
+
+    const completedEvents = await db.events.query({ teamId, topics: [TASK_COMPLETED] });
+    expect(completedEvents).toHaveLength(1);
+    expect(completedEvents[0].subject_id).toBe(task.uuid);
+  });
+
   it('closes a linked snoozed checkin and clears snooze_until', async () => {
     const task = await insertTaskDirect(db, teamId, 'autoclose-snoozed', coderAgentId);
     const checkinId = `chk_${crypto.randomUUID()}`;
