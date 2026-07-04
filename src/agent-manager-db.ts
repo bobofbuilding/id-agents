@@ -14436,6 +14436,39 @@ Return this JSON shape:
     return graceMs > 0 && occurredAt >= Date.now() - graceMs;
   }
 
+  private blockedTaskReassignCooldownMs(): number {
+    const raw = Number(process.env.ID_BLOCKED_TASK_REASSIGN_COOLDOWN_MS);
+    if (Number.isFinite(raw) && raw >= 0) return raw;
+    return 60 * 60 * 1000;
+  }
+
+  private async hasRecentBlockedTaskTriage(teamId: string, task: TaskRow, nowMs: number): Promise<boolean> {
+    if (!task.uuid) return false;
+    const cooldownMs = this.blockedTaskReassignCooldownMs();
+    if (cooldownMs <= 0) return false;
+
+    const dialect = this.db.adapter.dialect;
+    const p = (n: number) => dialect === 'postgres' ? `$${n}` : '?';
+    const sinceMs = nowMs - cooldownMs;
+    const { rows } = await this.db.adapter.query<{ seq: number | string; data?: string }>(
+      `SELECT seq, data
+         FROM event_log
+        WHERE team_id = ${p(1)}
+          AND subject_kind = 'task'
+          AND subject_id = ${p(2)}
+          AND topic = 'task:triaged'
+          AND occurred_at >= ${p(3)}
+          AND (
+            data LIKE '%"reason":"control_reply_blocked"%'
+            OR data LIKE '%"reason": "control_reply_blocked"%'
+          )
+        ORDER BY occurred_at DESC
+        LIMIT 1`,
+      [teamId, task.uuid, sinceMs],
+    ).catch(() => ({ rows: [] as Array<{ seq: number | string; data?: string }> }));
+    return rows.some((row) => /"reason"\s*:\s*"control_reply_blocked"/.test(String(row.data ?? '')));
+  }
+
   private isTerminalTaskStatus(status: string | null | undefined): boolean {
     return ['done', 'completed', 'archived', 'cancelled', 'canceled'].includes(String(status || '').toLowerCase());
   }
@@ -14575,6 +14608,7 @@ Return this JSON shape:
     opts: { dispatch?: boolean } = {},
   ): Promise<{ assigned: boolean; reason: string; owner?: AgentRow; dispatched?: boolean }> {
     if (task.owner || task.status !== 'todo') return { assigned: false, reason: 'not_unowned_todo' };
+    if (await this.hasRecentBlockedTaskTriage(teamRow.id, task, nowMs)) return { assigned: false, reason: 'recent_blocked_triage' };
     if (!(await this.hasDoingTaskRoom(teamRow.id))) return { assigned: false, reason: 'doing_limit_full' };
 
     const agents = await this.db.agents.list(teamRow.id).catch(() => [] as AgentRow[]);
@@ -14738,6 +14772,18 @@ Return this JSON shape:
           checkinSupervised++;
           continue;
         }
+        if (await this.hasRecentBlockedTaskTriage(teamRow.id, task, now)) {
+          skippedCount++;
+          items.push({
+            team: teamRow.name,
+            task: this.taskShortRef(task),
+            title: task.title,
+            status: 'skipped',
+            reason: 'recent_blocked_triage',
+            ageMinutes,
+          });
+          continue;
+        }
 
         considered++;
         const assignment = await this.assignUnownedTodoTask(task, teamRow, now, { dispatch: params.dispatch });
@@ -14811,6 +14857,7 @@ Return this JSON shape:
           .list({ teamId: teamRow.id, linkedTaskId: t.id, status: ['active', 'snoozed'], limit: 1 })
           .catch(() => [] as CheckinRow[]);
         if (active.length) continue;
+        if (await this.hasRecentBlockedTaskTriage(teamRow.id, t, now)) continue;
 
         const assignment = await this.assignUnownedTodoTask(t, teamRow, now);
         if (assignment.assigned) {
@@ -15176,6 +15223,7 @@ Return this JSON shape:
       const mins = Math.round((now - updated) / 60000);
       const hasRecentSupervision = await this.hasRecentTaskSupervisionEvent(teamRow.id, t, now - RENUDGE_MS);
       if (hasRecentSupervision) continue;
+      if (await this.hasRecentBlockedTaskTriage(teamRow.id, t, now)) continue;
 
       if (!lead) {
         const fallback = await this.routeStalledTaskToTaskManagerFallback({

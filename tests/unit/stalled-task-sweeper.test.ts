@@ -163,6 +163,7 @@ describe('stalled task sweeper', () => {
     delete process.env.ID_UNOWNED_ASSIGN_MIN_MS;
     delete process.env.ID_UNOWNED_ASSIGN_MAX_PER_SWEEP;
     delete process.env.ID_MAX_DOING_TASKS;
+    delete process.env.ID_BLOCKED_TASK_REASSIGN_COOLDOWN_MS;
   });
 
   it('delays immediate lead delegation kickoff for fresh second-based tasks', () => {
@@ -835,6 +836,72 @@ describe('stalled task sweeper', () => {
       'lead',
       expect.any(String),
     );
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it('does not auto-assign an unowned todo task that was recently blocked', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const recentlyBlocked = task({
+      id: 'todo-blocked-1',
+      name: 'recently-blocked',
+      uuid: 'abcdef12-3456-4789-8123-abcdef123456',
+      title: 'Recently blocked task',
+      status: 'todo',
+      owner: null,
+      updated_at: nowSec - 600,
+    });
+    const worker = agent({ id: 'worker-2', name: 'worker-b' });
+    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
+    const create = vi.fn(async () => {});
+    const db = fakeDb({
+      agents: {
+        getById: vi.fn(async () => worker),
+        getByName: vi.fn(async () => lead),
+        list: vi.fn(async () => [lead, worker]),
+      },
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => {
+          if (status === 'doing') return [];
+          if (status === 'todo') return [recentlyBlocked];
+          return [];
+        }),
+        getByUuidPrefix: vi.fn(async (prefix: string) => prefix === 'abcdef12' ? [recentlyBlocked] : []),
+        getByNameForTeam: vi.fn(async () => recentlyBlocked),
+        claim: vi.fn(async () => true),
+        updateFields: vi.fn(async () => {}),
+        create,
+      },
+      adapter: {
+        query: vi.fn(async (sql: string) => {
+          if (sql.includes("topic = 'task:triaged'")) {
+            return { rows: [{ seq: 1, data: '{"reason":"control_reply_blocked"}' }], rowCount: 1 };
+          }
+          return { rows: [], rowCount: 0 };
+        }),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-assign-unowned-blocked-cooldown-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const result = await manager.executeRemoteCommand('/task assign-unowned --task #abcdef12 --limit 4 --min-age-min 1', TEAM_ID, 'default');
+
+    expect(result).toMatchObject({
+      ok: true,
+      result: {
+        assignedCount: 0,
+        skippedCount: 1,
+        items: [
+          {
+            team: 'default',
+            task: '#abcdef12',
+            status: 'skipped',
+            reason: 'recent_blocked_triage',
+          },
+        ],
+      },
+    });
+    expect(db.tasks.claim).not.toHaveBeenCalled();
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
     expect(create).not.toHaveBeenCalled();
   });
 
