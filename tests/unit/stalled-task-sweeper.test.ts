@@ -160,6 +160,7 @@ describe('stalled task sweeper', () => {
     delete process.env.ID_STALL_MANUAL_RENUDGE_MS;
     delete process.env.STALL_SWEEP_MAX_PER_SWEEP;
     delete process.env.STALL_MAX_PROBES;
+    delete process.env.ID_TASK_MANAGER_FALLBACK_COOLDOWN_MS;
     delete process.env.ID_UNOWNED_ASSIGN_MIN_MS;
     delete process.env.ID_UNOWNED_ASSIGN_MAX_PER_SWEEP;
     delete process.env.ID_MAX_DOING_TASKS;
@@ -1933,6 +1934,131 @@ describe('stalled task sweeper', () => {
         stalled_minutes: 60,
       }),
     }));
+  });
+
+  it('does not fan out task-manager fallback prompts while the task-manager lane is cooling down', async () => {
+    const unavailableOwner = agent({ status: 'stopped' });
+    const opsTeam = team({ id: 'ops-team-id', name: 'ops-team' });
+    const taskMaster = agent({
+      id: 'task-master-id',
+      team_id: opsTeam.id,
+      name: 'task-master',
+      status: 'running',
+    });
+    const recentFailedFallback = {
+      team_id: opsTeam.id,
+      agent_id: taskMaster.id,
+      query_id: 'recent-task-manager-fallback',
+      status: 'failed',
+      prompt: 'Backlog guard: legal task #484f50b2 ("Inventory legal skills") has been active 17m, team lead general-counsel owns a parent objective without member-owned child tasks.',
+      created: NOW_MS - 60_000,
+      completed: NOW_MS - 10_000,
+      result: null,
+      error: 'Query recent-task-manager-fallback exceeded control-plane timeout after 90s',
+      session_id: null,
+      owner_kind: 'agent',
+      owner_id: taskMaster.id,
+      metadata: null,
+    };
+    const db = fakeDb({
+      teams: {
+        getTeamByName: vi.fn(async (name: string) => name === 'ops-team' ? opsTeam : null),
+      },
+      agents: {
+        getById: vi.fn(async (id: string) => id === unavailableOwner.id ? unavailableOwner : null),
+        getByName: vi.fn(async (teamId: string, name: string) =>
+          teamId === opsTeam.id && name === 'task-master' ? taskMaster : null,
+        ),
+        list: vi.fn(async (teamId: string) => teamId === opsTeam.id ? [taskMaster] : [unavailableOwner]),
+      },
+      adapter: {
+        query: vi.fn(async () => ({ rows: [recentFailedFallback], rowCount: 1 })),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-task-manager-fallback-cooldown-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const guard = await manager.stalledOwnerBacklogGuard({
+      teamId: TEAM_ID,
+      teamName: 'default',
+      owner: unavailableOwner,
+    });
+
+    expect(guard?.triage).toMatchObject({
+      status: 'task_manager_recent_backlog_probe',
+      taskRef: '#12345678',
+      actor: 'task-master',
+      actorTeam: 'ops-team',
+    });
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
+    expect(db.events.insert).not.toHaveBeenCalled();
+  });
+
+  it('limits task-manager fallback to one accepted prompt per lane cooldown window', async () => {
+    const ownerA = agent({ id: 'owner-a', name: 'worker-a', status: 'stopped', runtime: 'public-agent-remote' });
+    const ownerB = agent({ id: 'owner-b', name: 'worker-b', status: 'stopped', runtime: 'public-agent-remote' });
+    const opsTeam = team({ id: 'ops-team-id', name: 'ops-team' });
+    const taskMaster = agent({
+      id: 'task-master-id',
+      team_id: opsTeam.id,
+      name: 'task-master',
+      status: 'running',
+    });
+    const taskA = task({
+      id: 'task-a',
+      name: 'stalled-a',
+      uuid: 'aaaaaaaa-1234-4234-8234-123456789abc',
+      owner: ownerA.id,
+    });
+    const taskB = task({
+      id: 'task-b',
+      name: 'stalled-b',
+      uuid: 'bbbbbbbb-1234-4234-8234-123456789abc',
+      owner: ownerB.id,
+    });
+    const db = fakeDb({
+      teams: {
+        getTeamByName: vi.fn(async (name: string) => name === 'ops-team' ? opsTeam : null),
+      },
+      agents: {
+        getById: vi.fn(async (id: string) => id === ownerA.id ? ownerA : id === ownerB.id ? ownerB : null),
+        getByName: vi.fn(async (teamId: string, name: string) =>
+          teamId === opsTeam.id && name === 'task-master' ? taskMaster : null,
+        ),
+        list: vi.fn(async (teamId: string) => teamId === opsTeam.id ? [taskMaster] : [ownerA, ownerB]),
+      },
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => status === 'doing' ? [taskA, taskB] : []),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-task-manager-fallback-lane-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const first = await manager.stalledOwnerBacklogGuard({
+      teamId: TEAM_ID,
+      teamName: 'default',
+      owner: ownerA,
+    });
+    const second = await manager.stalledOwnerBacklogGuard({
+      teamId: TEAM_ID,
+      teamName: 'default',
+      owner: ownerB,
+      onlyTaskId: taskB.id,
+    });
+
+    expect(first?.triage).toMatchObject({
+      status: 'sent_task_manager',
+      taskRef: '#aaaaaaaa',
+      actor: 'task-master',
+      actorTeam: 'ops-team',
+    });
+    expect(second?.triage).toMatchObject({
+      status: 'task_manager_recent_backlog_probe',
+      taskRef: '#bbbbbbbb',
+      actor: 'task-master',
+      actorTeam: 'ops-team',
+    });
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledTimes(1);
   });
 
   it('routes stalled-owner triage to task-master when the team lead is busy', async () => {

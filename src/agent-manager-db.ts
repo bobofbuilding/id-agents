@@ -726,6 +726,12 @@ export class AgentManagerDb {
     return Number(process.env.STALL_RENUDGE_MS) || 90 * 60 * 1000;
   }
 
+  private getTaskManagerFallbackCooldownMs(renudgeMs = this.getStallRenudgeMs(), force = false): number {
+    const parsed = Number(process.env.ID_TASK_MANAGER_FALLBACK_COOLDOWN_MS);
+    const base = Number.isFinite(parsed) && parsed >= 0 ? parsed : Math.min(renudgeMs, 15 * 60 * 1000);
+    return force ? Math.min(base, this.getManualStallRenudgeMs()) : base;
+  }
+
   private getManualStallRenudgeMs(): number {
     const parsed = Number(process.env.STALL_MANUAL_RENUDGE_MS || process.env.ID_STALL_MANUAL_RENUDGE_MS);
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : 60_000;
@@ -757,6 +763,12 @@ export class AgentManagerDb {
       force ? Math.min(renudgeMs, this.getManualStallRenudgeMs()) : renudgeMs,
       maxProbes,
     );
+  }
+
+  private canRunStalledCooldown(key: string, nowMs: number, cooldownMs: number): boolean {
+    if (cooldownMs <= 0) return true;
+    const state = this.stalledNudges.get(key);
+    return !state || nowMs - state.lastAt >= cooldownMs;
   }
 
   private markStalledProbe(key: string, nowMs: number): number {
@@ -1461,6 +1473,30 @@ export class AgentManagerDb {
     return `Backlog guard: ${params.teamName} task ${params.ref} ("${params.task.title}") has been active ${params.stalledMinutes}m, ${ownerState}, and ${leadState}. New task assignment to that owner is held until this is triaged. Please route it through the task-manager flow: restart or replace the owner, reassign the task, split it into member-owned work, or park it as todo with a clear blocker.`;
   }
 
+  private taskManagerFallbackLaneKey(teamId: string): string {
+    return `task-manager-fallback-lane:${teamId}`;
+  }
+
+  private async hasRecentTaskManagerFallbackAsk(params: {
+    teamId: string;
+    nowMs: number;
+    cooldownMs: number;
+  }): Promise<boolean> {
+    if (params.cooldownMs <= 0) return false;
+    const since = params.nowMs - params.cooldownMs;
+    const { rows } = await this.db.adapter.query<QueryRow>(
+      `SELECT team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id, metadata
+         FROM queries
+        WHERE team_id = ?
+          AND status IN ('pending', 'processing', 'failed', 'expired')
+          AND (created >= ? OR COALESCE(completed, 0) >= ?)
+        ORDER BY created DESC
+        LIMIT 20`,
+      [params.teamId, since, since],
+    ).catch(() => ({ rows: [] as QueryRow[] }));
+    return rows.some((row) => String(row.prompt || '').trim().toLowerCase().startsWith('backlog guard:'));
+  }
+
   private async routeStalledTaskToTaskManagerFallback(params: {
     teamId: string;
     teamName: string;
@@ -1479,8 +1515,33 @@ export class AgentManagerDb {
     const taskManagers = await this.findTaskManagerFallbacks().catch(() => []);
     if (!taskManagers.length) return null;
     let lastBlocked: { status: string; taskRef: string; actor?: string; actorTeam?: string } | null = null;
+    const cooldownMs = this.getTaskManagerFallbackCooldownMs(params.renudgeMs, params.force === true);
     for (const taskManager of taskManagers) {
       const key = `task:${params.task.id}:task-manager-fallback:${params.reason}:${taskManager.agent.id}`;
+      const laneKey = this.taskManagerFallbackLaneKey(taskManager.team.id);
+      if (!params.force && !this.canRunStalledCooldown(laneKey, params.nowMs, cooldownMs)) {
+        lastBlocked = {
+          status: 'task_manager_recent_backlog_probe',
+          taskRef: params.ref,
+          actor: taskManager.agent.name,
+          actorTeam: taskManager.team.name,
+        };
+        continue;
+      }
+      if (!params.force && await this.hasRecentTaskManagerFallbackAsk({
+        teamId: taskManager.team.id,
+        nowMs: params.nowMs,
+        cooldownMs,
+      })) {
+        this.markStalledProbe(laneKey, params.nowMs);
+        lastBlocked = {
+          status: 'task_manager_recent_backlog_probe',
+          taskRef: params.ref,
+          actor: taskManager.agent.name,
+          actorTeam: taskManager.team.name,
+        };
+        continue;
+      }
       if (!this.canRunStalledProbeForTriage(key, params.nowMs, params.renudgeMs, params.maxProbes, params.force)) {
         lastBlocked = {
           status: 'throttled',
@@ -1501,7 +1562,9 @@ export class AgentManagerDb {
         continue;
       }
       const prevProbe = this.stalledNudges.get(key);
+      const prevLaneProbe = this.stalledNudges.get(laneKey);
       const attempt = this.markStalledProbe(key, params.nowMs);
+      this.markStalledProbe(laneKey, params.nowMs);
       const msg = this.stalledTaskManagerFallbackPrompt(params);
       const sent = await this.sendRecentThrottledSupervisionAsk({
         teamId: taskManager.team.id,
@@ -1522,6 +1585,7 @@ export class AgentManagerDb {
         };
       }
       this.restoreStalledProbe(key, prevProbe);
+      this.restoreStalledProbe(laneKey, prevLaneProbe);
       lastBlocked = {
         status: sent === 'recent' ? 'throttled' : 'send_failed',
         taskRef: params.ref,
