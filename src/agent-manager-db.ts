@@ -1423,16 +1423,20 @@ export class AgentManagerDb {
     ref: string;
     stalledMinutes: number;
     ownerName: string;
-    reason: 'no_live_lead' | 'lead_busy' | 'owner_busy' | 'lead_delegation_required';
+    reason: 'no_live_lead' | 'lead_busy' | 'owner_busy' | 'lead_delegation_required' | 'unclaimed';
     leadName?: string;
   }): string {
     const ownerState = params.reason === 'owner_busy'
       ? `owner ${params.ownerName} already has another active query`
+      : params.reason === 'unclaimed'
+        ? 'task has no owner'
       : params.reason === 'lead_delegation_required'
         ? `team lead ${params.ownerName} owns a parent objective without member-owned child tasks`
         : `owner ${params.ownerName} is not live`;
     const leadState = params.reason === 'lead_busy'
       ? `team lead ${params.leadName || 'lead'} is busy with another active query`
+      : params.reason === 'unclaimed'
+        ? `team lead ${params.leadName || 'lead'} cannot accept this unclaimed-task triage right now`
       : params.reason === 'no_live_lead'
         ? 'there is no live team lead'
         : params.reason === 'lead_delegation_required'
@@ -1452,7 +1456,7 @@ export class AgentManagerDb {
     renudgeMs: number;
     maxProbes: number;
     force?: boolean;
-    reason: 'no_live_lead' | 'lead_busy' | 'owner_busy' | 'lead_delegation_required';
+    reason: 'no_live_lead' | 'lead_busy' | 'owner_busy' | 'lead_delegation_required' | 'unclaimed';
     eventReason: 'owner_unavailable' | 'owner_busy' | 'lead_delegation_required' | 'probe_limit_reached' | 'unclaimed';
     leadName?: string;
   }): Promise<{ status: string; taskRef: string; actor?: string; actorTeam?: string; attempt?: number } | null> {
@@ -14623,16 +14627,62 @@ Return this JSON shape:
       if (unownedAgeMs < STALL_MS) continue;
 
       const lead = await getLeadForTeam(teamRow.id);
-      if (!lead) continue;
       const ref = this.taskShortRef(t);
       const mins = Math.round((now - updated) / 60000);
-      const [hasRecentSupervision, leadPendingQueries] = await Promise.all([
-        this.hasRecentTaskSupervisionEvent(teamRow.id, t, now - RENUDGE_MS),
-        getPendingQueriesFor(lead),
-      ]);
+      const hasRecentSupervision = await this.hasRecentTaskSupervisionEvent(teamRow.id, t, now - RENUDGE_MS);
       if (hasRecentSupervision) continue;
+
+      if (!lead) {
+        const fallback = await this.routeStalledTaskToTaskManagerFallback({
+          teamId: teamRow.id,
+          teamName: teamRow.name,
+          task: t,
+          ref,
+          stalledMinutes: mins,
+          ownerName: 'unclaimed',
+          nowMs: now,
+          renudgeMs: RENUDGE_MS,
+          maxProbes: MAX_PROBES,
+          reason: 'unclaimed',
+          eventReason: 'unclaimed',
+        });
+        if (fallback?.status === 'sent_task_manager') {
+          nudged++;
+        }
+        continue;
+      }
+
+      const leadPendingQueries = await getPendingQueriesFor(lead);
       const leadProbeState = this.supervisionQueryStateFromRows(teamRow.id, leadPendingQueries, ref);
-      if (leadProbeState.hasActiveSupervisionAsk || leadProbeState.hasAnyActiveQuery) continue;
+      const [leadStalledBlockers, leadDelegationBlockers] = await Promise.all([
+        this.findStalledOwnerTaskBlockers({ teamId: teamRow.id, owner: lead, excludeTaskId: t.id, nowMs: now }),
+        this.findLeadDelegationBlockers(teamRow.id, teamRow.name, lead, t.id),
+      ]);
+      if (
+        leadProbeState.hasActiveSupervisionAsk
+        || leadProbeState.hasAnyActiveQuery
+        || leadStalledBlockers.length > 0
+        || leadDelegationBlockers.length > 0
+      ) {
+        const fallback = await this.routeStalledTaskToTaskManagerFallback({
+          teamId: teamRow.id,
+          teamName: teamRow.name,
+          task: t,
+          ref,
+          stalledMinutes: mins,
+          ownerName: 'unclaimed',
+          nowMs: now,
+          renudgeMs: RENUDGE_MS,
+          maxProbes: MAX_PROBES,
+          reason: 'unclaimed',
+          eventReason: 'unclaimed',
+          leadName: lead.name,
+        });
+        if (fallback?.status === 'sent_task_manager') {
+          nudged++;
+        }
+        continue;
+      }
       const prevProbe = this.stalledNudges.get(nudgeKey);
       const attempt = this.markStalledProbe(nudgeKey, now);
       const msg = `Supervision: unclaimed task ${ref} ("${t.title}") has been waiting ${mins}m with no owner (triage probe ${attempt}/${MAX_PROBES}). Reply with one line: CLAIM, ROUTE: <team/agent>, or BLOCKED: <reason>. Do not create new tasks from this control prompt.`;

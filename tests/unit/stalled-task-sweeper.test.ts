@@ -1993,6 +1993,89 @@ describe('stalled task sweeper', () => {
     expect(db.events.insert).not.toHaveBeenCalled();
   });
 
+  it('routes unclaimed-task triage to task-manager when the lead is busy', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const unclaimed = task({
+      id: 'todo-1',
+      name: 'unclaimed-work',
+      uuid: '11111111-2222-4333-8444-555555555555',
+      title: 'Unclaimed work',
+      status: 'todo',
+      owner: null,
+      updated_at: nowSec - 3600,
+    });
+    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
+    const opsTeam = team({ id: 'ops-team-id', name: 'ops-team' });
+    const taskMaster = agent({
+      team_id: opsTeam.id,
+      id: 'task-master-id',
+      name: 'task-master',
+      metadata: { catalog: { role: 'task-manager' } },
+    });
+    const db = fakeDb({
+      teams: {
+        getTeamByName: vi.fn(async (name: string) => name === 'ops-team' ? opsTeam : null),
+      },
+      agents: {
+        getByName: vi.fn(async (teamId: string, name: string) =>
+          teamId === opsTeam.id && name === 'task-master' ? taskMaster : null,
+        ),
+        list: vi.fn(async (teamId: string) => teamId === opsTeam.id ? [taskMaster] : [lead]),
+      },
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => {
+          if (status === 'doing') return [];
+          if (status === 'todo') return [unclaimed];
+          return [];
+        }),
+        updateFields: vi.fn(async () => {}),
+      },
+      queries: {
+        getPending: vi.fn(async (agentId: string) => agentId === lead.id ? [{
+          team_id: TEAM_ID,
+          agent_id: lead.id,
+          query_id: 'lead-current-work',
+          status: 'processing',
+          prompt: 'Heartbeat: review your checklist and act on anything that needs attention.',
+          created: NOW_MS - 60_000,
+          completed: null,
+          result: null,
+          error: null,
+          session_id: null,
+          owner_kind: 'agent',
+          owner_id: lead.id,
+          metadata: null,
+        }] : []),
+        getPendingByOwner: vi.fn(async () => []),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-unclaimed-task-manager-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.sweepStalledTasks();
+
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'ops-team',
+      'task-master',
+      expect.stringContaining('task has no owner'),
+    );
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalledWith(
+      'default',
+      'lead',
+      expect.any(String),
+    );
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      team_id: TEAM_ID,
+      topic: 'task:triaged',
+      actor_agent_id: 'task-master-id',
+      subject_id: '11111111-2222-4333-8444-555555555555',
+      data: expect.objectContaining({
+        reason: 'unclaimed',
+        stalled_minutes: 60,
+      }),
+    }));
+  });
+
   it('parks stopped lead-owned work that missed delegation instead of nudging another lead', async () => {
     const nowSec = Math.floor(NOW_MS / 1000);
     const stoppedLead = agent({
