@@ -11,6 +11,7 @@
  *     + `checkin:created` event emitted
  *   - --no-checkin (`no_checkin: true`): task is created, no checkin row
  *   - custom duration (`checkin: '30m'`): checkin.interval_seconds = 1800
+ *   - default iterations: checkin.max_iterations = 3
  *   - custom iterations (`checkin_iters: 5`): checkin.max_iterations = 5
  *   - no `task` body: legacy /talk-to behavior, no rows created
  */
@@ -360,7 +361,7 @@ describe('/talk-to auto-attach', () => {
       interval_seconds: 600,
       priority: 'normal',
       status: 'active',
-      max_iterations: null,
+      max_iterations: 3,
     });
     expect(checkins[0].next_fire_at).toBeGreaterThan(Date.now() - 1000);
     expect(checkins[0].last_event_seq).not.toBeNull();
@@ -415,7 +416,7 @@ describe('/talk-to auto-attach', () => {
     const checkins = await db.checkins.list({ teamId });
     expect(checkins).toHaveLength(1);
     expect(checkins[0].interval_seconds).toBe(1800);
-    expect(checkins[0].max_iterations).toBeNull();
+    expect(checkins[0].max_iterations).toBe(3);
   });
 
   it('honors --checkin-iters <N> override', async () => {
@@ -429,7 +430,7 @@ describe('/talk-to auto-attach', () => {
         wait: false,
         task: { title: 'Bounded check', ...validBriefFields() },
         checkin: '5m',
-        checkin_iters: 3,
+        checkin_iters: 5,
       }),
     });
     expect(res.status).toBe(200);
@@ -437,7 +438,7 @@ describe('/talk-to auto-attach', () => {
     const checkins = await db.checkins.list({ teamId });
     expect(checkins).toHaveLength(1);
     expect(checkins[0].interval_seconds).toBe(300);
-    expect(checkins[0].max_iterations).toBe(3);
+    expect(checkins[0].max_iterations).toBe(5);
   });
 
   it('rejects an invalid checkin duration with 400', async () => {

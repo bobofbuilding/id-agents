@@ -231,6 +231,7 @@ function expandTopicAliases(topics: readonly string[]): string[] {
  * frequent inspection on the dispatcher's side.
  */
 const AUTO_ATTACH_DEFAULT_INTERVAL_SECONDS = 600;
+const AUTO_ATTACH_DEFAULT_MAX_ITERATIONS = 3;
 
 interface AutoAttachFlagsResult {
   disabled: boolean;
@@ -3903,7 +3904,7 @@ Return this JSON shape:
 
     const nowMs = Date.now();
     const intervalSeconds = flagsResult.intervalSeconds ?? AUTO_ATTACH_DEFAULT_INTERVAL_SECONDS;
-    const maxIterations = flagsResult.maxIterations ?? null;
+    const maxIterations = flagsResult.maxIterations ?? AUTO_ATTACH_DEFAULT_MAX_ITERATIONS;
 
     const checkinRow: CheckinRow = {
       id: generateCheckinId(nowMs),
@@ -5103,7 +5104,7 @@ Return this JSON shape:
     // dispatcher. The auto-attach is governed by these flags on the body:
     //   - no_checkin: true            disables auto-attach for this dispatch
     //   - checkin: <duration|seconds> overrides interval (default 10m)
-    //   - checkin_iters: <N>          sets max_iterations (default null)
+    //   - checkin_iters: <N>          sets max_iterations (default 3)
     // If no `task` object is supplied, /talk-to behaves exactly as before.
     this.managementApp.post('/talk-to', async (req, res, next) => {
       // Inject wait:true if not explicitly set
