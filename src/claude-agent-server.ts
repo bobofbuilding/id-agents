@@ -518,20 +518,37 @@ export function shouldSuppressPrimaryLeadValidatorNoopWake(params: {
   inReplyTo?: unknown;
   message?: unknown;
 }): boolean {
-  if (!params.isPrimaryLead) return false;
-  if (params.newsType !== 'reply') return false;
-  if (typeof params.inReplyTo !== 'string' || !params.inReplyTo.trim()) return false;
+  return classifyPrimaryLeadValidatorWakeSuppression(params) !== null;
+}
+
+export type PrimaryLeadValidatorWakeSuppressionReason =
+  | 'validator_approved_no_dispatch_ready_recommendations'
+  | 'validator_blocked_no_dispatch_ready_recommendations';
+
+export function classifyPrimaryLeadValidatorWakeSuppression(params: {
+  isPrimaryLead: boolean;
+  newsType: string;
+  from?: unknown;
+  inReplyTo?: unknown;
+  message?: unknown;
+}): PrimaryLeadValidatorWakeSuppressionReason | null {
+  if (!params.isPrimaryLead) return null;
+  if (params.newsType !== 'reply') return null;
+  if (typeof params.inReplyTo !== 'string' || !params.inReplyTo.trim()) return null;
 
   const sender = typeof params.from === 'string' ? params.from.trim().toLowerCase() : '';
-  if (sender !== 'coder' && sender !== 'researcher') return false;
+  if (sender !== 'coder' && sender !== 'researcher') return null;
 
   const packet = parseJsonObjectMessage(params.message);
-  if (!packet) return false;
+  if (!packet) return null;
 
   const status = String(packet.validation_status || '').trim().toLowerCase();
-  if (status !== 'approved') return false;
+  if (hasHighOrMediumRecommendation(packet)) return null;
 
-  return !hasHighOrMediumRecommendation(packet);
+  if (status === 'approved') return 'validator_approved_no_dispatch_ready_recommendations';
+  if (status === 'blocked') return 'validator_blocked_no_dispatch_ready_recommendations';
+
+  return null;
 }
 
 // Waiter for replies to outbound messages (used by /talk-to endpoint)
@@ -1590,21 +1607,22 @@ export class AgentRestServer {
 
         // If trigger is true, process the message with the LLM
         if (trigger && from) {
-          if (shouldSuppressPrimaryLeadValidatorNoopWake({
+          const primaryLeadSuppressionReason = classifyPrimaryLeadValidatorWakeSuppression({
             isPrimaryLead: this.isPrimaryLeadIdentity(),
             newsType,
             from,
             inReplyTo: in_reply_to,
             message: newsMessage,
-          })) {
-            console.log(`${logTime()} [Agent] Suppressed primary-lead wake for approved validator packet with no dispatch-ready recommendations from ${from}`);
+          });
+          if (primaryLeadSuppressionReason) {
+            console.log(`${logTime()} [Agent] Suppressed primary-lead wake for validator packet with no dispatch-ready recommendations from ${from} (${primaryLeadSuppressionReason})`);
             return res.status(202).json({
               success: true,
               type: newsType,
               timestamp: ts,
               triggered: false,
               suppressed: true,
-              reason: 'validator_approved_no_dispatch_ready_recommendations',
+              reason: primaryLeadSuppressionReason,
             });
           }
 
