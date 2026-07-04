@@ -108,6 +108,7 @@ function fakeDb(overrides: Record<string, any> = {}): any {
     tasks: {
       list: vi.fn(async ({ status }: { status?: string } = {}) => status === 'doing' ? [task()] : []),
       getByNameForTeam: vi.fn(async () => task()),
+      getByUuidPrefix: vi.fn(async () => [task()]),
       claim: vi.fn(async () => true),
       updateFields: vi.fn(async () => {}),
       ...overrides.tasks,
@@ -204,6 +205,104 @@ describe('stalled task sweeper', () => {
     expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
     expect(db.tasks.updateFields).not.toHaveBeenCalled();
     expect(db.events.insert).not.toHaveBeenCalled();
+  });
+
+  it('bumps task activity when a backlog guard reply reports in progress', async () => {
+    const staleTask = task();
+    const db = fakeDb({
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [staleTask]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-control-reply-test', db, { libraryRoot: null }) as any;
+
+    await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery(staleTask.owner!, {
+        query_id: 'guard-in-progress',
+        prompt: 'Backlog guard: task #12345678 ("Stalled work") has been active 60m with no progress update. Reply with one line: DONE, BLOCKED: <reason>, NEEDS-REASSIGNMENT, or IN-PROGRESS: <next update>.',
+        status: 'completed',
+      }),
+      { result: 'IN-PROGRESS: reviewing the artifact now' },
+      NOW_MS,
+    );
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(staleTask.id, {
+      updated_at: Math.floor(NOW_MS / 1000),
+    });
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:refreshed',
+      subject_id: staleTask.uuid,
+      data: expect.objectContaining({
+        reason: 'control_reply_in_progress',
+        stalled_minutes: 60,
+      }),
+    }));
+  });
+
+  it('parks task for reassignment when a backlog guard reply requests reassignment', async () => {
+    const staleTask = task();
+    const db = fakeDb({
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [staleTask]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-control-reassign-test', db, { libraryRoot: null }) as any;
+
+    await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery(staleTask.owner!, {
+        query_id: 'guard-reassign',
+        prompt: 'Backlog guard: task #12345678 ("Stalled work") has been active 60m with no progress update. Reply with one line: DONE, BLOCKED: <reason>, NEEDS-REASSIGNMENT, or IN-PROGRESS: <next update>.',
+        status: 'completed',
+      }),
+      { result: 'NEEDS-REASSIGNMENT: no matching workspace state' },
+      NOW_MS,
+    );
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(staleTask.id, expect.objectContaining({
+      owner: null,
+      status: 'todo',
+      completed_at: null,
+      updated_at: Math.floor(NOW_MS / 1000),
+    }));
+    expect(db.tasks.updateFields.mock.calls[0][1].description).toContain('NEEDS-REASSIGNMENT');
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:triaged',
+      subject_id: staleTask.uuid,
+      data: expect.objectContaining({
+        reason: 'control_reply_reassign',
+        stalled_minutes: 60,
+      }),
+    }));
+  });
+
+  it('marks a task done when a supervision reply starts with task done command syntax', async () => {
+    const staleTask = task();
+    const db = fakeDb({
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [staleTask]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-control-done-test', db, { libraryRoot: null }) as any;
+
+    await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery(staleTask.owner!, {
+        query_id: 'guard-done',
+        prompt: 'Supervision: task #12345678 ("Stalled work") has been in progress 60m with no completion. Reply with one line: DONE, BLOCKED: <reason>, NEEDS-REASSIGNMENT, or IN-PROGRESS: <next update>.',
+        status: 'completed',
+      }),
+      { result: '/task done #12345678' },
+      NOW_MS,
+    );
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(staleTask.id, {
+      status: 'done',
+      completed_at: Math.floor(NOW_MS / 1000),
+      updated_at: Math.floor(NOW_MS / 1000),
+    });
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:completed',
+      subject_id: staleTask.uuid,
+    }));
   });
 
   it('refreshes a stalled task by nudging its live owner and recording an event', async () => {

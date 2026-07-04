@@ -2786,6 +2786,9 @@ Return this JSON shape:
     }
 
     if (transitioned || completedRow?.status === 'completed') {
+      if (completedRow?.status === 'completed') {
+        await this.applyTaskControlReplyFromCompletedQuery(completedRow, completionPayload, occurredAt);
+      }
       await this.closeQueryShadowRows({
         teamId,
         queryId,
@@ -2797,6 +2800,214 @@ Return this JSON shape:
 
     this.wakeQueryWaiters(teamId, queryId, waiterReply);
     this.releaseLocalGate(queryId); // #7: free the local-model slot on success
+  }
+
+  private taskControlReplyPrompt(prompt: string | null | undefined): boolean {
+    const lower = String(prompt ?? '').trim().toLowerCase();
+    if (!lower) return false;
+    return lower.startsWith('backlog guard:')
+      || lower.startsWith('backlog guard alert:')
+      || lower.startsWith('supervision:')
+      || lower.startsWith('supervision routing:')
+      || lower.startsWith('supervision probe from manager:')
+      || lower.startsWith('lead delegation kickoff:')
+      || lower.startsWith('urgent delegation probe:');
+  }
+
+  private replyMessageFromPayload(payload: Record<string, unknown>): string {
+    const direct = payload.message;
+    if (typeof direct === 'string') return direct;
+    const result = payload.result;
+    if (typeof result === 'string') return result;
+    if (result && typeof result === 'object') {
+      const nested = (result as Record<string, unknown>).result;
+      if (typeof nested === 'string') return nested;
+      const nestedMessage = (result as Record<string, unknown>).message;
+      if (typeof nestedMessage === 'string') return nestedMessage;
+    }
+    return '';
+  }
+
+  private parseTaskControlReply(message: string): {
+    action: 'done' | 'in_progress' | 'blocked' | 'reassign' | 'claim' | 'delegated' | null;
+    note: string;
+  } {
+    const firstLine = String(message || '')
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find(Boolean) || '';
+    const upper = firstLine.toUpperCase();
+    if (!firstLine) return { action: null, note: '' };
+    if (/^(DONE\b|\/TASK\s+DONE\b|MARKED\s+DONE\b)/.test(upper)) return { action: 'done', note: firstLine };
+    if (/^TASK\b.*\b(?:MARKED|CLOSED)\b.*\bDONE\b/.test(upper)) return { action: 'done', note: firstLine };
+    if (/^(IN-PROGRESS|READY-TO-RESUME)\b/.test(upper)) return { action: 'in_progress', note: firstLine };
+    if (/^DELEGATED\b/.test(upper)) return { action: 'delegated', note: firstLine };
+    if (/^(CLAIM|CLAIMED)\b/.test(upper)) return { action: 'claim', note: firstLine };
+    if (/^(NEEDS-REASSIGNMENT|REASSIGN\b|REASSIGN:|ROUTE:|ROUTE\b)/.test(upper)) {
+      return { action: 'reassign', note: firstLine };
+    }
+    if (/^(BLOCKED|BLOCKER|UNBLOCK:|UNBLOCK\b)/.test(upper)) {
+      return { action: 'blocked', note: firstLine };
+    }
+    return { action: null, note: firstLine };
+  }
+
+  private appendTaskTriageNote(description: string | null, reason: string, note: string, occurredAt: number): string {
+    const trimmed = note.trim().replace(/\s+/g, ' ').slice(0, 500);
+    const line = `Manager triage (${reason}, ${new Date(occurredAt).toISOString()}): ${trimmed || 'no detail'}`;
+    return [description?.trim(), line].filter(Boolean).join('\n\n');
+  }
+
+  private async hasAppliedTaskControlReply(teamId: string, queryId: string): Promise<boolean> {
+    const dialect = this.db.adapter.dialect;
+    const p = (n: number) => dialect === 'postgres' ? `$${n}` : '?';
+    const { rows } = await this.db.adapter.query<{ seq: number | string }>(
+      `SELECT seq
+         FROM event_log
+        WHERE team_id = ${p(1)}
+          AND topic = 'query:control-reply-applied'
+          AND subject_kind = 'query'
+          AND subject_id = ${p(2)}
+        LIMIT 1`,
+      [teamId, queryId],
+    ).catch(() => ({ rows: [] as Array<{ seq: number | string }> }));
+    return rows.length > 0;
+  }
+
+  private async markTaskControlReplyApplied(params: {
+    teamId: string;
+    queryId: string;
+    agentId: string | null;
+    occurredAt: number;
+    task: TaskRow;
+    action: string;
+  }): Promise<void> {
+    await this.db.events.insert({
+      team_id: params.teamId,
+      topic: 'query:control-reply-applied',
+      actor_agent_id: params.agentId,
+      subject_kind: 'query',
+      subject_id: params.queryId,
+      occurred_at: params.occurredAt,
+      data: {
+        query_id: params.queryId,
+        task_uuid: params.task.uuid,
+        task_name: params.task.name,
+        action: params.action,
+      },
+    });
+  }
+
+  private async applyTaskControlReplyFromCompletedQuery(
+    queryRow: QueryRow,
+    payload: Record<string, unknown>,
+    occurredAt: number,
+  ): Promise<{ applied: boolean; action?: string; task?: string; reason?: string }> {
+    if (!this.taskControlReplyPrompt(queryRow.prompt)) return { applied: false, reason: 'not_control_prompt' };
+    if (await this.hasAppliedTaskControlReply(queryRow.team_id, queryRow.query_id)) {
+      return { applied: false, reason: 'already_applied' };
+    }
+    const marker = this.activeTaskAskMarker(queryRow.prompt);
+    if (!marker) return { applied: false, reason: 'no_task_marker' };
+    const message = this.replyMessageFromPayload(payload);
+    const parsed = this.parseTaskControlReply(message);
+    if (!parsed.action) return { applied: false, reason: 'no_control_action' };
+
+    const { task } = await this.resolveTaskRef(marker, queryRow.team_id).catch(() => ({ task: undefined }));
+    if (!task) return { applied: false, action: parsed.action, reason: 'task_not_found' };
+    if (this.isTerminalTaskStatus(task.status)) return { applied: false, action: parsed.action, task: task.name, reason: 'task_terminal' };
+
+    const nowSec = Math.floor(occurredAt / 1000);
+    const stalledMinutes = Math.max(0, Math.round((occurredAt - this.taskLastActivityMs(task)) / 60000));
+    const actorAgentId = queryRow.agent_id ?? task.owner ?? null;
+
+    if (parsed.action === 'done') {
+      await this.db.tasks.updateFields(task.id, {
+        status: 'done',
+        completed_at: nowSec,
+        updated_at: nowSec,
+      });
+      await emitTaskCompleted(this.db.events, {
+        teamId: queryRow.team_id,
+        taskUuid: task.uuid,
+        taskName: task.name,
+        title: task.title,
+        ownerAgentId: task.owner ?? null,
+        actorAgentId,
+        occurredAt,
+        failureNote: parsed.note,
+      });
+      await closeLinkedCheckinsForTerminalTask(this.db, {
+        teamId: queryRow.team_id,
+        taskId: task.id,
+        taskStatus: 'done',
+        actorAgentId,
+        occurredAt,
+      });
+      await this.recordTaskSupervision(task, queryRow.team_id, actorAgentId, 'control_reply_done', stalledMinutes, occurredAt);
+      await this.markTaskControlReplyApplied({ teamId: queryRow.team_id, queryId: queryRow.query_id, agentId: actorAgentId, occurredAt, task, action: parsed.action });
+      this.managerLog(`Applied DONE control reply for task ${task.name} from query ${queryRow.query_id}`);
+      return { applied: true, action: parsed.action, task: task.name };
+    }
+
+    if (parsed.action === 'in_progress' || parsed.action === 'delegated') {
+      await this.db.tasks.updateFields(task.id, { updated_at: nowSec });
+      await this.recordTaskSupervision(
+        task,
+        queryRow.team_id,
+        actorAgentId,
+        parsed.action === 'delegated' ? 'control_reply_delegated' : 'control_reply_in_progress',
+        stalledMinutes,
+        occurredAt,
+      );
+      await this.markTaskControlReplyApplied({ teamId: queryRow.team_id, queryId: queryRow.query_id, agentId: actorAgentId, occurredAt, task, action: parsed.action });
+      this.managerLog(`Applied ${parsed.action} control reply for task ${task.name} from query ${queryRow.query_id}`);
+      return { applied: true, action: parsed.action, task: task.name };
+    }
+
+    if (parsed.action === 'claim') {
+      if (task.status === 'todo' && !task.owner && actorAgentId) {
+        await this.db.tasks.updateFields(task.id, {
+          owner: actorAgentId,
+          status: 'doing',
+          completed_at: null,
+          updated_at: nowSec,
+        });
+        await emitTaskClaimed(this.db.events, {
+          teamId: queryRow.team_id,
+          taskUuid: task.uuid,
+          taskName: task.name,
+          title: task.title,
+          ownerAgentId: actorAgentId,
+          occurredAt,
+        });
+      } else {
+        await this.db.tasks.updateFields(task.id, { updated_at: nowSec });
+      }
+      await this.recordTaskSupervision(task, queryRow.team_id, actorAgentId, 'control_reply_claimed', stalledMinutes, occurredAt);
+      await this.markTaskControlReplyApplied({ teamId: queryRow.team_id, queryId: queryRow.query_id, agentId: actorAgentId, occurredAt, task, action: parsed.action });
+      this.managerLog(`Applied CLAIM control reply for task ${task.name} from query ${queryRow.query_id}`);
+      return { applied: true, action: parsed.action, task: task.name };
+    }
+
+    await this.db.tasks.updateFields(task.id, {
+      owner: null,
+      status: 'todo',
+      completed_at: null,
+      description: this.appendTaskTriageNote(task.description, `control_reply_${parsed.action}`, parsed.note, occurredAt),
+      updated_at: nowSec,
+    });
+    await this.recordTaskSupervision(
+      task,
+      queryRow.team_id,
+      actorAgentId,
+      parsed.action === 'blocked' ? 'control_reply_blocked' : 'control_reply_reassign',
+      stalledMinutes,
+      occurredAt,
+    );
+    await this.markTaskControlReplyApplied({ teamId: queryRow.team_id, queryId: queryRow.query_id, agentId: actorAgentId, occurredAt, task, action: parsed.action });
+    this.managerLog(`Applied ${parsed.action} control reply for task ${task.name} from query ${queryRow.query_id}`);
+    return { applied: true, action: parsed.action, task: task.name };
   }
 
   private async closeQueryShadowRows(params: {
@@ -6562,6 +6773,41 @@ Return this JSON shape:
         });
       } catch (err: any) {
         console.error('[Manager] Error in POST /manager/inbox/respond:', err);
+        res.status(500).json({ error: err?.message || 'Internal server error' });
+      }
+    });
+
+    // POST /query/:id/apply-control-reply — replay the task-state side effects
+    // for already-completed manager control prompts. Local workers can complete
+    // the shared query row before their /news reply reaches the manager, so the
+    // normal completion path must be safely replayable.
+    this.managementApp.post('/query/:id/apply-control-reply', async (req, res) => {
+      try {
+        const { id: teamId } = await this.getTeam(req);
+        const queryId = String(req.params.id || '').trim();
+        if (!queryId) return res.status(400).json({ error: 'Missing query id' });
+
+        const row = await this.db.queries.getByQueryIdForTeam(teamId, queryId);
+        if (!row) return res.status(404).json({ error: 'query_not_found', query_id: queryId });
+        if (row.status !== 'completed') {
+          return res.status(409).json({
+            error: 'query_not_completed',
+            query_id: queryId,
+            status: row.status,
+          });
+        }
+
+        const resultPayload = row.result && typeof row.result === 'object'
+          ? row.result as Record<string, unknown>
+          : {};
+        const applied = await this.applyTaskControlReplyFromCompletedQuery(
+          row,
+          resultPayload,
+          row.completed ?? Date.now(),
+        );
+        res.json({ ok: true, query_id: queryId, ...applied });
+      } catch (err: any) {
+        console.error('[Manager] Error in POST /query/:id/apply-control-reply:', err);
         res.status(500).json({ error: err?.message || 'Internal server error' });
       }
     });
@@ -13649,7 +13895,7 @@ Return this JSON shape:
     task: TaskRow,
     teamId: string,
     actorAgentId: string | null,
-    reason: 'owner_refresh' | 'owner_unavailable' | 'owner_busy' | 'unclaimed' | 'checkin_heartbeat_probe' | 'probe_limit_reached' | 'validator_stalled_terminal' | 'lead_delegation_required' | 'lead_owner_unavailable',
+    reason: 'owner_refresh' | 'owner_unavailable' | 'owner_busy' | 'unclaimed' | 'checkin_heartbeat_probe' | 'probe_limit_reached' | 'validator_stalled_terminal' | 'lead_delegation_required' | 'lead_owner_unavailable' | 'control_reply_done' | 'control_reply_in_progress' | 'control_reply_delegated' | 'control_reply_claimed' | 'control_reply_blocked' | 'control_reply_reassign',
     stalledMinutes: number,
     nowMs: number,
   ): Promise<void> {
@@ -13664,7 +13910,13 @@ Return this JSON shape:
       reason,
       stalledMinutes,
     };
-    if (reason === 'owner_refresh' || reason === 'checkin_heartbeat_probe') {
+    if (
+      reason === 'owner_refresh'
+      || reason === 'checkin_heartbeat_probe'
+      || reason === 'control_reply_in_progress'
+      || reason === 'control_reply_delegated'
+      || reason === 'control_reply_claimed'
+    ) {
       await emitTaskRefreshed(this.db.events, input);
     } else {
       await emitTaskTriaged(this.db.events, input);
