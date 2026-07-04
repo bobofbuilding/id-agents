@@ -2796,13 +2796,16 @@ ${prompt}`
   /**
    * Post news to manager for WebSocket broadcast to CLI watchers.
    *
-   * `in_reply_to` is hoisted to the top level (out of `data`) so the
+   * Real reply rows hoist `in_reply_to` to the top level (out of `data`) so the
    * manager's /news handler can run its reply-routing branch:
    * mark the query complete, emit `query:delivered`, and resolve any
    * waiting /talk-to caller. Without this hoist the manager kept the
    * `pendingReplyWaiter` keyed on query_id but never matched, so a
    * synchronous /talk-to caller blocked until full timeout even though
    * the reply had already landed at the originating agent's inbox.
+   *
+   * Status/bookkeeping rows keep their query reference inside `data`; otherwise
+   * the manager treats "Sent reply..." bookkeeping as a second reply wake.
    *
    * `skip_persist: true` tells the manager's /news handler to skip the
    * news_items insert under its manager-inbox identity. The originating
@@ -2815,7 +2818,8 @@ ${prompt}`
 
     if (!managerUrl) return;
 
-    const inReplyTo = data?.in_reply_to ?? undefined;
+    const isReplyLifecycleType = type === 'reply' || type === 'reply.error';
+    const inReplyTo = isReplyLifecycleType ? data?.in_reply_to ?? undefined : undefined;
     // For broadcasted replies, the upstream /news payload's `from` is the
     // original sender. Hoist it so the manager's waiter resolution
     // (`waiter.resolve({ from, message })`) returns the actual replier

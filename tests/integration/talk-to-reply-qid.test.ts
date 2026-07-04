@@ -247,6 +247,69 @@ describe('/talk-to reply: query_id populated, no duplicate, manager waiter resol
     expect(Number(rows[0].cnt)).toBe(0);
   });
 
+  it('manager /news ignores outbound reply status rows for query completion', async () => {
+    const qid = `qid_${crypto.randomUUID()}`;
+    await db.queries.create(teamId, qid, agentAId, 'what color?', Date.now() - 1000);
+
+    let resolved: { from: string; message: string } | null = null;
+    (manager as any).queryWaiters.set(qid, {
+      resolve: (r: any) => { resolved = r; },
+      reject: () => {},
+      timeout: null,
+    });
+
+    const statusRow = await fetch(`http://127.0.0.1:${managerPort}/news`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Id-Team': TEAM },
+      body: JSON.stringify({
+        type: 'outbound.reply',
+        from: 'agent_a',
+        in_reply_to: qid,
+        message: 'Sent reply to remote',
+        skip_persist: true,
+        data: {
+          to: 'remote',
+          in_reply_to: qid,
+          message: 'yellow',
+          success: true,
+        },
+      }),
+    });
+    expect(statusRow.status).toBe(201);
+
+    expect(resolved).toBeNull();
+    const stillPending = await db.queries.getByQueryIdForTeam(teamId, qid);
+    expect(stillPending?.status).toBe('pending');
+    const { rows: deliveredBefore } = await db.adapter.query(
+      `SELECT seq FROM event_log WHERE team_id = ? AND topic = 'query:delivered' AND subject_id = ?`,
+      [teamId, qid],
+    ) as any;
+    expect(deliveredBefore).toHaveLength(0);
+
+    const reply = await fetch(`http://127.0.0.1:${managerPort}/news`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Id-Team': TEAM },
+      body: JSON.stringify({
+        type: 'reply',
+        from: 'agent_b',
+        in_reply_to: qid,
+        message: 'yellow',
+        skip_persist: true,
+      }),
+    });
+    expect(reply.status).toBe(201);
+
+    expect(resolved).toMatchObject({ from: 'agent_b', message: 'yellow' });
+    const completed = await db.queries.getByQueryIdForTeam(teamId, qid);
+    expect(completed?.status).toBe('completed');
+    expect(completed?.result).toMatchObject({ from: 'agent_b', message: 'yellow' });
+    const { rows: deliveredAfter } = await db.adapter.query(
+      `SELECT seq, data FROM event_log WHERE team_id = ? AND topic = 'query:delivered' AND subject_id = ?`,
+      [teamId, qid],
+    ) as any;
+    expect(deliveredAfter).toHaveLength(1);
+  });
+
   it('manager /news completes source-team shadow rows for cross-team replies', async () => {
     const qid = `qid_${crypto.randomUUID()}`;
     await db.queries.create(sourceTeamId, qid, agentAId, 'source-team shadow', Date.now() - 2_000);

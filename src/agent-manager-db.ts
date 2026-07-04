@@ -6573,8 +6573,13 @@ Return this JSON shape:
         // instead of `query:delivered` so the wakeup-service event log carries
         // the real lifecycle transition. Audit finding #9
         // (output/security-review-wakeup-service.md).
-        const isQueryFailure = newsType === 'reply.error' || type === 'reply.error';
-        if (in_reply_to) {
+        // Only actual replies should mutate query lifecycle. Agent-local
+        // bookkeeping rows such as `outbound.reply` also carry in_reply_to for
+        // traceability, but treating them as terminal replies duplicates events
+        // and can wake orchestration loops with "Sent reply..." status text.
+        const isQueryReply = newsType === 'reply' || newsType === 'reply.error';
+        const isQueryFailure = newsType === 'reply.error';
+        if (in_reply_to && isQueryReply) {
           const queryRow = await this.db.queries.getByQueryIdForTeam(teamId, in_reply_to).catch(() => null);
           const retryOf = this.runtimeFailoverRetryOf.get(in_reply_to)
             || (typeof (queryRow?.metadata as any)?.retry_of === 'string' ? (queryRow?.metadata as any).retry_of : undefined);
