@@ -53,6 +53,18 @@ describe('agent query queue priority', () => {
     })).toBe('delegation');
 
     expect(classifyQueryQueuePriority({
+      prompt: 'Lead delegation kickoff: task #12345678 is assigned to you as the team coordinator.',
+      from: 'manager',
+    })).toBe('delegation');
+
+    expect(classifyQueryQueuePriority({
+      prompt: `[Message from the manager (your owner/operator) | Query ID: q1]
+
+Team objective: Decompose this objective into member-owned work.`,
+      from: 'manager',
+    })).toBe('delegation');
+
+    expect(classifyQueryQueuePriority({
       prompt: 'Heartbeat: review your checklist and act on anything that needs attention.',
     })).toBe('background');
 

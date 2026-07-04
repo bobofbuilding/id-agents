@@ -106,7 +106,14 @@ const DELEGATION_PROMPT_PATTERNS = [
   /^Task delegation/i,
   /^Coordinator handoff/i,
   /^Resume and complete task\b/i,
+  /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nTeam objective:/,
+  /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nLead delegation kickoff:/,
+  /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nTask delegation/i,
 ];
+
+function isDelegationPrompt(text: string): boolean {
+  return DELEGATION_PROMPT_PATTERNS.some((pattern) => pattern.test(text));
+}
 
 export function classifyQueryQueuePriority(input: {
   prompt: string;
@@ -118,8 +125,8 @@ export function classifyQueryQueuePriority(input: {
   const text = String(input.prompt || '').trimStart();
   if (!text) return 'normal';
 
+  if (isDelegationPrompt(text)) return 'delegation';
   if (shouldSuppressMcpForPrompt(text)) return 'background';
-  if (DELEGATION_PROMPT_PATTERNS.some((pattern) => pattern.test(text))) return 'delegation';
 
   const from = String(input.from || '').trim().toLowerCase();
   if (from === 'manager' || from === 'remote' || from === 'operator') return 'operator';
