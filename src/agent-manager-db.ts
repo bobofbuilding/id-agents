@@ -650,6 +650,7 @@ export class AgentManagerDb {
   private lastQuerySweepAt = 0;
   private stalledSweepInterval: NodeJS.Timeout | null = null;
   private idleParkingInterval: NodeJS.Timeout | null = null;
+  private idleParkingInitialTimeout: NodeJS.Timeout | null = null;
   private runtimeLaneCooldowns: Map<string, RuntimeLaneCooldown> = new Map();
   private runtimeCredentialPoolByTeam: Map<string, RuntimeCredentialPoolConfig> = new Map();
   private defaultRuntimeCredentialPool: RuntimeCredentialPoolConfig | null = null;
@@ -13945,6 +13946,10 @@ Return this JSON shape:
     const intervalMs = Number.isFinite(rawInterval) && rawInterval > 0
       ? Math.max(60_000, Math.floor(rawInterval))
       : 15 * 60 * 1000;
+    const rawInitialDelay = Number(process.env.ID_IDLE_PARK_INITIAL_DELAY_MS || 2 * 60 * 1000);
+    const initialDelayMs = Number.isFinite(rawInitialDelay) && rawInitialDelay >= 0
+      ? Math.min(intervalMs, Math.floor(rawInitialDelay))
+      : 2 * 60 * 1000;
     const run = async () => {
       try {
         const result = await this.parkIdleAgents({
@@ -13964,6 +13969,9 @@ Return this JSON shape:
         console.error('[Manager] Idle parking sweep failed:', e);
       }
     };
+    if (initialDelayMs < intervalMs) {
+      this.idleParkingInitialTimeout = setTimeout(run, initialDelayMs);
+    }
     this.idleParkingInterval = setInterval(run, intervalMs);
   }
 
@@ -15803,6 +15811,10 @@ Return this JSON shape:
     if (this.idleParkingInterval) {
       clearInterval(this.idleParkingInterval);
       this.idleParkingInterval = null;
+    }
+    if (this.idleParkingInitialTimeout) {
+      clearTimeout(this.idleParkingInitialTimeout);
+      this.idleParkingInitialTimeout = null;
     }
     if (this.healthCheckInterval) {
       clearInterval(this.healthCheckInterval);

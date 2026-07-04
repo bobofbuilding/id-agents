@@ -180,6 +180,9 @@ describe('AgentManagerDb killAgentProcess guards', () => {
 
   afterEach(async () => {
     vi.useRealTimers();
+    delete process.env.ID_IDLE_PARK_INTERVAL_MS;
+    delete process.env.ID_IDLE_PARK_INITIAL_DELAY_MS;
+    delete process.env.ID_IDLE_PARK_DISABLED;
     while (dbs.length > 0) {
       await dbs.pop()!.close();
     }
@@ -630,6 +633,48 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     ]);
     expect((manager as any).killAgentProcess).not.toHaveBeenCalled();
     expect((await db.agents.getById('agent-recent-query'))?.status).toBe('running');
+  });
+
+  it('runs an initial idle parking sweep shortly after startup', async () => {
+    vi.useFakeTimers();
+    process.env.ID_IDLE_PARK_INTERVAL_MS = String(10 * 60 * 1000);
+    process.env.ID_IDLE_PARK_INITIAL_DELAY_MS = '1000';
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const parkIdleAgents = vi.spyOn(manager as any, 'parkIdleAgents').mockResolvedValue({
+      ok: true,
+      result: {
+        action: 'agents-park-idle',
+        dryRun: false,
+        scope: 'all-teams',
+        parked: 0,
+        skipped: 0,
+        failed: 0,
+        agents: [],
+      },
+    });
+
+    (manager as any).startIdleParkingSweeper();
+
+    await vi.advanceTimersByTimeAsync(999);
+    expect(parkIdleAgents).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(parkIdleAgents).toHaveBeenCalledTimes(1);
+    expect(parkIdleAgents).toHaveBeenCalledWith(expect.objectContaining({
+      confirmed: true,
+      allTeams: true,
+      includeLeads: false,
+      includeScheduled: false,
+      includeActiveTeams: true,
+    }));
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(parkIdleAgents).toHaveBeenCalledTimes(1);
+
+    await manager.shutdown();
   });
 
   it('does not park idle helpers in teams that still have open work by default', async () => {
