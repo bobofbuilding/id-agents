@@ -74,6 +74,7 @@ const MCP_CONTROL_PLANE_PROMPT_PATTERNS = [
   /^No approved recommendation routed\b/,
   /^Already handled\.\s+Task\b/,
   /^Please validate\b[\s\S]*\bagainst task\s+#?[a-z0-9_-]+/i,
+  /^Validation request for\b[\s\S]*\(#[a-z0-9_-]+\)/i,
   /^AUTO-RELEASE shipped\b/i,
   /^You have \d+ stalled doing tasks\b/,
   /^\[Message from agent "[^"]+"\s*\|[^\n]*\]\s*\n[\s\S]*\n\[Incoming Reply from "[^"]+"\]/,
@@ -96,7 +97,9 @@ const MCP_CONTROL_PLANE_PROMPT_PATTERNS = [
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nStatus check on task\b/,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nYou have \d+ stalled doing tasks\b/,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nPlease validate\b[\s\S]*\bagainst task\s+#?[a-z0-9_-]+/i,
+  /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nValidation request for\b[\s\S]*\(#[a-z0-9_-]+\)/i,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nAUTO-RELEASE shipped\b/i,
+  /^\[Message from agent "[^"]+"\s*\|[^\n]*\]\s*\n[\s\S]*\nValidation request for\b[\s\S]*\(#[a-z0-9_-]+\)/i,
 ];
 
 const DEFAULT_AGENT_ALLOWED_TOOLS = ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'WebSearch', 'WebFetch'];

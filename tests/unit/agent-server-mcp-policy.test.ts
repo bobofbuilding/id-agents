@@ -102,6 +102,11 @@ Lead delegation kickoff: task #f0b7515a is assigned to you as the team coordinat
 [Respond directly and helpfully — this is the person who manages you.]
 
 Team objective: Decompose this objective into member-owned work.`)).toBe(true);
+
+    expect(shouldSuppressMcpForPrompt(`[Message from agent "task-master" | Query ID: query_11]
+[Note: task-master will poll for your reply for ~2 minutes.]
+
+Validation request for run-baseline-cycle (#784ff464), goal goal_mr4khc5x_lf68y. Read the artifact and reply PASS or FAIL.`)).toBe(true);
   });
 
   it('keeps MCP available for normal delegated task work', () => {
@@ -124,6 +129,8 @@ Please inspect the repository, edit the integration, and run the test suite.`)).
     expect(allowedToolsForPrompt('Supervision: task #12345678 has been in progress 48m.', configured))
       .toEqual(['Read', 'Glob', 'Grep']);
     expect(allowedToolsForPrompt('Please validate output/legal-routing-policy-8da84377.md against task #8da84377.', configured))
+      .toEqual(['Read', 'Glob', 'Grep']);
+    expect(allowedToolsForPrompt('Validation request for run-baseline-cycle (#784ff464), goal goal_mr4khc5x_lf68y. Read the artifact and reply PASS or FAIL.', configured))
       .toEqual(['Read', 'Glob', 'Grep']);
     expect(allowedToolsForPrompt('Implement a filesystem-backed MCP integration and cite the changed files.', configured))
       .toEqual(configured);

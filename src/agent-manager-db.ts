@@ -4244,6 +4244,7 @@ Return this JSON shape:
       /^No approved recommendation routed\b/,
       /^Already handled\.\s+Task\b/,
       /^Please validate\b[\s\S]*\bagainst task\s+#?[a-z0-9_-]+/i,
+      /^Validation request for\b[\s\S]*\(#[a-z0-9_-]+\)/i,
       /^AUTO-RELEASE shipped\b/i,
     ].some((pattern) => pattern.test(text));
   }
@@ -13278,7 +13279,8 @@ Return this JSON shape:
       || lower.startsWith('status check on')
       || lower.startsWith('please claim and execute #')
       || lower.startsWith('please claim and complete task #')
-      || (lower.startsWith('please validate ') && lower.includes(' against task #'));
+      || (lower.startsWith('please validate ') && lower.includes(' against task #'))
+      || lower.startsWith('validation request for ');
     if (!managedTaskAsk) return null;
     return text.match(/#[a-z0-9][a-z0-9_-]{3,}/i)?.[0]?.toLowerCase() ?? null;
   }
@@ -13393,6 +13395,7 @@ Return this JSON shape:
            OR LOWER(prompt) LIKE 'please claim and execute #%'
            OR LOWER(prompt) LIKE 'please claim and complete task #%'
            OR (LOWER(prompt) LIKE 'please validate %' AND LOWER(prompt) LIKE '% against task #%')
+           OR LOWER(prompt) LIKE 'validation request for %'
            OR LOWER(prompt) LIKE 'assignment sweep complete%'
            OR LOWER(prompt) LIKE 'ack on the sweep%'
            OR LOWER(prompt) LIKE 're your assignment sweep%'

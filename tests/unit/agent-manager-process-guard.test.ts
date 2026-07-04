@@ -1593,6 +1593,44 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
+  it('dedupes active validation-request /ask prompts by task marker before dispatching', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-researcher',
+        name: 'researcher',
+        port: 4116,
+        status: 'running',
+        endpoint: 'http://127.0.0.1:9',
+      }),
+    });
+    await db.queries.upsert(teamId, 'agent-researcher', {
+      query_id: 'existing-validation-request',
+      status: 'processing',
+      prompt: 'Validation request for run-baseline-cycle (#784ff464), goal goal_mr4khc5x_lf68y. Read the artifact and reply PASS or FAIL.',
+      created: Date.now(),
+      owner_kind: 'agent',
+      owner_id: 'agent-researcher',
+    });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+    const result = await (manager as any).executeRemoteCommand(
+      '/ask researcher Validation request for run-baseline-cycle (#784ff464), goal goal_mr4khc5x_lf68y. Retry with concise findings.',
+      teamId,
+      'default',
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.result?.queryId).toBe('existing-validation-request');
+    expect(result.result?.deduped).toBe(true);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
   it('dedupes exact active auto-release verification prompts before dispatching', async () => {
     const { manager, db, workDir } = await makeManager();
     dbs.push(db);

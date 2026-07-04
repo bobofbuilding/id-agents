@@ -395,6 +395,7 @@ describe('stalled task sweeper', () => {
     expect(manager.shouldAttachBrainContext('No approved recommendation routed. The completed result was REVISE.')).toBe(false);
     expect(manager.shouldAttachBrainContext('Already handled. Task #12345678 is done with no active delegation.')).toBe(false);
     expect(manager.shouldAttachBrainContext('Please validate output/legal-routing-policy-8da84377.md against task #8da84377.')).toBe(false);
+    expect(manager.shouldAttachBrainContext('Validation request for run-baseline-cycle (#784ff464), goal goal_mr4khc5x_lf68y. Read the artifact and reply PASS or FAIL.')).toBe(false);
     expect(manager.shouldAttachBrainContext('AUTO-RELEASE shipped v0.1.585. Please verify the asset and self-update smoke.')).toBe(false);
     expect(manager.shouldAttachBrainContext('Resume and complete task #12345678: inventory MCP servers.')).toBe(true);
     expect(manager.shouldAttachBrainContext('Please inspect the repository and run the integration tests.')).toBe(true);
