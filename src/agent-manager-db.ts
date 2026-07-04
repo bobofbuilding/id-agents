@@ -2900,9 +2900,12 @@ Return this JSON shape:
   private readonly localGateByQuery = new Map<string, { token: string; agent?: string }>();
   private readonly localGateByAgent = new Map<string, string>();
 
-  /** Acquire a local-model slot before dispatching to `runtime`. Returns a token or undefined. */
-  private async acquireLocalGate(runtime?: string | null): Promise<string | undefined> {
-    if (!isLocalModelRuntime(runtime)) return undefined;
+  /** Acquire a local-model slot before dispatching to `agent`. Returns a token or undefined. */
+  private async acquireLocalGate(agent?: AgentRow | null): Promise<string | undefined> {
+    if (!agent) return undefined;
+    const metadata = (agent.metadata || {}) as AgentMetadata;
+    const providerRuntime = this.providerRuntimeForAgent(agent, metadata);
+    if (!isLocalModelRuntime(agent.runtime || (metadata as any).runtime, providerRuntime?.baseUrl)) return undefined;
     const token = `lmg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     await this.localModelGate.acquire(token);
     return token;
@@ -3670,7 +3673,7 @@ Return this JSON shape:
 
       // Serialize local-model dispatch (#7): wait for a slot if this target runs
       // a local model; API-backed targets pass through immediately.
-      const lmgToken = await this.acquireLocalGate(targetAgent.runtime);
+      const lmgToken = await this.acquireLocalGate(targetAgent);
 
       // Forward the message to the agent's /talk endpoint
       const result = await this.forwardToAgent(targetUrl, outgoingMessage, from || 'manager', session_id);
@@ -4408,6 +4411,28 @@ Return this JSON shape:
     // manager supports (vs stock upstream) and degrade gracefully. See src/control-center/manifest.ts.
     this.managementApp.get('/capabilities', (_req, res) => {
       res.json(ccCapabilities());
+    });
+
+    this.managementApp.get('/manager/local-concurrency', (_req, res) => {
+      res.json({
+        concurrency: this.localModelGate.getConcurrency(),
+        active: this.localModelGate.activeCount,
+        queued: this.localModelGate.queuedCount,
+      });
+    });
+
+    this.managementApp.post('/manager/local-concurrency', (req, res) => {
+      if (!this.isAdminRequest(req)) return res.status(403).json({ error: 'admin_required' });
+      const n = Number(req.body?.concurrency);
+      if (!Number.isFinite(n) || n < 1 || n > 16) {
+        return res.status(400).json({ error: 'invalid_concurrency', message: 'concurrency must be a number from 1 to 16' });
+      }
+      this.localModelGate.setConcurrency(n);
+      return res.json({
+        concurrency: this.localModelGate.getConcurrency(),
+        active: this.localModelGate.activeCount,
+        queued: this.localModelGate.queuedCount,
+      });
     });
 
     this.managementApp.get('/usage', (req, res) => {
@@ -9633,7 +9658,7 @@ Return this JSON shape:
         // Send message to agent's /talk endpoint
         const talkHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
         // Serialize local-model dispatch (#7).
-        const askGate = await this.acquireLocalGate(a.runtime);
+        const askGate = await this.acquireLocalGate(a);
         const talkResp = await fetch(talkUrl, {
           method: 'POST',
           headers: talkHeaders,

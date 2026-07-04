@@ -20,16 +20,27 @@
 /**
  * Runtimes whose inference happens on THIS machine and must be serialized.
  *
- * Only the `ollama` runtime qualifies — it's the catch-all for every local
- * inference server (Ollama, LM Studio, openai-compatible local). Every other
- * runtime is subscription/cloud-backed and runs in parallel, INCLUDING
- * `claude-code-local`: despite its name, it's the Claude Code CLI on an Anthropic
- * *subscription* serving cloud Claude models (opus/sonnet/haiku) — the "local"
- * refers to the agent process, not the model. (See idctl runtimeCatalog: claude-*
- * runtimes ← anthropic provider; the `ollama` runtime ← local model servers.)
+ * `ollama` is the native local-model runtime. OpenAI-compatible provider lanes
+ * can also be local when their endpoint is loopback (for example LM Studio at
+ * http://127.0.0.1:1234/v1). Cloud provider lanes stay parallel. Every other
+ * subscription runtime also runs in parallel, INCLUDING `claude-code-local`:
+ * despite its name, it's the Claude Code CLI on an Anthropic subscription
+ * serving cloud Claude models — the "local" refers to the agent process.
  */
-export function isLocalModelRuntime(runtime?: string | null): boolean {
-  return runtime === 'ollama';
+export function isLocalProviderUrl(raw?: string | null): boolean {
+  if (!raw) return false;
+  try {
+    const host = new URL(raw).hostname.toLowerCase();
+    return host === '127.0.0.1' || host === 'localhost' || host === '0.0.0.0' || host === '::1' || host.endsWith('.local');
+  } catch {
+    return false;
+  }
+}
+
+export function isLocalModelRuntime(runtime?: string | null, providerBaseUrl?: string | null): boolean {
+  if (runtime === 'ollama') return true;
+  if (providerBaseUrl && isLocalProviderUrl(providerBaseUrl)) return true;
+  return String(runtime ?? '').toLowerCase() === 'provider:lmstudio';
 }
 
 export class LocalModelGate {

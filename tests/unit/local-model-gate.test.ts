@@ -4,10 +4,14 @@ import { LocalModelGate, isLocalModelRuntime } from '../../src/lib/local-model-g
 describe('isLocalModelRuntime', () => {
   it('serializes only local model runtimes', () => {
     expect(isLocalModelRuntime('ollama')).toBe(true);
+    expect(isLocalModelRuntime('provider:lmstudio')).toBe(true);
+    expect(isLocalModelRuntime('provider:custom', 'http://127.0.0.1:1234/v1')).toBe(true);
+    expect(isLocalModelRuntime('provider:custom', 'http://localhost:1234/v1')).toBe(true);
     expect(isLocalModelRuntime('claude-code-local')).toBe(false);
     expect(isLocalModelRuntime('claude-code-cli')).toBe(false);
     expect(isLocalModelRuntime('codex')).toBe(false);
     expect(isLocalModelRuntime('cursor-cli')).toBe(false);
+    expect(isLocalModelRuntime('provider:openrouter', 'https://openrouter.ai/api/v1')).toBe(false);
     expect(isLocalModelRuntime(undefined)).toBe(false);
     expect(isLocalModelRuntime(null)).toBe(false);
   });

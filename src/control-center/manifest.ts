@@ -30,6 +30,9 @@ export const CC_ROUTES: CcRoute[] = [
   { method: 'POST', path: '/usage/record', group: 'observability' },
   { method: 'GET', path: '/usage/by-task', group: 'observability' },
   { method: 'GET', path: '/agents/:id/queries/active', group: 'observability' },
+  // manager runtime controls
+  { method: 'GET', path: '/manager/local-concurrency', group: 'manager-controls' },
+  { method: 'POST', path: '/manager/local-concurrency', group: 'manager-controls' },
   // per-agent configuration
   { method: 'GET', path: '/agents/:id/instructions', group: 'agent-config' },
   { method: 'POST', path: '/agents/:id/instructions', group: 'agent-config' },
@@ -49,6 +52,7 @@ export const CC_ROUTES: CcRoute[] = [
 /** Coarse feature flags the GUI can gate on. */
 export const CC_FEATURES = [
   'observability', // /activity, /usage, /usage/by-task
+  'manager-controls', // local-model concurrency
   'agent-config', // per-agent instructions/runtime/mcp/delegates/team/metadata
   'team-config', // per-team relay config
   'library', // skills/plugins install
