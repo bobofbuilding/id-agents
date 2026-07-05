@@ -1386,6 +1386,105 @@ describe('stalled task sweeper', () => {
     expect(manager.shouldAttachBrainContext('Please inspect the repository and run the integration tests.')).toBe(true);
   });
 
+  it('expires duplicate active control-plane relay prompts after restart', async () => {
+    const rows = [
+      {
+        team_id: TEAM_ID,
+        agent_id: 'lead-1',
+        query_id: 'no-route-old',
+        status: 'pending',
+        prompt: 'No approved recommendation routed. This is the same #edad4eb3 Deepsec task-focus loop. The completed result was APPROVE.',
+        created: NOW_MS - 20_000,
+        completed: null,
+        result: null,
+        error: null,
+        session_id: null,
+        owner_kind: 'agent',
+        owner_id: 'lead-1',
+        metadata: null,
+      },
+      {
+        team_id: TEAM_ID,
+        agent_id: 'lead-1',
+        query_id: 'no-route-new',
+        status: 'pending',
+        prompt: 'No approved recommendation routed. For #edad4eb3, the completed Deepsec task-focus result was APPROVE CLOSURE.',
+        created: NOW_MS - 10_000,
+        completed: null,
+        result: null,
+        error: null,
+        session_id: null,
+        owner_kind: 'agent',
+        owner_id: 'lead-1',
+        metadata: null,
+      },
+      {
+        team_id: TEAM_ID,
+        agent_id: 'lead-1',
+        query_id: 'handled-old',
+        status: 'pending',
+        prompt: 'Already handled. Task #abc12345 is done with no active delegation.',
+        created: NOW_MS - 20_000,
+        completed: null,
+        result: null,
+        error: null,
+        session_id: null,
+        owner_kind: 'agent',
+        owner_id: 'lead-1',
+        metadata: null,
+      },
+      {
+        team_id: TEAM_ID,
+        agent_id: 'lead-1',
+        query_id: 'handled-new',
+        status: 'pending',
+        prompt: 'Already handled. Task #abc12345 is done with no active delegation path.',
+        created: NOW_MS - 10_000,
+        completed: null,
+        result: null,
+        error: null,
+        session_id: null,
+        owner_kind: 'agent',
+        owner_id: 'lead-1',
+        metadata: null,
+      },
+    ];
+    const query = vi.fn(async (sql: string, params: unknown[] = []) => {
+      if (/FROM queries\s+WHERE status IN \('pending', 'processing'\)/.test(sql)) {
+        return { rows, rowCount: rows.length };
+      }
+      if (/FROM queries\s+WHERE status = 'completed'/.test(sql)) {
+        return { rows: [], rowCount: 0 };
+      }
+      if (/UPDATE queries/.test(sql)) {
+        const ids = params.slice(1).map(String);
+        const expired = rows.filter((row) => ids.includes(row.query_id)).map((row) => ({
+          ...row,
+          status: 'expired',
+          completed: params[0],
+        }));
+        return { rows: expired, rowCount: expired.length };
+      }
+      return { rows: [], rowCount: 0 };
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-control-relay-dedupe-test', fakeDb({
+      adapter: { query },
+    }), { libraryRoot: null }) as any;
+
+    const expired = await manager.expireDuplicateActiveTaskAsks(NOW_MS);
+
+    expect(expired.map((row: { query_id: string }) => row.query_id).sort()).toEqual([
+      'handled-new',
+      'no-route-new',
+    ]);
+    expect(query).toHaveBeenCalledWith(
+      expect.stringContaining("LOWER(prompt) LIKE 'no approved recommendation routed%'"),
+    );
+    expect(query).toHaveBeenCalledWith(
+      expect.stringContaining("LOWER(prompt) LIKE 'already handled. task%'"),
+    );
+  });
+
   it('cancels active query rows before rebuilding an agent process', async () => {
     const db = fakeDb({
       queries: {

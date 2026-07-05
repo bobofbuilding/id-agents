@@ -14633,7 +14633,13 @@ Return this JSON shape:
       || lower.startsWith('resume and complete task')
       || lower.startsWith('backlog guard:')
       || lower.startsWith('backlog guard alert:')
+      || lower.startsWith('urgent: task')
       || lower.startsWith('status check on')
+      || /^you have \d+ stalled doing tasks\b/.test(lower)
+      || lower.startsWith('no approved recommendation routed')
+      || lower.startsWith('already handled. task')
+      || /^please close (?:your )?task\b/.test(lower)
+      || /^please mark (?:your )?task\b/.test(lower)
       || lower.startsWith('please claim and execute #')
       || lower.startsWith('please claim and complete task #')
       || (lower.startsWith('please validate ') && lower.includes(' against task #'))
@@ -14658,9 +14664,18 @@ Return this JSON shape:
       'ack on the sweep',
       're your assignment sweep',
       'task assignment sweep:',
+      'no approved recommendation routed',
+      'already handled. task',
+      'please close your task',
+      'please close task',
+      'please mark your task',
+      'please mark task',
       'auto-release shipped',
     ];
-    if (!dedupePrefixes.some((prefix) => lower.startsWith(prefix))) return null;
+    const dedupeByPrefix = dedupePrefixes.some((prefix) => lower.startsWith(prefix))
+      || /^you have \d+ stalled doing tasks\b/.test(lower)
+      || (lower.startsWith('urgent: task') && lower.includes('stalled'));
+    if (!dedupeByPrefix) return null;
     return lower.slice(0, 1024);
   }
 
@@ -14748,7 +14763,15 @@ Return this JSON shape:
            OR LOWER(prompt) LIKE 'resume and complete task #%'
            OR LOWER(prompt) LIKE 'backlog guard:%'
            OR LOWER(prompt) LIKE 'backlog guard alert:%'
+           OR (LOWER(prompt) LIKE 'urgent: task%' AND LOWER(prompt) LIKE '%stalled%')
            OR LOWER(prompt) LIKE 'status check on%'
+           OR LOWER(prompt) LIKE 'you have % stalled doing tasks%'
+           OR LOWER(prompt) LIKE 'no approved recommendation routed%'
+           OR LOWER(prompt) LIKE 'already handled. task%'
+           OR LOWER(prompt) LIKE 'please close your task%'
+           OR LOWER(prompt) LIKE 'please close task%'
+           OR LOWER(prompt) LIKE 'please mark your task%'
+           OR LOWER(prompt) LIKE 'please mark task%'
            OR LOWER(prompt) LIKE 'please claim and execute #%'
            OR LOWER(prompt) LIKE 'please claim and complete task #%'
            OR (LOWER(prompt) LIKE 'please validate %' AND LOWER(prompt) LIKE '% against task #%')
