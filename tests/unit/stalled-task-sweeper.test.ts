@@ -153,6 +153,7 @@ describe('stalled task sweeper', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
     delete process.env.STALL_SWEEP_MS;
     delete process.env.STALL_SWEEP_INTERVAL_MS;
@@ -208,6 +209,68 @@ describe('stalled task sweeper', () => {
       created_at: NOW_MS - 180_000,
       updated_at: NOW_MS - 180_000,
     }), NOW_MS)).toBe(false);
+  });
+
+  it('retries a fresh lead delegation kickoff after the freshness grace', async () => {
+    vi.restoreAllMocks();
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW_MS);
+
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const lead = agent({
+      id: 'research-lead-1',
+      name: 'research-lead',
+      metadata: { catalog: { role: 'lead' } },
+    });
+    const worker = agent({
+      id: 'researcher-1',
+      name: 'researcher',
+    });
+    const leadTask = task({
+      id: 'lead-task-1',
+      name: 'coordinate-research-work',
+      uuid: '87654321-4321-4321-8321-123456789abc',
+      title: 'Coordinate research work',
+      owner: lead.id,
+      created_by: lead.id,
+      created_at: nowSec,
+      updated_at: nowSec,
+    });
+    const db = fakeDb({
+      agents: {
+        getById: vi.fn(async (id: string) => id === lead.id ? lead : worker),
+        list: vi.fn(async () => [lead, worker]),
+      },
+      tasks: {
+        getByNameForTeam: vi.fn(async () => leadTask),
+        list: vi.fn(async () => [leadTask]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-lead-kickoff-retry-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.promptLeadForDelegationKickoff(TEAM_ID, 'research', leadTask, lead);
+
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(2 * 60 * 1000);
+
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'research',
+      'research-lead',
+      expect.stringContaining('Lead delegation kickoff: task #87654321'),
+    );
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      team_id: TEAM_ID,
+      topic: 'task:triaged',
+      actor_agent_id: lead.id,
+      subject_id: leadTask.uuid,
+      data: expect.objectContaining({
+        reason: 'lead_delegation_required',
+      }),
+    }));
+
+    await manager.shutdown();
   });
 
   it('does not treat fresh second-based task timestamps as stalled', async () => {

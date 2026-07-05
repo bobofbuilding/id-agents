@@ -254,9 +254,17 @@ export function shouldDelayLeadDelegationKickoffForFreshTask(
   task: Pick<TaskRow, 'created_at' | 'updated_at'>,
   nowMs: number = Date.now(),
 ): boolean {
+  return leadDelegationKickoffDelayMsForFreshTask(task, nowMs) > 0;
+}
+
+export function leadDelegationKickoffDelayMsForFreshTask(
+  task: Pick<TaskRow, 'created_at' | 'updated_at'>,
+  nowMs: number = Date.now(),
+): number {
   const createdMs = rowTimestampMs(task.created_at);
-  if (!createdMs) return false;
-  return Math.max(0, nowMs - createdMs) < LEAD_DELEGATION_KICKOFF_GRACE_MS;
+  if (!createdMs) return 0;
+  const ageMs = Math.max(0, nowMs - createdMs);
+  return Math.max(0, LEAD_DELEGATION_KICKOFF_GRACE_MS - ageMs);
 }
 
 function expandTopicAliases(topics: readonly string[]): string[] {
@@ -661,6 +669,7 @@ export class AgentManagerDb {
   private taskOwnerWakeAttempts: Map<string, number> = new Map();
   private scheduleTargetWakeAttempts: Map<string, number> = new Map();
   private stalledNudges = new Map<string, StalledProbeState>(); // probe key -> throttle/count state
+  private leadDelegationKickoffRetryTimers: Map<string, NodeJS.Timeout> = new Map();
   private retentionService: RetentionService | null = null;
   private checkinService: CheckinService | null = null;
   /**
@@ -2346,7 +2355,11 @@ export class AgentManagerDb {
   private async promptLeadForDelegationKickoff(teamId: string, teamName: string, task: TaskRow, owner: AgentRow | null): Promise<void> {
     if (!this.isConfiguredTeamLead(teamName, owner)) return;
     if (!this.isLiveForSupervision(owner) || !owner.endpoint) return;
-    if (shouldDelayLeadDelegationKickoffForFreshTask(task)) return;
+    const freshDelayMs = leadDelegationKickoffDelayMsForFreshTask(task);
+    if (freshDelayMs > 0) {
+      this.scheduleLeadDelegationKickoffRetry(teamId, teamName, task, owner, freshDelayMs);
+      return;
+    }
     const key = `task:${task.id}:lead-delegation-kickoff`;
     if (this.stalledNudges.has(key)) return;
     const children = await this.findDelegatedChildTasks(task, teamId, owner);
@@ -2403,6 +2416,32 @@ export class AgentManagerDb {
       this.markStalledProbe(key, Date.now());
       await this.recordTaskSupervision(task, teamId, owner.id, 'lead_delegation_required', 0, Date.now());
     }
+  }
+
+  private scheduleLeadDelegationKickoffRetry(
+    teamId: string,
+    teamName: string,
+    task: TaskRow,
+    owner: AgentRow,
+    delayMs: number,
+  ): void {
+    const timerKey = `${teamId}:${task.id}:${owner.id}`;
+    if (this.leadDelegationKickoffRetryTimers.has(timerKey)) return;
+    const timer = setTimeout(() => {
+      this.leadDelegationKickoffRetryTimers.delete(timerKey);
+      void (async () => {
+        const [freshTask, freshOwner] = await Promise.all([
+          this.db.tasks.getByNameForTeam(task.name, teamId).catch(() => null),
+          this.db.agents.getById(owner.id).catch(() => owner),
+        ]);
+        if (!freshTask || freshTask.status !== 'doing' || freshTask.owner !== owner.id) return;
+        await this.promptLeadForDelegationKickoff(teamId, teamName, freshTask, freshOwner ?? owner);
+      })().catch((err) => {
+        console.warn(`[Supervision] Lead delegation kickoff retry failed for ${task.name}: ${err?.message || err}`);
+      });
+    }, Math.max(0, delayMs));
+    timer.unref?.();
+    this.leadDelegationKickoffRetryTimers.set(timerKey, timer);
   }
 
   private canWakeLocalAgentLifecycle(agent: AgentRow | null | undefined): boolean {
@@ -16125,6 +16164,10 @@ Return this JSON shape:
       clearInterval(this.remoteProbeInterval);
       this.remoteProbeInterval = null;
     }
+    for (const timer of this.leadDelegationKickoffRetryTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.leadDelegationKickoffRetryTimers.clear();
     if (this.wss) {
       try { this.wss.close(); } catch { /* swallow */ }
       this.wss = null;
