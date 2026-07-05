@@ -1782,10 +1782,13 @@ export class AgentManagerDb {
     const source = params.sourceAction
       ? ` The owner replied ${params.sourceAction.toUpperCase()}${blocker ? `: ${blocker}` : ''}.`
       : '';
+    const blockerDetail = !params.sourceAction && blocker
+      ? ` Blocker detail: ${blocker}.`
+      : '';
     const unblock = blocker
       ? ' If the blocker requires the lead, project manager, or user, create or update the relevant inbox/decision item with the exact missing decision and next owner; do not leave this as an unexplained retry.'
       : '';
-    return `TASK DELEGATION from manager: You are assigned task-manager triage for ${params.teamName} task ${params.ref} ("${params.task.title}"). The task has been active ${params.stalledMinutes}m, ${ownerState}, and ${leadState}.${source} New task assignment to that owner is held until this is triaged. Return a solution-oriented outcome: ROUTE to a live owner with why, SPLIT into member-owned work, ASK-USER with the exact missing decision, or PARK with a clear blocker and unblock owner.${unblock} Do not create duplicate objectives; mutate only the existing task or the minimum child tasks required to unblock it.`;
+    return `TASK DELEGATION from manager: You are assigned task-manager triage for ${params.teamName} task ${params.ref} ("${params.task.title}"). The task has been active ${params.stalledMinutes}m, ${ownerState}, and ${leadState}.${source}${blockerDetail} New task assignment to that owner is held until this is triaged. Return a solution-oriented outcome: ROUTE to a live owner with why, SPLIT into member-owned work, ASK-USER with the exact missing decision, or PARK with a clear blocker and unblock owner.${unblock} Do not create duplicate objectives; mutate only the existing task or the minimum child tasks required to unblock it.`;
   }
 
   private taskManagerFallbackLaneKey(teamId: string): string {
@@ -15624,6 +15627,44 @@ Return this JSON shape:
     return { assigned: false, reason: 'no_idle_live_member' };
   }
 
+  private shouldRouteUnownedAssignmentMiss(reason: string): boolean {
+    return [
+      'no_idle_live_member',
+      'owner_has_active_task',
+      'owner_has_open_task',
+      'owner_has_active_checkin',
+      'owner_has_active_query',
+      'owner_has_stalled_backlog',
+    ].includes(reason);
+  }
+
+  private async routeUnownedAssignmentMissToTaskManager(params: {
+    teamRow: { id: string; name: string };
+    task: TaskRow;
+    reason: string;
+    ageMinutes: number;
+    nowMs: number;
+  }): Promise<boolean> {
+    if (!this.shouldRouteUnownedAssignmentMiss(params.reason)) return false;
+    if (await this.recentAssignmentHoldTriageReason(params.teamRow.id, params.task, params.nowMs)) return false;
+    const ref = this.taskShortRef(params.task);
+    const fallback = await this.routeStalledTaskToTaskManagerFallback({
+      teamId: params.teamRow.id,
+      teamName: params.teamRow.name,
+      task: params.task,
+      ref,
+      stalledMinutes: Math.max(0, params.ageMinutes),
+      ownerName: `unclaimed (${params.reason})`,
+      nowMs: params.nowMs,
+      renudgeMs: this.getStallRenudgeMs(),
+      maxProbes: this.getMaxStalledTaskProbes(),
+      reason: 'unclaimed',
+      eventReason: 'unclaimed',
+      blockerNote: `Auto-assignment could not find an immediately available executor: ${params.reason}. Route this existing task to a live owner, split it into smaller member-owned work, or park it with the concrete blocker.`,
+    });
+    return fallback?.status === 'sent_task_manager';
+  }
+
   private async checkinsAreCoordinatorOwned(teamName: string, checkins: CheckinRow[]): Promise<boolean> {
     if (!checkins.length) return false;
     for (const checkin of checkins) {
@@ -15874,6 +15915,19 @@ Return this JSON shape:
           assignedTodoTaskIds.add(t.id);
           nudged++;
           unownedAssigned++;
+        } else {
+          const routed = await this.routeUnownedAssignmentMissToTaskManager({
+            teamRow,
+            task: t,
+            reason: assignment.reason,
+            ageMinutes: Math.round((now - this.taskLastActivityMs(t)) / 60000),
+            nowMs: now,
+          });
+          if (routed) {
+            this.markStalledProbe(nudgeKey, now);
+            assignedTodoTaskIds.add(t.id);
+            nudged++;
+          }
         }
       }
     }
@@ -16241,6 +16295,16 @@ Return this JSON shape:
           assignedTodoTaskIds.add(t.id);
           nudged++;
           unownedAssigned++;
+          continue;
+        }
+        if (await this.routeUnownedAssignmentMissToTaskManager({
+          teamRow,
+          task: t,
+          reason: assignment.reason,
+          ageMinutes: Math.round(unownedAgeMs / 60000),
+          nowMs: now,
+        })) {
+          nudged++;
           continue;
         }
         if (assignment.reason === 'doing_limit_full') continue;

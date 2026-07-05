@@ -4918,6 +4918,92 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('routes old unclaimed work to task-manager when every executor is already occupied', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const staleTodo = task({
+      id: 'todo-busy-assign-1',
+      name: 'stale-unclaimed-busy',
+      uuid: '77777777-8888-4777-9666-555555555555',
+      title: 'Stale unclaimed busy work',
+      status: 'todo',
+      owner: null,
+      updated_at: nowSec - 3600,
+    });
+    const activeDoing = task({
+      id: 'doing-worker-1',
+      name: 'active-worker-task',
+      uuid: '88888888-8888-4777-9666-555555555555',
+      title: 'Active worker task',
+      status: 'doing',
+      owner: 'worker-2',
+      updated_at: nowSec,
+    });
+    const worker = agent({ id: 'worker-2', name: 'worker-b' });
+    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
+    const opsTeam = team({ id: 'ops-team-id', name: 'ops-team' });
+    const taskMaster = agent({
+      team_id: opsTeam.id,
+      id: 'task-master-id',
+      name: 'task-master',
+      metadata: { catalog: { role: 'task-manager' } },
+    });
+    const db = fakeDb({
+      teams: {
+        getTeamByName: vi.fn(async (name: string) => name === 'ops-team' ? opsTeam : null),
+        listTeams: vi.fn(async () => [opsTeam]),
+      },
+      agents: {
+        getById: vi.fn(async (id: string) => id === worker.id ? worker : id === lead.id ? lead : null),
+        getByName: vi.fn(async (teamId: string, name: string) =>
+          teamId === opsTeam.id && name === 'task-master' ? taskMaster : lead,
+        ),
+        list: vi.fn(async (teamId: string) => teamId === opsTeam.id ? [taskMaster] : [lead, worker]),
+      },
+      tasks: {
+        list: vi.fn(async ({ status, owner }: { status?: string; owner?: string } = {}) => {
+          if (status === 'doing' && owner === worker.id) return [activeDoing];
+          if (status === 'doing' && owner === lead.id) return [];
+          if (status === 'doing') return [activeDoing];
+          if (status === 'todo') return [staleTodo];
+          return [];
+        }),
+        getByNameForTeam: vi.fn(async () => staleTodo),
+        claim: vi.fn(async () => true),
+        updateFields: vi.fn(async () => {}),
+      },
+      queries: {
+        getPending: vi.fn(async () => []),
+        getPendingByOwner: vi.fn(async () => []),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-busy-unclaimed-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.sweepStalledTasks();
+
+    expect(db.tasks.claim).not.toHaveBeenCalled();
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'ops-team',
+      'task-master',
+      expect.stringContaining('Auto-assignment could not find an immediately available executor: no_idle_live_member'),
+    );
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalledWith(
+      'default',
+      'lead',
+      expect.any(String),
+    );
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      team_id: TEAM_ID,
+      topic: 'task:triaged',
+      actor_agent_id: 'task-master-id',
+      subject_id: '77777777-8888-4777-9666-555555555555',
+      data: expect.objectContaining({
+        reason: 'unclaimed',
+        stalled_minutes: 60,
+      }),
+    }));
+  });
+
   it('transfers coordinator-owned checkins when auto-assigning unowned todo work', async () => {
     const nowSec = Math.floor(NOW_MS / 1000);
     const staleTodo = task({
