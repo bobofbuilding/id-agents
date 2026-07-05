@@ -15591,6 +15591,32 @@ Return this JSON shape:
     return { assigned: false, reason: 'no_idle_live_member' };
   }
 
+  private async checkinsAreCoordinatorOwned(teamName: string, checkins: CheckinRow[]): Promise<boolean> {
+    if (!checkins.length) return false;
+    for (const checkin of checkins) {
+      if (!checkin.owner_agent_id) return false;
+      const owner = await this.db.agents.getById(checkin.owner_agent_id).catch(() => null);
+      if (!this.isConfiguredTeamLead(teamName, owner)) return false;
+    }
+    return true;
+  }
+
+  private async transferLinkedCheckinsToAssignee(
+    teamRow: { id: string; name: string },
+    checkins: CheckinRow[],
+    owner: AgentRow | undefined,
+    nowMs: number,
+  ): Promise<void> {
+    if (!owner?.id || !checkins.length) return;
+    for (const checkin of checkins) {
+      if (checkin.owner_agent_id === owner.id) continue;
+      await this.db.checkins.updateFields(checkin.id, teamRow.id, {
+        owner_agent_id: owner.id,
+        updated_at: nowMs,
+      });
+    }
+  }
+
   private async assignUnownedTodoTasks(params: {
     teams: Array<{ id: string; name: string }>;
     limit: number;
@@ -15680,9 +15706,12 @@ Return this JSON shape:
         }
 
         const active = await this.db.checkins
-          .list({ teamId: teamRow.id, linkedTaskId: task.id, status: ['active', 'snoozed'], limit: 1 })
+          .list({ teamId: teamRow.id, linkedTaskId: task.id, status: ['active', 'snoozed'], limit: 10 })
           .catch(() => [] as CheckinRow[]);
-        if (active.length) {
+        const transferableCheckins = active.length && await this.checkinsAreCoordinatorOwned(teamRow.name, active)
+          ? active
+          : [];
+        if (active.length && !transferableCheckins.length) {
           checkinSupervised++;
           continue;
         }
@@ -15704,6 +15733,7 @@ Return this JSON shape:
         const assignment = await this.assignUnownedTodoTask(task, teamRow, now, { dispatch: params.dispatch });
         const ref = this.taskShortRef(task);
         if (assignment.assigned) {
+          await this.transferLinkedCheckinsToAssignee(teamRow, transferableCheckins, assignment.owner, now);
           assignedCount++;
           assignedForTeam++;
           items.push({
@@ -15772,13 +15802,17 @@ Return this JSON shape:
         const teamRow = await this.db.teams.getTeam(t.team_id).catch(() => null);
         if (!teamRow) continue;
         const active = await this.db.checkins
-          .list({ teamId: teamRow.id, linkedTaskId: t.id, status: ['active', 'snoozed'], limit: 1 })
+          .list({ teamId: teamRow.id, linkedTaskId: t.id, status: ['active', 'snoozed'], limit: 10 })
           .catch(() => [] as CheckinRow[]);
-        if (active.length) continue;
+        const transferableCheckins = active.length && await this.checkinsAreCoordinatorOwned(teamRow.name, active)
+          ? active
+          : [];
+        if (active.length && !transferableCheckins.length) continue;
         if (await this.recentAssignmentHoldTriageReason(teamRow.id, t, now)) continue;
 
         const assignment = await this.assignUnownedTodoTask(t, teamRow, now);
         if (assignment.assigned) {
+          await this.transferLinkedCheckinsToAssignee(teamRow, transferableCheckins, assignment.owner, now);
           this.markStalledProbe(nudgeKey, now);
           assignedTodoTaskIds.add(t.id);
           nudged++;

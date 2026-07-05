@@ -4724,6 +4724,85 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('transfers coordinator-owned checkins when auto-assigning unowned todo work', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const staleTodo = task({
+      id: 'todo-checkin-assign',
+      name: 'stale-checkin-unclaimed',
+      uuid: 'aaaaaaaa-8888-4777-9666-555555555555',
+      title: 'Stale checkin unclaimed work',
+      status: 'todo',
+      owner: null,
+      created_by: 'lead-1',
+      updated_at: nowSec - 3600,
+    });
+    const worker = agent({ id: 'worker-2', name: 'worker-b' });
+    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
+    const updated = { ...staleTodo, owner: worker.id, status: 'doing' as const, updated_at: nowSec };
+    const checkin = {
+      id: 'checkin-1',
+      team_id: TEAM_ID,
+      owner_agent_id: lead.id,
+      created_by_agent_id: lead.id,
+      linked_task_id: staleTodo.id,
+      interval_seconds: 1200,
+      priority: 'normal',
+      status: 'active',
+      close_when: { task_status: ['done'] },
+      max_iterations: null,
+      iteration_count: 0,
+      next_fire_at: NOW_MS + 1200_000,
+      snooze_until: null,
+      ttl_expires_at: null,
+      last_fire_at: null,
+      last_event_seq: null,
+      note: null,
+      created_at: NOW_MS - 3600_000,
+      updated_at: NOW_MS - 3600_000,
+      closed_at: null,
+      closed_reason: null,
+    };
+    let taskLookupCount = 0;
+    const db = fakeDb({
+      agents: {
+        getById: vi.fn(async (id: string) => id === lead.id ? lead : id === worker.id ? worker : null),
+        getByName: vi.fn(async () => lead),
+        list: vi.fn(async () => [lead, worker]),
+      },
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => {
+          if (status === 'doing') return [];
+          if (status === 'todo') return [staleTodo];
+          return [];
+        }),
+        getByNameForTeam: vi.fn(async () => (++taskLookupCount === 1 ? staleTodo : updated)),
+        claim: vi.fn(async () => true),
+        updateFields: vi.fn(async () => {}),
+      },
+      checkins: {
+        list: vi.fn(async () => [checkin]),
+        updateFields: vi.fn(async () => {}),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-checkin-transfer-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.sweepStalledTasks();
+
+    expect(db.tasks.claim).toHaveBeenCalledWith('todo-checkin-assign', 'worker-2', nowSec, {
+      maxDoingForTeam: expect.any(Number),
+    });
+    expect(db.checkins.updateFields).toHaveBeenCalledWith('checkin-1', TEAM_ID, {
+      owner_agent_id: 'worker-2',
+      updated_at: NOW_MS,
+    });
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'worker-b',
+      expect.stringContaining('TASK DELEGATION from manager'),
+    );
+  });
+
   it('does not auto-assign unclaimed todo work when the doing cap is full', async () => {
     process.env.ID_MAX_DOING_TASKS = '1';
     const nowSec = Math.floor(NOW_MS / 1000);
