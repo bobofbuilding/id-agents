@@ -132,6 +132,7 @@ const HELP_ITEMS: Array<{ cmd: string; desc: string; indent?: boolean }> = [
   { cmd: '/agent <name> probe', desc: 'End-to-end dispatch probe of a single agent' },
   { cmd: '/agent <name> wallet provision', desc: 'Provision an OWS wallet for one agent' },
   { cmd: '/agents', desc: 'List all agents' },
+  { cmd: '/agents park-idle [--confirm]', desc: 'Park idle local agents; add --include-inactive-leads for dormant team leads' },
   { cmd: '/agents probe', desc: 'End-to-end dispatch probe of every running agent' },
   { cmd: '/agents rebuild --confirm [--running-only]', desc: 'Rebuild all eligible local Claude agents, or only running agents' },
   { cmd: '/ask [/hey] <agent> <msg>', desc: 'Talk to agent (continues session)' },
@@ -1614,9 +1615,10 @@ async function handleLine(line: string) {
     const action = parts[0].toLowerCase();
     const actionArg = parts.slice(1).join(' '); // For reset, this is the optional config path
 
-    if (!['start', 'stop', 'rebuild', 'save', 'reset', 'probe'].includes(action)) {
-      console.log(`\n${colors.red}❌ Usage: /agents <start|stop|rebuild|reset|save|probe>${colors.reset}`);
+    if (!['start', 'stop', 'rebuild', 'save', 'reset', 'probe', 'park-idle'].includes(action)) {
+      console.log(`\n${colors.red}❌ Usage: /agents <start|stop|rebuild|reset|save|probe|park-idle>${colors.reset}`);
       console.log(`${colors.gray}  /agents rebuild --confirm [--running-only|--active-only] [--regenerate-config]  - Rebuild all eligible local Claude agents, or only running agents; optionally rewrite configs/<team>.yaml from DB${colors.reset}`);
+      console.log(`${colors.gray}  /agents park-idle [--confirm] [--all-teams] [--include-default] [--include-active-teams] [--include-inactive-leads]  - Park idle local agents${colors.reset}`);
       console.log(`${colors.gray}  /agents reset [config-file]  - Reset agents with plugins from config${colors.reset}`);
       console.log(`${colors.gray}  /agents probe  - End-to-end dispatch probe of every running agent${colors.reset}\n`);
       rl.prompt();
@@ -1759,6 +1761,41 @@ async function handleLine(line: string) {
         }
       } catch (err: any) {
         console.log(`\n${colors.red}❌ Probe error: ${err.message}${colors.reset}\n`);
+      }
+      rl.prompt();
+      return;
+    }
+
+    if (action === 'park-idle') {
+      try {
+        const command = ['/agents', 'park-idle', ...parts.slice(1)].join(' ').trim();
+        const resp = await managerFetch('/remote', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ command })
+        });
+        const data = await resp.json() as any;
+        if (!resp.ok || !data.ok) {
+          console.log(`\n${colors.red}❌ Idle parking failed: ${data.error || resp.statusText}${colors.reset}\n`);
+        } else {
+          const r = data.result || {};
+          console.log(`\n${colors.cyan}${r.dryRun ? 'Dry-run' : 'Parked'} idle agents (${r.scope || activeTeam}):${colors.reset} ${colors.green}${r.parked || 0} parked${colors.reset}, ${colors.yellow}${r.skipped || 0} skipped${colors.reset}, ${colors.red}${r.failed || 0} failed${colors.reset}`);
+          for (const row of r.agents || []) {
+            const color = row.status === 'parked' || row.status === 'candidate'
+              ? colors.green
+              : row.status === 'failed'
+                ? colors.red
+                : colors.gray;
+            const pids = row.pids?.length ? ` pids=${row.pids.join(',')}` : '';
+            console.log(`  ${color}${row.status}${colors.reset} ${row.team}/${row.name}: ${row.reason}${pids}`);
+          }
+          if (r.dryRun) {
+            console.log(`${colors.gray}  Re-run with --confirm to apply.${colors.reset}`);
+          }
+          console.log('');
+        }
+      } catch (err: any) {
+        console.log(`\n${colors.red}❌ Idle parking error: ${err.message}${colors.reset}\n`);
       }
       rl.prompt();
       return;

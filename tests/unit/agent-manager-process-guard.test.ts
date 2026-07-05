@@ -849,6 +849,7 @@ describe('AgentManagerDb killAgentProcess guards', () => {
       confirmed: true,
       allTeams: true,
       includeLeads: false,
+      includeInactiveLeads: true,
       includeScheduled: false,
       includeActiveTeams: true,
     }));
@@ -857,6 +858,80 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     expect(parkIdleAgents).toHaveBeenCalledTimes(1);
 
     await manager.shutdown();
+  });
+
+  it('parks dormant lead-like agents only when inactive-lead parking is enabled and the team has no open work', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const inactiveTeamId = await db.teams.getOrCreateTeamId('engineering-team');
+    await db.agents.create({
+      ...agentRow({
+        team_id: inactiveTeamId,
+        id: 'agent-engineering-lead',
+        name: 'engineering-lead',
+        port: 4110,
+        status: 'running',
+        metadata: { runtime: 'codex', pid: 55556, processOwner: 'manager-child', processParentPid: process.pid },
+      }),
+    });
+
+    const activeTeamId = await db.teams.getOrCreateTeamId('legal');
+    await db.agents.create({
+      ...agentRow({
+        team_id: activeTeamId,
+        id: 'agent-general-counsel',
+        name: 'general-counsel',
+        port: 4111,
+        status: 'running',
+        metadata: {
+          runtime: 'codex',
+          pid: 55557,
+          processOwner: 'manager-child',
+          processParentPid: process.pid,
+          catalog: { role: 'General Counsel coordinates legal team delegation.' },
+        },
+      }),
+    });
+    const now = Date.now();
+    await db.tasks.create({
+      id: 'task-open-legal',
+      name: 'open-legal-task',
+      uuid: 'open-legal-task',
+      team_id: activeTeamId,
+      title: 'Open legal work',
+      description: null,
+      status: 'todo',
+      created_by: null,
+      owner: null,
+      created_at: now,
+      updated_at: now,
+      completed_at: null,
+    } satisfies TaskRow);
+
+    (manager as any).killAgentProcess = vi.fn(async (port: number) => ({ killed: true, pids: [port] }));
+
+    const result = await (manager as any).parkIdleAgents({
+      teamId: '',
+      teamName: 'all-teams',
+      confirmed: true,
+      allTeams: true,
+      includeDefault: false,
+      includeLeads: false,
+      includeInactiveLeads: true,
+      includeScheduled: false,
+      includeActiveTeams: true,
+    });
+
+    expect(result.result.parked).toBe(1);
+    expect(result.result.agents).toEqual(expect.arrayContaining([
+      { team: 'engineering-team', name: 'engineering-lead', status: 'parked', reason: 'idle', pids: [4110] },
+      { team: 'legal', name: 'general-counsel', status: 'skipped', reason: 'lead_like_team_has_1_open_task_requires_--include-leads' },
+    ]));
+    expect((manager as any).killAgentProcess).toHaveBeenCalledTimes(1);
+    expect((await db.agents.getById('agent-engineering-lead'))?.status).toBe('stopped');
+    expect((await db.agents.getById('agent-general-counsel'))?.status).toBe('running');
   });
 
   it('does not park idle helpers in teams that still have open work by default', async () => {

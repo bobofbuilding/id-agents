@@ -10874,6 +10874,7 @@ Return this JSON shape:
           const allTeams = args.includes('--all-teams');
           const includeDefault = args.includes('--include-default');
           const includeLeads = args.includes('--include-leads');
+          const includeInactiveLeads = args.includes('--include-inactive-leads');
           const includeScheduled = args.includes('--include-scheduled');
           const includeActiveTeams = args.includes('--include-active-teams');
           return this.parkIdleAgents({
@@ -10883,6 +10884,7 @@ Return this JSON shape:
             allTeams,
             includeDefault,
             includeLeads,
+            includeInactiveLeads,
             includeScheduled,
             includeActiveTeams,
           });
@@ -14292,6 +14294,7 @@ Return this JSON shape:
           allTeams: true,
           includeDefault: process.env.ID_IDLE_PARK_INCLUDE_DEFAULT === 'true',
           includeLeads: false,
+          includeInactiveLeads: process.env.ID_IDLE_PARK_INCLUDE_INACTIVE_LEADS !== 'false',
           includeScheduled: false,
           includeActiveTeams: true,
         });
@@ -17349,6 +17352,7 @@ Return this JSON shape:
     allTeams: boolean;
     includeDefault: boolean;
     includeLeads: boolean;
+    includeInactiveLeads?: boolean;
     includeScheduled: boolean;
     includeActiveTeams: boolean;
   }): Promise<{ ok: boolean; result: {
@@ -17387,11 +17391,22 @@ Return this JSON shape:
           rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: 'idle_parking_protected' });
           continue;
         }
-        if (!opts.includeLeads && this.isLeadLikeAgentForParking(agent, team.name)) {
-          rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: 'lead_like_requires_--include-leads' });
+        const leadLike = this.isLeadLikeAgentForParking(agent, team.name);
+        if (!opts.includeLeads && leadLike) {
+          if (!opts.includeInactiveLeads) {
+            rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: 'lead_like_requires_--include-leads' });
+            continue;
+          }
+          if (teamOpenTasks > 0) {
+            rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: `lead_like_team_has_${teamOpenTasks}_open_task${teamOpenTasks === 1 ? '' : 's'}_requires_--include-leads` });
+            continue;
+          }
+        }
+        if (opts.includeLeads && leadLike && teamOpenTasks > 0 && !opts.includeActiveTeams) {
+          rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: `team_has_${teamOpenTasks}_open_task${teamOpenTasks === 1 ? '' : 's'}_requires_--include-active-teams` });
           continue;
         }
-        if (!opts.includeActiveTeams && teamOpenTasks > 0) {
+        if (!leadLike && !opts.includeActiveTeams && teamOpenTasks > 0) {
           rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: `team_has_${teamOpenTasks}_open_task${teamOpenTasks === 1 ? '' : 's'}_requires_--include-active-teams` });
           continue;
         }
