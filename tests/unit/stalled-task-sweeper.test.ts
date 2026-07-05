@@ -657,7 +657,7 @@ describe('stalled task sweeper', () => {
     expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
       'research',
       'research-lead',
-      expect.stringContaining('has all delegated child tasks done'),
+      expect.stringContaining('Manager DB confirms parent task #87654321'),
     );
     expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
       'research',
@@ -667,7 +667,93 @@ describe('stalled task sweeper', () => {
     expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
       'research',
       'research-lead',
-      expect.stringContaining('#33333333:done by analyst'),
+      expect.stringContaining('#33333333 status=done owner=analyst'),
+    );
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'research',
+      'research-lead',
+      expect.stringContaining('Do not answer that #87654321 has no trace'),
+    );
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:refreshed',
+      subject_id: parent.uuid,
+      data: expect.objectContaining({
+        reason: 'delegated_children_complete',
+      }),
+    }));
+  });
+
+  it('retries completed-child parent reconciliation with DB-backed context instead of generic owner refresh', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const lead = agent({
+      id: 'lead-1',
+      name: 'engineering-lead',
+      metadata: { catalog: { role: 'lead' } },
+    });
+    const worker = agent({
+      id: 'worker-1',
+      name: 'architecture-engineer',
+      metadata: { catalog: { role: 'member' } },
+    });
+    const parent = task({
+      id: 'parent-task',
+      name: 'design-memory-architecture',
+      uuid: 'effa1c30-3d9d-4633-af13-9db1833c24d2',
+      title: 'Design memory architecture',
+      owner: lead.id,
+      created_by: null,
+      status: 'doing',
+      created_at: nowSec - 3600,
+      updated_at: nowSec - 3600,
+    });
+    const child = task({
+      id: 'child-task',
+      name: 'consolidate-memory-architecture-plan',
+      uuid: '7679bede-aaaa-4333-8333-333333333333',
+      title: 'Consolidate memory architecture into one canonical implementation-ready plan',
+      owner: worker.id,
+      created_by: lead.id,
+      status: 'done',
+      created_at: nowSec - 3500,
+      updated_at: nowSec - 3000,
+      completed_at: nowSec - 3000,
+    });
+    const db = fakeDb({
+      teams: {
+        getTeam: vi.fn(async () => team({ name: 'engineering-team' })),
+      },
+      agents: {
+        getById: vi.fn(async (id: string) => id === lead.id ? lead : id === worker.id ? worker : null),
+        getByName: vi.fn(async () => null),
+      },
+      tasks: {
+        list: vi.fn(async ({ status, teamId }: { status?: string; teamId?: string } = {}) => {
+          if (status === 'doing') return [parent];
+          if (teamId === TEAM_ID) return [parent, child];
+          return [parent, child];
+        }),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-done-child-reconcile-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.sweepStalledTasks();
+
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledTimes(1);
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'engineering-team',
+      'engineering-lead',
+      expect.stringContaining('Manager DB confirms parent task #effa1c30'),
+    );
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'engineering-team',
+      'engineering-lead',
+      expect.stringContaining('#7679bede status=done owner=architecture-engineer'),
+    );
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalledWith(
+      'engineering-team',
+      'engineering-lead',
+      expect.stringContaining('has been in progress'),
     );
     expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
       topic: 'task:refreshed',

@@ -138,7 +138,7 @@ const __dirname = path.dirname(__filename);
 const DEFAULT_MAX_DOING_TASKS = 30;
 const DEFAULT_STALLED_TASK_MAX_PROBES = 3;
 const DEFAULT_MAX_ACTIVE_QUERIES_PER_AGENT = 1;
-const DEFAULT_MAX_ACTIVE_QUERIES_PER_LEAD = 0;
+const DEFAULT_MAX_ACTIVE_QUERIES_PER_LEAD = Number.POSITIVE_INFINITY;
 const DEFAULT_TASK_BOARD_OPEN_LIMIT = 250;
 const DEFAULT_TASK_BOARD_DONE_LIMIT = 25;
 
@@ -1429,6 +1429,25 @@ export class AgentManagerDb {
     };
   }
 
+  private async delegatedChildrenCompletePrompt(parent: TaskRow, children: TaskRow[], ownerLookup?: Map<string, AgentRow>): Promise<string> {
+    const parentRef = this.taskShortRef(parent);
+    const childSummaries = await Promise.all(children.map((child) => this.delegatedChildTaskSummary(child, ownerLookup)));
+    const childLines = childSummaries.map((summary) => {
+      const ref = String(summary.ref || summary.name || 'child');
+      const owner = summary.ownerName ? ` owner=${summary.ownerName}` : '';
+      const title = summary.title ? ` title="${String(summary.title).slice(0, 120)}"` : '';
+      return `- ${ref} status=${summary.status || 'unknown'}${owner}${title}`;
+    }).join('\n');
+    return [
+      `Supervision: Manager DB confirms parent task ${parentRef} ("${parent.title}") exists and all detected delegated child tasks are done.`,
+      `Parent task name: ${parent.name}. Parent task uuid: ${parent.uuid || 'unknown'}.`,
+      'Completed delegated children:',
+      childLines || '- none detected',
+      'Reconcile the child outputs now and mark the parent done with child_task_names/delegated_task_names, or reply BLOCKED: <reason> if a concrete blocker remains.',
+      `Do not answer that ${parentRef} has no trace; this prompt is the authoritative task record. Do not create new tasks from this control prompt.`,
+    ].join('\n');
+  }
+
   private async wakeDelegatedParentLeadIfReady(params: {
     teamId: string;
     teamName: string;
@@ -1454,14 +1473,7 @@ export class AgentManagerDb {
       if (!children.length || children.some((candidate) => candidate.status !== 'done')) continue;
       if (!(await this.hasActiveQueryCapacity(owner, params.teamName))) continue;
 
-      const childSummaries = await Promise.all(children.map((child) => this.delegatedChildTaskSummary(child, ownerCache)));
-      const childText = childSummaries.map((summary) => {
-        const ref = String(summary.ref || summary.name || 'child');
-        const childOwner = summary.ownerName ? ` by ${summary.ownerName}` : '';
-        return `${ref}:${summary.status || 'unknown'}${childOwner}`;
-      }).join(', ');
-      const parentRef = this.taskShortRef(parent);
-      const message = `Supervision: task ${parentRef} ("${parent.title}") has all delegated child tasks done (${childText}). Reconcile the child outputs, then mark the parent done with child_task_names, or reply BLOCKED: <reason>. Do not create new tasks from this control prompt.`;
+      const message = await this.delegatedChildrenCompletePrompt(parent, children, ownerCache);
       const status = await this.sendRecentThrottledSupervisionAsk({
         teamId: params.teamId,
         teamName: params.teamName,
@@ -15645,6 +15657,25 @@ Return this JSON shape:
             });
             nudged++;
             continue;
+          }
+        } else if (audit?.status === 'ok') {
+          const children = await this.findDelegatedChildTasks(t, teamRow.id, ownerAgent);
+          if (children.length && children.every((child) => child.status === 'done')) {
+            if (ownerProbeState.hasActiveSupervisionAsk) continue;
+            const message = await this.delegatedChildrenCompletePrompt(t, children);
+            const sent = await this.sendRecentThrottledSupervisionAsk({
+              teamId: teamRow.id,
+              teamName,
+              recipient: ownerAgent,
+              message,
+              nowMs: now,
+            });
+            if (sent === 'sent') {
+              await this.recordTaskSupervision(t, teamRow.id, ownerAgent.id, 'delegated_children_complete', mins, now);
+              markSupervisionSentTo(ownerAgent);
+              nudged++;
+              continue;
+            }
           }
         }
       }
