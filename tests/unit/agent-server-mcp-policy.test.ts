@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { allowedToolsForPrompt, queryExecutionTimeoutMsForPrompt, shouldSuppressMcpForPrompt } from '../../src/claude-agent-server.js';
+import { allowedToolsForPrompt, classifyQueryQueuePriority, queryExecutionTimeoutMsForPrompt, shouldSuppressMcpForPrompt } from '../../src/claude-agent-server.js';
 
 describe('agent server MCP prompt policy', () => {
   it('suppresses MCP for manager supervision and heartbeat control-plane prompts', () => {
@@ -138,6 +138,7 @@ Please inspect the repository, edit the integration, and run the test suite.`)).
 
   it('restricts control-plane prompts to read-only local tools', () => {
     const configured = ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'WebSearch', 'WebFetch'];
+    const taskManagerTriage = 'TASK DELEGATION from manager: You are assigned task-manager triage for engineering-team task #fdcc9380 ("Inventory engineering skills"). Use the manager task flow to reassign or park it.';
 
     expect(allowedToolsForPrompt('Supervision: task #12345678 has been in progress 48m.', configured))
       .toEqual(['Read', 'Glob', 'Grep']);
@@ -150,6 +151,8 @@ Please inspect the repository, edit the integration, and run the test suite.`)).
     expect(allowedToolsForPrompt('Lead delegation kickoff: task #12345678 is assigned to you as the team coordinator.', configured))
       .toEqual(['Read', 'Bash', 'Glob', 'Grep']);
     expect(allowedToolsForPrompt('Team objective: Decompose this objective into member-owned work.', configured))
+      .toEqual(['Read', 'Bash', 'Glob', 'Grep']);
+    expect(allowedToolsForPrompt(taskManagerTriage, configured))
       .toEqual(['Read', 'Bash', 'Glob', 'Grep']);
     expect(allowedToolsForPrompt('Implement a filesystem-backed MCP integration and cite the changed files.', configured))
       .toEqual(configured);
@@ -174,6 +177,8 @@ Please inspect the repository, edit the integration, and run the test suite.`)).
         .toBe(720_000);
       expect(queryExecutionTimeoutMsForPrompt('Team objective: Decompose this objective into member-owned work.'))
         .toBe(720_000);
+      expect(queryExecutionTimeoutMsForPrompt('TASK DELEGATION from manager: You are assigned task-manager triage for engineering-team task #fdcc9380 ("Inventory engineering skills"). Use the manager task flow to reassign or park it.'))
+        .toBe(720_000);
       expect(queryExecutionTimeoutMsForPrompt('Implement a filesystem-backed MCP integration and cite the changed files.'))
         .toBeUndefined();
     } finally {
@@ -184,6 +189,13 @@ Please inspect the repository, edit the integration, and run the test suite.`)).
       if (priorDelegation === undefined) delete process.env.ID_AGENT_DELEGATION_QUERY_TIMEOUT_MS;
       else process.env.ID_AGENT_DELEGATION_QUERY_TIMEOUT_MS = priorDelegation;
     }
+  });
+
+  it('queues task-manager triage as delegation work instead of background control-plane work', () => {
+    expect(classifyQueryQueuePriority({
+      prompt: 'TASK DELEGATION from manager: You are assigned task-manager triage for engineering-team task #fdcc9380 ("Inventory engineering skills"). Use the manager task flow to reassign or park it.',
+      from: 'manager',
+    })).toBe('delegation');
   });
 
   it('clamps configured control-plane query timeouts', () => {

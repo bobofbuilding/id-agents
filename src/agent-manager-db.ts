@@ -1477,7 +1477,7 @@ export class AgentManagerDb {
         : params.reason === 'lead_delegation_required'
           ? 'task-manager delegation is required'
           : 'manual jumpstart was requested';
-    return `Backlog guard: ${params.teamName} task ${params.ref} ("${params.task.title}") has been active ${params.stalledMinutes}m, ${ownerState}, and ${leadState}. New task assignment to that owner is held until this is triaged. Please route it through the task-manager flow: restart or replace the owner, reassign the task, split it into member-owned work, or park it as todo with a clear blocker.`;
+    return `TASK DELEGATION from manager: You are assigned task-manager triage for ${params.teamName} task ${params.ref} ("${params.task.title}"). The task has been active ${params.stalledMinutes}m, ${ownerState}, and ${leadState}. New task assignment to that owner is held until this is triaged. Use the manager task flow to restart or replace the owner, reassign the task, split it into member-owned work, or park it as todo with a clear blocker. Do not create duplicate objectives; mutate only the existing task or the minimum child tasks required to unblock it.`;
   }
 
   private taskManagerFallbackLaneKey(teamId: string): string {
@@ -1501,7 +1501,11 @@ export class AgentManagerDb {
         LIMIT 20`,
       [params.teamId, since, since],
     ).catch(() => ({ rows: [] as QueryRow[] }));
-    return rows.some((row) => String(row.prompt || '').trim().toLowerCase().startsWith('backlog guard:'));
+    return rows.some((row) => {
+      const prompt = String(row.prompt || '').trim().toLowerCase();
+      return prompt.startsWith('backlog guard:')
+        || prompt.startsWith('task delegation from manager: you are assigned task-manager triage');
+    });
   }
 
   private async routeStalledTaskToTaskManagerFallback(params: {

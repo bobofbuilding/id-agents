@@ -86,6 +86,7 @@ const MCP_CONTROL_PLANE_PROMPT_PATTERNS = [
   /^Supervision probe on task\b/,
   /^Lead delegation kickoff:/,
   /^Team objective:/,
+  /^TASK DELEGATION from manager: You are assigned task-manager triage\b/i,
   /^Backlog guard:/,
   /^Backlog guard alert:/,
   /^Urgent:\s+task\b[\s\S]*\bstalled\b/i,
@@ -2524,7 +2525,7 @@ ${prompt}`
       }
       const executionTimeoutMs = queryExecutionTimeoutMsForPrompt(promptWithSender);
       if (executionTimeoutMs) {
-        const timeoutKind = suppressMcp ? 'Control-plane' : 'Delegation';
+        const timeoutKind = isDelegationControl ? 'Delegation' : suppressMcp ? 'Control-plane' : 'Delegation';
         console.log(`${logTime()} [Agent] ${timeoutKind} timeout for ${queryId}: ${executionTimeoutMs}ms`);
       }
 
