@@ -38,6 +38,15 @@ Control ping after manager restart: reply OK only.`)).toBe(true);
   });
 
   it('suppresses MCP for incoming-reply processing loops', () => {
+    expect(shouldSuppressMcpForPrompt(`[Incoming Reply from "coder"]
+
+{"validation_status":"approved","next_step_recommendations":[{"title":"Route approved follow-up","priority":"high"}]}
+
+---
+
+INBOUND WAKE BOUNDARY:
+4. If the message contains explicit follow-up recommendations, route only those recommendations and avoid duplicates.`)).toBe(true);
+
     expect(shouldSuppressMcpForPrompt(`[Message from agent "researcher" | Query ID: news_123]
 [Note: researcher will poll for your reply for ~2 minutes.]
 
@@ -168,6 +177,8 @@ Please inspect the repository, edit the integration, and run the test suite.`)).
       .toEqual(['Read', 'Glob', 'Grep']);
     expect(allowedToolsForPrompt('[Incoming Message from "checkin-service"]\n\nCheckin due for linked task #12345678.', configured))
       .toEqual(['Read', 'Glob', 'Grep']);
+    expect(allowedToolsForPrompt('[Incoming Reply from "coder"]\n\n{"validation_status":"approved","next_step_recommendations":[{"title":"Route approved follow-up","priority":"high"}]}', configured))
+      .toEqual(['Read', 'Bash', 'Glob', 'Grep']);
     expect(allowedToolsForPrompt('Lead delegation kickoff: task #12345678 is assigned to you as the team coordinator.', configured))
       .toEqual(['Read', 'Bash', 'Glob', 'Grep']);
     expect(allowedToolsForPrompt('Team objective: Decompose this objective into member-owned work.', configured))
@@ -209,6 +220,8 @@ Please inspect the repository, edit the integration, and run the test suite.`)).
         .toBe(90_000);
       expect(queryExecutionTimeoutMsForPrompt('TASK DELEGATION from manager: You are assigned task-manager triage for engineering-team task #fdcc9380 ("Inventory engineering skills"). Use the manager task flow to reassign or park it.'))
         .toBe(720_000);
+      expect(queryExecutionTimeoutMsForPrompt('[Incoming Reply from "coder"]\n\n{"validation_status":"approved","next_step_recommendations":[{"title":"Route approved follow-up","priority":"high"}]}'))
+        .toBe(720_000);
       expect(queryExecutionTimeoutMsForPrompt('Implement a filesystem-backed MCP integration and cite the changed files.'))
         .toBeUndefined();
     } finally {
@@ -225,6 +238,12 @@ Please inspect the repository, edit the integration, and run the test suite.`)).
     expect(classifyQueryQueuePriority({
       prompt: 'TASK DELEGATION from manager: You are assigned task-manager triage for engineering-team task #fdcc9380 ("Inventory engineering skills"). Use the manager task flow to reassign or park it.',
       from: 'manager',
+    })).toBe('delegation');
+
+    expect(classifyQueryQueuePriority({
+      prompt: '[Incoming Reply from "coder"]\n\n{"validation_status":"approved","next_step_recommendations":[{"title":"Route approved follow-up","priority":"high"}]}',
+      from: 'coder',
+      options: { noAutoReply: true },
     })).toBe('delegation');
   });
 

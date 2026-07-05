@@ -82,6 +82,12 @@ Team objective: Decompose this objective into member-owned work.`,
       prompt: '[Incoming Reply from "researcher"]\n\nDone.',
       from: 'researcher',
       options: { noAutoReply: true },
+    })).toBe('delegation');
+
+    expect(classifyQueryQueuePriority({
+      prompt: '[Incoming Message from "checkin-service"]\n\nCheckin due for linked task #12345678.',
+      from: 'checkin-service',
+      options: { noAutoReply: true },
     })).toBe('background');
   });
 
@@ -164,6 +170,48 @@ Team objective: Decompose this objective into member-owned work.`,
         body: JSON.stringify({
           from: 'manager',
           message: 'Lead delegation kickoff: task #12345678 is assigned to you as the team coordinator.',
+        }),
+      });
+
+      expect(res.status).toBe(202);
+      await viWaitFor(() => expect(harness.prompts).toHaveLength(1));
+      expect(harness.options[0]?.executionPolicy).toBe('default');
+      expect(harness.options[0]?.allowedTools).toEqual(['Read', 'Bash', 'Glob', 'Grep']);
+      expect(harness.options[0]?.mcpServers).toBeUndefined();
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('runs incoming agent reply wakes without MCP but with delegation-capable local tools', async () => {
+    process.env.ID_MCP_SERVERS = JSON.stringify([
+      { name: 'removed-server', transport: 'stdio', command: 'node', args: ['server.js'] },
+    ]);
+    const harness = new RecordingHarness();
+    const server = new AgentRestServer({
+      agentName: 'lead',
+      agentIdentity: { name: 'lead', team: 'default', primaryLead: true } as any,
+      harness,
+    });
+
+    try {
+      await server.start(0);
+      const port = ((server as any).httpServer.address() as AddressInfo).port;
+
+      const res = await fetch(`http://127.0.0.1:${port}/news`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: 'reply',
+          from: 'coder',
+          in_reply_to: 'query_validator_packet',
+          message: JSON.stringify({
+            validation_status: 'approved',
+            summary: 'Validation passed and includes a dispatch-ready follow-up.',
+            next_step_recommendations: [
+              { title: 'Route approved follow-up', priority: 'high' },
+            ],
+          }),
         }),
       });
 
