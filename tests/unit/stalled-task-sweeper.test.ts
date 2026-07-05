@@ -1041,6 +1041,8 @@ describe('stalled task sweeper', () => {
     expect(manager.shouldAttachBrainContext('Status check on task #12345678. Reply in one sentence.')).toBe(false);
     expect(manager.shouldAttachBrainContext('Lead delegation kickoff: task #12345678 is assigned to you as the team coordinator.')).toBe(false);
     expect(manager.shouldAttachBrainContext('Team objective: Decompose this objective into member-owned work.')).toBe(false);
+    expect(manager.shouldAttachBrainContext('You are the team lead. Break the objective below into a small set of concrete, independently-actionable sub-tasks.')).toBe(false);
+    expect(manager.shouldAttachBrainContext('IDACC Learn routed this material to the default team lead for digestion.')).toBe(false);
     expect(manager.shouldAttachBrainContext('You have 2 stalled doing tasks from before a team outage that need to be closed.')).toBe(false);
     expect(manager.shouldAttachBrainContext('Assignment sweep complete (Jul 4). Assigned: 0.')).toBe(false);
     expect(manager.shouldAttachBrainContext('Task assignment sweep: inspect unassigned todo tasks across all teams.')).toBe(false);

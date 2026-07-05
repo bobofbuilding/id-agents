@@ -5120,6 +5120,8 @@ Return this JSON shape:
     if (!text) return false;
     return ![
       /^Heartbeat:/,
+      /^You are the team lead\./,
+      /^IDACC Learn routed this material\b/i,
       /^TASK DELEGATION\b/i,
       /^Supervision:/,
       /^Supervision probe on task\b/,

@@ -82,6 +82,8 @@ export function shouldUseImplicitDefaultConversation(input: {
 
 const MCP_CONTROL_PLANE_PROMPT_PATTERNS = [
   /^Heartbeat:/,
+  /^You are the team lead\./,
+  /^IDACC Learn routed this material\b/i,
   /^Supervision:/,
   /^Supervision probe on task\b/,
   /^Lead delegation kickoff:/,
@@ -110,6 +112,8 @@ const MCP_CONTROL_PLANE_PROMPT_PATTERNS = [
   /^\[Message from agent "[^"]+"\s*\|[^\n]*\]\s*\n[\s\S]*\nStatus check on task\b/,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nTask assignment sweep:/,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nHeartbeat:/,
+  /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nYou are the team lead\./,
+  /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nIDACC Learn routed this material\b/i,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nSupervision:/,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nSupervision probe on task\b/,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nLead delegation kickoff:/,
