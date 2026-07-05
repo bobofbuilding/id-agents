@@ -15617,6 +15617,30 @@ Return this JSON shape:
     }
   }
 
+  private async transferCoordinatorCheckinsForAssignedTask(
+    teamRow: { id: string; name: string },
+    task: TaskRow,
+    owner: AgentRow | null | undefined,
+    nowMs: number,
+  ): Promise<number> {
+    if (!owner?.id || task.owner !== owner.id) return 0;
+    const checkins = await this.db.checkins
+      .list({ teamId: teamRow.id, linkedTaskId: task.id, status: ['active', 'snoozed'], limit: 10 })
+      .catch(() => [] as CheckinRow[]);
+    let transferred = 0;
+    for (const checkin of checkins) {
+      if (!checkin.owner_agent_id || checkin.owner_agent_id === owner.id) continue;
+      const checkinOwner = await this.db.agents.getById(checkin.owner_agent_id).catch(() => null);
+      if (!this.isConfiguredTeamLead(teamRow.name, checkinOwner)) continue;
+      await this.db.checkins.updateFields(checkin.id, teamRow.id, {
+        owner_agent_id: owner.id,
+        updated_at: nowMs,
+      });
+      transferred++;
+    }
+    return transferred;
+  }
+
   private async assignUnownedTodoTasks(params: {
     teams: Array<{ id: string; name: string }>;
     limit: number;
@@ -15901,6 +15925,7 @@ Return this JSON shape:
         this.hasRecentTaskSupervisionEvent(teamRow.id, t, now - RENUDGE_MS),
         getPendingQueriesFor(ownerAgent),
       ]);
+      await this.transferCoordinatorCheckinsForAssignedTask(teamRow, t, ownerAgent, now);
       if (hasRecentSupervision) continue;
       const ownerProbeState = this.supervisionQueryStateFromRows(teamRow.id, ownerPendingQueries, ref, ownerAgent, teamName);
 
