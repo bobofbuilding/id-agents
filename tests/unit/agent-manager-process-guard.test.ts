@@ -1777,6 +1777,60 @@ new org text from sidecar
     }
   });
 
+  it('uses the target team when applying cross-team lead query caps', async () => {
+    const savedEnv = {
+      maxActive: process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT,
+      leadMaxActive: process.env.ID_MAX_ACTIVE_QUERIES_PER_LEAD,
+      brainDisabled: process.env.BRAIN_CONTEXT_DISABLED,
+    };
+    let talkServer: Awaited<ReturnType<typeof startTalkServer>> | null = null;
+    process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT = '1';
+    delete process.env.ID_MAX_ACTIVE_QUERIES_PER_LEAD;
+    process.env.BRAIN_CONTEXT_DISABLED = 'true';
+    try {
+      const { manager, db, workDir } = await makeManager();
+      dbs.push(db);
+      workDirs.push(workDir);
+      talkServer = await startTalkServer({ query_id: 'legal-lead-new-query' });
+
+      const defaultTeamId = await db.teams.getOrCreateTeamId('default');
+      const legalTeamId = await db.teams.getOrCreateTeamId('legal');
+      await db.agents.create({
+        ...agentRow({
+          team_id: legalTeamId,
+          id: 'agent-legal-general-counsel',
+          name: 'general-counsel',
+          port: 4113,
+          status: 'running',
+          endpoint: talkServer.endpoint,
+          metadata: { runtime: 'codex', maxActiveQueries: 1, queryConcurrency: 1 },
+        }),
+      });
+      await db.queries.upsert(legalTeamId, 'agent-legal-general-counsel', {
+        query_id: 'legal-lead-existing-processing',
+        status: 'processing',
+        prompt: 'current legal lead work',
+        created: Date.now(),
+        owner_kind: 'agent',
+        owner_id: 'agent-legal-general-counsel',
+      });
+
+      const result = await (manager as any).executeRemoteCommand('/ask legal/general-counsel review this plan', defaultTeamId, 'default');
+
+      expect(result.ok).toBe(true);
+      expect(result.result?.queryId).toBe('legal-lead-new-query');
+      expect(talkServer.talkBodies).toHaveLength(1);
+    } finally {
+      await talkServer?.close();
+      if (savedEnv.maxActive === undefined) delete process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
+      else process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT = savedEnv.maxActive;
+      if (savedEnv.leadMaxActive === undefined) delete process.env.ID_MAX_ACTIVE_QUERIES_PER_LEAD;
+      else process.env.ID_MAX_ACTIVE_QUERIES_PER_LEAD = savedEnv.leadMaxActive;
+      if (savedEnv.brainDisabled === undefined) delete process.env.BRAIN_CONTEXT_DISABLED;
+      else process.env.BRAIN_CONTEXT_DISABLED = savedEnv.brainDisabled;
+    }
+  });
+
   it('keeps non-lead agents capped at one active /ask query by default', async () => {
     const saved = process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
     delete process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;

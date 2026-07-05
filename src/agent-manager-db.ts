@@ -11866,6 +11866,7 @@ Return this JSON shape:
         // Resolve the target agent. "<team>/<agent>" delegates ACROSS teams (#9);
         // a bare ref resolves within the current team.
         let a: AgentRow;
+        let targetTeamName = teamName;
         const slash = agentName.indexOf('/');
         if (slash > 0 && !agentName.startsWith('http')) {
           const teamPart = agentName.slice(0, slash);
@@ -11897,6 +11898,7 @@ Return this JSON shape:
             return { ok: false, error: `Agent "${namePart}" not found in team "${teamPart}"` };
           }
           a = found;
+          targetTeamName = targetTeam.name;
           this.managerLog(`[delegate] ${teamId} → ${teamPart}/${namePart}`);
         } else {
           const matches = await this.dbResolveAgents(teamId, agentName);
@@ -11929,7 +11931,7 @@ Return this JSON shape:
             },
           };
         }
-        const maxActiveQueries = this.getMaxActiveQueriesForAgent(a, teamName);
+        const maxActiveQueries = this.getMaxActiveQueriesForAgent(a, targetTeamName);
         if (maxActiveQueries > 0) {
           const activeQueries = await this.countActiveQueries(a.id);
           if (activeQueries >= maxActiveQueries) {
