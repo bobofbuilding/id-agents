@@ -157,18 +157,7 @@ export class SchedulerService {
         await runBounded(agentIds, this.dispatchConcurrency, async (agentId) => {
           let target = await this.resolveAgent(agentId);
           if (!target) return;
-
-          if (target.status !== 'running') {
-            if (!this.prepareTarget) return;
-            const targetName = target.name;
-            try {
-              target = await this.prepareTarget(target, def, run);
-            } catch (err: any) {
-              console.log(`[Scheduler] ${def.title}: target prepare failed for ${targetName}: ${err?.message ?? err}`);
-              return;
-            }
-            if (!target || target.status !== 'running') return;
-          }
+          if (target.status !== 'running' && !this.prepareTarget) return;
 
           if (this.shouldDispatch) {
             let allowed = false;
@@ -200,6 +189,24 @@ export class SchedulerService {
 
           const inserted = await this.db.schedules.insertRun(runRow);
           if (!inserted) return;
+
+          if (target.status !== 'running') {
+            const targetName = target.name;
+            try {
+              target = await this.prepareTarget!(target, def, run);
+            } catch (err: any) {
+              const error = err?.message ?? String(err);
+              await this.db.schedules.updateRunStatus(run.scheduleId, agentId, run.scheduledKey, 'failed', error);
+              console.log(`[Scheduler] ${def.title}: target prepare failed for ${targetName}: ${error}`);
+              return;
+            }
+            if (!target || target.status !== 'running') {
+              const status = target?.status ?? 'missing';
+              const error = `Agent ${targetName} not running after prepare (status: ${status})`;
+              await this.db.schedules.updateRunStatus(run.scheduleId, agentId, run.scheduledKey, 'skipped', error);
+              return;
+            }
+          }
 
           let result: DispatchResult;
           if (this.managedDispatch) {

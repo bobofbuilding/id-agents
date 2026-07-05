@@ -430,7 +430,7 @@ describe('SchedulerService.tick', () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
-  it('prepares stopped targets before recording and dispatching due runs', async () => {
+  it('records stopped target runs before preparing and dispatching them', async () => {
     vi.spyOn(Date, 'now').mockReturnValue(1_700_000_301_000);
     const fetchSpy = vi
       .spyOn(globalThis, 'fetch')
@@ -447,7 +447,16 @@ describe('SchedulerService.tick', () => {
       insertRun: vi.fn(async () => true),
       updateRunStatus: vi.fn(async () => undefined),
     };
+    const calls: string[] = [];
+    schedules.insertRun.mockImplementation(async () => {
+      calls.push('insertRun');
+      return true;
+    });
     const prepareTarget = vi.fn(async () => makeTarget({ status: 'running' }));
+    prepareTarget.mockImplementation(async () => {
+      calls.push('prepareTarget');
+      return makeTarget({ status: 'running' });
+    });
     const dbStub = { schedules } as unknown as Db;
     const service = new SchedulerService(
       dbStub,
@@ -458,9 +467,81 @@ describe('SchedulerService.tick', () => {
     await service.tick();
 
     expect(prepareTarget).toHaveBeenCalledOnce();
+    expect(calls).toEqual(['insertRun', 'prepareTarget']);
     expect(schedules.insertRun).toHaveBeenCalledOnce();
     expect(schedules.updateRunStatus).toHaveBeenCalledWith(def.id, 'agent_123', expect.any(String), 'sent');
     expect(fetchSpy).toHaveBeenCalledOnce();
+  });
+
+  it('does not prepare stopped targets when the due run is already recorded', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1_700_000_301_000);
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response(null, { status: 200 }));
+    const def = makeHeartbeatDef({
+      anchor_at: 1_700_000_000,
+      interval_seconds: 300,
+      max_runs: null,
+    });
+    const schedules = {
+      listActiveDefinitions: vi.fn(async () => [def]),
+      listTargets: vi.fn(async () => ['agent_123']),
+      countRuns: vi.fn(async () => 0),
+      insertRun: vi.fn(async () => false),
+      updateRunStatus: vi.fn(async () => undefined),
+    };
+    const prepareTarget = vi.fn(async () => makeTarget({ status: 'running' }));
+    const dbStub = { schedules } as unknown as Db;
+    const service = new SchedulerService(
+      dbStub,
+      async () => makeTarget({ status: 'stopped' }),
+      { prepareTarget },
+    );
+
+    await service.tick();
+
+    expect(schedules.insertRun).toHaveBeenCalledOnce();
+    expect(prepareTarget).not.toHaveBeenCalled();
+    expect(schedules.updateRunStatus).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('marks recorded runs skipped when target preparation leaves the target stopped', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1_700_000_301_000);
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response(null, { status: 200 }));
+    const def = makeHeartbeatDef({
+      anchor_at: 1_700_000_000,
+      interval_seconds: 300,
+      max_runs: null,
+    });
+    const schedules = {
+      listActiveDefinitions: vi.fn(async () => [def]),
+      listTargets: vi.fn(async () => ['agent_123']),
+      countRuns: vi.fn(async () => 0),
+      insertRun: vi.fn(async () => true),
+      updateRunStatus: vi.fn(async () => undefined),
+    };
+    const prepareTarget = vi.fn(async () => makeTarget({ status: 'stopped' }));
+    const dbStub = { schedules } as unknown as Db;
+    const service = new SchedulerService(
+      dbStub,
+      async () => makeTarget({ status: 'stopped' }),
+      { prepareTarget },
+    );
+
+    await service.tick();
+
+    expect(prepareTarget).toHaveBeenCalledOnce();
+    expect(schedules.updateRunStatus).toHaveBeenCalledWith(
+      def.id,
+      'agent_123',
+      expect.any(String),
+      'skipped',
+      expect.stringContaining('not running after prepare'),
+    );
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 
   it('skips busy targets before recording automatic due runs', async () => {
