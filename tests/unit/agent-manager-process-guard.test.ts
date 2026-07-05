@@ -16,7 +16,7 @@ import { SqliteNewsRepo } from '../../src/db/repos/sqlite/news-repo.js';
 import { SqliteSchedulesRepo } from '../../src/db/repos/sqlite/schedules-repo.js';
 import { SqliteTasksRepo } from '../../src/db/repos/sqlite/tasks-repo.js';
 import { SqliteEventsRepo } from '../../src/db/repos/sqlite/events-repo.js';
-import type { AgentRow, TaskRow } from '../../src/db/types.js';
+import type { AgentRow, ScheduleDefinitionRow, TaskRow } from '../../src/db/types.js';
 
 async function createInMemoryDb() {
   const adapter = new SqliteAdapter(':memory:');
@@ -171,6 +171,34 @@ function taskRow(overrides: Partial<TaskRow> = {}): TaskRow {
     created_at: overrides.created_at ?? 1,
     updated_at: overrides.updated_at ?? 1,
     completed_at: overrides.completed_at ?? null,
+  };
+}
+
+function scheduleRow(overrides: Partial<ScheduleDefinitionRow> = {}): ScheduleDefinitionRow {
+  return {
+    id: 'schedule-1',
+    kind: 'heartbeat',
+    title: 'Heartbeat: worker',
+    description: null,
+    active: true,
+    message: 'Heartbeat: review your checklist and act on anything that needs attention.',
+    sender: 'heartbeat',
+    delivery_mode: 'internal',
+    timezone: null,
+    catch_up_policy: 'skip',
+    dedupe_window_seconds: 60,
+    interval_seconds: 3600,
+    anchor_at: 1_700_000_000,
+    max_runs: null,
+    expires_at: null,
+    local_time_seconds: null,
+    local_date: null,
+    days_of_week: null,
+    source_type: 'yaml',
+    source_key: 'heartbeat:agent-1',
+    created_at: 1,
+    updated_at: 1,
+    ...overrides,
   };
 }
 
@@ -633,6 +661,160 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     ]);
     expect((manager as any).killAgentProcess).not.toHaveBeenCalled();
     expect((await db.agents.getById('agent-recent-query'))?.status).toBe('running');
+  });
+
+  it('parks idle wakeable local agents even when they have active schedules', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('skillmesh');
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-scheduled-worker',
+        name: 'skill-discoverer',
+        port: 4118,
+        status: 'running',
+        metadata: { runtime: 'codex', pid: 55570, processOwner: 'manager-child', processParentPid: process.pid },
+      }),
+    });
+    const def = scheduleRow({
+      id: 'hb-agent-scheduled-worker',
+      source_key: 'heartbeat:agent-scheduled-worker',
+    });
+    await db.schedules.upsertDefinition(def);
+    await db.schedules.replaceTargets(def.id, ['agent-scheduled-worker']);
+
+    (manager as any).killAgentProcess = vi.fn(async () => ({ killed: true, pids: [55570] }));
+
+    const result = await (manager as any).parkIdleAgents({
+      teamId,
+      teamName: 'skillmesh',
+      confirmed: true,
+      allTeams: false,
+      includeDefault: false,
+      includeLeads: false,
+      includeScheduled: false,
+      includeActiveTeams: true,
+    });
+
+    expect(result.result.parked).toBe(1);
+    expect(result.result.agents).toEqual([
+      { team: 'skillmesh', name: 'skill-discoverer', status: 'parked', reason: 'idle', pids: [55570] },
+    ]);
+    expect((manager as any).killAgentProcess).toHaveBeenCalledTimes(1);
+    expect((await db.agents.getById('agent-scheduled-worker'))?.status).toBe('stopped');
+  });
+
+  it('keeps scheduled agents running when their lifecycle cannot be restarted on demand', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('skillmesh');
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-scheduled-no-port',
+        name: 'external-scheduled-worker',
+        port: 0,
+        endpoint: null,
+        status: 'running',
+        metadata: { runtime: 'codex', pid: 55571, processOwner: 'manager-child', processParentPid: process.pid },
+      }),
+    });
+    const def = scheduleRow({
+      id: 'hb-agent-scheduled-no-port',
+      source_key: 'heartbeat:agent-scheduled-no-port',
+    });
+    await db.schedules.upsertDefinition(def);
+    await db.schedules.replaceTargets(def.id, ['agent-scheduled-no-port']);
+
+    (manager as any).killAgentProcess = vi.fn(async () => ({ killed: true, pids: [55571] }));
+
+    const result = await (manager as any).parkIdleAgents({
+      teamId,
+      teamName: 'skillmesh',
+      confirmed: true,
+      allTeams: false,
+      includeDefault: false,
+      includeLeads: false,
+      includeScheduled: false,
+      includeActiveTeams: true,
+    });
+
+    expect(result.result.parked).toBe(0);
+    expect(result.result.agents).toEqual([
+      { team: 'skillmesh', name: 'external-scheduled-worker', status: 'skipped', reason: 'has_1_active_schedule_requires_live_runtime' },
+    ]);
+    expect((manager as any).killAgentProcess).not.toHaveBeenCalled();
+    expect((await db.agents.getById('agent-scheduled-no-port'))?.status).toBe('running');
+  });
+
+  it('wakes stopped local schedule targets just in time for scheduler dispatch', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('skillmesh');
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-stopped-scheduled-worker',
+        name: 'skill-discoverer',
+        port: 4119,
+        endpoint: 'http://127.0.0.1:4119',
+        status: 'stopped',
+        metadata: { runtime: 'codex' },
+      }),
+    });
+    const def = scheduleRow({
+      id: 'hb-agent-stopped-scheduled-worker',
+      source_key: 'heartbeat:agent-stopped-scheduled-worker',
+    });
+
+    (manager as any).spawnLocalAgentProcess = vi.fn(async () => ({
+      success: true,
+      pid: 55572,
+      logFile: '/tmp/skill-discoverer.log',
+    }));
+
+    const target = await (manager as any).prepareScheduledDispatchTarget(
+      {
+        id: 'agent-stopped-scheduled-worker',
+        name: 'skill-discoverer',
+        endpoint: 'http://127.0.0.1:4119',
+        talkPath: '/talk',
+        schedulePath: null,
+        status: 'stopped',
+      },
+      def,
+      { scheduleId: def.id, scheduledKey: 'interval:1700000300', scheduledAt: 1_700_000_300, kind: 'heartbeat' },
+    );
+
+    expect(target).toEqual(expect.objectContaining({
+      id: 'agent-stopped-scheduled-worker',
+      name: 'skill-discoverer',
+      status: 'running',
+      endpoint: 'http://127.0.0.1:4119',
+    }));
+    expect((manager as any).spawnLocalAgentProcess).toHaveBeenCalledOnce();
+    expect((await db.agents.getById('agent-stopped-scheduled-worker'))?.status).toBe('running');
+
+    const { rows } = await db.adapter.query<{ topic: string; data: string }>(
+      `SELECT topic, data FROM event_log WHERE subject_id = ?`,
+      ['agent-stopped-scheduled-worker'],
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.topic).toBe('agent:started');
+    expect(JSON.parse(rows[0]!.data)).toEqual(expect.objectContaining({
+      agent: 'skill-discoverer',
+      schedule_id: def.id,
+      scheduled_key: 'interval:1700000300',
+      reason: 'schedule-dispatch',
+      pid: 55572,
+    }));
   });
 
   it('runs an initial idle parking sweep shortly after startup', async () => {

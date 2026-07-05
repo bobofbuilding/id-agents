@@ -19,6 +19,16 @@ export interface SchedulerServiceOptions {
     run: DueRun,
   ) => Promise<boolean> | boolean;
   /**
+   * Optional hook that lets the manager prepare a target before dispatch.
+   * Used for local lifecycle-managed agents that can be started just-in-time
+   * for an otherwise due schedule fire.
+   */
+  prepareTarget?: (
+    target: DispatchTarget,
+    def: ScheduleDefinitionRow,
+    run: DueRun,
+  ) => Promise<DispatchTarget | null> | DispatchTarget | null;
+  /**
    * Optional manager-owned dispatch path for schedules whose work should be
    * handled by the manager itself instead of waking an agent conversation.
    * Return null to fall through to the normal agent dispatcher.
@@ -63,6 +73,7 @@ export class SchedulerService {
   private timer: NodeJS.Timeout | null = null;
   private readonly dispatcher: ScheduleDispatcher;
   private readonly shouldDispatch: SchedulerServiceOptions['shouldDispatch'] | null;
+  private readonly prepareTarget: SchedulerServiceOptions['prepareTarget'] | null;
   private readonly managedDispatch: SchedulerServiceOptions['managedDispatch'] | null;
   private readonly dispatchConcurrency: number;
 
@@ -73,6 +84,7 @@ export class SchedulerService {
   ) {
     this.dispatcher = new ScheduleDispatcher();
     this.shouldDispatch = opts.shouldDispatch ?? null;
+    this.prepareTarget = opts.prepareTarget ?? null;
     this.managedDispatch = opts.managedDispatch ?? null;
     this.dispatchConcurrency = normalizeDispatchConcurrency(opts.dispatchConcurrency);
   }
@@ -143,8 +155,20 @@ export class SchedulerService {
         }
 
         await runBounded(agentIds, this.dispatchConcurrency, async (agentId) => {
-          const target = await this.resolveAgent(agentId);
-          if (!target || target.status !== 'running') return;
+          let target = await this.resolveAgent(agentId);
+          if (!target) return;
+
+          if (target.status !== 'running') {
+            if (!this.prepareTarget) return;
+            const targetName = target.name;
+            try {
+              target = await this.prepareTarget(target, def, run);
+            } catch (err: any) {
+              console.log(`[Scheduler] ${def.title}: target prepare failed for ${targetName}: ${err?.message ?? err}`);
+              return;
+            }
+            if (!target || target.status !== 'running') return;
+          }
 
           if (this.shouldDispatch) {
             let allowed = false;

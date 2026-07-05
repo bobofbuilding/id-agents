@@ -659,6 +659,7 @@ export class AgentManagerDb {
   private agentLifecycleLocks: Map<string, Promise<void>> = new Map();
   private validatorRecommendationLoopLocks: Map<string, Promise<void>> = new Map();
   private taskOwnerWakeAttempts: Map<string, number> = new Map();
+  private scheduleTargetWakeAttempts: Map<string, number> = new Map();
   private stalledNudges = new Map<string, StalledProbeState>(); // probe key -> throttle/count state
   private retentionService: RetentionService | null = null;
   private checkinService: CheckinService | null = null;
@@ -2404,12 +2405,21 @@ export class AgentManagerDb {
     }
   }
 
-  private canWakeAssignedTaskOwner(agent: AgentRow | null | undefined): boolean {
+  private canWakeLocalAgentLifecycle(agent: AgentRow | null | undefined): boolean {
     if (!agent) return false;
-    if (agent.status === 'running' || agent.status === 'starting') return false;
     if (isRemoteEndpointRuntime(agent.runtime)) return false;
     if (agent.type !== 'claude') return false;
     return Number.isInteger(agent.port) && agent.port > 0;
+  }
+
+  private canWakeAssignedTaskOwner(agent: AgentRow | null | undefined): boolean {
+    if (!agent) return false;
+    if (agent.status === 'running' || agent.status === 'starting') return false;
+    return this.canWakeLocalAgentLifecycle(agent);
+  }
+
+  private canWakeScheduledAgent(agent: AgentRow | null | undefined): boolean {
+    return this.canWakeLocalAgentLifecycle(agent);
   }
 
   private async wakeAssignedTaskOwner(
@@ -15946,6 +15956,7 @@ Return this JSON shape:
               scheduleKind: def.kind,
               scheduleMessage: def.message,
             }),
+            prepareTarget: async (target, def, run) => this.prepareScheduledDispatchTarget(target, def, run),
             managedDispatch: async (target, def, run) => this.dispatchManagedSchedule(target, def, run),
           },
         );
@@ -17037,6 +17048,84 @@ Return this JSON shape:
     };
   }
 
+  private async prepareScheduledDispatchTarget(
+    target: DispatchTarget,
+    def: ScheduleDefinitionRow,
+    run: DueRun,
+  ): Promise<DispatchTarget | null> {
+    if (target.status === 'running') return target;
+
+    const agent = await this.db.agents.getById(target.id).catch(() => null);
+    if (!agent) return null;
+    if (agent.status === 'running') return target;
+    if (agent.status === 'starting') return target;
+    if (!this.canWakeScheduledAgent(agent)) return target;
+
+    const allowed = await this.canDispatchAutomatedWake(agent.id, {
+      source: 'schedule',
+      scheduleKind: def.kind,
+      scheduleMessage: def.message,
+    });
+    if (!allowed) return target;
+
+    const team = await this.db.teams.getTeam(agent.team_id).catch(() => null);
+    if (!team) return target;
+
+    const now = Date.now();
+    const key = `${agent.team_id}:${agent.id}:${def.id}`;
+    const previous = this.scheduleTargetWakeAttempts.get(key) ?? 0;
+    if (now - previous < 5 * 60 * 1000) return target;
+    this.scheduleTargetWakeAttempts.set(key, now);
+
+    const spawnResult = await this.spawnLocalAgentProcess(agent.team_id, team.name, {
+      name: agent.name,
+      id: agent.id,
+      port: agent.port,
+      model: agent.model,
+      workingDirectory: agent.working_directory ?? undefined,
+      tokenId: agent.token_id ?? undefined,
+    });
+    if (!spawnResult.success) {
+      this.managerLog(`Could not wake ${agent.name} for schedule ${def.id}: ${spawnResult.error || 'spawn failed'}`);
+      return target;
+    }
+
+    await this.db.agents.updateStatus(agent.id, 'running');
+    await this.db.events.insert({
+      team_id: agent.team_id,
+      topic: 'agent:started',
+      actor_agent_id: agent.id,
+      subject_kind: 'agent',
+      subject_id: agent.id,
+      occurred_at: now,
+      data: {
+        agent: agent.name,
+        schedule_id: def.id,
+        schedule_title: def.title,
+        scheduled_key: run.scheduledKey,
+        reason: 'schedule-dispatch',
+        pid: spawnResult.pid ?? null,
+      },
+    }).catch(() => ({ seq: 0 }));
+
+    const endpoint = (agent.endpoint || `http://localhost:${agent.port}`).replace(/\/+$/, '');
+    let endpoints: { talk: string; schedule?: string | null } = { talk: '/talk', schedule: null };
+    try {
+      endpoints = await discoverRestAPEndpoints(endpoint);
+    } catch {
+      // The dispatcher will surface endpoint failures; waking remains useful.
+    }
+    this.managerLog(`Woke ${agent.name} for schedule ${def.id} (${def.title})`);
+    return {
+      id: agent.id,
+      name: agent.name,
+      endpoint,
+      talkPath: endpoints.talk || '/talk',
+      schedulePath: endpoints.schedule || null,
+      status: 'running',
+    };
+  }
+
   private async countFleetStalledDoingTasks(nowMs = Date.now()): Promise<number> {
     const stallMs = this.getStallSweepMs();
     const teams = await this.db.teams.listTeams();
@@ -17195,8 +17284,8 @@ Return this JSON shape:
           rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: `owns_${openTasks}_open_task${openTasks === 1 ? '' : 's'}` });
           continue;
         }
-        if (!opts.includeScheduled && schedules > 0) {
-          rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: `has_${schedules}_active_schedule${schedules === 1 ? '' : 's'}` });
+        if (!opts.includeScheduled && schedules > 0 && !this.canWakeScheduledAgent(agent)) {
+          rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: `has_${schedules}_active_schedule${schedules === 1 ? '' : 's'}_requires_live_runtime` });
           continue;
         }
         if (checkins > 0) {
