@@ -168,6 +168,11 @@ describe('stalled task sweeper', () => {
     delete process.env.ID_UNOWNED_ASSIGN_MAX_PER_SWEEP;
     delete process.env.ID_MAX_DOING_TASKS;
     delete process.env.ID_BLOCKED_TASK_REASSIGN_COOLDOWN_MS;
+    delete process.env.ID_AGENT_QUERY_CONCURRENCY;
+    delete process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
+    delete process.env.ID_MAX_ACTIVE_QUERIES_PER_LEAD;
+    delete process.env.ID_LEAD_QUERY_CONCURRENCY;
+    delete process.env.ID_AGENT_LEAD_QUERY_CONCURRENCY;
   });
 
   it('defaults automatic stalled-task sweeps to a quieter cadence', () => {
@@ -2479,6 +2484,108 @@ describe('stalled task sweeper', () => {
     manager.sendSupervisionAsk = vi.fn(async () => true);
 
     await manager.promptLeadForDelegationKickoff(TEAM_ID, 'ops-team', leadTask, lead);
+
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
+    expect(db.events.insert).not.toHaveBeenCalled();
+  });
+
+  it('does not suppress lead delegation kickoff when the lead has spare query capacity', async () => {
+    process.env.ID_AGENT_LEAD_QUERY_CONCURRENCY = '2';
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const lead = agent({
+      id: 'lead-1',
+      name: 'research-lead',
+      metadata: { catalog: { role: 'lead' } },
+    });
+    const worker = agent({ id: 'worker-1', name: 'researcher' });
+    const leadTask = task({
+      id: 'lead-task-1',
+      name: 'coordinate-research-work',
+      uuid: '87654321-4321-4321-8321-123456789abc',
+      title: 'Coordinate research work',
+      owner: lead.id,
+      created_by: lead.id,
+      created_at: nowSec - 11 * 60,
+      updated_at: nowSec - 11 * 60,
+    });
+    const db = fakeDb({
+      agents: {
+        list: vi.fn(async () => [lead, worker]),
+      },
+      tasks: {
+        list: vi.fn(async ({ teamId }: { teamId?: string } = {}) => teamId === TEAM_ID ? [leadTask] : []),
+      },
+      queries: {
+        getPending: vi.fn(async (agentId: string) => agentId === lead.id
+          ? [activeQuery(lead.id, {
+              query_id: 'active-operator-plan',
+              prompt: 'Create a clear, structured implementation plan for the operator.',
+            })]
+          : []),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-lead-spare-capacity-kickoff-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.promptLeadForDelegationKickoff(TEAM_ID, 'research', leadTask, lead);
+
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'research',
+      'research-lead',
+      expect.stringContaining('Lead delegation kickoff: task #87654321'),
+    );
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'research',
+      'research-lead',
+      expect.stringContaining('Available teammates: researcher'),
+    );
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      team_id: TEAM_ID,
+      topic: 'task:triaged',
+      actor_agent_id: lead.id,
+      subject_id: leadTask.uuid,
+      data: expect.objectContaining({
+        reason: 'lead_delegation_required',
+      }),
+    }));
+  });
+
+  it('holds lead delegation kickoff when the lead query capacity is full', async () => {
+    process.env.ID_AGENT_LEAD_QUERY_CONCURRENCY = '1';
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const lead = agent({
+      id: 'lead-1',
+      name: 'research-lead',
+      metadata: { catalog: { role: 'lead' } },
+    });
+    const worker = agent({ id: 'worker-1', name: 'researcher' });
+    const leadTask = task({
+      id: 'lead-task-1',
+      name: 'coordinate-research-work',
+      uuid: '87654321-4321-4321-8321-123456789abc',
+      title: 'Coordinate research work',
+      owner: lead.id,
+      created_by: lead.id,
+      created_at: nowSec - 11 * 60,
+      updated_at: nowSec - 11 * 60,
+    });
+    const db = fakeDb({
+      agents: {
+        list: vi.fn(async () => [lead, worker]),
+      },
+      tasks: {
+        list: vi.fn(async ({ teamId }: { teamId?: string } = {}) => teamId === TEAM_ID ? [leadTask] : []),
+      },
+      queries: {
+        getPending: vi.fn(async (agentId: string) => agentId === lead.id
+          ? [activeQuery(lead.id, { query_id: 'active-operator-plan', prompt: 'operator plan in progress' })]
+          : []),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-lead-full-capacity-kickoff-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.promptLeadForDelegationKickoff(TEAM_ID, 'research', leadTask, lead);
 
     expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
     expect(db.events.insert).not.toHaveBeenCalled();

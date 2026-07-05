@@ -796,7 +796,9 @@ export class AgentManagerDb {
     const metadataCap = this.parseAgentQueryCap(metadata);
     if (metadataCap !== null) return metadataCap;
 
-    const raw = process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
+    const raw = process.env.ID_AGENT_QUERY_CONCURRENCY !== undefined && process.env.ID_AGENT_QUERY_CONCURRENCY !== ''
+      ? process.env.ID_AGENT_QUERY_CONCURRENCY
+      : process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
     if (raw === '0') return 0;
     if (raw !== undefined && raw !== '') {
       const parsed = Number(raw);
@@ -1427,7 +1429,7 @@ export class AgentManagerDb {
       const children = await this.findDelegatedChildTasks(parent, params.teamId, owner);
       if (!children.some((candidate) => candidate.id === params.child.id)) continue;
       if (!children.length || children.some((candidate) => candidate.status !== 'done')) continue;
-      if (await this.hasAnyActiveQuery(owner)) continue;
+      if (!(await this.hasActiveQueryCapacity(owner, params.teamName))) continue;
 
       const childSummaries = await Promise.all(children.map((child) => this.delegatedChildTaskSummary(child, ownerCache)));
       const childText = childSummaries.map((summary) => {
@@ -2497,7 +2499,7 @@ export class AgentManagerDb {
     if (children.length) return;
     const ref = this.taskShortRef(task);
     if (await this.hasActiveSupervisionAskForMarker(teamId, owner, ref)) return;
-    if (await this.hasAnyActiveQuery(owner)) return;
+    if (!(await this.hasActiveQueryCapacity(owner, teamName))) return;
     const teamAgents = await this.db.agents.list(teamId).catch(() => [] as AgentRow[]);
     const liveMembers = teamAgents
       .filter((agent) =>
@@ -14734,6 +14736,18 @@ Return this JSON shape:
     if (!recipient?.id) return false;
     const active = await this.loadPendingQueriesForRecipient(recipient);
     return this.hasAnyActiveQueryFromRows(active);
+  }
+
+  private async hasActiveQueryCapacity(
+    recipient: AgentRow | null | undefined,
+    teamName?: string,
+  ): Promise<boolean> {
+    if (!recipient?.id) return false;
+    const cap = this.getMaxActiveQueriesForAgent(recipient, teamName);
+    if (cap <= 0) return false;
+    const active = await this.loadPendingQueriesForRecipient(recipient);
+    const activeCount = active.filter((row) => row.status === 'pending' || row.status === 'processing').length;
+    return activeCount < cap;
   }
 
   private async findActiveDuplicateTaskAsk(
