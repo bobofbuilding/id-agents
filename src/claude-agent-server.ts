@@ -207,7 +207,9 @@ const OPERATOR_DIRECT_RESPONSE_PROMPT_PATTERNS = [
 ];
 
 const OPERATOR_DIRECT_RESPONSE_EXCLUDED_PROMPT_PATTERNS = [
-  /\b(?:implement|fix|refactor|patch|edit|commit|push|release|deploy|publish|run the repo|run tests?|rebuild|restart|sync|delete|remove)\b/i,
+  /^\s*(?:please\s+)?(?:implement|fix|refactor|patch|edit)\b/i,
+  /\b(?:and|then|also)\s+(?:implement|fix|refactor|patch|edit|start working|do it|make (?:the )?changes)\b/i,
+  /\b(?:commit|push|release|deploy|publish|run the repo|run tests?|rebuild|restart|sync|delete|remove)\b/i,
   /\b(?:create|assign|delegate|start|jump-?start|triage)\s+(?:a\s+|the\s+)?(?:task|work|agent|team|stalled task)\b/i,
   /\b(?:claim|complete|close)\s+(?:a\s+|the\s+)?task\b/i,
   /\bfull\s+(?:refactor|cleanup|triage)\b/i,

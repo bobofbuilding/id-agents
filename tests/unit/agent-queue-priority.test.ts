@@ -104,12 +104,27 @@ Team objective: Decompose this objective into member-owned work.`,
     })).toBe(true);
 
     expect(isOperatorDirectResponseRequest({
+      prompt: 'generate me a plan to fix the task delegation backlog',
+      from: 'remote',
+    })).toBe(true);
+
+    expect(isOperatorDirectResponseRequest({
+      prompt: 'draft a plan to refactor the manager relay flow',
+      from: 'remote',
+    })).toBe(true);
+
+    expect(isOperatorDirectResponseRequest({
       prompt: 'Create a clear, structured implementation plan for this request.',
       from: 'manager',
     })).toBe(false);
 
     expect(isOperatorDirectResponseRequest({
       prompt: 'fix the task delegation bug and run the tests',
+      from: 'remote',
+    })).toBe(false);
+
+    expect(isOperatorDirectResponseRequest({
+      prompt: 'generate me a plan and implement the task delegation fix',
       from: 'remote',
     })).toBe(false);
 
