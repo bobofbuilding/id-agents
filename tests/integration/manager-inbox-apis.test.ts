@@ -399,4 +399,22 @@ describe('POST /manager/inbox/respond', () => {
     // IAS-style result shape: { result: <response> }.
     expect(body.result?.result).toBe('unblocked');
   });
+
+  it('reports cancelled queries as cancelled instead of failed', async () => {
+    const queryId = await postQuery('cancel me');
+    const teamId = await db.teams.getOrCreateTeamId(TEAM);
+    await db.adapter.query(
+      `UPDATE queries SET status = 'cancelled', completed = ?
+       WHERE team_id = ? AND query_id = ?`,
+      [Date.now(), teamId, queryId],
+    );
+    const queryRow = await db.queries.getByQueryIdForTeam(teamId, queryId);
+    expect(queryRow?.status).toBe('cancelled');
+
+    const res = await fetch(`${baseUrl}/query/${queryId}?wait=0`, { headers: teamHeaders(TEAM) });
+    expect(res.status).toBe(200);
+    const body = await res.json() as { status: string; error?: string };
+    expect(body.status).toBe('cancelled');
+    expect(body.error).toBeUndefined();
+  });
 });

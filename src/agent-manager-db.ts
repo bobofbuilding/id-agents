@@ -7678,7 +7678,7 @@ Return this JSON shape:
 
     // GET /query/:id - one-row lookup for a query's status/result
     // Team-scoped via the team header. Status is mapped to the external
-    // vocabulary: { pending, processing, delivered, failed, expired }.
+    // vocabulary: { pending, processing, delivered, failed, expired, cancelled }.
     //
     // Optional `?wait=<seconds>` (0–30, default 0) enables long-poll: if the
     // row is still pending/processing, the handler blocks until a waiter is
@@ -7702,7 +7702,7 @@ Return this JSON shape:
           pending: 'pending',
           processing: 'processing',
           completed: 'delivered',
-          cancelled: 'failed',
+          cancelled: 'cancelled',
           failed: 'failed',
           expired: 'expired',
         };
