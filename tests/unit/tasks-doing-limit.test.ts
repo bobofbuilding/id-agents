@@ -99,4 +99,20 @@ describe('TasksRepository claim doing limit', () => {
     expect(after?.status).toBe('doing');
     expect(after?.owner).toBe('agent-b');
   });
+
+  it('can list the oldest updated tasks first with a limit', async () => {
+    const teamId = await teams.getOrCreateTeamId('scan-team');
+    await tasks.create(task({ team_id: teamId, name: 'newest', updated_at: 30 }));
+    await tasks.create(task({ team_id: teamId, name: 'oldest', updated_at: 10 }));
+    await tasks.create(task({ team_id: teamId, name: 'middle', updated_at: 20 }));
+
+    const rows = await tasks.list({
+      teamId,
+      status: 'todo',
+      order: 'updated_asc',
+      limit: 2,
+    });
+
+    expect(rows.map((row) => row.name)).toEqual(['oldest', 'middle']);
+  });
 });

@@ -68,6 +68,7 @@ export class PgTasksRepo implements TasksRepository {
     owner?: string;
     teamId?: string | null;
     limit?: number;
+    order?: 'updated_desc' | 'updated_asc';
   }): Promise<TaskRow[]> {
     const clauses: string[] = [];
     const params: unknown[] = [];
@@ -95,8 +96,9 @@ export class PgTasksRepo implements TasksRepository {
       : 0;
     const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
     if (limit) params.push(limit);
+    const order = filters?.order === 'updated_asc' ? 'ASC' : 'DESC';
     const r = await this.db.query<TaskRow>(
-      `SELECT * FROM tasks ${where} ORDER BY updated_at DESC${limit ? ` LIMIT $${idx++}` : ''}`,
+      `SELECT * FROM tasks ${where} ORDER BY updated_at ${order}${limit ? ` LIMIT $${idx++}` : ''}`,
       params,
     );
     return r.rows;

@@ -729,6 +729,13 @@ export class AgentManagerDb {
       : 15 * 60 * 1000;
   }
 
+  private getStallSweepScanLimit(): number {
+    const raw = Number(process.env.STALL_SWEEP_SCAN_LIMIT || process.env.ID_STALL_SWEEP_SCAN_LIMIT);
+    return Number.isFinite(raw) && raw > 0
+      ? Math.max(25, Math.min(500, Math.floor(raw)))
+      : 200;
+  }
+
   private getStallRenudgeMs(): number {
     return Number(process.env.STALL_RENUDGE_MS) || 90 * 60 * 1000;
   }
@@ -14937,6 +14944,7 @@ Return this JSON shape:
       0,
       Math.min(MAX_PER_SWEEP, Number(process.env.ID_UNOWNED_ASSIGN_MAX_PER_SWEEP) || 1),
     );
+    const SCAN_LIMIT = this.getStallSweepScanLimit();
     const MAX_PROBES = this.getMaxStalledTaskProbes();
     const now = Date.now();
     let nudged = 0;
@@ -14944,7 +14952,9 @@ Return this JSON shape:
     const assignedTodoTaskIds = new Set<string>();
 
     if (UNOWNED_ASSIGN_MAX_PER_SWEEP > 0) {
-      const assignableTodo = await this.db.tasks.list({ status: 'todo' }).catch(() => [] as TaskRow[]);
+      const assignableTodo = await this.db.tasks
+        .list({ status: 'todo', order: 'updated_asc', limit: SCAN_LIMIT })
+        .catch(() => [] as TaskRow[]);
       for (const t of assignableTodo) {
         if (nudged >= MAX_PER_SWEEP || unownedAssigned >= UNOWNED_ASSIGN_MAX_PER_SWEEP) break;
         if (t.owner || !t.team_id) continue;
@@ -14970,7 +14980,9 @@ Return this JSON shape:
       }
     }
 
-    const doing = await this.db.tasks.list({ status: 'doing' }).catch(() => [] as TaskRow[]);
+    const doing = await this.db.tasks
+      .list({ status: 'doing', order: 'updated_asc', limit: SCAN_LIMIT })
+      .catch(() => [] as TaskRow[]);
     const teamRowsById = new Map<string, Promise<TeamRow | null>>();
     const ownerAgentsById = new Map<string, Promise<AgentRow | null>>();
     const leadsByTeamId = new Map<string, Promise<AgentRow | null>>();
@@ -15287,7 +15299,9 @@ Return this JSON shape:
     }
 
     const todo = nudged < MAX_PER_SWEEP
-      ? await this.db.tasks.list({ status: 'todo' }).catch(() => [] as TaskRow[])
+      ? await this.db.tasks
+        .list({ status: 'todo', order: 'updated_asc', limit: SCAN_LIMIT })
+        .catch(() => [] as TaskRow[])
       : [];
     for (const t of todo) {
       if (nudged >= MAX_PER_SWEEP) break;

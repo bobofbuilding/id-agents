@@ -537,6 +537,7 @@ export interface TasksRepository {
     owner?: string;
     teamId?: string | null;
     limit?: number;
+    order?: 'updated_desc' | 'updated_asc';
   }): Promise<TaskRow[]>;
 
   /** Update one or more mutable fields on a task. */
