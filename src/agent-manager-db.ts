@@ -14875,17 +14875,26 @@ Return this JSON shape:
     return graceMs > 0 && occurredAt >= Date.now() - graceMs;
   }
 
-  private blockedTaskReassignCooldownMs(): number {
+  private assignmentHoldTriageCooldownMs(): number {
     const raw = Number(process.env.ID_BLOCKED_TASK_REASSIGN_COOLDOWN_MS);
     if (Number.isFinite(raw) && raw >= 0) return raw;
     return 60 * 60 * 1000;
   }
 
-  private async hasRecentBlockedTaskTriage(teamId: string, task: TaskRow, nowMs: number): Promise<boolean> {
-    if (!task.uuid) return false;
-    const cooldownMs = this.blockedTaskReassignCooldownMs();
-    if (cooldownMs <= 0) return false;
+  private assignmentHoldSkipReason(
+    reason: 'control_reply_blocked' | 'lead_delegation_required' | 'lead_owner_unavailable',
+  ): string {
+    return reason === 'control_reply_blocked' ? 'recent_blocked_triage' : 'recent_lead_delegation_triage';
+  }
 
+  private async recentAssignmentHoldTriageReason(
+    teamId: string,
+    task: TaskRow,
+    nowMs: number,
+  ): Promise<'control_reply_blocked' | 'lead_delegation_required' | 'lead_owner_unavailable' | null> {
+    if (!task.uuid) return null;
+    const cooldownMs = this.assignmentHoldTriageCooldownMs();
+    if (cooldownMs <= 0) return null;
     const dialect = this.db.adapter.dialect;
     const p = (n: number) => dialect === 'postgres' ? `$${n}` : '?';
     const sinceMs = nowMs - cooldownMs;
@@ -14900,12 +14909,20 @@ Return this JSON shape:
           AND (
             data LIKE '%"reason":"control_reply_blocked"%'
             OR data LIKE '%"reason": "control_reply_blocked"%'
+            OR data LIKE '%"reason":"lead_delegation_required"%'
+            OR data LIKE '%"reason": "lead_delegation_required"%'
+            OR data LIKE '%"reason":"lead_owner_unavailable"%'
+            OR data LIKE '%"reason": "lead_owner_unavailable"%'
           )
         ORDER BY occurred_at DESC
         LIMIT 1`,
       [teamId, task.uuid, sinceMs],
     ).catch(() => ({ rows: [] as Array<{ seq: number | string; data?: string }> }));
-    return rows.some((row) => /"reason"\s*:\s*"control_reply_blocked"/.test(String(row.data ?? '')));
+    for (const row of rows) {
+      const match = String(row.data ?? '').match(/"reason"\s*:\s*"(control_reply_blocked|lead_delegation_required|lead_owner_unavailable)"/);
+      if (match) return match[1] as 'control_reply_blocked' | 'lead_delegation_required' | 'lead_owner_unavailable';
+    }
+    return null;
   }
 
   private isTerminalTaskStatus(status: string | null | undefined): boolean {
@@ -15078,7 +15095,10 @@ Return this JSON shape:
     opts: { dispatch?: boolean } = {},
   ): Promise<{ assigned: boolean; reason: string; owner?: AgentRow; dispatched?: boolean }> {
     if (task.owner || task.status !== 'todo') return { assigned: false, reason: 'not_unowned_todo' };
-    if (await this.hasRecentBlockedTaskTriage(teamRow.id, task, nowMs)) return { assigned: false, reason: 'recent_blocked_triage' };
+    const assignmentHoldReason = await this.recentAssignmentHoldTriageReason(teamRow.id, task, nowMs);
+    if (assignmentHoldReason) {
+      return { assigned: false, reason: this.assignmentHoldSkipReason(assignmentHoldReason) };
+    }
     if (!(await this.hasDoingTaskRoom(teamRow.id))) return { assigned: false, reason: 'doing_limit_full' };
 
     const agents = await this.db.agents.list(teamRow.id).catch(() => [] as AgentRow[]);
@@ -15274,14 +15294,15 @@ Return this JSON shape:
           checkinSupervised++;
           continue;
         }
-        if (await this.hasRecentBlockedTaskTriage(teamRow.id, task, now)) {
+        const assignmentHoldReason = await this.recentAssignmentHoldTriageReason(teamRow.id, task, now);
+        if (assignmentHoldReason) {
           skippedCount++;
           items.push({
             team: teamRow.name,
             task: this.taskShortRef(task),
             title: task.title,
             status: 'skipped',
-            reason: 'recent_blocked_triage',
+            reason: this.assignmentHoldSkipReason(assignmentHoldReason),
             ageMinutes,
           });
           continue;
@@ -15362,7 +15383,7 @@ Return this JSON shape:
           .list({ teamId: teamRow.id, linkedTaskId: t.id, status: ['active', 'snoozed'], limit: 1 })
           .catch(() => [] as CheckinRow[]);
         if (active.length) continue;
-        if (await this.hasRecentBlockedTaskTriage(teamRow.id, t, now)) continue;
+        if (await this.recentAssignmentHoldTriageReason(teamRow.id, t, now)) continue;
 
         const assignment = await this.assignUnownedTodoTask(t, teamRow, now);
         if (assignment.assigned) {
@@ -15504,6 +15525,20 @@ Return this JSON shape:
       if (!this.isLiveForSupervision(ownerAgent) && this.isConfiguredTeamLead(teamName, ownerAgent)) {
         const audit = await this.buildDelegationAudit(t, teamRow.id, teamName, ownerAgent);
         if (audit?.status === 'needs-delegation') {
+          const taskManagerFallback = await this.routeStalledTaskToTaskManagerFallback({
+            teamId: teamRow.id,
+            teamName,
+            task: t,
+            ref,
+            stalledMinutes: mins,
+            ownerName,
+            nowMs: now,
+            renudgeMs: RENUDGE_MS,
+            maxProbes: MAX_PROBES,
+            reason: 'lead_delegation_required',
+            eventReason: 'lead_delegation_required',
+            leadName: ownerName,
+          });
           await this.parkLeadDelegationTask({
             task: t,
             teamId: teamRow.id,
@@ -15512,7 +15547,10 @@ Return this JSON shape:
             reason: 'lead_owner_unavailable',
             stalledMinutes: mins,
             nowMs: now,
-            message: `owner ${ownerName} is unavailable and no delegated child task was detected`,
+            recordEvent: taskManagerFallback?.status !== 'sent_task_manager',
+            message: taskManagerFallback?.status === 'sent_task_manager'
+              ? `owner ${ownerName} is unavailable and overdue delegation was routed to ${taskManagerFallback.actorTeam}/${taskManagerFallback.actor}`
+              : `owner ${ownerName} is unavailable, no delegated child task was detected, and task-manager route was ${taskManagerFallback?.status || 'unavailable'}`,
           });
           nudged++;
           continue;
@@ -15710,7 +15748,7 @@ Return this JSON shape:
       const mins = Math.round((now - updated) / 60000);
       const hasRecentSupervision = await this.hasRecentTaskSupervisionEvent(teamRow.id, t, now - RENUDGE_MS);
       if (hasRecentSupervision) continue;
-      if (await this.hasRecentBlockedTaskTriage(teamRow.id, t, now)) continue;
+      if (await this.recentAssignmentHoldTriageReason(teamRow.id, t, now)) continue;
 
       if (!lead) {
         const fallback = await this.routeStalledTaskToTaskManagerFallback({

@@ -1166,6 +1166,72 @@ describe('stalled task sweeper', () => {
     expect(create).not.toHaveBeenCalled();
   });
 
+  it('does not auto-assign an unowned todo task that was recently held for lead delegation', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const recentlyHeld = task({
+      id: 'todo-delegation-hold-1',
+      name: 'recently-held-delegation',
+      uuid: 'ba5eba11-3456-4789-8123-ba5eba111111',
+      title: 'Recently held delegation task',
+      status: 'todo',
+      owner: null,
+      updated_at: nowSec - 600,
+    });
+    const worker = agent({ id: 'worker-2', name: 'worker-b' });
+    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
+    const create = vi.fn(async () => {});
+    const db = fakeDb({
+      agents: {
+        getById: vi.fn(async () => worker),
+        getByName: vi.fn(async () => lead),
+        list: vi.fn(async () => [lead, worker]),
+      },
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => {
+          if (status === 'doing') return [];
+          if (status === 'todo') return [recentlyHeld];
+          return [];
+        }),
+        getByUuidPrefix: vi.fn(async (prefix: string) => prefix === 'ba5eba11' ? [recentlyHeld] : []),
+        getByNameForTeam: vi.fn(async () => recentlyHeld),
+        claim: vi.fn(async () => true),
+        updateFields: vi.fn(async () => {}),
+        create,
+      },
+      adapter: {
+        query: vi.fn(async (sql: string) => {
+          if (sql.includes("topic = 'task:triaged'")) {
+            return { rows: [{ seq: 1, data: '{"reason":"lead_delegation_required"}' }], rowCount: 1 };
+          }
+          return { rows: [], rowCount: 0 };
+        }),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-assign-unowned-lead-delegation-cooldown-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const result = await manager.executeRemoteCommand('/task assign-unowned --task #ba5eba11 --limit 4 --min-age-min 1', TEAM_ID, 'default');
+
+    expect(result).toMatchObject({
+      ok: true,
+      result: {
+        assignedCount: 0,
+        skippedCount: 1,
+        items: [
+          {
+            team: 'default',
+            task: '#ba5eba11',
+            status: 'skipped',
+            reason: 'recent_lead_delegation_triage',
+          },
+        ],
+      },
+    });
+    expect(db.tasks.claim).not.toHaveBeenCalled();
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
+    expect(create).not.toHaveBeenCalled();
+  });
+
   it('rejects owner-targeted task creation when that owner has stalled work', async () => {
     const create = vi.fn(async () => {});
     const db = fakeDb({
@@ -3456,6 +3522,85 @@ describe('stalled task sweeper', () => {
       data: expect.objectContaining({
         owner: 'research-lead-1',
         reason: 'lead_owner_unavailable',
+        stalled_minutes: 11,
+      }),
+    }));
+  });
+
+  it('routes stopped lead-owned delegation stalls to task-manager when available', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const researchTeam = team({ name: 'research' });
+    const opsTeam = team({ id: 'ops-team-id', name: 'ops-team' });
+    const stoppedLead = agent({
+      id: 'research-lead-1',
+      name: 'research-lead',
+      status: 'stopped',
+      metadata: { catalog: { role: 'lead' } },
+    });
+    const taskManager = agent({
+      team_id: opsTeam.id,
+      id: 'task-manager-id',
+      name: 'task-manager',
+      metadata: { catalog: { role: 'task-manager' } },
+    });
+    const leadTask = task({
+      id: 'research-task-1',
+      name: 'run-deep-research',
+      uuid: 'aaaa1111-2222-4333-8444-555555555555',
+      title: 'Run deep research',
+      owner: 'research-lead-1',
+      created_by: 'research-lead-1',
+      created_at: nowSec - 11 * 60,
+      updated_at: nowSec - 11 * 60,
+    });
+    const db = fakeDb({
+      teams: {
+        getTeam: vi.fn(async () => researchTeam),
+        getTeamByName: vi.fn(async (name: string) => name === 'ops-team' ? opsTeam : null),
+      },
+      agents: {
+        getById: vi.fn(async () => stoppedLead),
+        getByName: vi.fn(async (teamId: string, name: string) =>
+          teamId === opsTeam.id && name === 'task-manager' ? taskManager : null,
+        ),
+        list: vi.fn(async (teamId: string) => teamId === opsTeam.id ? [taskManager] : [stoppedLead]),
+      },
+      tasks: {
+        list: vi.fn(async ({ status, teamId }: { status?: string; teamId?: string } = {}) => {
+          if (status === 'doing') return [leadTask];
+          if (teamId === TEAM_ID) return [leadTask];
+          return [];
+        }),
+        updateFields: vi.fn(async () => {}),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stopped-lead-task-manager-route-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.sweepStalledTasks();
+
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'ops-team',
+      'task-manager',
+      expect.stringContaining('task-manager delegation is required'),
+    );
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalledWith(
+      'research',
+      'research-lead',
+      expect.any(String),
+    );
+    expect(db.tasks.updateFields).toHaveBeenCalledWith('research-task-1', {
+      status: 'todo',
+      owner: null,
+      updated_at: nowSec,
+    });
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      team_id: TEAM_ID,
+      topic: 'task:triaged',
+      actor_agent_id: 'task-manager-id',
+      subject_id: 'aaaa1111-2222-4333-8444-555555555555',
+      data: expect.objectContaining({
+        reason: 'lead_delegation_required',
         stalled_minutes: 11,
       }),
     }));
