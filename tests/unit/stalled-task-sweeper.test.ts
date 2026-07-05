@@ -1633,7 +1633,7 @@ describe('stalled task sweeper', () => {
     }));
   });
 
-  it('asks a live team lead to delegate when a lead-owned task has no real child tasks', async () => {
+  it('parks a live team lead task that missed delegation instead of asking the lead again', async () => {
     const nowSec = Math.floor(NOW_MS / 1000);
     const lead = agent({
       id: 'lead-1',
@@ -1678,22 +1678,23 @@ describe('stalled task sweeper', () => {
         }),
         updateFields: vi.fn(async () => {}),
       },
+      queries: {
+        getPending: vi.fn(async () => [activeQuery('lead-1', {
+          prompt: 'lead is still working the parent objective',
+        })]),
+      },
     });
     const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', db, { libraryRoot: null }) as any;
     manager.sendSupervisionAsk = vi.fn(async () => true);
 
     await manager.sweepStalledTasks();
 
-    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
-      'ops-team',
-      'ops-lead',
-      expect.stringContaining('has no detected member-owned child tasks'),
-    );
-    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
-      'ops-team',
-      'ops-lead',
-      expect.stringContaining('delegation probe 1/3'),
-    );
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
+    expect(db.tasks.updateFields).toHaveBeenCalledWith('lead-task-1', {
+      status: 'todo',
+      owner: null,
+      updated_at: nowSec,
+    });
     expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
       team_id: TEAM_ID,
       topic: 'task:triaged',
@@ -1763,6 +1764,11 @@ describe('stalled task sweeper', () => {
       'task-manager',
       expect.stringContaining('task-manager delegation is required'),
     );
+    expect(db.tasks.updateFields).toHaveBeenCalledWith('lead-task-1', {
+      status: 'todo',
+      owner: null,
+      updated_at: nowSec,
+    });
     expect(manager.sendSupervisionAsk).not.toHaveBeenCalledWith(
       'research',
       'research-lead',
@@ -1844,11 +1850,12 @@ describe('stalled task sweeper', () => {
 
       await manager.sweepStalledTasks();
 
-      expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
-        ownerCase.teamName,
-        ownerCase.agent.name,
-        expect.stringContaining('has no detected member-owned child tasks'),
-      );
+      expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
+      expect(db.tasks.updateFields).toHaveBeenCalledWith(`task-${ownerCase.agent.id}`, {
+        status: 'todo',
+        owner: null,
+        updated_at: nowSec,
+      });
       expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
         topic: 'task:triaged',
         actor_agent_id: ownerCase.agent.id,

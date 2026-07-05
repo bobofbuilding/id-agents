@@ -2592,21 +2592,6 @@ export class AgentManagerDb {
     return { status: 'started', reason, pid: spawnResult.pid, logFile: spawnResult.logFile };
   }
 
-  private async buildLeadDelegationNudge(
-    task: TaskRow,
-    teamId: string,
-    teamName: string,
-    owner: AgentRow | null,
-    ref: string,
-    attempt: number,
-    maxProbes: number,
-    stalledMinutes: number,
-  ): Promise<string | null> {
-    const audit = await this.buildDelegationAudit(task, teamId, teamName, owner);
-    if (!audit || audit.status !== 'needs-delegation') return null;
-    return `Supervision: team-lead task ${ref} ("${task.title}") has no detected member-owned child tasks after ${Math.round(Number(audit.ageSeconds || 0) / 60)}m (delegation probe ${attempt}/${maxProbes}). Reply with one line: DELEGATED, NEEDS-TASK-MANAGER, ADVISORY: <reason>, or BLOCKED: <reason>. Do not create child tasks from this control prompt. Current stalled time: ${stalledMinutes}m.`;
-  }
-
   private async sendInternalNewsTo(teamName: string, to: string, message: string, from: string): Promise<void> {
     const res = await fetch(`http://127.0.0.1:${this.managementPort}/news-to`, {
       method: 'POST',
@@ -14463,7 +14448,7 @@ Return this JSON shape:
   }
 
   private async findTaskManagerFallbacks(): Promise<Array<{ team: TeamRow; agent: AgentRow }>> {
-    const preferredNames = ['task-master', 'ops-lead'];
+    const preferredNames = ['task-master', 'task-manager', 'ops-lead'];
     const getTeamByName = this.db.teams.getTeamByName?.bind(this.db.teams);
     const opsTeam = getTeamByName ? await getTeamByName('ops-team').catch(() => null) : null;
     const seen = new Set<string>();
@@ -14961,6 +14946,36 @@ Return this JSON shape:
     }
   }
 
+  private async parkLeadDelegationTask(params: {
+    task: TaskRow;
+    teamId: string;
+    ownerAgent: AgentRow | null;
+    ownerName: string;
+    reason: 'lead_delegation_required' | 'lead_owner_unavailable';
+    stalledMinutes: number;
+    nowMs: number;
+    recordEvent?: boolean;
+    message: string;
+  }): Promise<void> {
+    const nowSec = Math.floor(params.nowMs / 1000);
+    await this.db.tasks.updateFields(params.task.id, {
+      status: 'todo',
+      owner: null,
+      updated_at: nowSec,
+    });
+    if (params.recordEvent !== false) {
+      await this.recordTaskSupervision(
+        params.task,
+        params.teamId,
+        params.ownerAgent?.id ?? params.task.owner ?? null,
+        params.reason,
+        params.stalledMinutes,
+        params.nowMs,
+      );
+    }
+    this.managerLog(`Parked lead-owned task ${params.task.name}: ${params.message}`);
+  }
+
   private async closeStalledValidatorTaskTerminal(params: {
     task: TaskRow;
     teamRow: { id: string; name: string };
@@ -15443,24 +15458,14 @@ Return this JSON shape:
       const ownerProbeState = this.supervisionQueryStateFromRows(teamRow.id, ownerPendingQueries, ref);
 
       if (this.isLiveForSupervision(ownerAgent) && this.isConfiguredTeamLead(teamName, ownerAgent)) {
-        const nudgeKey = `task:${t.id}:lead-delegation`;
-        const canRun = this.canRunStalledProbe(nudgeKey, now, RENUDGE_MS, MAX_PROBES);
-        const canEscalate = !canRun && this.canEscalateStalledProbe(nudgeKey, MAX_PROBES);
-        if (canRun || canEscalate) {
-          if (ownerProbeState.hasActiveSupervisionAsk || ownerProbeState.hasAnyActiveQuery) continue;
-          const prevProbe = this.stalledNudges.get(nudgeKey);
-          const attempt = canRun ? this.markStalledProbe(nudgeKey, now) : MAX_PROBES;
-          const msg = await this.buildLeadDelegationNudge(
-            t,
-            teamRow.id,
-            teamName,
-            ownerAgent,
-            ref,
-            attempt,
-            MAX_PROBES,
-            mins,
-          );
-          if (msg) {
+        const audit = await this.buildDelegationAudit(t, teamRow.id, teamName, ownerAgent);
+        if (audit?.status === 'needs-delegation') {
+          const nudgeKey = `task:${t.id}:lead-delegation`;
+          const canRun = this.canRunStalledProbe(nudgeKey, now, RENUDGE_MS, MAX_PROBES);
+          const canEscalate = !canRun && this.canEscalateStalledProbe(nudgeKey, MAX_PROBES);
+          if (canRun || canEscalate) {
+            if (ownerProbeState.hasActiveSupervisionAsk) continue;
+            if (canRun) this.markStalledProbe(nudgeKey, now);
             if (canEscalate) this.markStalledProbeEscalated(nudgeKey, now);
             const taskManagerFallback = await this.routeStalledTaskToTaskManagerFallback({
               teamId: teamRow.id,
@@ -15472,55 +15477,43 @@ Return this JSON shape:
               nowMs: now,
               renudgeMs: RENUDGE_MS,
               maxProbes: MAX_PROBES,
+              force: canEscalate,
               reason: 'lead_delegation_required',
               eventReason: canEscalate ? 'probe_limit_reached' : 'lead_delegation_required',
               leadName: ownerName,
             });
-            if (taskManagerFallback?.status === 'sent_task_manager') {
-              nudged++;
-              continue;
-            }
-            if (taskManagerFallback?.status === 'task_manager_busy' || taskManagerFallback?.status === 'throttled') {
-              continue;
-            }
-            if (await this.sendSupervisionAsk(teamName, ownerName, msg)) {
-              await this.recordTaskSupervision(
-                t,
-                teamRow.id,
-                ownerAgent.id,
-                canEscalate ? 'probe_limit_reached' : 'lead_delegation_required',
-                mins,
-                now,
-              );
-              markSupervisionSentTo(ownerAgent);
-              nudged++;
-            } else {
-              this.restoreStalledProbe(nudgeKey, prevProbe);
-            }
+            await this.parkLeadDelegationTask({
+              task: t,
+              teamId: teamRow.id,
+              ownerAgent,
+              ownerName,
+              reason: 'lead_delegation_required',
+              stalledMinutes: mins,
+              nowMs: now,
+              recordEvent: taskManagerFallback?.status !== 'sent_task_manager',
+              message: taskManagerFallback?.status === 'sent_task_manager'
+                ? `routed overdue delegation to ${taskManagerFallback.actorTeam}/${taskManagerFallback.actor}`
+                : `no member-owned child task was detected and task-manager route was ${taskManagerFallback?.status || 'unavailable'}`,
+            });
+            nudged++;
             continue;
           }
-          if (canRun) this.stalledNudges.delete(nudgeKey);
         }
       }
 
       if (!this.isLiveForSupervision(ownerAgent) && this.isConfiguredTeamLead(teamName, ownerAgent)) {
         const audit = await this.buildDelegationAudit(t, teamRow.id, teamName, ownerAgent);
         if (audit?.status === 'needs-delegation') {
-          const nowSec = Math.floor(now / 1000);
-          await this.db.tasks.updateFields(t.id, {
-            status: 'todo',
-            owner: null,
-            updated_at: nowSec,
+          await this.parkLeadDelegationTask({
+            task: t,
+            teamId: teamRow.id,
+            ownerAgent,
+            ownerName,
+            reason: 'lead_owner_unavailable',
+            stalledMinutes: mins,
+            nowMs: now,
+            message: `owner ${ownerName} is unavailable and no delegated child task was detected`,
           });
-          await this.recordTaskSupervision(
-            t,
-            teamRow.id,
-            t.owner ?? null,
-            'lead_owner_unavailable',
-            mins,
-            now,
-          );
-          this.managerLog(`Parked lead-owned task ${t.name}: owner ${ownerName} is unavailable and no delegated child task was detected`);
           nudged++;
           continue;
         }
