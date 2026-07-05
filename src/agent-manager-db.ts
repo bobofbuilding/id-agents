@@ -3468,6 +3468,7 @@ Return this JSON shape:
     const lower = String(prompt ?? '').trim().toLowerCase();
     if (!lower) return false;
     return lower.startsWith('task delegation')
+      || (lower.startsWith('team objective:') && /\byour assigned task\s*\(#?[a-z0-9][a-z0-9_-]{3,}\)/i.test(lower))
       || lower.startsWith('backlog guard:')
       || lower.startsWith('backlog guard alert:')
       || lower.startsWith('supervision:')
@@ -14875,6 +14876,7 @@ Return this JSON shape:
     const text = String(prompt ?? '').trim();
     const lower = text.toLowerCase();
     const managedTaskAsk = lower.startsWith('task delegation')
+      || (lower.startsWith('team objective:') && /\byour assigned task\s*\(#?[a-z0-9][a-z0-9_-]{3,}\)/i.test(lower))
       || lower.startsWith('task-manager triage assigned existing')
       || lower.startsWith('supervision:')
       || lower.startsWith('supervision routing:')

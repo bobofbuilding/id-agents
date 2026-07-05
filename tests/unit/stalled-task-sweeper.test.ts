@@ -1228,6 +1228,54 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('marks an assigned team-objective task done when the reply includes a completion packet', async () => {
+    const staleTask = task({
+      name: 'audit-brain-fact-quality',
+      title: 'Audit Brain fact quality',
+      uuid: '7f0d68c3-610c-4df9-9a0c-f512fc18203d',
+    });
+    const db = fakeDb({
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [staleTask]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-team-objective-completion-test', db, { libraryRoot: null }) as any;
+
+    await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery(staleTask.owner!, {
+        query_id: 'team-objective-completion',
+        prompt: [
+          'Team objective: Build a cleaner, more reliable Brain knowledge base that stores facts in structured, source-grounded form.',
+          '',
+          'Your assigned task (#7f0d68c3): Audit Brain fact quality',
+          'Do this task now. When finished, mark it done with: /task done #7f0d68c3 --acceptance "completed the assigned scope; evidence is in my reply"',
+        ].join('\n'),
+        status: 'completed',
+      }),
+      {
+        result: [
+          'Task #7f0d68c3 complete. Output: [brain-fact-audit.md](/tmp/brain-fact-audit.md)',
+          '',
+          '- Highest-priority cluster: duplicated learning facts with contradictory routed teams.',
+          '- Highest-priority structural bug: malformed query IDs.',
+          '',
+          '/task done #7f0d68c3 --acceptance "completed the assigned scope; evidence is in my reply"',
+        ].join('\n'),
+      },
+      NOW_MS,
+    );
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(staleTask.id, {
+      status: 'done',
+      completed_at: Math.floor(NOW_MS / 1000),
+      updated_at: Math.floor(NOW_MS / 1000),
+    });
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:completed',
+      subject_id: staleTask.uuid,
+    }));
+  });
+
   it('marks a memory-writing delegation done when it returns a memory update package', async () => {
     const staleTask = task({
       name: 'write-memory-entries',
