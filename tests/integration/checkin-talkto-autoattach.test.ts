@@ -742,9 +742,10 @@ describe('/talk-to auto-attach', () => {
       headers: adminHeaders('engineering-team'),
     });
     expect(freshAudit.status).toBe(200);
-    const freshAuditBody = await freshAudit.json() as { task: { delegationAudit?: { status?: string; childTaskRefs?: string[] } } };
+    const freshAuditBody = await freshAudit.json() as { task: { delegationAudit?: { status?: string; childTaskRefs?: string[]; childTasks?: unknown[] } } };
     expect(freshAuditBody.task.delegationAudit?.status).toBe('pending-delegation');
     expect(freshAuditBody.task.delegationAudit?.childTaskRefs).toEqual([]);
+    expect(freshAuditBody.task.delegationAudit?.childTasks).toEqual([]);
 
     await db.tasks.create({
       id: 'task_old_child',
@@ -779,9 +780,10 @@ describe('/talk-to auto-attach', () => {
       headers: adminHeaders('engineering-team'),
     });
     expect(staleAudit.status).toBe(200);
-    const staleAuditBody = await staleAudit.json() as { task: { delegationAudit?: { status?: string; childTaskRefs?: string[] } } };
+    const staleAuditBody = await staleAudit.json() as { task: { delegationAudit?: { status?: string; childTaskRefs?: string[]; childTasks?: unknown[] } } };
     expect(staleAuditBody.task.delegationAudit?.status).toBe('needs-delegation');
     expect(staleAuditBody.task.delegationAudit?.childTaskRefs).toEqual([]);
+    expect(staleAuditBody.task.delegationAudit?.childTasks).toEqual([]);
 
     await db.tasks.create({
       id: 'task_new_child',
@@ -802,9 +804,25 @@ describe('/talk-to auto-attach', () => {
       headers: adminHeaders('engineering-team'),
     });
     expect(delegatedAudit.status).toBe(200);
-    const delegatedAuditBody = await delegatedAudit.json() as { task: { delegationAudit?: { status?: string; childTaskRefs?: string[] } } };
+    const delegatedAuditBody = await delegatedAudit.json() as {
+      task: {
+        delegationAudit?: {
+          status?: string;
+          childTaskRefs?: string[];
+          childTasks?: Array<{ ref?: string; title?: string; status?: string; ownerName?: string | null }>;
+        };
+      };
+    };
     expect(delegatedAuditBody.task.delegationAudit?.status).toBe('ok');
     expect(delegatedAuditBody.task.delegationAudit?.childTaskRefs).toEqual(['#33333333']);
+    expect(delegatedAuditBody.task.delegationAudit?.childTasks).toEqual([
+      expect.objectContaining({
+        ref: '#33333333',
+        title: 'New child work',
+        status: 'done',
+        ownerName: 'implementation-engineer',
+      }),
+    ]);
   });
 
   it('blocks team leads from accepting another parent objective until current lead work is delegated', async () => {

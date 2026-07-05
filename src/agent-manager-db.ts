@@ -1330,6 +1330,23 @@ export class AgentManagerDb {
     );
   }
 
+  private async delegatedChildTaskSummary(child: TaskRow, ownerLookup?: Map<string, AgentRow>): Promise<Record<string, unknown>> {
+    let ownerName: string | null = null;
+    if (child.owner) {
+      const owner = ownerLookup?.get(child.owner) || await this.db.agents.getById(child.owner);
+      ownerName = owner ? ((owner.metadata as any)?.alias || owner.name) : null;
+    }
+    return {
+      ref: this.taskShortRef(child),
+      name: child.name,
+      title: child.title,
+      status: child.status,
+      ownerName,
+      updatedAt: child.updated_at,
+      completedAt: child.completed_at,
+    };
+  }
+
   private async findDelegatedChildTasks(task: TaskRow, teamId: string, owner: AgentRow | null): Promise<TaskRow[]> {
     const allTasks = await this.db.tasks.list({ teamId });
     return allTasks.filter((candidate) => {
@@ -1341,13 +1358,22 @@ export class AgentManagerDb {
     });
   }
 
-  private async buildDelegationAudit(task: TaskRow, teamId: string, teamName: string | null, owner: AgentRow | null): Promise<Record<string, unknown> | null> {
+  private async buildDelegationAudit(
+    task: TaskRow,
+    teamId: string,
+    teamName: string | null,
+    owner: AgentRow | null,
+    ownerLookup?: Map<string, AgentRow>,
+  ): Promise<Record<string, unknown> | null> {
     if (!teamName || !this.isConfiguredTeamLead(teamName, owner)) return null;
     if (task.status !== 'doing') return null;
     const now = Math.floor(Date.now() / 1000);
     const ageSeconds = Math.max(0, now - task.updated_at);
     const childTasks = await this.findDelegatedChildTasks(task, teamId, owner);
     const childTaskRefs = childTasks.map((child) => child.uuid ? `#${child.uuid.replace(/-/g, '').slice(0, 8)}` : child.name);
+    const childTaskSummaries = childTasks.length
+      ? await Promise.all(childTasks.map((child) => this.delegatedChildTaskSummary(child, ownerLookup)))
+      : [];
     if (childTaskRefs.length > 0) {
       return {
         status: 'ok',
@@ -1355,6 +1381,7 @@ export class AgentManagerDb {
         ageSeconds,
         graceSeconds: this.teamLeadDelegationGraceSeconds,
         childTaskRefs,
+        childTasks: childTaskSummaries,
       };
     }
     if (ageSeconds < this.teamLeadDelegationGraceSeconds) {
@@ -1365,6 +1392,7 @@ export class AgentManagerDb {
         ageSeconds,
         graceSeconds: this.teamLeadDelegationGraceSeconds,
         childTaskRefs,
+        childTasks: childTaskSummaries,
       };
     }
     return {
@@ -1374,6 +1402,7 @@ export class AgentManagerDb {
       ageSeconds,
       graceSeconds: this.teamLeadDelegationGraceSeconds,
       childTaskRefs,
+      childTasks: childTaskSummaries,
     };
   }
 
@@ -10431,7 +10460,7 @@ Return this JSON shape:
 
     const links = await this.db.tasks.listEventLinksForTask(task.id);
     const shortId = task.uuid ? `#${task.uuid.replace(/-/g, '').slice(0, 8)}` : null;
-    const delegationAudit = await this.buildDelegationAudit(task, teamId, teamName, ownerAgent);
+    const delegationAudit = await this.buildDelegationAudit(task, teamId, teamName, ownerAgent, lookups?.agentsById);
 
     return {
       name: task.name,
