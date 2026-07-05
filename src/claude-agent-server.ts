@@ -356,6 +356,7 @@ const DELEGATION_PROMPT_PATTERNS = [
   /^You are the team lead\./,
   /^Team objective:/,
   /^Lead delegation kickoff:/,
+  /^Supervision:\s+Manager DB confirms parent task\b[\s\S]*\ball detected delegated child tasks are done\b/i,
   /^Task delegation/i,
   /^Coordinator handoff/i,
   /^Resume and complete task\b/i,

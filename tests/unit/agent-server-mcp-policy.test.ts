@@ -212,6 +212,8 @@ Please inspect the repository, edit the integration, and run the test suite.`)).
         .toBe(720_000);
       expect(queryExecutionTimeoutMsForPrompt('Lead delegation kickoff: task #12345678 is assigned to you as the team coordinator.'))
         .toBe(720_000);
+      expect(queryExecutionTimeoutMsForPrompt('Supervision: Manager DB confirms parent task #f7d643d3 ("Codify validation decisions") exists and all detected delegated child tasks are done.'))
+        .toBe(720_000);
       expect(queryExecutionTimeoutMsForPrompt('Team objective: Decompose this objective into member-owned work.'))
         .toBe(720_000);
       expect(queryExecutionTimeoutMsForPrompt('You are the team lead. Break the objective below into a small set of concrete, independently-actionable sub-tasks.'))
