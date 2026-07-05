@@ -1655,7 +1655,7 @@ export class AgentManagerDb {
       `SELECT team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id, metadata
          FROM queries
         WHERE team_id = ?
-          AND status IN ('pending', 'processing', 'failed', 'expired')
+          AND status IN ('pending', 'processing', 'completed', 'failed', 'expired')
           AND (created >= ? OR COALESCE(completed, 0) >= ?)
         ORDER BY created DESC
         LIMIT 20`,

@@ -2844,6 +2844,64 @@ describe('stalled task sweeper', () => {
     expect(db.events.insert).not.toHaveBeenCalled();
   });
 
+  it('uses recently completed task-manager triage as restart-persistent lane cooldown', async () => {
+    const unavailableOwner = agent({ status: 'stopped' });
+    const opsTeam = team({ id: 'ops-team-id', name: 'ops-team' });
+    const taskMaster = agent({
+      id: 'task-master-id',
+      team_id: opsTeam.id,
+      name: 'task-master',
+      status: 'running',
+    });
+    const recentCompletedTriage = {
+      team_id: opsTeam.id,
+      agent_id: taskMaster.id,
+      query_id: 'recent-completed-task-manager-triage',
+      status: 'completed',
+      prompt: 'TASK DELEGATION from manager: You are assigned task-manager triage for legal task #484f50b2 ("Inventory legal skills"). Use the manager task flow to reassign or park it.',
+      created: NOW_MS - 90_000,
+      completed: NOW_MS - 30_000,
+      result: { result: 'PARK: waiting on legal owner decision.' },
+      error: null,
+      session_id: null,
+      owner_kind: 'agent',
+      owner_id: taskMaster.id,
+      metadata: null,
+    };
+    const db = fakeDb({
+      teams: {
+        getTeamByName: vi.fn(async (name: string) => name === 'ops-team' ? opsTeam : null),
+      },
+      agents: {
+        getById: vi.fn(async (id: string) => id === unavailableOwner.id ? unavailableOwner : null),
+        getByName: vi.fn(async (teamId: string, name: string) =>
+          teamId === opsTeam.id && name === 'task-master' ? taskMaster : null,
+        ),
+        list: vi.fn(async (teamId: string) => teamId === opsTeam.id ? [taskMaster] : [unavailableOwner]),
+      },
+      adapter: {
+        query: vi.fn(async () => ({ rows: [recentCompletedTriage], rowCount: 1 })),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-task-manager-completed-triage-cooldown-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const guard = await manager.stalledOwnerBacklogGuard({
+      teamId: TEAM_ID,
+      teamName: 'default',
+      owner: unavailableOwner,
+    });
+
+    expect(guard?.triage).toMatchObject({
+      status: 'task_manager_recent_backlog_probe',
+      taskRef: '#12345678',
+      actor: 'task-master',
+      actorTeam: 'ops-team',
+    });
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
+    expect(db.events.insert).not.toHaveBeenCalled();
+  });
+
   it('limits task-manager fallback to one accepted prompt per lane cooldown window', async () => {
     const ownerA = agent({ id: 'owner-a', name: 'worker-a', status: 'stopped', runtime: 'public-agent-remote' });
     const ownerB = agent({ id: 'owner-b', name: 'worker-b', status: 'stopped', runtime: 'public-agent-remote' });
