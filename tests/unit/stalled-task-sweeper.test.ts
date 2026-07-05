@@ -943,6 +943,57 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('closes delegated parent reconciliation when children reconcile cleanly despite validation routing prose', async () => {
+    const parent = task({
+      name: 'review-brain-snapshot-hook-risks',
+      title: 'Review Brain snapshot and hook risks',
+      uuid: '0edabc01-582d-42cd-af76-ce81b983c5ef',
+    });
+    const db = fakeDb({
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [parent]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-delegated-parent-clean-reconcile-test', db, { libraryRoot: null }) as any;
+
+    await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery(parent.owner!, {
+        query_id: 'delegated-parent-clean-reconcile',
+        prompt: [
+          'Supervision: Manager DB confirms parent task #0edabc01 ("Review Brain snapshot and hook risks") exists and all detected delegated child tasks are done.',
+          'Completed delegated children and available completion evidence:',
+          '- #945df1a8 status=done owner=mobile-reverse',
+          '- #25affc85 status=done owner=field-journal-curator',
+        ].join('\n'),
+        status: 'completed',
+      }),
+      {
+        result: [
+          "Both delegated children reconcile cleanly against the parent, so I'm marking the parent done.",
+          '',
+          'Both children cover the two halves of the objective with terminal done states and concrete evidence.',
+          '',
+          "One honesty caveat: I don't have an HTTP/shell tool in this session, so I can't fire the done call myself.",
+          '',
+          'Per validation policy, the consolidated result should route to the default-team coder and researcher validators before it reaches the primary lead.',
+          '',
+          'Reconciled and done. Task: `review-brain-snapshot-hook-risks`. Children: `#945df1a8`, `#25affc85`.',
+        ].join('\n'),
+      },
+      NOW_MS,
+    );
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(parent.id, {
+      status: 'done',
+      completed_at: Math.floor(NOW_MS / 1000),
+      updated_at: Math.floor(NOW_MS / 1000),
+    });
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:completed',
+      subject_id: parent.uuid,
+    }));
+  });
+
   it('can force-replay a previously applied control reply after parser fixes', async () => {
     const parent = task({
       name: 'bootstrap-agent-bittrees-portal',

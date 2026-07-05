@@ -3570,10 +3570,14 @@ Return this JSON shape:
       || /\breconciliation complete\b/i.test(normalized)
       || /\breconciliation\b.{0,80}\b(?:done|complete|completed)\b/i.test(normalized)
       || /\bmark(?:ing|ed)?\s+parent task\b.{0,160}\bdone\b/i.test(normalized)
+      || /\bmark(?:ing|ed)?\s+(?:the\s+)?parent\b.{0,160}\bdone\b/i.test(normalized)
+      || /\bdelegated children\b.{0,80}\breconcile cleanly\b/i.test(normalized)
+      || /\b(?:both|all)\b.{0,80}\bchildren\b.{0,80}\breconcile cleanly\b/i.test(normalized)
       || /\ball\b.{0,80}\bdelegated children\b.{0,80}\b(?:are\s+)?done\b/i.test(normalized)
       || /\ball\b.{0,80}\bdelegated children\b.{0,80}\b(?:are\s+)?complete\b/i.test(normalized)
       || /\ball\b.{0,80}\bchildren\b.{0,80}\b(?:are\s+)?done\b/i.test(normalized)
       || /\ball\b.{0,80}\bchildren\b.{0,80}\b(?:are\s+)?complete\b/i.test(normalized)
+      || /\breconciled and done\b/i.test(normalized)
       || /\bsubstantive reconciliation is clear\b/i.test(normalized)
     );
     if (!completionSignal) return null;
