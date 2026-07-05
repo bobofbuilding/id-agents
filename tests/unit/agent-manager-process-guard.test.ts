@@ -1682,6 +1682,48 @@ new org text from sidecar
     expect((await db.queries.getByQueryIdForTeam(teamId, 'normal-done-task-mention'))?.status).toBe('processing');
   });
 
+  it('preserves a fresh active delegation query while its assigned agent finishes replying after task completion', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('skillmesh');
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-skill-discoverer',
+        name: 'skill-discoverer',
+        port: 4157,
+        status: 'running',
+      }),
+    });
+
+    const now = Date.now();
+    await db.tasks.create(taskRow({
+      id: 'done-by-active-delegation',
+      name: 'done-by-active-delegation',
+      uuid: 'abc12345-0000-4000-8000-000000000000',
+      team_id: teamId,
+      status: 'done',
+      owner: 'agent-skill-discoverer',
+      completed_at: Math.floor(now / 1000),
+    }));
+    await db.queries.upsert(teamId, 'agent-skill-discoverer', {
+      query_id: 'active-delegation-finishing-reply',
+      status: 'processing',
+      prompt: 'TASK DELEGATION from manager: You are assigned task #abc12345 ("Map overlap and consolidation").',
+      created: now - 45_000,
+      owner_kind: 'agent',
+      owner_id: 'agent-skill-discoverer',
+    });
+
+    const result = await (manager as any).sweepStaleQueries();
+
+    expect(result.terminalTaskAsk).toBe(0);
+    expect(result.total).toBe(0);
+    expect((await db.queries.getByQueryIdForTeam(teamId, 'active-delegation-finishing-reply'))?.status).toBe('processing');
+  });
+
   it('expires active control prompts that duplicate a recent completed equivalent', async () => {
     const { manager, db, workDir } = await makeManager();
     dbs.push(db);

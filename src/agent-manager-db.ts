@@ -14441,19 +14441,20 @@ Return this JSON shape:
        ORDER BY created ASC, query_id ASC`,
     ).then((r) => r.rows).catch(() => [] as QueryRow[]);
 
-    const terminalByKey = new Map<string, boolean>();
+    const taskByKey = new Map<string, TaskRow | undefined>();
     const terminalIds: string[] = [];
     const terminalIdSet = new Set<string>();
     for (const row of rows) {
       const marker = this.activeTaskAskMarker(row.prompt);
       if (!marker?.startsWith('#')) continue;
       const key = `${row.team_id}\u0001${marker}`;
-      let terminal = terminalByKey.get(key);
-      if (terminal === undefined) {
-        const { task } = await this.resolveTaskRef(marker, row.team_id).catch(() => ({ task: undefined }));
-        terminal = task?.status === 'done';
-        terminalByKey.set(key, terminal);
+      let task = taskByKey.get(key);
+      if (!taskByKey.has(key)) {
+        const { task: resolvedTask } = await this.resolveTaskRef(marker, row.team_id).catch(() => ({ task: undefined }));
+        taskByKey.set(key, resolvedTask);
       }
+      task = taskByKey.get(key);
+      const terminal = task?.status === 'done' && !this.shouldPreserveFreshCompletingTaskAsk(row, task, nowMs);
       if (terminal && !terminalIdSet.has(row.query_id)) {
         terminalIdSet.add(row.query_id);
         terminalIds.push(row.query_id);
@@ -14474,6 +14475,19 @@ Return this JSON shape:
       [nowMs, ...terminalIds],
     );
     return result.rows;
+  }
+
+  private shouldPreserveFreshCompletingTaskAsk(row: QueryRow, task: TaskRow | undefined, nowMs: number): boolean {
+    if (!task || task.status !== 'done' || !task.completed_at) return false;
+    if (!task.owner || !row.agent_id || task.owner !== row.agent_id) return false;
+
+    const queryCreatedMs = rowTimestampMs(Number(row.created || 0));
+    const taskCompletedMs = this.taskTimestampMs(task.completed_at);
+    if (!queryCreatedMs || !taskCompletedMs) return false;
+    if (queryCreatedMs >= taskCompletedMs) return false;
+
+    const graceMs = this.positiveIntEnv('ID_TERMINAL_TASK_REPLY_GRACE_MS', 2 * 60 * 1000);
+    return nowMs - taskCompletedMs < graceMs;
   }
 
   private taskShortRef(task: TaskRow): string {
