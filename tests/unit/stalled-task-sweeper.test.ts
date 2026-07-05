@@ -173,6 +173,8 @@ describe('stalled task sweeper', () => {
     delete process.env.ID_MAX_ACTIVE_QUERIES_PER_LEAD;
     delete process.env.ID_LEAD_QUERY_CONCURRENCY;
     delete process.env.ID_AGENT_LEAD_QUERY_CONCURRENCY;
+    delete process.env.ID_LEAD_DELEGATION_KICKOFF_GRACE_MS;
+    delete process.env.LEAD_DELEGATION_KICKOFF_GRACE_MS;
   });
 
   it('defaults automatic stalled-task sweeps to a quieter cadence', () => {
@@ -191,20 +193,28 @@ describe('stalled task sweeper', () => {
     expect(manager.getStallSweepIntervalMs()).toBe(20 * 60 * 1000);
   });
 
-  it('delays immediate lead delegation kickoff for fresh second-based tasks', () => {
+  it('does not delay lead delegation kickoff for fresh tasks by default', () => {
     const nowSec = Math.floor(NOW_MS / 1000);
+    expect(shouldDelayLeadDelegationKickoffForFreshTask(task({
+      created_at: nowSec - 30,
+      updated_at: nowSec - 30,
+    }), NOW_MS)).toBe(false);
+
+    expect(shouldDelayLeadDelegationKickoffForFreshTask(task({
+      created_at: NOW_MS - 30_000,
+      updated_at: NOW_MS - 30_000,
+    }), NOW_MS)).toBe(false);
+  });
+
+  it('supports an optional lead delegation kickoff grace override', () => {
+    process.env.ID_LEAD_DELEGATION_KICKOFF_GRACE_MS = String(2 * 60 * 1000);
+    const nowSec = Math.floor(NOW_MS / 1000);
+
     expect(shouldDelayLeadDelegationKickoffForFreshTask(task({
       created_at: nowSec - 30,
       updated_at: nowSec - 30,
     }), NOW_MS)).toBe(true);
 
-    expect(shouldDelayLeadDelegationKickoffForFreshTask(task({
-      created_at: nowSec - 180,
-      updated_at: nowSec - 180,
-    }), NOW_MS)).toBe(false);
-  });
-
-  it('delays immediate lead delegation kickoff for fresh millisecond-based tasks', () => {
     expect(shouldDelayLeadDelegationKickoffForFreshTask(task({
       created_at: NOW_MS - 30_000,
       updated_at: NOW_MS - 30_000,
@@ -216,10 +226,8 @@ describe('stalled task sweeper', () => {
     }), NOW_MS)).toBe(false);
   });
 
-  it('retries a fresh lead delegation kickoff after the freshness grace', async () => {
+  it('prompts fresh lead delegation kickoff immediately by default', async () => {
     vi.restoreAllMocks();
-    vi.useFakeTimers();
-    vi.setSystemTime(NOW_MS);
 
     const nowSec = Math.floor(NOW_MS / 1000);
     const lead = agent({
@@ -255,10 +263,6 @@ describe('stalled task sweeper', () => {
     manager.sendSupervisionAsk = vi.fn(async () => true);
 
     await manager.promptLeadForDelegationKickoff(TEAM_ID, 'research', leadTask, lead);
-
-    expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
-
-    await vi.advanceTimersByTimeAsync(2 * 60 * 1000);
 
     expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
       'research',

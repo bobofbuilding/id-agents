@@ -247,7 +247,7 @@ const TOPIC_ALIASES: Record<string, readonly string[]> = {
   'agent:lifecycle': ['agent:started', 'agent:stopped', 'agent:rebuild'],
 };
 
-const LEAD_DELEGATION_KICKOFF_GRACE_MS = 2 * 60 * 1000;
+const DEFAULT_LEAD_DELEGATION_KICKOFF_GRACE_MS = 0;
 
 function rowTimestampMs(ts: number): number {
   if (!Number.isFinite(ts) || ts <= 0) return 0;
@@ -265,10 +265,19 @@ export function leadDelegationKickoffDelayMsForFreshTask(
   task: Pick<TaskRow, 'created_at' | 'updated_at'>,
   nowMs: number = Date.now(),
 ): number {
+  const raw = process.env.ID_LEAD_DELEGATION_KICKOFF_GRACE_MS
+    ?? process.env.LEAD_DELEGATION_KICKOFF_GRACE_MS;
+  const graceMs = raw === undefined
+    ? DEFAULT_LEAD_DELEGATION_KICKOFF_GRACE_MS
+    : Number(raw);
+  const boundedGraceMs = Number.isFinite(graceMs) && graceMs > 0
+    ? Math.min(10 * 60 * 1000, Math.floor(graceMs))
+    : 0;
+  if (boundedGraceMs <= 0) return 0;
   const createdMs = rowTimestampMs(task.created_at);
   if (!createdMs) return 0;
   const ageMs = Math.max(0, nowMs - createdMs);
-  return Math.max(0, LEAD_DELEGATION_KICKOFF_GRACE_MS - ageMs);
+  return Math.max(0, boundedGraceMs - ageMs);
 }
 
 function expandTopicAliases(topics: readonly string[]): string[] {
