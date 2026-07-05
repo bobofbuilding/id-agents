@@ -501,6 +501,7 @@ interface StaleQuerySweepResult {
   processing: number;
   duplicateTaskAsk: number;
   terminalTaskAsk: number;
+  stalePlanDecision: number;
   queuedPeerWake: number;
   total: number;
 }
@@ -1982,8 +1983,8 @@ export class AgentManagerDb {
         return { status: 'throttled', taskRef: ref };
       }
       const pending = await this.loadPendingQueriesForRecipient(params.owner).catch(() => [] as QueryRow[]);
-      const state = this.supervisionQueryStateFromRows(params.teamId, pending, ref);
-      if (state.hasActiveSupervisionAsk || state.hasAnyActiveQuery) {
+      const state = this.supervisionQueryStateFromRows(params.teamId, pending, ref, params.owner, params.teamName);
+      if (state.hasActiveSupervisionAsk || !state.hasActiveQueryCapacity) {
         if (params.force) {
           const fallback = await this.routeStalledTaskToTaskManagerFallback({
             teamId: params.teamId,
@@ -2097,8 +2098,8 @@ export class AgentManagerDb {
       return { status: 'throttled', taskRef: ref, actor: lead.name };
     }
     const pending = await this.loadPendingQueriesForRecipient(lead).catch(() => [] as QueryRow[]);
-    const state = this.supervisionQueryStateFromRows(params.teamId, pending, ref);
-    if (state.hasActiveSupervisionAsk || state.hasAnyActiveQuery) {
+    const state = this.supervisionQueryStateFromRows(params.teamId, pending, ref, lead, params.teamName);
+    if (state.hasActiveSupervisionAsk || !state.hasActiveQueryCapacity) {
       const fallback = await this.routeStalledTaskToTaskManagerFallback({
         teamId: params.teamId,
         teamName: params.teamName,
@@ -3932,7 +3933,7 @@ Return this JSON shape:
           routeBlock('lead_delegation_backlog');
         } else if (stalledBacklog) {
           routeBlock('stalled_task_backlog');
-        } else if (await this.hasAnyActiveQuery(route.agent)) {
+        } else if (!(await this.hasActiveQueryCapacity(route.agent, route.team.name))) {
           routeBlock('target_has_active_query');
         } else {
           await this.db.tasks.updateFields(task.id, {
@@ -14941,11 +14942,25 @@ Return this JSON shape:
     return active.some((row) => row.status === 'pending' || row.status === 'processing');
   }
 
+  private hasActiveQueryCapacityFromRows(
+    recipient: AgentRow | null | undefined,
+    teamName: string | undefined,
+    active: QueryRow[],
+  ): boolean {
+    if (!recipient?.id) return false;
+    const cap = this.getMaxActiveQueriesForAgent(recipient, teamName);
+    if (cap <= 0) return false;
+    const activeCount = active.filter((row) => row.status === 'pending' || row.status === 'processing').length;
+    return activeCount < cap;
+  }
+
   private supervisionQueryStateFromRows(
     teamId: string,
     active: QueryRow[],
     marker: string,
-  ): { hasActiveSupervisionAsk: boolean; hasAnyActiveQuery: boolean } {
+    recipient?: AgentRow | null,
+    teamName?: string,
+  ): { hasActiveSupervisionAsk: boolean; hasAnyActiveQuery: boolean; hasActiveQueryCapacity: boolean } {
     return {
       hasActiveSupervisionAsk: active.some((row) =>
         row.team_id === teamId
@@ -14953,6 +14968,7 @@ Return this JSON shape:
         && this.supervisionPromptMatchesMarker(row.prompt, marker),
       ),
       hasAnyActiveQuery: this.hasAnyActiveQueryFromRows(active),
+      hasActiveQueryCapacity: this.hasActiveQueryCapacityFromRows(recipient, teamName, active),
     };
   }
 
@@ -14972,7 +14988,7 @@ Return this JSON shape:
   ): Promise<boolean> {
     if (!recipient?.id) return false;
     const active = await this.loadPendingQueriesForRecipient(recipient);
-    return this.supervisionQueryStateFromRows(teamId, active, marker).hasActiveSupervisionAsk;
+    return this.supervisionQueryStateFromRows(teamId, active, marker, recipient).hasActiveSupervisionAsk;
   }
 
   private async hasAnyActiveQuery(recipient: AgentRow | null | undefined): Promise<boolean> {
@@ -14989,8 +15005,7 @@ Return this JSON shape:
     const cap = this.getMaxActiveQueriesForAgent(recipient, teamName);
     if (cap <= 0) return false;
     const active = await this.loadPendingQueriesForRecipient(recipient);
-    const activeCount = active.filter((row) => row.status === 'pending' || row.status === 'processing').length;
-    return activeCount < cap;
+    return this.hasActiveQueryCapacityFromRows(recipient, teamName, active);
   }
 
   private async findActiveDuplicateTaskAsk(
@@ -15167,6 +15182,31 @@ Return this JSON shape:
        RETURNING team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id, metadata`,
       [nowMs, ...terminalIds],
     );
+    return result.rows;
+  }
+
+  private planDecisionQueryExpiryMs(): number {
+    const raw = Number(process.env.ID_PLAN_DECISION_QUERY_EXPIRY_MS || 5 * 60 * 1000);
+    return Number.isFinite(raw) && raw >= 0 ? raw : 5 * 60 * 1000;
+  }
+
+  private async expireStalePlanDecisionQueries(nowMs: number): Promise<QueryRow[]> {
+    const expiryMs = this.planDecisionQueryExpiryMs();
+    if (expiryMs <= 0) return [];
+    const cutoff = nowMs - expiryMs;
+    const dialect = this.db.adapter.dialect;
+    const completedParam = dialect === 'postgres' ? '$1' : '?';
+    const cutoffParam = dialect === 'postgres' ? '$2' : '?';
+    const result = await this.db.adapter.query<QueryRow>(
+      `UPDATE queries
+       SET status = 'expired', completed = ${completedParam}
+       WHERE status IN ('pending', 'processing')
+         AND created <= ${cutoffParam}
+         AND LOWER(prompt) LIKE 'decision on %'
+         AND LOWER(prompt) LIKE '%work > plans%'
+       RETURNING team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id, metadata`,
+      [nowMs, cutoff],
+    ).catch(() => ({ rows: [] as QueryRow[] }));
     return result.rows;
   }
 
@@ -15826,7 +15866,7 @@ Return this JSON shape:
         getPendingQueriesFor(ownerAgent),
       ]);
       if (hasRecentSupervision) continue;
-      const ownerProbeState = this.supervisionQueryStateFromRows(teamRow.id, ownerPendingQueries, ref);
+      const ownerProbeState = this.supervisionQueryStateFromRows(teamRow.id, ownerPendingQueries, ref, ownerAgent, teamName);
 
       if (this.isLiveForSupervision(ownerAgent) && this.isConfiguredTeamLead(teamName, ownerAgent)) {
         const audit = await this.buildDelegationAudit(t, teamRow.id, teamName, ownerAgent);
@@ -15994,8 +16034,8 @@ Return this JSON shape:
             }
             if (lead) {
               const leadPendingQueries = await getPendingQueriesFor(lead);
-              const leadProbeState = this.supervisionQueryStateFromRows(teamRow.id, leadPendingQueries, ref);
-              if (leadProbeState.hasActiveSupervisionAsk || leadProbeState.hasAnyActiveQuery) continue;
+              const leadProbeState = this.supervisionQueryStateFromRows(teamRow.id, leadPendingQueries, ref, lead, teamRow.name);
+              if (leadProbeState.hasActiveSupervisionAsk || !leadProbeState.hasActiveQueryCapacity) continue;
               const prevProbe = this.stalledNudges.get(nudgeKey);
               this.markStalledProbeEscalated(nudgeKey, now);
               const msg = `Supervision: task ${ref} ("${t.title}") is still in progress after ${MAX_PROBES} stalled owner probes over ${mins}m. Reply with one line: CLOSE, UNBLOCK: <need>, REASSIGN: <owner>, SPLIT, or BLOCKED: <reason>. Do not create new tasks from this control prompt.`;
@@ -16046,8 +16086,8 @@ Return this JSON shape:
       const nudgeKey = `task:${t.id}:owner-unavailable`;
       if (!this.canRunStalledProbe(nudgeKey, now, RENUDGE_MS, MAX_PROBES)) continue;
       const leadPendingQueries = await getPendingQueriesFor(lead);
-      const leadProbeState = this.supervisionQueryStateFromRows(teamRow.id, leadPendingQueries, ref);
-      if (leadProbeState.hasActiveSupervisionAsk || leadProbeState.hasAnyActiveQuery) {
+      const leadProbeState = this.supervisionQueryStateFromRows(teamRow.id, leadPendingQueries, ref, lead, teamName);
+      if (leadProbeState.hasActiveSupervisionAsk || !leadProbeState.hasActiveQueryCapacity) {
         const fallback = await this.routeStalledTaskToTaskManagerFallback({
           teamId: teamRow.id,
           teamName,
@@ -16142,14 +16182,14 @@ Return this JSON shape:
       }
 
       const leadPendingQueries = await getPendingQueriesFor(lead);
-      const leadProbeState = this.supervisionQueryStateFromRows(teamRow.id, leadPendingQueries, ref);
+      const leadProbeState = this.supervisionQueryStateFromRows(teamRow.id, leadPendingQueries, ref, lead, teamRow.name);
       const [leadStalledBlockers, leadDelegationBlockers] = await Promise.all([
         this.findStalledOwnerTaskBlockers({ teamId: teamRow.id, owner: lead, excludeTaskId: t.id, nowMs: now }),
         this.findLeadDelegationBlockers(teamRow.id, teamRow.name, lead, t.id),
       ]);
       if (
         leadProbeState.hasActiveSupervisionAsk
-        || leadProbeState.hasAnyActiveQuery
+        || !leadProbeState.hasActiveQueryCapacity
         || leadStalledBlockers.length > 0
         || leadDelegationBlockers.length > 0
       ) {
@@ -16200,8 +16240,8 @@ Return this JSON shape:
           const lead = await getLeadForTeam(team.id);
           if (!lead) continue;
           const leadPendingQueries = await getPendingQueriesFor(lead);
-          const leadProbeState = this.supervisionQueryStateFromRows(team.id, leadPendingQueries, q.query_id);
-          if (leadProbeState.hasActiveSupervisionAsk || leadProbeState.hasAnyActiveQuery) continue;
+          const leadProbeState = this.supervisionQueryStateFromRows(team.id, leadPendingQueries, q.query_id, lead, team.name);
+          if (leadProbeState.hasActiveSupervisionAsk || !leadProbeState.hasActiveQueryCapacity) continue;
           const mins = Math.round((now - q.created) / 60000);
           const prompt = q.prompt ? ` ("${q.prompt.slice(0, 120)}${q.prompt.length > 120 ? '...' : ''}")` : '';
           const prevProbe = this.stalledNudges.get(nudgeKey);
@@ -16243,7 +16283,7 @@ Return this JSON shape:
     const now = Date.now();
     if (this.querySweepInFlight) return this.querySweepInFlight;
     if (this.lastQuerySweepAt > 0 && now - this.lastQuerySweepAt < minIntervalMs) {
-      return { pending: 0, processing: 0, duplicateTaskAsk: 0, terminalTaskAsk: 0, queuedPeerWake: 0, total: 0 };
+      return { pending: 0, processing: 0, duplicateTaskAsk: 0, terminalTaskAsk: 0, stalePlanDecision: 0, queuedPeerWake: 0, total: 0 };
     }
     return this.sweepStaleQueries();
   }
@@ -16267,9 +16307,10 @@ Return this JSON shape:
     const cancelledProcessingAgents = await this.cancelExpiredProcessingQueryAgents(expiredProcessing);
     const expiredDuplicateTaskAsks = await this.expireDuplicateActiveTaskAsks(now);
     const expiredTerminalTaskAsks = await this.expireTerminalTaskAsks(now);
+    const expiredStalePlanDecisions = await this.expireStalePlanDecisionQueries(now);
     const expiredQueuedPeerWakes = await this.db.queries.expireQueuedPeerWakes(peerWakeCutoff);
     this.lastQuerySweepAt = now;
-    const expired = [...expiredPending, ...expiredProcessing, ...expiredDuplicateTaskAsks, ...expiredTerminalTaskAsks, ...expiredQueuedPeerWakes];
+    const expired = [...expiredPending, ...expiredProcessing, ...expiredDuplicateTaskAsks, ...expiredTerminalTaskAsks, ...expiredStalePlanDecisions, ...expiredQueuedPeerWakes];
     const count = expired.length;
     if (count > 0) {
       const occurredAt = now;
@@ -16284,10 +16325,10 @@ Return this JSON shape:
         });
       }
       this.managerLog(
-        `Expired ${count} stale/duplicate queries (pending>${this.PENDING_QUERY_EXPIRY_MINUTES}m, processing>${this.PROCESSING_QUERY_EXPIRY_MINUTES}m, duplicate-task-asks=${expiredDuplicateTaskAsks.length}, terminal-task-asks=${expiredTerminalTaskAsks.length}, queued-peer-wakes>${this.QUEUED_PEER_WAKE_EXPIRY_MINUTES}m=${expiredQueuedPeerWakes.length}, cancelled-processing-agents=${cancelledProcessingAgents})`,
+        `Expired ${count} stale/duplicate queries (pending>${this.PENDING_QUERY_EXPIRY_MINUTES}m, processing>${this.PROCESSING_QUERY_EXPIRY_MINUTES}m, duplicate-task-asks=${expiredDuplicateTaskAsks.length}, terminal-task-asks=${expiredTerminalTaskAsks.length}, stale-plan-decisions=${expiredStalePlanDecisions.length}, queued-peer-wakes>${this.QUEUED_PEER_WAKE_EXPIRY_MINUTES}m=${expiredQueuedPeerWakes.length}, cancelled-processing-agents=${cancelledProcessingAgents})`,
       );
       console.log(
-        `[Manager] Query sweeper expired ${count} stale/duplicate queries (pending>${this.PENDING_QUERY_EXPIRY_MINUTES}m, processing>${this.PROCESSING_QUERY_EXPIRY_MINUTES}m, duplicate-task-asks=${expiredDuplicateTaskAsks.length}, terminal-task-asks=${expiredTerminalTaskAsks.length}, queued-peer-wakes>${this.QUEUED_PEER_WAKE_EXPIRY_MINUTES}m=${expiredQueuedPeerWakes.length}, cancelled-processing-agents=${cancelledProcessingAgents})`,
+        `[Manager] Query sweeper expired ${count} stale/duplicate queries (pending>${this.PENDING_QUERY_EXPIRY_MINUTES}m, processing>${this.PROCESSING_QUERY_EXPIRY_MINUTES}m, duplicate-task-asks=${expiredDuplicateTaskAsks.length}, terminal-task-asks=${expiredTerminalTaskAsks.length}, stale-plan-decisions=${expiredStalePlanDecisions.length}, queued-peer-wakes>${this.QUEUED_PEER_WAKE_EXPIRY_MINUTES}m=${expiredQueuedPeerWakes.length}, cancelled-processing-agents=${cancelledProcessingAgents})`,
       );
     }
     return {
@@ -16295,6 +16336,7 @@ Return this JSON shape:
       processing: expiredProcessing.length,
       duplicateTaskAsk: expiredDuplicateTaskAsks.length,
       terminalTaskAsk: expiredTerminalTaskAsks.length,
+      stalePlanDecision: expiredStalePlanDecisions.length,
       queuedPeerWake: expiredQueuedPeerWakes.length,
       total: count,
     };

@@ -1451,7 +1451,7 @@ describe('stalled task sweeper', () => {
       updated_at: nowSec - 120,
     });
     const worker = agent({ id: 'worker-2', name: 'worker-b' });
-    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
+    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true, leadMaxActiveQueries: 1 } });
     const updated = { ...selected, owner: worker.id, status: 'doing' as const, updated_at: nowSec };
     const create = vi.fn(async () => {});
     let taskLookupCount = 0;
@@ -1527,7 +1527,7 @@ describe('stalled task sweeper', () => {
       updated_at: nowSec - 600,
     });
     const worker = agent({ id: 'worker-2', name: 'worker-b' });
-    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
+    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true, leadMaxActiveQueries: 1 } });
     const create = vi.fn(async () => {});
     const db = fakeDb({
       agents: {
@@ -1673,7 +1673,7 @@ describe('stalled task sweeper', () => {
       updated_at: nowSec - 600,
     });
     const worker = agent({ id: 'worker-2', name: 'worker-b' });
-    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
+    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true, leadMaxActiveQueries: 1 } });
     const create = vi.fn(async () => {});
     const db = fakeDb({
       agents: {
@@ -3470,7 +3470,7 @@ describe('stalled task sweeper', () => {
 
   it('routes stalled-owner triage to task-master when the team lead is busy', async () => {
     const unavailableOwner = agent({ status: 'stopped', runtime: 'public-agent-remote' });
-    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
+    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true, leadMaxActiveQueries: 1 } });
     const opsTeam = team({ id: 'ops-team-id', name: 'ops-team' });
     const taskMaster = agent({
       id: 'task-master-id',
@@ -3518,6 +3518,48 @@ describe('stalled task sweeper', () => {
       team_id: TEAM_ID,
       topic: 'task:triaged',
       actor_agent_id: 'task-master-id',
+      data: expect.objectContaining({
+        reason: 'owner_unavailable',
+        stalled_minutes: 60,
+      }),
+    }));
+  });
+
+  it('routes stalled-owner triage to a lead that still has query capacity', async () => {
+    const unavailableOwner = agent({ status: 'stopped', runtime: 'public-agent-remote' });
+    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true, leadMaxActiveQueries: 2 } });
+    const db = fakeDb({
+      agents: {
+        getById: vi.fn(async (id: string) => id === unavailableOwner.id ? unavailableOwner : null),
+        list: vi.fn(async () => [unavailableOwner, lead]),
+      },
+      queries: {
+        getPending: vi.fn(async (agentId: string) => agentId === lead.id ? [activeQuery(lead.id)] : []),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-lead-spare-capacity-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const guard = await manager.stalledOwnerBacklogGuard({
+      teamId: TEAM_ID,
+      teamName: 'default',
+      owner: unavailableOwner,
+    });
+
+    expect(guard?.triage).toMatchObject({
+      status: 'sent_lead',
+      taskRef: '#12345678',
+      actor: 'lead',
+    });
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'lead',
+      expect.stringContaining('owner worker is not live'),
+    );
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      team_id: TEAM_ID,
+      topic: 'task:triaged',
+      actor_agent_id: 'lead-1',
       data: expect.objectContaining({
         reason: 'owner_unavailable',
         stalled_minutes: 60,
@@ -4083,7 +4125,7 @@ describe('stalled task sweeper', () => {
 
   it('does not stack unavailable-owner triage probes while a prior task supervision ask is active', async () => {
     const unavailableOwner = agent({ status: 'stopped' });
-    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
+    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true, leadMaxActiveQueries: 1 } });
     const db = fakeDb({
       agents: {
         getById: vi.fn(async () => unavailableOwner),
@@ -4127,7 +4169,7 @@ describe('stalled task sweeper', () => {
       status: 'todo',
       owner: null,
     });
-    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
+    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true, leadMaxActiveQueries: 1 } });
     const db = fakeDb({
       agents: {
         getByName: vi.fn(async () => lead),
@@ -4180,7 +4222,7 @@ describe('stalled task sweeper', () => {
       owner: null,
       updated_at: nowSec - 3600,
     });
-    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
+    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true, leadMaxActiveQueries: 1 } });
     const opsTeam = team({ id: 'ops-team-id', name: 'ops-team' });
     const taskMaster = agent({
       team_id: opsTeam.id,

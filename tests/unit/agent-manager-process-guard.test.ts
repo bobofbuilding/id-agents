@@ -211,6 +211,7 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     delete process.env.ID_IDLE_PARK_INTERVAL_MS;
     delete process.env.ID_IDLE_PARK_INITIAL_DELAY_MS;
     delete process.env.ID_IDLE_PARK_DISABLED;
+    delete process.env.ID_PLAN_DECISION_QUERY_EXPIRY_MS;
     while (dbs.length > 0) {
       await dbs.pop()!.close();
     }
@@ -2183,6 +2184,58 @@ new org text from sidecar
     expect((await db.queries.getByQueryIdForTeam(teamId, 'terminal-lead-kickoff'))?.status).toBe('expired');
     expect((await db.queries.getByQueryIdForTeam(teamId, 'active-backlog-guard'))?.status).toBe('processing');
     expect((await db.queries.getByQueryIdForTeam(teamId, 'normal-done-task-mention'))?.status).toBe('processing');
+  });
+
+  it('expires stale Work Plans decision prompts without touching normal lead work', async () => {
+    process.env.ID_PLAN_DECISION_QUERY_EXPIRY_MS = String(5 * 60 * 1000);
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-lead',
+        name: 'lead',
+        port: 4115,
+        status: 'running',
+      }),
+    });
+
+    const now = Date.now();
+    await db.queries.upsert(teamId, 'agent-lead', {
+      query_id: 'stale-plan-decision',
+      status: 'processing',
+      prompt: 'Decision on "agent.bittrees.org". You asked: Work > Plans could not complete the blocker preflight for "agent.bittrees.org". Delegation will continue, but retry should not stack.',
+      created: now - 10 * 60 * 1000,
+      owner_kind: 'agent',
+      owner_id: 'agent-lead',
+    });
+    await db.queries.upsert(teamId, 'agent-lead', {
+      query_id: 'fresh-plan-decision',
+      status: 'processing',
+      prompt: 'Decision on "agent.bittrees.org". You asked: Work > Plans could not complete the audit preflight for "agent.bittrees.org".',
+      created: now - 30 * 1000,
+      owner_kind: 'agent',
+      owner_id: 'agent-lead',
+    });
+    await db.queries.upsert(teamId, 'agent-lead', {
+      query_id: 'normal-lead-research',
+      status: 'processing',
+      prompt: 'Decision on "agent.bittrees.org". You asked: Review the site copy and produce a source-grounded summary.',
+      created: now - 10 * 60 * 1000,
+      owner_kind: 'agent',
+      owner_id: 'agent-lead',
+    });
+
+    const result = await (manager as any).sweepStaleQueries();
+
+    expect(result.stalePlanDecision).toBe(1);
+    expect(result.total).toBe(1);
+    expect((await db.queries.getByQueryIdForTeam(teamId, 'stale-plan-decision'))?.status).toBe('expired');
+    expect((await db.queries.getByQueryIdForTeam(teamId, 'fresh-plan-decision'))?.status).toBe('processing');
+    expect((await db.queries.getByQueryIdForTeam(teamId, 'normal-lead-research'))?.status).toBe('processing');
   });
 
   it('preserves a fresh active delegation query while its assigned agent finishes replying after task completion', async () => {
