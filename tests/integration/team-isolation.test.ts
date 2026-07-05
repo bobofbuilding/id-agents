@@ -79,6 +79,7 @@ let port: number;
 let manager: AgentManagerDb;
 let baseUrl: string;
 let workDir: string;
+let testDb: Awaited<ReturnType<typeof createInMemoryDb>>;
 
 // IDs set during beforeAll
 let idchainTeamId: string;
@@ -94,6 +95,7 @@ beforeAll(async () => {
   baseUrl = `http://127.0.0.1:${port}`;
 
   const db = await createInMemoryDb();
+  testDb = db;
   manager = new AgentManagerDb(workDir, db as any);
 
   // Start manager — this seeds default/idchain/public teams
@@ -549,6 +551,62 @@ describe('GET /tasks — defaults to current team', () => {
     const publicBody = await publicRes.json() as any;
     const publicNames = publicBody.tasks.map((t: any) => t.name);
     expect(publicNames).not.toContain(uniqueTaskName);
+  });
+
+  it('GET /tasks without status returns a bounded board snapshot instead of all done history', async () => {
+    const stamp = Date.now();
+    const now = Math.floor(Date.now() / 1000);
+    const makeTask = (name: string, status: TaskRow['status'], index: number): TaskRow => ({
+      id: `task-${randomUUID()}`,
+      name,
+      uuid: randomUUID(),
+      team_id: idchainTeamId,
+      title: name,
+      description: null,
+      status,
+      created_by: null,
+      owner: status === 'doing' ? idchainAgentId : null,
+      created_at: now + index,
+      updated_at: now + 10_000 + index,
+      completed_at: status === 'done' ? now + 10_000 + index : null,
+    });
+
+    const todoName = `bounded-board-todo-${stamp}`;
+    const doingName = `bounded-board-doing-${stamp}`;
+    await testDb.tasks.create(makeTask(todoName, 'todo', 100));
+    await testDb.tasks.create(makeTask(doingName, 'doing', 101));
+
+    const doneNames: string[] = [];
+    for (let i = 0; i < 30; i++) {
+      const name = `bounded-board-done-${stamp}-${String(i).padStart(2, '0')}`;
+      doneNames.push(name);
+      await testDb.tasks.create(makeTask(name, 'done', i));
+    }
+
+    const boardRes = await fetch(`${baseUrl}/tasks`, {
+      headers: adminHeaders('idchain'),
+    });
+    const boardBody = await boardRes.json().catch(() => ({})) as any;
+    expect(boardRes.ok, `GET /tasks failed: ${JSON.stringify(boardBody)}`).toBe(true);
+    expect(boardBody.meta?.mode).toBe('board_snapshot');
+
+    const boardTasks = boardBody.tasks as any[];
+    const boardNames = boardTasks.map((task) => task.name);
+    const boardDoneNames = boardTasks
+      .filter((task) => task.status === 'done')
+      .map((task) => task.name);
+
+    expect(boardNames).toContain(todoName);
+    expect(boardNames).toContain(doingName);
+    expect(boardDoneNames.filter((name) => doneNames.includes(name))).toHaveLength(25);
+
+    const explicitDoneRes = await fetch(`${baseUrl}/tasks?status=done&limit=30`, {
+      headers: adminHeaders('idchain'),
+    });
+    const explicitDoneBody = await explicitDoneRes.json().catch(() => ({})) as any;
+    expect(explicitDoneRes.ok, `GET /tasks?status=done failed: ${JSON.stringify(explicitDoneBody)}`).toBe(true);
+    const explicitDoneNames = explicitDoneBody.tasks.map((task: any) => task.name);
+    expect(explicitDoneNames.filter((name: string) => doneNames.includes(name))).toHaveLength(30);
   });
 });
 

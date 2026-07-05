@@ -138,6 +138,8 @@ const __dirname = path.dirname(__filename);
 const DEFAULT_MAX_DOING_TASKS = 30;
 const DEFAULT_STALLED_TASK_MAX_PROBES = 3;
 const DEFAULT_MAX_ACTIVE_QUERIES_PER_AGENT = 1;
+const DEFAULT_TASK_BOARD_OPEN_LIMIT = 250;
+const DEFAULT_TASK_BOARD_DONE_LIMIT = 25;
 
 interface StalledProbeState {
   lastAt: number;
@@ -9594,16 +9596,36 @@ Return this JSON shape:
         }
 
         const validStatuses = ['todo', 'doing', 'done'];
-        const tasks = await this.db.tasks.list({
-          status: status && validStatuses.includes(status) ? status as 'todo' | 'doing' | 'done' : undefined,
-          owner: ownerIdFilter,
-          teamId: teamIdFilter,
-          limit,
-        });
+        const statusFilter = status && validStatuses.includes(status) ? status as 'todo' | 'doing' | 'done' : undefined;
+        const useBoardDefault = !statusFilter && !limit;
+        const tasks = useBoardDefault
+          ? await this.listTaskBoardSnapshot({
+              owner: ownerIdFilter,
+              teamId: teamIdFilter,
+            })
+          : await this.db.tasks.list({
+              status: statusFilter,
+              owner: ownerIdFilter,
+              teamId: teamIdFilter,
+              limit,
+            });
 
         const lookups = tasks.length > 0 ? await this.preloadTaskResultLookups(tasks) : undefined;
         const results = await Promise.all(tasks.map((task) => this.buildTaskResult(task, teamId, lookups)));
-        res.json({ ok: true, tasks: results });
+        res.json({
+          ok: true,
+          tasks: results,
+          ...(useBoardDefault ? {
+            meta: {
+              mode: 'board_snapshot',
+              default_limits: {
+                todo: DEFAULT_TASK_BOARD_OPEN_LIMIT,
+                doing: DEFAULT_TASK_BOARD_OPEN_LIMIT,
+                done: DEFAULT_TASK_BOARD_DONE_LIMIT,
+              },
+            },
+          } : {}),
+        });
       } catch (err: any) {
         console.error('[Manager] Error in GET /tasks:', err);
         res.status(500).json({ error: err?.message || 'Internal server error' });
@@ -10620,6 +10642,33 @@ Return this JSON shape:
       return { error: `Multiple agents match "${agentName}". Be more specific.` };
     }
     return { agent: matches[0] };
+  }
+
+  private async listTaskBoardSnapshot(filters: {
+    owner?: string;
+    teamId: string | null;
+  }): Promise<TaskRow[]> {
+    const [doing, todo, done] = await Promise.all([
+      this.db.tasks.list({
+        status: 'doing',
+        owner: filters.owner,
+        teamId: filters.teamId,
+        limit: DEFAULT_TASK_BOARD_OPEN_LIMIT,
+      }),
+      this.db.tasks.list({
+        status: 'todo',
+        owner: filters.owner,
+        teamId: filters.teamId,
+        limit: DEFAULT_TASK_BOARD_OPEN_LIMIT,
+      }),
+      this.db.tasks.list({
+        status: 'done',
+        owner: filters.owner,
+        teamId: filters.teamId,
+        limit: DEFAULT_TASK_BOARD_DONE_LIMIT,
+      }),
+    ]);
+    return [...doing, ...todo, ...done];
   }
 
   private async preloadTaskResultLookups(tasks: TaskRow[]): Promise<{
