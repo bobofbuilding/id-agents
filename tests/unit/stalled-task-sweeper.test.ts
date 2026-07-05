@@ -2199,7 +2199,7 @@ describe('stalled task sweeper', () => {
     }));
   });
 
-  it('parks a live team lead task that missed delegation instead of asking the lead again', async () => {
+  it('holds a live team lead task that missed delegation when task-manager routing is unavailable', async () => {
     const nowSec = Math.floor(NOW_MS / 1000);
     const lead = agent({
       id: 'lead-1',
@@ -2256,11 +2256,7 @@ describe('stalled task sweeper', () => {
     await manager.sweepStalledTasks();
 
     expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
-    expect(db.tasks.updateFields).toHaveBeenCalledWith('lead-task-1', {
-      status: 'todo',
-      owner: null,
-      updated_at: nowSec,
-    });
+    expect(db.tasks.updateFields).not.toHaveBeenCalled();
     expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
       team_id: TEAM_ID,
       topic: 'task:triaged',
@@ -2417,11 +2413,7 @@ describe('stalled task sweeper', () => {
       await manager.sweepStalledTasks();
 
       expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
-      expect(db.tasks.updateFields).toHaveBeenCalledWith(`task-${ownerCase.agent.id}`, {
-        status: 'todo',
-        owner: null,
-        updated_at: nowSec,
-      });
+      expect(db.tasks.updateFields).not.toHaveBeenCalled();
       expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
         topic: 'task:triaged',
         actor_agent_id: ownerCase.agent.id,
@@ -4127,7 +4119,7 @@ describe('stalled task sweeper', () => {
     }));
   });
 
-  it('parks stopped lead-owned work that missed delegation instead of nudging another lead', async () => {
+  it('holds stopped lead-owned work that missed delegation when task-manager routing is unavailable', async () => {
     const nowSec = Math.floor(NOW_MS / 1000);
     const stoppedLead = agent({
       id: 'research-lead-1',
@@ -4169,11 +4161,7 @@ describe('stalled task sweeper', () => {
     await manager.sweepStalledTasks();
 
     expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
-    expect(db.tasks.updateFields).toHaveBeenCalledWith('research-task-1', {
-      status: 'todo',
-      owner: null,
-      updated_at: nowSec,
-    });
+    expect(db.tasks.updateFields).not.toHaveBeenCalled();
     expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
       team_id: TEAM_ID,
       topic: 'task:triaged',

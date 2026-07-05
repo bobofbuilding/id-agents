@@ -15253,14 +15253,17 @@ Return this JSON shape:
     stalledMinutes: number;
     nowMs: number;
     recordEvent?: boolean;
+    parkTask?: boolean;
     message: string;
   }): Promise<void> {
     const nowSec = Math.floor(params.nowMs / 1000);
-    await this.db.tasks.updateFields(params.task.id, {
-      status: 'todo',
-      owner: null,
-      updated_at: nowSec,
-    });
+    if (params.parkTask !== false) {
+      await this.db.tasks.updateFields(params.task.id, {
+        status: 'todo',
+        owner: null,
+        updated_at: nowSec,
+      });
+    }
     if (params.recordEvent !== false) {
       await this.recordTaskSupervision(
         params.task,
@@ -15271,7 +15274,7 @@ Return this JSON shape:
         params.nowMs,
       );
     }
-    this.managerLog(`Parked lead-owned task ${params.task.name}: ${params.message}`);
+    this.managerLog(`${params.parkTask === false ? 'Held' : 'Parked'} lead-owned task ${params.task.name}: ${params.message}`);
   }
 
   private async closeStalledValidatorTaskTerminal(params: {
@@ -15792,6 +15795,7 @@ Return this JSON shape:
               reason: 'lead_delegation_required',
               stalledMinutes: mins,
               nowMs: now,
+              parkTask: taskManagerFallback?.status === 'sent_task_manager',
               recordEvent: taskManagerFallback?.status !== 'sent_task_manager',
               message: taskManagerFallback?.status === 'sent_task_manager'
                 ? `routed overdue delegation to ${taskManagerFallback.actorTeam}/${taskManagerFallback.actor}`
@@ -15847,6 +15851,7 @@ Return this JSON shape:
             reason: 'lead_owner_unavailable',
             stalledMinutes: mins,
             nowMs: now,
+            parkTask: taskManagerFallback?.status === 'sent_task_manager',
             recordEvent: taskManagerFallback?.status !== 'sent_task_manager',
             message: taskManagerFallback?.status === 'sent_task_manager'
               ? `owner ${ownerName} is unavailable and overdue delegation was routed to ${taskManagerFallback.actorTeam}/${taskManagerFallback.actor}`
