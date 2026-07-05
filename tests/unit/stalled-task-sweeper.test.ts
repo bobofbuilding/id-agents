@@ -896,6 +896,139 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('closes delegated parent reconciliation when the only blocker is missing HTTP tooling', async () => {
+    const parent = task({
+      name: 'bootstrap-agent-bittrees-portal',
+      title: 'Bootstrap dedicated agent.bittrees.org portal repo',
+      uuid: 'befe37a7-c751-4d66-938f-92ae045bf839',
+    });
+    const db = fakeDb({
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [parent]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-delegated-parent-no-http-close-test', db, { libraryRoot: null }) as any;
+
+    await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery(parent.owner!, {
+        query_id: 'delegated-parent-no-http-close',
+        prompt: [
+          'Supervision: Manager DB confirms parent task #befe37a7 ("Bootstrap dedicated agent.bittrees.org portal repo") exists and all detected delegated child tasks are done.',
+          'Completed delegated children and available completion evidence:',
+          '- #5afa13f5 status=done owner=architecture-engineer',
+        ].join('\n'),
+        status: 'completed',
+      }),
+      {
+        result: [
+          'BLOCKED: I have no tool in this session capable of making the HTTP call needed to close the task.',
+          '',
+          'All four children are done with concrete evidence, so the parent objective is complete.',
+          'No contradicting source was found in the child evidence.',
+          'Reconciliation: parent task bootstrap-agent-bittrees-portal is DONE.',
+        ].join('\n'),
+      },
+      NOW_MS,
+    );
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(parent.id, {
+      status: 'done',
+      completed_at: Math.floor(NOW_MS / 1000),
+      updated_at: Math.floor(NOW_MS / 1000),
+    });
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:completed',
+      subject_id: parent.uuid,
+    }));
+  });
+
+  it('can force-replay a previously applied control reply after parser fixes', async () => {
+    const parent = task({
+      name: 'bootstrap-agent-bittrees-portal',
+      title: 'Bootstrap dedicated agent.bittrees.org portal repo',
+      uuid: 'befe37a7-c751-4d66-938f-92ae045bf839',
+    });
+    const db = fakeDb({
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [parent]),
+      },
+      adapter: {
+        query: vi.fn(async (sql: string) => {
+          if (sql.includes("topic = 'query:control-reply-applied'")) {
+            return { rows: [{ seq: 1 }], rowCount: 1 };
+          }
+          return { rows: [], rowCount: 0 };
+        }),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-control-reply-force-replay-test', db, { libraryRoot: null }) as any;
+    const query = activeQuery(parent.owner!, {
+      query_id: 'delegated-parent-applied-before-parser-fix',
+      prompt: 'Supervision: Manager DB confirms parent task #befe37a7 ("Bootstrap dedicated agent.bittrees.org portal repo") exists and all detected delegated child tasks are done.',
+      status: 'completed',
+    });
+    const payload = {
+      result: 'All delegated children are done with concrete evidence. Reconciliation complete: parent task is DONE.',
+    };
+
+    const skipped = await manager.applyTaskControlReplyFromCompletedQuery(query, payload, NOW_MS);
+    const forced = await manager.applyTaskControlReplyFromCompletedQuery(query, payload, NOW_MS, { force: true });
+
+    expect(skipped).toMatchObject({ applied: false, reason: 'already_applied' });
+    expect(forced).toMatchObject({ applied: true, action: 'done', task: parent.name });
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(parent.id, {
+      status: 'done',
+      completed_at: Math.floor(NOW_MS / 1000),
+      updated_at: Math.floor(NOW_MS / 1000),
+    });
+  });
+
+  it('keeps delegated parent reconciliation blocked when the reply reports a real missing artifact', async () => {
+    const parent = task({
+      name: 'design-memory-architecture',
+      title: 'Design memory architecture',
+      uuid: 'effa1c30-3d9d-4633-af13-9db1833c24d2',
+    });
+    const db = fakeDb({
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [parent]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-delegated-parent-real-blocker-test', db, { libraryRoot: null }) as any;
+
+    await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery(parent.owner!, {
+        query_id: 'delegated-parent-real-blocker',
+        prompt: [
+          'Supervision: Manager DB confirms parent task #effa1c30 ("Design memory architecture") exists and all detected delegated child tasks are done.',
+          'Completed delegated children and available completion evidence:',
+          '- #7679bede status=done owner=architecture-engineer',
+        ].join('\n'),
+        status: 'completed',
+      }),
+      {
+        result: [
+          'BLOCKED: child output artifact path is missing from the task handoff.',
+          '',
+          'I cannot reconcile the parent without the missing artifact evidence.',
+        ].join('\n'),
+      },
+      NOW_MS,
+    );
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(parent.id, expect.objectContaining({
+      owner: null,
+      status: 'todo',
+      completed_at: null,
+      updated_at: Math.floor(NOW_MS / 1000),
+      description: expect.stringContaining('BLOCKED: child output artifact path is missing'),
+    }));
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:triaged',
+      subject_id: parent.uuid,
+    }));
+  });
+
   it('does not mark a task done when the reply reports done-blocked ambiguity', async () => {
     const staleTask = task();
     const db = fakeDb({

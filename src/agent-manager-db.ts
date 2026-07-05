@@ -3541,6 +3541,65 @@ Return this JSON shape:
     return { action: null, note: firstLine, target: null };
   }
 
+  private delegatedParentCompletionPrompt(prompt: string | null | undefined): boolean {
+    const lower = String(prompt ?? '').trim().toLowerCase();
+    return lower.startsWith('supervision: manager db confirms parent task ')
+      && lower.includes('all detected delegated child tasks are done');
+  }
+
+  private inferDelegatedParentCompletionReply(
+    prompt: string | null | undefined,
+    message: string,
+    parsed: { action: 'done' | 'in_progress' | 'blocked' | 'reassign' | 'claim' | 'delegated' | null; note: string; target: string | null },
+  ): { action: 'done'; note: string; target: null } | null {
+    if (!this.delegatedParentCompletionPrompt(prompt)) return null;
+
+    const text = String(message || '').trim();
+    if (!text) return null;
+    const normalized = text.replace(/[\u2013\u2014]/g, '-');
+    const lower = normalized.toLowerCase();
+    const firstLine = normalized
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find(Boolean) || 'Delegated parent reconciliation complete.';
+
+    const completionSignal = (
+      /\b(?:determination|status|result)\s*:?\s*(?:\*\*)?\s*done\b/i.test(normalized)
+      || /\bparent task\b.{0,180}\b(?:confirmed complete|complete|done)\b/i.test(normalized)
+      || /\breconciliation complete\b/i.test(normalized)
+      || /\breconciliation\b.{0,80}\b(?:done|complete|completed)\b/i.test(normalized)
+      || /\bmark(?:ing|ed)?\s+parent task\b.{0,160}\bdone\b/i.test(normalized)
+      || /\ball\b.{0,80}\bdelegated children\b.{0,80}\b(?:are\s+)?done\b/i.test(normalized)
+      || /\ball\b.{0,80}\bdelegated children\b.{0,80}\b(?:are\s+)?complete\b/i.test(normalized)
+      || /\ball\b.{0,80}\bchildren\b.{0,80}\b(?:are\s+)?done\b/i.test(normalized)
+      || /\ball\b.{0,80}\bchildren\b.{0,80}\b(?:are\s+)?complete\b/i.test(normalized)
+      || /\bsubstantive reconciliation is clear\b/i.test(normalized)
+    );
+    if (!completionSignal) return null;
+
+    const toolOnlyClosureBlock = (
+      /\b(?:no|without|lacking|lacks)\b.{0,100}\b(?:tool|bash|shell|http|curl|post|request|write access|manager api)\b/i.test(normalized)
+      || /\b(?:can't|cannot|unable)\b.{0,140}\b(?:post|execute|issue|make|call|close)\b.{0,100}\b(?:done|closure|http|request|manager api|tasks?\/)/i.test(normalized)
+      || /\bno way\b.{0,120}\b(?:post|manager api|done endpoint|closure call)\b/i.test(normalized)
+    );
+    const realTaskBlocker = (
+      /\b(?:missing|not found|unavailable)\b.{0,100}\b(?:artifact|output|evidence|source|deliverable|child output)\b/i.test(normalized)
+      || /\bno\s+(?:artifact|output|evidence|deliverable|child output)\b/i.test(normalized)
+      || /\bmismatch\b/i.test(normalized)
+      || /\bnot a clean pass\b/i.test(normalized)
+      || /\brequires additional information\b/i.test(normalized)
+    );
+
+    if (parsed.action === 'blocked' && !toolOnlyClosureBlock) return null;
+    if (realTaskBlocker) return null;
+
+    return {
+      action: 'done',
+      note: firstLine.slice(0, 600),
+      target: null,
+    };
+  }
+
   private inferTaskDelegationArtifactReply(
     prompt: string | null | undefined,
     message: string,
@@ -3732,9 +3791,10 @@ Return this JSON shape:
     queryRow: QueryRow,
     payload: Record<string, unknown>,
     occurredAt: number,
+    options: { force?: boolean } = {},
   ): Promise<{ applied: boolean; action?: string; task?: string; reason?: string }> {
     if (!this.taskControlReplyPrompt(queryRow.prompt)) return { applied: false, reason: 'not_control_prompt' };
-    if (await this.hasAppliedTaskControlReply(queryRow.team_id, queryRow.query_id)) {
+    if (!options.force && await this.hasAppliedTaskControlReply(queryRow.team_id, queryRow.query_id)) {
       return { applied: false, reason: 'already_applied' };
     }
     const marker = this.activeTaskAskMarker(queryRow.prompt);
@@ -3744,11 +3804,13 @@ Return this JSON shape:
 
     const { task } = await this.resolveTaskRef(marker, queryRow.team_id).catch(() => ({ task: undefined }));
     if (!task) return { applied: false, action: parsed.action ?? undefined, reason: 'task_not_found' };
-    const effectiveParsed = parsed.action
-      ? parsed
-      : this.inferTaskDelegationArtifactReply(queryRow.prompt, message, task, marker)
+    const delegatedParentCompletion = this.inferDelegatedParentCompletionReply(queryRow.prompt, message, parsed);
+    const effectiveParsed = delegatedParentCompletion
+      ?? (parsed.action
+        ? parsed
+        : this.inferTaskDelegationArtifactReply(queryRow.prompt, message, task, marker)
         ?? this.inferTaskControlFollowupReply(queryRow.prompt, message)
-        ?? parsed;
+        ?? parsed);
     if (!effectiveParsed.action) return { applied: false, reason: 'no_control_action' };
     if (this.isTerminalTaskStatus(task.status)) return { applied: false, action: effectiveParsed.action, task: task.name, reason: 'task_terminal' };
 
@@ -7816,10 +7878,14 @@ Return this JSON shape:
         const resultPayload = row.result && typeof row.result === 'object'
           ? row.result as Record<string, unknown>
           : {};
+        const force = req.query.force === '1'
+          || req.query.force === 'true'
+          || req.body?.force === true;
         const applied = await this.applyTaskControlReplyFromCompletedQuery(
           row,
           resultPayload,
           row.completed ?? Date.now(),
+          { force },
         );
         res.json({ ok: true, query_id: queryId, ...applied });
       } catch (err: any) {
