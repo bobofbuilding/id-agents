@@ -764,6 +764,86 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('does not attach unrelated later lead-created tasks as delegated children', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const lead = agent({
+      id: 'lead-1',
+      name: 'engineering-lead',
+      metadata: { catalog: { role: 'lead' } },
+    });
+    const worker = agent({
+      id: 'worker-1',
+      name: 'architecture-engineer',
+      metadata: { catalog: { role: 'member' } },
+    });
+    const parent = task({
+      id: 'parent-task',
+      name: 'design-memory-architecture',
+      uuid: 'effa1c30-3d9d-4633-af13-9db1833c24d2',
+      title: 'Design memory architecture',
+      owner: lead.id,
+      created_by: null,
+      status: 'doing',
+      created_at: nowSec - 3600,
+      updated_at: nowSec - 3600,
+      description: '[goal:goal_memory] Design durable memory storage and retrieval.',
+    });
+    const realChild = task({
+      id: 'real-child',
+      name: 'consolidate-memory-architecture-plan',
+      uuid: '7679bede-aaaa-4333-8333-333333333333',
+      title: 'Consolidate memory architecture into one canonical implementation-ready plan',
+      description: 'Child of #effa1c30. Goal: stable longterm memory.',
+      owner: worker.id,
+      created_by: lead.id,
+      status: 'done',
+      created_at: nowSec - 3500,
+      updated_at: nowSec - 3000,
+      completed_at: nowSec - 3000,
+    });
+    const unrelated = task({
+      id: 'unrelated-child',
+      name: 'incorporate-security-norun-bittrees-readiness',
+      uuid: 'f723c0ce-aaaa-4333-8333-333333333333',
+      title: 'Incorporate security-router NO-GO into agent.bittrees.org readiness packet',
+      description: 'Child of #cfafce2f and #befe37a7. Goal ID: goal_plan_rzit49',
+      owner: worker.id,
+      created_by: lead.id,
+      status: 'done',
+      created_at: nowSec - 1000,
+      updated_at: nowSec - 900,
+      completed_at: nowSec - 900,
+    });
+    const db = fakeDb({
+      teams: {
+        getTeam: vi.fn(async () => team({ name: 'engineering-team' })),
+      },
+      agents: {
+        getById: vi.fn(async (id: string) => id === lead.id ? lead : id === worker.id ? worker : null),
+      },
+      tasks: {
+        list: vi.fn(async ({ teamId }: { teamId?: string } = {}) => {
+          if (teamId === TEAM_ID) return [parent, realChild, unrelated];
+          return [parent, realChild, unrelated];
+        }),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-delegated-child-filter-test', db, { libraryRoot: null }) as any;
+
+    const audit = await manager.buildDelegationAudit(parent, TEAM_ID, 'engineering-team', lead);
+
+    expect(audit).toMatchObject({
+      status: 'ok',
+      childTaskRefs: ['#7679bede'],
+    });
+    expect(audit.childTasks).toEqual([
+      expect.objectContaining({
+        ref: '#7679bede',
+        name: 'consolidate-memory-architecture-plan',
+      }),
+    ]);
+  });
+
   it('marks a task done when a delegation reply starts with completed-task prose', async () => {
     const staleTask = task();
     const db = fakeDb({

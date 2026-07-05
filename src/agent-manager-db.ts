@@ -1412,6 +1412,26 @@ export class AgentManagerDb {
     );
   }
 
+  private taskTitlesLookRelated(parent: TaskRow, candidate: TaskRow): boolean {
+    const parentTokens = this.duplicateTitleTokens(`${parent.name} ${parent.title}`);
+    const candidateTokens = this.duplicateTitleTokens(`${candidate.name} ${candidate.title}`);
+    if (!parentTokens.size || !candidateTokens.size) return false;
+    const shared = [...parentTokens].filter((token) => candidateTokens.has(token));
+    return shared.length >= Math.min(2, parentTokens.size);
+  }
+
+  private tasksShareGoal(parent: TaskRow, candidate: TaskRow): boolean {
+    const parentGoal = this.taskGoalIdFromInput(this.taskBriefInputFromTask(parent));
+    const candidateGoal = this.taskGoalIdFromInput(this.taskBriefInputFromTask(candidate));
+    return Boolean(parentGoal && candidateGoal && parentGoal === candidateGoal);
+  }
+
+  private taskLooksDelegatedChildOfParent(candidate: TaskRow, parent: TaskRow, owner: AgentRow | null): boolean {
+    if (this.taskMatchesParentRef(candidate, parent)) return true;
+    if (candidate.created_by !== owner?.id) return false;
+    return this.tasksShareGoal(parent, candidate) || this.taskTitlesLookRelated(parent, candidate);
+  }
+
   private async delegatedChildTaskSummary(child: TaskRow, ownerLookup?: Map<string, AgentRow>): Promise<Record<string, unknown>> {
     let ownerName: string | null = null;
     if (child.owner) {
@@ -1497,7 +1517,7 @@ export class AgentManagerDb {
       if (candidate.team_id && candidate.team_id !== teamId) return false;
       if (candidate.created_at < task.created_at) return false;
       if (candidate.status !== 'done' && candidate.status !== 'doing' && candidate.status !== 'todo') return false;
-      return candidate.created_by === owner?.id || this.taskMatchesParentRef(candidate, task);
+      return this.taskLooksDelegatedChildOfParent(candidate, task, owner);
     });
   }
 
