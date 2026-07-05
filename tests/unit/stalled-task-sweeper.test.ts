@@ -1953,6 +1953,7 @@ describe('stalled task sweeper', () => {
       id: 'researcher-1',
       name: 'researcher',
       status: 'stopped',
+      runtime: 'public-agent-remote',
     });
     const taskManager = agent({
       team_id: opsTeam.id,
@@ -2013,6 +2014,86 @@ describe('stalled task sweeper', () => {
       data: expect.objectContaining({
         reason: 'lead_delegation_required',
         stalled_minutes: 11,
+      }),
+    }));
+  });
+
+  it('wakes one stopped teammate before asking a lead to delegate', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const researchTeam = team({ name: 'research' });
+    const lead = agent({
+      id: 'research-lead-1',
+      name: 'research-lead',
+      metadata: { catalog: { role: 'lead' } },
+    });
+    const stoppedWorker = agent({
+      id: 'researcher-1',
+      name: 'researcher',
+      status: 'stopped',
+      port: 4218,
+      runtime: 'codex',
+      endpoint: 'http://127.0.0.1:4218',
+    });
+    const leadTask = task({
+      id: 'lead-task-1',
+      name: 'coordinate-research-work',
+      uuid: '87654321-4321-4321-8321-123456789abc',
+      title: 'Coordinate research work',
+      owner: lead.id,
+      created_by: lead.id,
+      created_at: nowSec - 11 * 60,
+      updated_at: nowSec - 11 * 60,
+    });
+    const db = fakeDb({
+      teams: {
+        getTeam: vi.fn(async () => researchTeam),
+      },
+      agents: {
+        list: vi.fn(async () => [lead, stoppedWorker]),
+        updateStatus: vi.fn(async () => {}),
+      },
+      tasks: {
+        list: vi.fn(async ({ teamId }: { teamId?: string } = {}) => teamId === TEAM_ID ? [leadTask] : []),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-lead-capacity-wake-test', db, { libraryRoot: null }) as any;
+    manager.spawnLocalAgentProcess = vi.fn(async () => ({ success: true, pid: 1234, logFile: '/tmp/researcher.log' }));
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.promptLeadForDelegationKickoff(TEAM_ID, 'research', leadTask, lead);
+
+    expect(manager.spawnLocalAgentProcess).toHaveBeenCalledWith(TEAM_ID, 'research', expect.objectContaining({
+      id: stoppedWorker.id,
+      name: stoppedWorker.name,
+      port: stoppedWorker.port,
+    }));
+    expect(db.agents.updateStatus).toHaveBeenCalledWith(stoppedWorker.id, 'running');
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'research',
+      'research-lead',
+      expect.stringContaining('Available teammates: researcher.'),
+    );
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalledWith(
+      'ops-team',
+      expect.any(String),
+      expect.any(String),
+    );
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      team_id: TEAM_ID,
+      topic: 'agent:started',
+      actor_agent_id: stoppedWorker.id,
+      data: expect.objectContaining({
+        reason: 'lead-delegation-capacity',
+        task_name: leadTask.name,
+      }),
+    }));
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      team_id: TEAM_ID,
+      topic: 'task:triaged',
+      actor_agent_id: lead.id,
+      subject_id: leadTask.uuid,
+      data: expect.objectContaining({
+        reason: 'lead_delegation_required',
       }),
     }));
   });

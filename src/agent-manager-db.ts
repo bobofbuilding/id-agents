@@ -2352,8 +2352,9 @@ export class AgentManagerDb {
     if (children.length) return;
     const ref = this.taskShortRef(task);
     if (await this.hasActiveSupervisionAskForMarker(teamId, owner, ref)) return;
+    if (await this.hasAnyActiveQuery(owner)) return;
     const teamAgents = await this.db.agents.list(teamId).catch(() => [] as AgentRow[]);
-    const members = teamAgents
+    const liveMembers = teamAgents
       .filter((agent) =>
         agent.id !== owner.id
         && this.isLiveForSupervision(agent)
@@ -2362,6 +2363,22 @@ export class AgentManagerDb {
         && Boolean(agent.endpoint),
       )
       .map((agent) => agent.name);
+    let members = liveMembers;
+    if (!members.length) {
+      const wakeable = teamAgents
+        .filter((agent) =>
+          agent.id !== owner.id
+          && !this.isConfiguredTeamLead(teamName, agent)
+          && !this.isIdleParkingProtectedAgent(agent, teamName)
+          && this.canWakeAssignedTaskOwner(agent),
+        )
+        .sort((a, b) => a.name.localeCompare(b.name));
+      const candidate = wakeable[0];
+      if (candidate) {
+        const wake = await this.wakeAssignedTaskOwner(teamId, teamName, task, candidate, 'lead-delegation-capacity');
+        if (wake.status === 'started') members = [candidate.name];
+      }
+    }
     if (!members.length) {
       const activeMinutes = Math.max(0, Math.round((Date.now() - this.taskLastActivityMs(task)) / 60000));
       await this.routeStalledTaskToTaskManagerFallback({
@@ -2379,7 +2396,6 @@ export class AgentManagerDb {
       });
       return;
     }
-    if (await this.hasAnyActiveQuery(owner)) return;
     const memberHint = members.length ? ` Available teammates: ${members.join(', ')}.` : '';
     const message = `Lead delegation kickoff: task ${ref} ("${task.title}") is assigned to you as the team coordinator. Do not do the whole task yourself. Immediately decompose it into member-owned child tasks with \`/task create ... --owner <teammate> --parent-task ${ref}\`, then close this parent only after child tasks are done using \`/task done ${ref} --delegated-task-names "child-a,child-b"\`. If this is truly advisory, close it with \`--no-delegation-reason\` and a failure/summary note.${memberHint}`;
     if (await this.sendSupervisionAsk(teamName, owner.name, message)) {
@@ -2401,7 +2417,7 @@ export class AgentManagerDb {
     teamName: string,
     task: TaskRow,
     owner: AgentRow | null,
-    reason: 'task-create' | 'task-assign' | 'task-claim' | 'stalled-owner',
+    reason: 'task-create' | 'task-assign' | 'task-claim' | 'stalled-owner' | 'lead-delegation-capacity',
   ): Promise<{ status: 'started' | 'skipped' | 'failed'; reason: string; pid?: number; logFile?: string }> {
     if (!owner) return { status: 'skipped', reason: 'no_owner' };
     if (owner.status === 'running') return { status: 'skipped', reason: 'already_running' };
