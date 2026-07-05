@@ -5119,6 +5119,7 @@ Return this JSON shape:
     const text = String(message || '').trimStart();
     if (!text) return false;
     return ![
+      /^(?:Control ping|reply with OK|respond with OK|reply OK|respond OK)\b/i,
       /^Heartbeat:/,
       /^You are the team lead\./,
       /^IDACC Learn routed this material\b/i,

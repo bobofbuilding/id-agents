@@ -1034,6 +1034,9 @@ describe('stalled task sweeper', () => {
   it('does not attach Brain context to control-plane status prompts', async () => {
     const manager = new AgentManagerDb('/tmp/id-agents-brain-context-control-plane-test', fakeDb(), { libraryRoot: null }) as any;
 
+    expect(manager.shouldAttachBrainContext('Control ping after manager restart: reply OK only.')).toBe(false);
+    expect(manager.shouldAttachBrainContext('reply with OK')).toBe(false);
+    expect(manager.shouldAttachBrainContext('respond with OK only')).toBe(false);
     expect(manager.shouldAttachBrainContext('Backlog guard: task #12345678 is stalled.')).toBe(false);
     expect(manager.shouldAttachBrainContext('TASK DELEGATION from manager: You are assigned task #12345678.')).toBe(false);
     expect(manager.shouldAttachBrainContext('Backlog guard alert: task #12345678 is stalled.')).toBe(false);

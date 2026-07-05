@@ -18,7 +18,15 @@ Backlog guard: task #12345678 has been active 60m with no progress update.`)).to
 
 Heartbeat: review your checklist and act on anything that needs attention.`)).toBe(true);
 
+    expect(shouldSuppressMcpForPrompt(`[Message from the manager (your owner/operator) | Query ID: q3b]
+[Respond directly and helpfully — this is the person who manages you.]
+
+Control ping after manager restart: reply OK only.`)).toBe(true);
+
     expect(shouldSuppressMcpForPrompt('Heartbeat: review your checklist and act on anything that needs attention.')).toBe(true);
+    expect(shouldSuppressMcpForPrompt('Control ping after manager restart: reply OK only.')).toBe(true);
+    expect(shouldSuppressMcpForPrompt('reply with OK')).toBe(true);
+    expect(shouldSuppressMcpForPrompt('respond with OK only')).toBe(true);
     expect(shouldSuppressMcpForPrompt('Backlog guard: task #12345678 has been active 60m with no progress update.')).toBe(true);
     expect(shouldSuppressMcpForPrompt('Backlog guard alert: task #12345678 has stalled and needs owner triage.')).toBe(true);
     expect(shouldSuppressMcpForPrompt('Urgent: task #12345678 has been stalled 88+ minutes on ops-team with no progress.')).toBe(true);
@@ -184,6 +192,8 @@ Please inspect the repository, edit the integration, and run the test suite.`)).
 
     try {
       expect(queryExecutionTimeoutMsForPrompt('Backlog guard: task #12345678 has been active 60m with no progress update.'))
+        .toBe(90_000);
+      expect(queryExecutionTimeoutMsForPrompt('Control ping after manager restart: reply OK only.'))
         .toBe(90_000);
       expect(queryExecutionTimeoutMsForPrompt('Validation request for run-baseline-cycle (#784ff464), goal goal_1. Read the artifact and reply PASS or FAIL.'))
         .toBe(180_000);

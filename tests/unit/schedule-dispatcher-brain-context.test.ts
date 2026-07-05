@@ -136,4 +136,69 @@ describe('ScheduleDispatcher Brain context', () => {
       await new Promise<void>((resolve) => agent.close(() => resolve()));
     }
   });
+
+  it('does not attach Brain context to scheduled control probes', async () => {
+    const received = { brain: [] as any[], agent: [] as any[] };
+    const brain = await startServer((req, body, res) => {
+      received.brain.push({ url: req.url, body });
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: { bundles: [{ query: 'should-not-attach' }] } }));
+    });
+    const agent = await startServer((_req, body, res) => {
+      received.agent.push(body);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    process.env.BRAIN_URL = serverUrl(brain);
+    delete process.env.BRAIN_CONTEXT_DISABLED;
+
+    try {
+      const dispatcher = new ScheduleDispatcher();
+      const def: ScheduleDefinitionRow = {
+        id: 'sched-control',
+        kind: 'calendar',
+        title: 'Control Probe',
+        description: null,
+        active: true,
+        message: 'Control ping after manager restart: reply OK only.',
+        sender: 'schedule',
+        delivery_mode: 'talk',
+        timezone: null,
+        catch_up_policy: 'skip',
+        dedupe_window_seconds: 60,
+        interval_seconds: 60,
+        anchor_at: null,
+        max_runs: null,
+        expires_at: null,
+        local_time_seconds: null,
+        local_date: null,
+        days_of_week: null,
+        source_type: 'test',
+        source_key: 'test:sched-control',
+        created_at: 1,
+        updated_at: 1,
+      };
+
+      const result = await dispatcher.dispatch(
+        def,
+        {
+          id: 'agent-lead',
+          name: 'lead',
+          endpoint: serverUrl(agent),
+          talkPath: '/talk',
+          schedulePath: null,
+          status: 'running',
+        },
+        'interval:1',
+      );
+
+      expect(result.success).toBe(true);
+      expect(received.brain).toEqual([]);
+      expect(received.agent[0].message).toBe('Control ping after manager restart: reply OK only.');
+      expect(received.agent[0].brain_context).toBeUndefined();
+    } finally {
+      await new Promise<void>((resolve) => brain.close(() => resolve()));
+      await new Promise<void>((resolve) => agent.close(() => resolve()));
+    }
+  });
 });
