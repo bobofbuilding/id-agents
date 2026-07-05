@@ -3416,31 +3416,43 @@ Return this JSON shape:
       .map((line) => line.trim())
       .filter(Boolean);
     const firstLine = lines[0] || '';
-    const upper = firstLine.toUpperCase();
     if (!firstLine) return { action: null, note: '', target: null };
-    if (/^DONE\s*,\s*BLOCKED\b/.test(upper)) return { action: 'blocked', note: firstLine, target: null };
+    const controlLine = lines.find((line) => (
+      /^DONE\s*,\s*BLOCKED\b/i.test(line)
+      || /^(DONE\b|\/TASK\s+DONE\b|MARKED\s+DONE\b)/i.test(line)
+      || /^TASK\b.{0,200}\b(?:IS\s+)?(?:DONE|COMPLETE|COMPLETED|CLOSED)\b/i.test(line)
+      || /^TASK\b.*\b(?:MARKED|CLOSED)\b.*\bDONE\b/i.test(line)
+      || /^(IN-PROGRESS|READY-TO-RESUME)\b/i.test(line)
+      || /^DELEGATED\b/i.test(line)
+      || /^(CLAIM|CLAIMED)\b/i.test(line)
+      || /^(NEEDS-REASSIGNMENT|REASSIGN\b|REASSIGN:|ROUTE:|ROUTE\b)/i.test(line)
+      || /\b(?:REASSIGN|ROUTE)\b.{0,160}\bTO\b/i.test(line)
+      || /^(BLOCKED|BLOCKER|UNBLOCK:|UNBLOCK\b)/i.test(line)
+    )) || firstLine;
+    const upper = controlLine.toUpperCase();
+    if (/^DONE\s*,\s*BLOCKED\b/.test(upper)) return { action: 'blocked', note: controlLine, target: null };
     const commandDoneLine = lines.find((line) => (
       /(^|\s)\/task\s+done\b/i.test(line)
         && !/\bwhen complete\b/i.test(line)
         && !/\bmark it done with\b/i.test(line)
     ));
     if (commandDoneLine) return { action: 'done', note: commandDoneLine, target: null };
-    if (/^(DONE\b|\/TASK\s+DONE\b|MARKED\s+DONE\b)/.test(upper)) return { action: 'done', note: firstLine, target: null };
-    if (/^TASK\b.{0,200}\b(?:IS\s+)?(?:DONE|COMPLETE|COMPLETED|CLOSED)\b/i.test(firstLine)) {
-      return { action: 'done', note: firstLine, target: null };
+    if (/^(DONE\b|\/TASK\s+DONE\b|MARKED\s+DONE\b)/.test(upper)) return { action: 'done', note: controlLine, target: null };
+    if (/^TASK\b.{0,200}\b(?:IS\s+)?(?:DONE|COMPLETE|COMPLETED|CLOSED)\b/i.test(controlLine)) {
+      return { action: 'done', note: controlLine, target: null };
     }
-    if (/^TASK\b.*\b(?:MARKED|CLOSED)\b.*\bDONE\b/.test(upper)) return { action: 'done', note: firstLine, target: null };
-    if (/^(IN-PROGRESS|READY-TO-RESUME)\b/.test(upper)) return { action: 'in_progress', note: firstLine, target: null };
-    if (/^DELEGATED\b/.test(upper)) return { action: 'delegated', note: firstLine, target: null };
-    if (/^(CLAIM|CLAIMED)\b/.test(upper)) return { action: 'claim', note: firstLine, target: null };
+    if (/^TASK\b.*\b(?:MARKED|CLOSED)\b.*\bDONE\b/.test(upper)) return { action: 'done', note: controlLine, target: null };
+    if (/^(IN-PROGRESS|READY-TO-RESUME)\b/.test(upper)) return { action: 'in_progress', note: controlLine, target: null };
+    if (/^DELEGATED\b/.test(upper)) return { action: 'delegated', note: controlLine, target: null };
+    if (/^(CLAIM|CLAIMED)\b/.test(upper)) return { action: 'claim', note: controlLine, target: null };
     if (
       /^(NEEDS-REASSIGNMENT|REASSIGN\b|REASSIGN:|ROUTE:|ROUTE\b)/.test(upper)
       || /\b(?:REASSIGN|ROUTE)\b.{0,160}\bTO\b/.test(upper)
     ) {
-      return { action: 'reassign', note: firstLine, target: this.extractTaskControlRouteTarget(firstLine) };
+      return { action: 'reassign', note: controlLine, target: this.extractTaskControlRouteTarget(controlLine) };
     }
     if (/^(BLOCKED|BLOCKER|UNBLOCK:|UNBLOCK\b)/.test(upper)) {
-      return { action: 'blocked', note: firstLine, target: null };
+      return { action: 'blocked', note: controlLine, target: null };
     }
     return { action: null, note: firstLine, target: null };
   }
@@ -3496,6 +3508,28 @@ Return this JSON shape:
 
     const note = `Artifact-style delegation completion: ${firstLine.slice(0, 220)}`;
     return { action: 'done', note, target: null };
+  }
+
+  private inferTaskControlFollowupReply(
+    prompt: string | null | undefined,
+    message: string,
+  ): { action: 'in_progress'; note: string; target: null } | null {
+    if (!this.taskControlReplyPrompt(prompt)) return null;
+    const text = String(message || '').trim();
+    if (!text) return null;
+    const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    const commandLine = lines.find((line) => /^\/(?:talk-to|ask|hey)\b/i.test(line));
+    const followupLine = lines.find((line) =>
+      /\b(?:i(?:'ll| will)|we(?:'ll| will))\b.{0,160}\b(?:confirm|ask|check|follow up|reconcile|validate|verify)\b/i.test(line)
+      || /\b(?:confirm|ask|check|follow up|reconcile|validate|verify)\b.{0,160}\bbefore\b.{0,80}\b(?:closing|marking|complete|completion)\b/i.test(line),
+    );
+    const line = commandLine || followupLine;
+    if (!line) return null;
+    return {
+      action: 'in_progress',
+      note: `Follow-up still in progress: ${line.slice(0, 220)}`,
+      target: null,
+    };
   }
 
   private cleanTaskControlRouteTarget(raw: string | null | undefined): string | null {
@@ -3628,7 +3662,9 @@ Return this JSON shape:
     if (!task) return { applied: false, action: parsed.action ?? undefined, reason: 'task_not_found' };
     const effectiveParsed = parsed.action
       ? parsed
-      : this.inferTaskDelegationArtifactReply(queryRow.prompt, message, task, marker) ?? parsed;
+      : this.inferTaskDelegationArtifactReply(queryRow.prompt, message, task, marker)
+        ?? this.inferTaskControlFollowupReply(queryRow.prompt, message)
+        ?? parsed;
     if (!effectiveParsed.action) return { applied: false, reason: 'no_control_action' };
     if (this.isTerminalTaskStatus(task.status)) return { applied: false, action: effectiveParsed.action, task: task.name, reason: 'task_terminal' };
 

@@ -905,6 +905,81 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('applies a blocked control reply even when context precedes the control line', async () => {
+    const staleTask = task();
+    const db = fakeDb({
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [staleTask]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-multiline-blocked-test', db, { libraryRoot: null }) as any;
+
+    await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery(staleTask.owner!, {
+        query_id: 'guard-multiline-blocked',
+        prompt: 'Supervision: task #12345678 ("Stalled work") has been in progress 60m.',
+        status: 'completed',
+      }),
+      {
+        result: [
+          'I checked my local session and do not have the artifact yet.',
+          '',
+          'BLOCKED: child output artifact path is missing from the task handoff.',
+        ].join('\n'),
+      },
+      NOW_MS,
+    );
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(staleTask.id, expect.objectContaining({
+      owner: null,
+      status: 'todo',
+      completed_at: null,
+      updated_at: Math.floor(NOW_MS / 1000),
+      description: expect.stringContaining('BLOCKED: child output artifact path is missing'),
+    }));
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:triaged',
+      subject_id: staleTask.uuid,
+    }));
+  });
+
+  it('refreshes supervision replies that contain follow-up command text instead of a control verb', async () => {
+    const staleTask = task();
+    const db = fakeDb({
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [staleTask]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-followup-command-test', db, { libraryRoot: null }) as any;
+
+    await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery(staleTask.owner!, {
+        query_id: 'guard-followup-command',
+        prompt: 'Supervision: Manager DB confirms parent task #12345678 ("Stalled work") exists and all detected delegated child tasks are done.',
+        status: 'completed',
+      }),
+      {
+        result: [
+          'The child artifact is not in my workspace.',
+          '',
+          '/talk-to architecture-engineer "Please provide the output artifact path before I close parent #12345678."',
+        ].join('\n'),
+      },
+      NOW_MS,
+    );
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(staleTask.id, {
+      updated_at: Math.floor(NOW_MS / 1000),
+    });
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:refreshed',
+      subject_id: staleTask.uuid,
+      data: expect.objectContaining({
+        reason: 'control_reply_in_progress',
+      }),
+    }));
+  });
+
   it('marks a task done when a delegation reply returns a report artifact heading', async () => {
     const staleTask = task({
       name: 'publish-improvement-report',
