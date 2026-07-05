@@ -15179,7 +15179,7 @@ Return this JSON shape:
       .filter((agent) =>
         this.isLiveForSupervision(agent)
         && !this.isConfiguredTeamLead(teamRow.name, agent)
-        && !this.isIdleParkingProtectedAgent(agent, teamRow.name)
+        && !this.isAutoAssignmentProtectedAgent(agent, teamRow.name)
         && Boolean(agent.endpoint),
       )
       .sort((a, b) =>
@@ -15189,7 +15189,7 @@ Return this JSON shape:
     const wakeCandidates = agents
       .filter((agent) =>
         !this.isConfiguredTeamLead(teamRow.name, agent)
-        && !this.isIdleParkingProtectedAgent(agent, teamRow.name)
+        && !this.isAutoAssignmentProtectedAgent(agent, teamRow.name)
         && this.canWakeAssignedTaskOwner(agent),
       )
       .sort((a, b) =>
@@ -17298,6 +17298,24 @@ Return this JSON shape:
     if (metadata.alwaysOn === true || metadata.keepAlive === true || metadata.parkIdleProtected === true) return true;
     if (/^task[-_]master$/i.test(agent.name)) return true;
     if (teamName === 'default' && /^(coder|researcher)$/i.test(agent.name)) return true;
+    const catalog = metadata.catalog && typeof metadata.catalog === 'object'
+      ? metadata.catalog as Record<string, unknown>
+      : {};
+    const role = String(metadata.role || catalog.role || '').toLowerCase();
+    const expertise = Array.isArray(catalog.expertise)
+      ? catalog.expertise.map((item) => String(item).toLowerCase())
+      : [];
+    return role.includes('supervisor') && expertise.some((item) =>
+      item.includes('task-management') || item.includes('agent-orchestration') || item.includes('fleet-health'),
+    );
+  }
+
+  private isAutoAssignmentProtectedAgent(agent: AgentRow, teamName: string): boolean {
+    const metadata = (agent.metadata as Record<string, unknown> | null | undefined) ?? {};
+    if (this.isConfiguredTeamLead(teamName, agent)) return true;
+    if (this.isLeadLikeAgentForParking(agent, teamName)) return true;
+    if (/^task[-_]master$/i.test(agent.name)) return true;
+    if (metadata.assignmentProtected === true || metadata.taskAssignmentProtected === true) return true;
     const catalog = metadata.catalog && typeof metadata.catalog === 'object'
       ? metadata.catalog as Record<string, unknown>
       : {};

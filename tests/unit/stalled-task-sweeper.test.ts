@@ -1721,6 +1721,45 @@ describe('stalled task sweeper', () => {
     expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
   });
 
+  it('auto-assigns queued default work to idle parking protected executor agents', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const coder = agent({ id: 'agent-coder', name: 'coder' });
+    const researcher = agent({ id: 'agent-researcher', name: 'researcher' });
+    const queued = task({
+      id: 'queued-task',
+      name: 'queued-task',
+      uuid: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+      title: 'Queued task',
+      description: 'Expected output: implement the requested change and report verification.',
+      status: 'todo',
+      owner: null,
+      updated_at: nowSec - 900,
+    });
+    const db = fakeDb({
+      agents: {
+        list: vi.fn(async () => [coder, researcher]),
+        getById: vi.fn(async (id: string) => id === coder.id ? coder : id === researcher.id ? researcher : null),
+      },
+      tasks: {
+        list: vi.fn(async () => []),
+        getByNameForTeam: vi.fn(async () => queued),
+        claim: vi.fn(async () => true),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-default-executor-autoassign-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const result = await manager.assignUnownedTodoTask(queued, team({ name: 'default' }), NOW_MS);
+
+    expect(result).toMatchObject({ assigned: true, owner: expect.objectContaining({ id: coder.id }) });
+    expect(db.tasks.claim).toHaveBeenCalledWith('queued-task', coder.id, nowSec, { maxDoingForTeam: expect.any(Number) });
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'coder',
+      expect.stringContaining('TASK DELEGATION from manager'),
+    );
+  });
+
   it('wakes a stopped local teammate before auto-assigning stale unowned work', async () => {
     const nowSec = Math.floor(NOW_MS / 1000);
     const stoppedWorker = agent({
