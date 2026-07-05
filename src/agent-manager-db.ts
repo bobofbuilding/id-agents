@@ -15730,15 +15730,14 @@ Return this JSON shape:
   }
 
   /**
-   * Start the event_log retention sweep.
+   * Start the manager DB retention sweep.
    *
-   * Audit #6 (output/security-review-wakeup-service.md): the design promises
-   * a 7-day age cap and 100k-events-per-team count cap on `event_log`.
-   * This loop enforces both, default every 5 minutes. Constants and env
-   * overrides live in src/wakeup-service/retention.ts.
+   * Keeps event_log and news_items bounded in long-lived local deployments.
+   * This loop enforces age and count caps every 5 minutes by default.
+   * Constants and env overrides live in src/wakeup-service/retention.ts.
    */
   private startEventLogRetentionSweep(): void {
-    this.retentionService = new RetentionService({ events: this.db.events, teams: this.db.teams });
+    this.retentionService = new RetentionService({ events: this.db.events, news: this.db.news, teams: this.db.teams });
     this.retentionService.start();
   }
 
@@ -16111,7 +16110,7 @@ Return this JSON shape:
         // checkin, or recent query activity.
         this.startIdleParkingSweeper();
 
-        // Start event_log retention sweep (every 5 min, 7d / 100k-per-team caps)
+        // Start manager DB retention sweep (events + news; every 5 min by default)
         this.startEventLogRetentionSweep();
 
         // Start checkin due-service tick (default 30s) so active checkins

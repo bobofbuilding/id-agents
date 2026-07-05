@@ -252,4 +252,39 @@ export class PgNewsRepo implements NewsRepository {
       [teamId, before],
     );
   }
+
+  async pruneByAge(teamId: string, beforeTimestamp: number): Promise<number> {
+    const { rowCount } = await this.db.query(
+      `DELETE FROM news_items WHERE team_id = $1 AND timestamp < $2`,
+      [teamId, beforeTimestamp],
+    );
+    return rowCount ?? 0;
+  }
+
+  async pruneByCount(teamId: string, keepCount: number): Promise<number> {
+    if (keepCount < 0) keepCount = 0;
+    const total = await this.countForTeam(teamId);
+    const excess = total - keepCount;
+    if (excess <= 0) return 0;
+    const { rowCount } = await this.db.query(
+      `DELETE FROM news_items
+       WHERE team_id = $1
+         AND id IN (
+           SELECT id FROM news_items
+           WHERE team_id = $1
+           ORDER BY timestamp ASC, id ASC
+           LIMIT $2
+         )`,
+      [teamId, excess],
+    );
+    return rowCount ?? 0;
+  }
+
+  async countForTeam(teamId: string): Promise<number> {
+    const { rows } = await this.db.query<{ c: string | number }>(
+      `SELECT COUNT(*) AS c FROM news_items WHERE team_id = $1`,
+      [teamId],
+    );
+    return Number(rows[0]?.c ?? 0);
+  }
 }

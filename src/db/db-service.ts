@@ -446,6 +446,23 @@ export interface NewsRepository {
 
   /** Delete all news items older than the given timestamp. */
   deleteArchived(teamId: string, before: number): Promise<void>;
+
+  /**
+   * Delete rows for a team whose `timestamp` is strictly less than the cutoff.
+   * Used by daemon retention to keep long-running local DBs bounded.
+   * Returns the number of rows deleted.
+   */
+  pruneByAge(teamId: string, beforeTimestamp: number): Promise<number>;
+
+  /**
+   * If the team has more than `keepCount` rows, delete the oldest ones so
+   * exactly `keepCount` remain. No-op when count <= keepCount.
+   * Returns the number of rows deleted.
+   */
+  pruneByCount(teamId: string, keepCount: number): Promise<number>;
+
+  /** Count rows for a team. Used by the retention sweep's count-cap check. */
+  countForTeam(teamId: string): Promise<number>;
 }
 
 // ---------------------------------------------------------------------------

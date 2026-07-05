@@ -296,4 +296,39 @@ export class SqliteNewsRepo implements NewsRepository {
       [teamId, before],
     );
   }
+
+  async pruneByAge(teamId: string, beforeTimestamp: number): Promise<number> {
+    const { rowCount } = await this.db.query(
+      'DELETE FROM news_items WHERE team_id = ? AND timestamp < ?',
+      [teamId, beforeTimestamp],
+    );
+    return rowCount ?? 0;
+  }
+
+  async pruneByCount(teamId: string, keepCount: number): Promise<number> {
+    if (keepCount < 0) keepCount = 0;
+    const total = await this.countForTeam(teamId);
+    const excess = total - keepCount;
+    if (excess <= 0) return 0;
+    const { rowCount } = await this.db.query(
+      `DELETE FROM news_items
+       WHERE team_id = ?
+         AND id IN (
+           SELECT id FROM news_items
+           WHERE team_id = ?
+           ORDER BY timestamp ASC, id ASC
+           LIMIT ?
+         )`,
+      [teamId, teamId, excess],
+    );
+    return rowCount ?? 0;
+  }
+
+  async countForTeam(teamId: string): Promise<number> {
+    const { rows } = await this.db.query<{ c: number | string }>(
+      'SELECT COUNT(*) AS c FROM news_items WHERE team_id = ?',
+      [teamId],
+    );
+    return Number(rows[0]?.c ?? 0);
+  }
 }
