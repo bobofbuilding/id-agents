@@ -129,6 +129,11 @@ describe('CheckinService.tick', () => {
 
   it('fires a due row: increments iteration_count, advances next_fire_at, writes news + checkin:due event', async () => {
     const now = 1_777_500_000_000;
+    const taskUpdatedAtMs = now - 2 * 60 * 1000;
+    await db.adapter.query(
+      `UPDATE tasks SET updated_at = ? WHERE id = ?`,
+      [Math.floor(taskUpdatedAtMs / 1000), taskId],
+    );
     await db.checkins.create(buildRow({
       id: 'chk_fire',
       team_id: teamId,
@@ -180,7 +185,37 @@ describe('CheckinService.tick', () => {
     const data = news[0].data as Record<string, any>;
     expect(data.checkin_id).toBe('chk_fire');
     expect(data.linked_task.id).toBe(taskId);
-    expect(typeof data.linked_task.idle_ms).toBe('number');
+    expect(data.linked_task.last_activity_at).toBe(taskUpdatedAtMs);
+    expect(data.linked_task.idle_ms).toBe(2 * 60 * 1000);
+  });
+
+  it('normalizes millisecond task timestamps when reporting linked-task idle time', async () => {
+    const now = 1_777_500_020_000;
+    const taskUpdatedAtMs = now - 5 * 60 * 1000;
+    await db.adapter.query(
+      `UPDATE tasks SET updated_at = ? WHERE id = ?`,
+      [taskUpdatedAtMs, taskId],
+    );
+    await db.checkins.create(buildRow({
+      id: 'chk_ms_task_time',
+      team_id: teamId,
+      owner_agent_id: ownerId,
+      linked_task_id: taskId,
+      interval_seconds: 600,
+      next_fire_at: now - 1,
+      created_at: now - 10_000,
+      updated_at: now - 10_000,
+    }));
+
+    const result = await svc.tick(now);
+    expect(result).toMatchObject({ scanned: 1, fired: 1, expired: 0, errors: 0 });
+
+    const news = await db.news.poll(ownerId, 0);
+    expect(news).toHaveLength(1);
+    const data = news[0].data as Record<string, any>;
+    expect(data.linked_task.id).toBe(taskId);
+    expect(data.linked_task.last_activity_at).toBe(taskUpdatedAtMs);
+    expect(data.linked_task.idle_ms).toBe(5 * 60 * 1000);
   });
 
   it('expires the row when iteration_count >= max_iterations and emits checkin:expired', async () => {

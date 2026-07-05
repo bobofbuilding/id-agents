@@ -313,8 +313,9 @@ export class CheckinService {
       taskOwnerName: string | null;
     },
   ): Promise<{ message: string; data: Record<string, unknown> }> {
+    const lastActivityAt = ctx.linkedTask ? this.timestampMs(ctx.linkedTask.updated_at) : null;
     const idleMs = ctx.linkedTask
-      ? Math.max(0, ctx.now - ctx.linkedTask.updated_at * 1000)
+      ? Math.max(0, ctx.now - (lastActivityAt ?? ctx.now))
       : null;
 
     const data: Record<string, unknown> = {
@@ -335,7 +336,7 @@ export class CheckinService {
         title: ctx.linkedTask.title,
         status: ctx.linkedTask.status,
         assignee: ctx.taskOwnerName,
-        last_activity_at: ctx.linkedTask.updated_at,
+        last_activity_at: lastActivityAt,
         idle_ms: idleMs,
       };
     }
@@ -372,6 +373,11 @@ export class CheckinService {
     status: string;
   } {
     return { id: task.id, name: task.name, title: task.title, status: task.status };
+  }
+
+  private timestampMs(timestamp: number | null | undefined): number | null {
+    if (!timestamp) return null;
+    return timestamp < 10_000_000_000 ? timestamp * 1000 : timestamp;
   }
 
   private async fetchTaskById(taskId: string): Promise<TaskRow | null> {
