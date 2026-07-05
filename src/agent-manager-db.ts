@@ -17205,6 +17205,21 @@ Return this JSON shape:
     if (!this.isTaskAssignmentSweepSchedule(def.message)) return null;
 
     const teams = (await this.db.teams.listTeams()).map((team) => ({ id: team.id, name: team.name }));
+    const stalled = await this.triageStalledOwnerBacklogs({
+      teams,
+      limit: 5,
+    });
+    if (stalled.items.length > 0) {
+      this.managerLog(
+        `Managed assignment sweep ${def.id} via ${target.name}: held new assignment while ${stalled.items.length} stalled owner backlog(s) were triaged`,
+      );
+      return {
+        scheduleId: def.id,
+        agentId: target.id,
+        scheduledKey: run.scheduledKey,
+        success: true,
+      };
+    }
     const report = await this.assignUnownedTodoTasks({
       teams,
       limit: 20,

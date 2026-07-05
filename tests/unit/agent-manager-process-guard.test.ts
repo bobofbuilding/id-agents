@@ -279,6 +279,74 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     expect(allowed).toBe(false);
   });
 
+  it('triages stalled work instead of assigning unowned tasks during managed assignment sweeps', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    await db.teams.getOrCreateTeamId('ops-team');
+    const triageSpy = vi.spyOn(manager as any, 'triageStalledOwnerBacklogs').mockResolvedValue({
+      stallMinutes: 30,
+      limit: 5,
+      scannedTeams: 1,
+      scannedOwners: 1,
+      triagedOwners: 1,
+      skippedOwners: [],
+      items: [{
+        team: 'ops-team',
+        owner: 'ops-lead',
+        ownerStatus: 'running',
+        message: 'stalled_task_backlog: ops-team/ops-lead already has 1 stalled active task (#abc123).',
+        blockers: ['#abc123'],
+        triage: { status: 'sent_owner', taskRef: '#abc123', actor: 'ops-lead' },
+      }],
+    });
+    const assignSpy = vi.spyOn(manager as any, 'assignUnownedTodoTasks').mockResolvedValue({
+      scannedTeams: 1,
+      scannedTasks: 1,
+      considered: 1,
+      assignedCount: 1,
+      skippedCount: 0,
+      tooFresh: 0,
+      checkinSupervised: 0,
+      items: [],
+    });
+
+    const result = await (manager as any).dispatchManagedSchedule(
+      {
+        id: 'agent-task-master',
+        name: 'task-master',
+        endpoint: 'http://127.0.0.1:4100',
+        talkPath: '/talk',
+        schedulePath: null,
+        status: 'running',
+      },
+      scheduleRow({
+        id: 'assignment-sweep',
+        title: 'Task assignment sweep',
+        message: 'Task assignment sweep: inspect unassigned todo tasks across all teams.',
+      }),
+      {
+        scheduleId: 'assignment-sweep',
+        scheduledKey: 'interval:1700000000',
+        scheduledAt: 1_700_000_000,
+        kind: 'heartbeat',
+      },
+    );
+
+    expect(result).toMatchObject({
+      scheduleId: 'assignment-sweep',
+      agentId: 'agent-task-master',
+      scheduledKey: 'interval:1700000000',
+      success: true,
+    });
+    expect(triageSpy).toHaveBeenCalledWith(expect.objectContaining({
+      limit: 5,
+      teams: [expect.objectContaining({ name: 'ops-team' })],
+    }));
+    expect(assignSpy).not.toHaveBeenCalled();
+  });
+
   it('does not apply stalled-backlog assignment gating to ordinary heartbeats', async () => {
     const { manager, db, workDir } = await makeManager();
     dbs.push(db);
