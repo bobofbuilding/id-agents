@@ -155,6 +155,8 @@ describe('stalled task sweeper', () => {
   afterEach(() => {
     vi.restoreAllMocks();
     delete process.env.STALL_SWEEP_MS;
+    delete process.env.STALL_SWEEP_INTERVAL_MS;
+    delete process.env.ID_STALL_SWEEP_INTERVAL_MS;
     delete process.env.STALL_RENUDGE_MS;
     delete process.env.STALL_MANUAL_RENUDGE_MS;
     delete process.env.ID_STALL_MANUAL_RENUDGE_MS;
@@ -165,6 +167,22 @@ describe('stalled task sweeper', () => {
     delete process.env.ID_UNOWNED_ASSIGN_MAX_PER_SWEEP;
     delete process.env.ID_MAX_DOING_TASKS;
     delete process.env.ID_BLOCKED_TASK_REASSIGN_COOLDOWN_MS;
+  });
+
+  it('defaults automatic stalled-task sweeps to a quieter cadence', () => {
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', fakeDb(), { libraryRoot: null }) as any;
+
+    expect(manager.getStallSweepIntervalMs()).toBe(15 * 60 * 1000);
+  });
+
+  it('allows stalled-task sweep cadence overrides with a one-minute floor', () => {
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', fakeDb(), { libraryRoot: null }) as any;
+
+    process.env.ID_STALL_SWEEP_INTERVAL_MS = '1000';
+    expect(manager.getStallSweepIntervalMs()).toBe(60 * 1000);
+
+    process.env.STALL_SWEEP_INTERVAL_MS = String(20 * 60 * 1000);
+    expect(manager.getStallSweepIntervalMs()).toBe(20 * 60 * 1000);
   });
 
   it('delays immediate lead delegation kickoff for fresh second-based tasks', () => {

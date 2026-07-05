@@ -722,6 +722,13 @@ export class AgentManagerDb {
     return Number(process.env.STALL_SWEEP_MS) || 45 * 60 * 1000;
   }
 
+  private getStallSweepIntervalMs(): number {
+    const raw = Number(process.env.STALL_SWEEP_INTERVAL_MS || process.env.ID_STALL_SWEEP_INTERVAL_MS);
+    return Number.isFinite(raw) && raw > 0
+      ? Math.max(60_000, Math.floor(raw))
+      : 15 * 60 * 1000;
+  }
+
   private getStallRenudgeMs(): number {
     return Number(process.env.STALL_RENUDGE_MS) || 90 * 60 * 1000;
   }
@@ -13998,7 +14005,7 @@ Return this JSON shape:
    */
   private startStalledTaskSweeper(): void {
     if (process.env.STALL_SWEEP_DISABLED === 'true') return;
-    const intervalMs = 5 * 60 * 1000;
+    const intervalMs = this.getStallSweepIntervalMs();
     const run = () => { this.sweepStalledTasks().catch((e) => console.error('[Manager] Stalled-task sweep failed:', e)); };
     setTimeout(run, 90_000); // let the fleet settle after boot before the first sweep
     this.stalledSweepInterval = setInterval(run, intervalMs);
