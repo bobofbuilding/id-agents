@@ -46,17 +46,18 @@ const EXTERNAL_STOP_QUERY_STATUSES = new Set<ExternalStopQueryStatus>(['cancelle
 
 const DEFAULT_NEWS_TRIGGER_MESSAGE_CHAR_LIMIT = 2400;
 const DEFAULT_AGENT_QUERY_CONCURRENCY = 1;
-const DEFAULT_LEAD_QUERY_CONCURRENCY = 3;
-const MAX_AGENT_QUERY_CONCURRENCY = 16;
+const DEFAULT_LEAD_QUERY_CONCURRENCY = Number.POSITIVE_INFINITY;
 
-function parsePositiveInteger(value: unknown): number | null {
+function parseQueryConcurrency(value: unknown): number | null {
   if (value === undefined || value === null || value === '') return null;
   const parsed = Number.parseInt(String(value), 10);
+  if (parsed === 0) return Number.POSITIVE_INFINITY;
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
-function clampQueryConcurrency(value: number): number {
-  return Math.max(1, Math.min(MAX_AGENT_QUERY_CONCURRENCY, Math.floor(value)));
+function normalizeQueryConcurrency(value: number): number {
+  if (value === Number.POSITIVE_INFINITY) return Number.POSITIVE_INFINITY;
+  return Math.max(1, Math.floor(value));
 }
 
 function getNewsTriggerMessageCharLimit(): number {
@@ -831,33 +832,33 @@ export class AgentRestServer {
     const catalog = metadata.catalog && typeof metadata.catalog === 'object'
       ? metadata.catalog as Record<string, unknown>
       : {};
-    return parsePositiveInteger(metadata.queryConcurrency)
-      ?? parsePositiveInteger(metadata.query_concurrency)
-      ?? parsePositiveInteger(metadata.maxActiveQueries)
-      ?? parsePositiveInteger(metadata.max_active_queries)
-      ?? parsePositiveInteger(catalog.queryConcurrency)
-      ?? parsePositiveInteger(catalog.query_concurrency)
-      ?? parsePositiveInteger(catalog.maxActiveQueries)
-      ?? parsePositiveInteger(catalog.max_active_queries);
+    return parseQueryConcurrency(metadata.queryConcurrency)
+      ?? parseQueryConcurrency(metadata.query_concurrency)
+      ?? parseQueryConcurrency(metadata.maxActiveQueries)
+      ?? parseQueryConcurrency(metadata.max_active_queries)
+      ?? parseQueryConcurrency(catalog.queryConcurrency)
+      ?? parseQueryConcurrency(catalog.query_concurrency)
+      ?? parseQueryConcurrency(catalog.maxActiveQueries)
+      ?? parseQueryConcurrency(catalog.max_active_queries);
   }
 
   private resolveQueryConcurrency(): number {
     const metadataValue = this.metadataQueryConcurrency();
-    if (metadataValue !== null) return clampQueryConcurrency(metadataValue);
-
-    const globalValue =
-      parsePositiveInteger(process.env.ID_AGENT_QUERY_CONCURRENCY)
-      ?? parsePositiveInteger(process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT);
-    if (globalValue !== null) return clampQueryConcurrency(globalValue);
+    if (metadataValue !== null) return normalizeQueryConcurrency(metadataValue);
 
     if (this.isLeadLikeIdentity()) {
       const leadValue =
-        parsePositiveInteger(process.env.ID_AGENT_LEAD_QUERY_CONCURRENCY)
-        ?? parsePositiveInteger(process.env.ID_LEAD_QUERY_CONCURRENCY)
-        ?? parsePositiveInteger(process.env.ID_MAX_ACTIVE_QUERIES_PER_LEAD)
+        parseQueryConcurrency(process.env.ID_AGENT_LEAD_QUERY_CONCURRENCY)
+        ?? parseQueryConcurrency(process.env.ID_LEAD_QUERY_CONCURRENCY)
+        ?? parseQueryConcurrency(process.env.ID_MAX_ACTIVE_QUERIES_PER_LEAD)
         ?? DEFAULT_LEAD_QUERY_CONCURRENCY;
-      return clampQueryConcurrency(leadValue);
+      return normalizeQueryConcurrency(leadValue);
     }
+
+    const globalValue =
+      parseQueryConcurrency(process.env.ID_AGENT_QUERY_CONCURRENCY)
+      ?? parseQueryConcurrency(process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT);
+    if (globalValue !== null) return normalizeQueryConcurrency(globalValue);
 
     return DEFAULT_AGENT_QUERY_CONCURRENCY;
   }

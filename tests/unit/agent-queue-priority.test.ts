@@ -42,11 +42,13 @@ class RecordingHarness implements AgentHarness {
 class BlockingHarness implements AgentHarness {
   readonly type = 'codex' as HarnessType;
   prompts: string[] = [];
+  options: HarnessOptions[] = [];
   started = 0;
   private releases: Array<() => void> = [];
 
   async *run(prompt: string, _options: HarnessOptions): AsyncGenerator<HarnessMessage> {
     this.prompts.push(prompt);
+    this.options.push(_options);
     this.started += 1;
     await new Promise<void>((resolve) => {
       this.releases.push(resolve);
@@ -173,7 +175,7 @@ Team objective: Decompose this objective into member-owned work.`,
   });
 
   it('runs queued operator work before older queued background work', async () => {
-    process.env.ID_AGENT_QUERY_CONCURRENCY = '1';
+    process.env.ID_AGENT_LEAD_QUERY_CONCURRENCY = '1';
     const harness = new RecordingHarness(true);
     const server = new AgentRestServer({ agentName: 'lead', harness });
 
@@ -216,6 +218,33 @@ Team objective: Decompose this objective into member-owned work.`,
       harness.releaseAll();
       await viWaitFor(() => expect(harness.started).toBe(3));
       expect(harness.prompts[2]).toContain('third lead request');
+    } finally {
+      harness.releaseAll();
+      await server.stop();
+    }
+  });
+
+  it('runs configured lead queries concurrently by default without the global worker cap', async () => {
+    process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT = '1';
+    const harness = new BlockingHarness();
+    const server = new AgentRestServer({
+      agentName: 'lead',
+      agentIdentity: { name: 'lead', team: 'default', metadata: { primaryLead: true } },
+      harness,
+    });
+
+    try {
+      await (server as any).startQuery('q1', 'first lead request', 'lead-session-1', 'remote');
+      await (server as any).startQuery('q2', 'second lead request', 'lead-session-2', 'remote');
+      await (server as any).startQuery('q3', 'third lead request', 'lead-session-3', 'remote');
+      await (server as any).startQuery('q4', 'fourth lead request', 'lead-session-4', 'remote');
+
+      await viWaitFor(() => expect(harness.started).toBe(4));
+      expect(harness.prompts[0]).toContain('first lead request');
+      expect(harness.prompts[1]).toContain('second lead request');
+      expect(harness.prompts[2]).toContain('third lead request');
+      expect(harness.prompts[3]).toContain('fourth lead request');
+      expect(harness.options.map((options) => options.resume)).toEqual([undefined, undefined, undefined, undefined]);
     } finally {
       harness.releaseAll();
       await server.stop();

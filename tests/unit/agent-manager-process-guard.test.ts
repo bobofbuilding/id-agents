@@ -1619,7 +1619,7 @@ new org text from sidecar
         ...agentRow({
           team_id: teamId,
           id: 'agent-busy',
-          name: 'busy-lead',
+          name: 'busy-worker',
           port: 4112,
           status: 'running',
         }),
@@ -1642,7 +1642,7 @@ new org text from sidecar
       });
       const fetchSpy = vi.spyOn(globalThis, 'fetch');
 
-      const result = await (manager as any).executeRemoteCommand('/ask busy-lead do one more thing', teamId, 'default');
+      const result = await (manager as any).executeRemoteCommand('/ask busy-worker do one more thing', teamId, 'default');
 
       expect(result.ok).toBe(false);
       expect(result.error).toContain('already has 2 active queries');
@@ -1660,7 +1660,7 @@ new org text from sidecar
       brainDisabled: process.env.BRAIN_CONTEXT_DISABLED,
     };
     let talkServer: Awaited<ReturnType<typeof startTalkServer>> | null = null;
-    delete process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
+    process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT = '1';
     delete process.env.ID_MAX_ACTIVE_QUERIES_PER_LEAD;
     process.env.BRAIN_CONTEXT_DISABLED = 'true';
     try {
@@ -1689,6 +1689,16 @@ new org text from sidecar
         owner_kind: 'agent',
         owner_id: 'agent-default-lead',
       });
+      for (let i = 2; i <= 5; i++) {
+        await db.queries.upsert(teamId, 'agent-default-lead', {
+          query_id: `lead-existing-processing-${i}`,
+          status: 'processing',
+          prompt: `current work ${i}`,
+          created: Date.now(),
+          owner_kind: 'agent',
+          owner_id: 'agent-default-lead',
+        });
+      }
 
       const result = await (manager as any).executeRemoteCommand('/ask lead do one more thing', teamId, 'default');
 

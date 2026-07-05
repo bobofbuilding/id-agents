@@ -6,6 +6,7 @@
 
 - **Apply the agent's configured model in the Claude Code CLI harness.** `src/harness/claude-code-cli.ts` now passes each agent's configured model (alias-resolved) as `--model` when spawning `claude`. Previously the CLI harness omitted `--model` entirely and only honored `CLAUDE_CLI_MODEL`, so every `claude-code-cli` agent ran Claude Code's account/subscription default regardless of its YAML `model:` field. `CLAUDE_CLI_MODEL` remains a global override; with neither set, Claude Code falls back to its own default.
 - **Kick off lead delegation immediately.** Lead-owned parent objectives now receive the delegation kickoff as soon as they are assigned/claimed instead of waiting through a fresh-task grace period. The 10-minute delegation audit grace still prevents false backlog alarms while the lead creates member-owned child tasks, and `ID_LEAD_DELEGATION_KICKOFF_GRACE_MS` remains available for deployments that deliberately want a short startup delay.
+- **Uncap configured lead query sessions by default.** Team leads and the primary lead no longer inherit the worker active-query cap, so multiple operator/delegation sessions can run concurrently with separate context windows. Set `ID_AGENT_LEAD_QUERY_CONCURRENCY` or `ID_MAX_ACTIVE_QUERIES_PER_LEAD` to a positive number only when an explicit lead cap is desired.
 
 ### Changes
 

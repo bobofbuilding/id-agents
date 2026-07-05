@@ -138,8 +138,7 @@ const __dirname = path.dirname(__filename);
 const DEFAULT_MAX_DOING_TASKS = 30;
 const DEFAULT_STALLED_TASK_MAX_PROBES = 3;
 const DEFAULT_MAX_ACTIVE_QUERIES_PER_AGENT = 1;
-const DEFAULT_MAX_ACTIVE_QUERIES_PER_LEAD = 3;
-const MAX_ACTIVE_QUERIES_PER_AGENT = 16;
+const DEFAULT_MAX_ACTIVE_QUERIES_PER_LEAD = 0;
 const DEFAULT_TASK_BOARD_OPEN_LIMIT = 250;
 const DEFAULT_TASK_BOARD_DONE_LIMIT = 25;
 
@@ -795,9 +794,7 @@ export class AgentManagerDb {
     if (raw === undefined || raw === null || raw === '') return null;
     const parsed = Number(raw);
     if (parsed === 0) return 0;
-    return Number.isFinite(parsed) && parsed > 0
-      ? Math.min(MAX_ACTIVE_QUERIES_PER_AGENT, Math.floor(parsed))
-      : null;
+    return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : null;
   }
 
   private getMaxActiveQueriesForAgent(agent?: AgentRow | null, teamName?: string): number {
@@ -805,27 +802,26 @@ export class AgentManagerDb {
     const metadataCap = this.parseAgentQueryCap(metadata);
     if (metadataCap !== null) return metadataCap;
 
-    const raw = process.env.ID_AGENT_QUERY_CONCURRENCY !== undefined && process.env.ID_AGENT_QUERY_CONCURRENCY !== ''
-      ? process.env.ID_AGENT_QUERY_CONCURRENCY
-      : process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
-    if (raw === '0') return 0;
-    if (raw !== undefined && raw !== '') {
-      const parsed = Number(raw);
-      return Number.isFinite(parsed) && parsed > 0
-        ? Math.min(MAX_ACTIVE_QUERIES_PER_AGENT, Math.floor(parsed))
-        : DEFAULT_MAX_ACTIVE_QUERIES_PER_AGENT;
-    }
-
     if (agent && teamName && this.isConfiguredTeamLead(teamName, agent)) {
       const leadRaw =
         process.env.ID_MAX_ACTIVE_QUERIES_PER_LEAD
         ?? process.env.ID_LEAD_QUERY_CONCURRENCY
         ?? process.env.ID_AGENT_LEAD_QUERY_CONCURRENCY;
       if (leadRaw === '0') return 0;
-      const parsed = leadRaw ? Number(leadRaw) : DEFAULT_MAX_ACTIVE_QUERIES_PER_LEAD;
-      return Number.isFinite(parsed) && parsed > 0
-        ? Math.min(MAX_ACTIVE_QUERIES_PER_AGENT, Math.floor(parsed))
-        : DEFAULT_MAX_ACTIVE_QUERIES_PER_LEAD;
+      if (leadRaw !== undefined && leadRaw !== '') {
+        const parsed = Number(leadRaw);
+        return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : DEFAULT_MAX_ACTIVE_QUERIES_PER_LEAD;
+      }
+      return DEFAULT_MAX_ACTIVE_QUERIES_PER_LEAD;
+    }
+
+    const raw = process.env.ID_AGENT_QUERY_CONCURRENCY !== undefined && process.env.ID_AGENT_QUERY_CONCURRENCY !== ''
+      ? process.env.ID_AGENT_QUERY_CONCURRENCY
+      : process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
+    if (raw === '0') return 0;
+    if (raw !== undefined && raw !== '') {
+      const parsed = Number(raw);
+      return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : DEFAULT_MAX_ACTIVE_QUERIES_PER_AGENT;
     }
 
     return DEFAULT_MAX_ACTIVE_QUERIES_PER_AGENT;
