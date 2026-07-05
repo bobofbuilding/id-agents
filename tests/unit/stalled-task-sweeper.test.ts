@@ -1176,6 +1176,86 @@ describe('stalled task sweeper', () => {
     expect(create).not.toHaveBeenCalled();
   });
 
+  it('routes manual jumpstart for parked blocked tasks to task-master triage', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const parkedBlocked = task({
+      id: 'todo-blocked-jumpstart-1',
+      name: 'parked-blocked',
+      uuid: 'abcdef12-3456-4789-8123-abcdef123456',
+      title: 'Parked blocked task',
+      status: 'todo',
+      owner: null,
+      updated_at: nowSec - 600,
+      description: [
+        'Original task brief',
+        'Manager triage (control_reply_blocked, 2026-07-05T05:55:13.599Z): BLOCKED: Task requires additional information from the team lead to proceed.',
+      ].join('\n\n'),
+    });
+    const opsTeam = team({ id: 'ops-team-id', name: 'ops-team' });
+    const taskMaster = agent({
+      id: 'task-master-id',
+      team_id: opsTeam.id,
+      name: 'task-master',
+      status: 'running',
+    });
+    const db = fakeDb({
+      teams: {
+        getTeamByName: vi.fn(async (name: string) => {
+          if (name === 'ops-team') return opsTeam;
+          if (name === 'default') return team();
+          return null;
+        }),
+        listTeams: vi.fn(async () => [opsTeam]),
+      },
+      agents: {
+        getByName: vi.fn(async (teamId: string, name: string) =>
+          teamId === opsTeam.id && name === 'task-master' ? taskMaster : null,
+        ),
+        list: vi.fn(async (teamId: string) => teamId === opsTeam.id ? [taskMaster] : [agent()]),
+      },
+      tasks: {
+        getByUuidPrefix: vi.fn(async (prefix: string) => prefix === 'abcdef12' ? [parkedBlocked] : []),
+        claim: vi.fn(async () => true),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-jumpstart-parked-blocked-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const result = await manager.executeRemoteCommand('/task jumpstart-stalled --task #abcdef12', TEAM_ID, 'default');
+
+    expect(result).toMatchObject({
+      ok: true,
+      result: {
+        scannedTeams: 1,
+        scannedOwners: 1,
+        triagedOwners: 1,
+        items: [
+          {
+            team: 'default',
+            owner: 'unclaimed',
+            message: expect.stringContaining('parked and needs task-manager triage'),
+            triage: {
+              status: 'sent_task_manager',
+              actor: 'task-master',
+              actorTeam: 'ops-team',
+            },
+          },
+        ],
+      },
+    });
+    expect(db.tasks.claim).not.toHaveBeenCalled();
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'ops-team',
+      'task-master',
+      expect.stringContaining('The owner replied BLOCKED: Task requires additional information from the team lead to proceed.'),
+    );
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'ops-team',
+      'task-master',
+      expect.stringContaining('ASK-USER with the exact missing decision'),
+    );
+  });
+
   it('does not auto-assign an unowned todo task that was recently held for lead delegation', async () => {
     const nowSec = Math.floor(NOW_MS / 1000);
     const recentlyHeld = task({

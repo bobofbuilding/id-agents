@@ -2130,6 +2130,43 @@ export class AgentManagerDb {
     }
 
     const taskRef = this.taskShortRef(task);
+    if (task.status === 'todo' && !task.owner) {
+      const nowMs = Date.now();
+      const stalledMinutes = Math.max(0, Math.round((nowMs - this.taskLastActivityMs(task)) / 60000));
+      const latestTriage = this.latestManagerTriageNote(task);
+      const sourceAction = latestTriage?.reason === 'control_reply_blocked'
+        ? 'blocked'
+        : latestTriage?.reason === 'control_reply_reassign'
+          ? 'reassign'
+          : null;
+      report.scannedOwners = 1;
+      const fallback = await this.routeStalledTaskToTaskManagerFallback({
+        teamId: params.team.id,
+        teamName: params.team.name,
+        task,
+        ref: taskRef,
+        stalledMinutes,
+        ownerName: 'unclaimed',
+        nowMs,
+        renudgeMs: this.getStallRenudgeMs(),
+        maxProbes: this.getMaxStalledTaskProbes(),
+        force: params.force,
+        reason: 'unclaimed',
+        eventReason: 'unclaimed',
+        blockerNote: latestTriage?.note ?? null,
+        sourceAction,
+      });
+      report.items.push({
+        team: params.team.name,
+        owner: 'unclaimed',
+        ownerStatus: null,
+        message: `unowned_todo_task: ${taskRef} is parked and needs task-manager triage`,
+        blockers: [taskRef],
+        triage: fallback ?? { status: 'no_task_manager_available', taskRef },
+      });
+      report.triagedOwners = fallback ? 1 : 0;
+      return report;
+    }
     if (task.status !== 'doing') {
       report.skippedOwners.push({
         team: params.team.name,
@@ -3463,6 +3500,17 @@ Return this JSON shape:
     const trimmed = note.trim().replace(/\s+/g, ' ').slice(0, 500);
     const line = `Manager triage (${reason}, ${new Date(occurredAt).toISOString()}): ${trimmed || 'no detail'}`;
     return [description?.trim(), line].filter(Boolean).join('\n\n');
+  }
+
+  private latestManagerTriageNote(task: TaskRow): { reason: string; note: string } | null {
+    const description = String(task.description || '');
+    const matches = [...description.matchAll(/Manager triage \(([^,]+), [^)]+\): ([^\n]+)/g)];
+    const latest = matches[matches.length - 1];
+    if (!latest) return null;
+    return {
+      reason: latest[1],
+      note: latest[2].trim().replace(/\s+/g, ' ').slice(0, 500),
+    };
   }
 
   private async hasAppliedTaskControlReply(teamId: string, queryId: string): Promise<boolean> {
