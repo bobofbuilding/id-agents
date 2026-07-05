@@ -1356,6 +1356,12 @@ export class AgentManagerDb {
       ?? payload.childTaskNames
       ?? payload.child_tasks
       ?? payload.childTasks;
+    if (typeof raw === 'string') {
+      return raw
+        .split(',')
+        .map((item) => item.trim())
+        .filter(Boolean);
+    }
     if (!Array.isArray(raw)) return [];
     return raw.map((item) => String(item).trim()).filter(Boolean);
   }

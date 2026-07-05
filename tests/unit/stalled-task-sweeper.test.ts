@@ -1276,6 +1276,56 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('accepts comma-separated delegated task names for team-lead completion packets', async () => {
+    const lead = agent({ id: 'lead-1', name: 'research-lead', metadata: { lead: true } });
+    const worker = agent({ id: 'worker-1', name: 'analyst' });
+    const parent = task({
+      id: 'parent-task',
+      name: 'design-brain-retrieval-eval-suite',
+      uuid: '2ddd2587-0cb1-49a5-bcf3-6afe773e8cfa',
+      title: 'Design Brain retrieval evaluation suite',
+      owner: lead.id,
+    });
+    const child = task({
+      id: 'child-task',
+      name: 'brain-eval-metrics-rubric',
+      uuid: '7e973121-091f-481e-bcc7-e15f042d9519',
+      title: 'Specify Brain retrieval evaluation metrics and rubric',
+      owner: worker.id,
+      status: 'done',
+      completed_at: Math.floor(NOW_MS / 1000) - 60,
+    });
+    const db = fakeDb({
+      agents: {
+        getById: vi.fn(async (id: string) => id === lead.id ? lead : id === worker.id ? worker : null),
+      },
+      tasks: {
+        getByUuidPrefix: vi.fn(async (prefix: string) => {
+          if (child.uuid.startsWith(prefix)) return [child];
+          if (parent.uuid.startsWith(prefix)) return [parent];
+          return [];
+        }),
+        getByNameForTeam: vi.fn(async (name: string) => {
+          if (name === child.name) return child;
+          if (name === parent.name) return parent;
+          return null;
+        }),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-comma-delegated-task-names-test', db, { libraryRoot: null }) as any;
+
+    const error = await manager.validateTeamLeadDelegationBeforeDone({
+      teamId: TEAM_ID,
+      teamName: 'research',
+      task: parent,
+      payload: {
+        delegated_task_names: ' brain-eval-metrics-rubric, brain-eval-metrics-rubric ',
+      },
+    });
+
+    expect(error).toBeNull();
+  });
+
   it('marks a memory-writing delegation done when it returns a memory update package', async () => {
     const staleTask = task({
       name: 'write-memory-entries',
