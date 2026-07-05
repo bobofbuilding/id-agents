@@ -1541,7 +1541,7 @@ export class AgentManagerDb {
     ref: string;
     stalledMinutes: number;
     ownerName: string;
-    reason: 'no_live_lead' | 'lead_busy' | 'owner_busy' | 'owner_unresponsive' | 'lead_delegation_required' | 'unclaimed';
+    reason: 'no_live_lead' | 'lead_busy' | 'owner_busy' | 'owner_unresponsive' | 'lead_delegation_required' | 'lead_capacity' | 'unclaimed';
     leadName?: string;
   }): string {
     const ownerState = params.reason === 'owner_busy'
@@ -1550,6 +1550,8 @@ export class AgentManagerDb {
         ? 'task has no owner'
       : params.reason === 'lead_delegation_required'
         ? `team lead ${params.ownerName} owns a parent objective without member-owned child tasks`
+        : params.reason === 'lead_capacity'
+          ? `team lead ${params.ownerName} has no live non-lead teammate available for delegation`
         : params.reason === 'owner_unresponsive'
           ? `owner ${params.ownerName} has repeated failed or expired control prompts for this task`
         : `owner ${params.ownerName} is not live`;
@@ -1557,11 +1559,13 @@ export class AgentManagerDb {
       ? `team lead ${params.leadName || 'lead'} is busy with another active query`
       : params.reason === 'unclaimed'
         ? `team lead ${params.leadName || 'lead'} cannot accept this unclaimed-task triage right now`
-      : params.reason === 'no_live_lead'
-        ? 'there is no live team lead'
-        : params.reason === 'lead_delegation_required'
-          ? 'task-manager delegation is required'
-          : 'manual jumpstart was requested';
+        : params.reason === 'no_live_lead'
+          ? 'there is no live team lead'
+          : params.reason === 'lead_delegation_required'
+            ? 'task-manager delegation is required'
+            : params.reason === 'lead_capacity'
+              ? 'task-manager capacity triage is required before waking the lead'
+              : 'manual jumpstart was requested';
     return `TASK DELEGATION from manager: You are assigned task-manager triage for ${params.teamName} task ${params.ref} ("${params.task.title}"). The task has been active ${params.stalledMinutes}m, ${ownerState}, and ${leadState}. New task assignment to that owner is held until this is triaged. Use the manager task flow to restart or replace the owner, reassign the task, split it into member-owned work, or park it as todo with a clear blocker. Do not create duplicate objectives; mutate only the existing task or the minimum child tasks required to unblock it.`;
   }
 
@@ -1604,7 +1608,7 @@ export class AgentManagerDb {
     renudgeMs: number;
     maxProbes: number;
     force?: boolean;
-    reason: 'no_live_lead' | 'lead_busy' | 'owner_busy' | 'owner_unresponsive' | 'lead_delegation_required' | 'unclaimed';
+    reason: 'no_live_lead' | 'lead_busy' | 'owner_busy' | 'owner_unresponsive' | 'lead_delegation_required' | 'lead_capacity' | 'unclaimed';
     eventReason: 'owner_unavailable' | 'owner_busy' | 'lead_delegation_required' | 'probe_limit_reached' | 'unclaimed';
     leadName?: string;
   }): Promise<{ status: string; taskRef: string; actor?: string; actorTeam?: string; attempt?: number } | null> {
@@ -2346,11 +2350,35 @@ export class AgentManagerDb {
     if (this.stalledNudges.has(key)) return;
     const children = await this.findDelegatedChildTasks(task, teamId, owner);
     if (children.length) return;
-    const members = (await this.db.agents.list(teamId).catch(() => [] as AgentRow[]))
-      .filter((agent) => agent.id !== owner.id && this.isLiveForSupervision(agent))
-      .map((agent) => agent.name);
     const ref = this.taskShortRef(task);
     if (await this.hasActiveSupervisionAskForMarker(teamId, owner, ref)) return;
+    const teamAgents = await this.db.agents.list(teamId).catch(() => [] as AgentRow[]);
+    const members = teamAgents
+      .filter((agent) =>
+        agent.id !== owner.id
+        && this.isLiveForSupervision(agent)
+        && !this.isConfiguredTeamLead(teamName, agent)
+        && !this.isIdleParkingProtectedAgent(agent, teamName)
+        && Boolean(agent.endpoint),
+      )
+      .map((agent) => agent.name);
+    if (!members.length) {
+      const activeMinutes = Math.max(0, Math.round((Date.now() - this.taskLastActivityMs(task)) / 60000));
+      await this.routeStalledTaskToTaskManagerFallback({
+        teamId,
+        teamName,
+        task,
+        ref,
+        stalledMinutes: activeMinutes,
+        ownerName: owner.name,
+        nowMs: Date.now(),
+        renudgeMs: this.getStallRenudgeMs(),
+        maxProbes: this.getMaxStalledTaskProbes(),
+        reason: 'lead_capacity',
+        eventReason: 'lead_delegation_required',
+      });
+      return;
+    }
     if (await this.hasAnyActiveQuery(owner)) return;
     const memberHint = members.length ? ` Available teammates: ${members.join(', ')}.` : '';
     const message = `Lead delegation kickoff: task ${ref} ("${task.title}") is assigned to you as the team coordinator. Do not do the whole task yourself. Immediately decompose it into member-owned child tasks with \`/task create ... --owner <teammate> --parent-task ${ref}\`, then close this parent only after child tasks are done using \`/task done ${ref} --delegated-task-names "child-a,child-b"\`. If this is truly advisory, close it with \`--no-delegation-reason\` and a failure/summary note.${memberHint}`;

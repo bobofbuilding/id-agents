@@ -1940,6 +1940,83 @@ describe('stalled task sweeper', () => {
     expect(db.events.insert).not.toHaveBeenCalled();
   });
 
+  it('routes lead kickoff to task-manager when no live member capacity exists', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const researchTeam = team({ name: 'research' });
+    const opsTeam = team({ id: 'ops-team-id', name: 'ops-team' });
+    const lead = agent({
+      id: 'research-lead-1',
+      name: 'research-lead',
+      metadata: { catalog: { role: 'lead' } },
+    });
+    const stoppedWorker = agent({
+      id: 'researcher-1',
+      name: 'researcher',
+      status: 'stopped',
+    });
+    const taskManager = agent({
+      team_id: opsTeam.id,
+      id: 'task-manager-id',
+      name: 'task-manager',
+      metadata: { catalog: { role: 'task-manager' } },
+    });
+    const leadTask = task({
+      id: 'lead-task-1',
+      name: 'coordinate-research-work',
+      uuid: '87654321-4321-4321-8321-123456789abc',
+      title: 'Coordinate research work',
+      owner: lead.id,
+      created_by: lead.id,
+      created_at: nowSec - 11 * 60,
+      updated_at: nowSec - 11 * 60,
+    });
+    const db = fakeDb({
+      teams: {
+        getTeam: vi.fn(async () => researchTeam),
+        getTeamByName: vi.fn(async (name: string) => name === 'ops-team' ? opsTeam : null),
+      },
+      agents: {
+        getByName: vi.fn(async (teamId: string, name: string) =>
+          teamId === opsTeam.id && name === 'task-master' ? taskManager : null,
+        ),
+        list: vi.fn(async (teamId: string) => teamId === opsTeam.id ? [taskManager] : [lead, stoppedWorker]),
+      },
+      tasks: {
+        list: vi.fn(async ({ teamId }: { teamId?: string } = {}) => teamId === TEAM_ID ? [leadTask] : []),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-lead-capacity-kickoff-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.promptLeadForDelegationKickoff(TEAM_ID, 'research', leadTask, lead);
+
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'ops-team',
+      'task-manager',
+      expect.stringContaining('no live non-lead teammate available for delegation'),
+    );
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'ops-team',
+      'task-manager',
+      expect.stringContaining('task-manager capacity triage is required before waking the lead'),
+    );
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalledWith(
+      'research',
+      'research-lead',
+      expect.any(String),
+    );
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      team_id: TEAM_ID,
+      topic: 'task:triaged',
+      actor_agent_id: taskManager.id,
+      subject_id: '87654321-4321-4321-8321-123456789abc',
+      data: expect.objectContaining({
+        reason: 'lead_delegation_required',
+        stalled_minutes: 11,
+      }),
+    }));
+  });
+
   it('triages a stalled task to the lead when the owner is unavailable', async () => {
     const unavailableOwner = agent({ status: 'stopped' });
     const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
