@@ -39,12 +39,37 @@ class RecordingHarness implements AgentHarness {
   }
 }
 
+class BlockingHarness implements AgentHarness {
+  readonly type = 'codex' as HarnessType;
+  prompts: string[] = [];
+  started = 0;
+  private releases: Array<() => void> = [];
+
+  async *run(prompt: string, _options: HarnessOptions): AsyncGenerator<HarnessMessage> {
+    this.prompts.push(prompt);
+    this.started += 1;
+    await new Promise<void>((resolve) => {
+      this.releases.push(resolve);
+    });
+    yield { type: 'result', result: 'ok' };
+  }
+
+  releaseAll(): void {
+    for (const release of this.releases.splice(0)) release();
+  }
+}
+
 describe('agent query queue priority', () => {
   afterEach(() => {
     delete process.env.MANAGER_URL;
     delete process.env.ID_TEAM;
     delete process.env.ID_AGENT_RUN_AUTOMATIC_HEARTBEATS;
     delete process.env.ID_MCP_SERVERS;
+    delete process.env.ID_AGENT_QUERY_CONCURRENCY;
+    delete process.env.ID_AGENT_LEAD_QUERY_CONCURRENCY;
+    delete process.env.ID_LEAD_QUERY_CONCURRENCY;
+    delete process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
+    delete process.env.ID_MAX_ACTIVE_QUERIES_PER_LEAD;
   });
 
   it('classifies operator work ahead of delegation and background work', () => {
@@ -148,6 +173,7 @@ Team objective: Decompose this objective into member-owned work.`,
   });
 
   it('runs queued operator work before older queued background work', async () => {
+    process.env.ID_AGENT_QUERY_CONCURRENCY = '1';
     const harness = new RecordingHarness(true);
     const server = new AgentRestServer({ agentName: 'lead', harness });
 
@@ -165,6 +191,56 @@ Team objective: Decompose this objective into member-owned work.`,
       expect(harness.prompts[1]).toContain('operator request that should jump the background queue');
       expect(harness.prompts[2]).toContain('Heartbeat: second background wake');
     } finally {
+      await server.stop();
+    }
+  });
+
+  it('runs lead queries in parallel up to the lead concurrency cap', async () => {
+    process.env.ID_AGENT_LEAD_QUERY_CONCURRENCY = '2';
+    const harness = new BlockingHarness();
+    const server = new AgentRestServer({
+      agentName: 'lead',
+      agentIdentity: { name: 'lead', team: 'default', metadata: { primaryLead: true } },
+      harness,
+    });
+
+    try {
+      await (server as any).startQuery('q1', 'first lead request', undefined, 'remote');
+      await (server as any).startQuery('q2', 'second lead request', undefined, 'remote');
+      await (server as any).startQuery('q3', 'third lead request', undefined, 'remote');
+
+      await viWaitFor(() => expect(harness.started).toBe(2));
+      expect(harness.prompts[0]).toContain('first lead request');
+      expect(harness.prompts[1]).toContain('second lead request');
+
+      harness.releaseAll();
+      await viWaitFor(() => expect(harness.started).toBe(3));
+      expect(harness.prompts[2]).toContain('third lead request');
+    } finally {
+      harness.releaseAll();
+      await server.stop();
+    }
+  });
+
+  it('keeps non-lead workers single slot by default', async () => {
+    const harness = new BlockingHarness();
+    const server = new AgentRestServer({
+      agentName: 'skill-discoverer',
+      agentIdentity: { name: 'skill-discoverer', team: 'skillmesh' },
+      harness,
+    });
+
+    try {
+      await (server as any).startQuery('q1', 'first worker request', undefined, 'remote');
+      await (server as any).startQuery('q2', 'second worker request', undefined, 'remote');
+
+      await viWaitFor(() => expect(harness.started).toBe(1));
+      expect(harness.prompts[0]).toContain('first worker request');
+
+      harness.releaseAll();
+      await viWaitFor(() => expect(harness.started).toBe(2));
+    } finally {
+      harness.releaseAll();
       await server.stop();
     }
   });

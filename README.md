@@ -541,6 +541,9 @@ See [Skills README](./skills/README.md) for the full skill directory listing.
 | `OWS_REGISTRAR_WALLET` | No | OWS wallet name for onchain signing (recommended over raw key) |
 | `ID_REGISTRAR_PRIVATE_KEY` | No | Wallet private key for onchain registration (fallback if OWS not used) |
 | `PUBLIC_BASE_URL` | No | Public URL base for agents (e.g., `https://idbot.live`) |
+| `ID_AGENT_LEAD_QUERY_CONCURRENCY` | No | Parallel query slots for lead-like agents (`default/lead`, configured team leads, `*-lead`; default `3`, max `16`) |
+| `ID_MAX_ACTIVE_QUERIES_PER_LEAD` | No | Manager-side `/ask` cap for lead-like agents (default `3`, max `16`) |
+| `ID_MAX_ACTIVE_QUERIES_PER_AGENT` | No | Global `/ask` cap override for all agents; leave unset to keep workers at `1` and leads at their lead cap |
 
 **Per-agent environment (set automatically by the manager):**
 

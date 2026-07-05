@@ -138,6 +138,8 @@ const __dirname = path.dirname(__filename);
 const DEFAULT_MAX_DOING_TASKS = 30;
 const DEFAULT_STALLED_TASK_MAX_PROBES = 3;
 const DEFAULT_MAX_ACTIVE_QUERIES_PER_AGENT = 1;
+const DEFAULT_MAX_ACTIVE_QUERIES_PER_LEAD = 3;
+const MAX_ACTIVE_QUERIES_PER_AGENT = 16;
 const DEFAULT_TASK_BOARD_OPEN_LIMIT = 250;
 const DEFAULT_TASK_BOARD_DONE_LIMIT = 25;
 
@@ -768,11 +770,54 @@ export class AgentManagerDb {
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : 5 * 60 * 1000;
   }
 
-  private getMaxActiveQueriesPerAgent(): number {
+  private parseAgentQueryCap(metadata: AgentMetadata): number | null {
+    const catalog = metadata.catalog && typeof metadata.catalog === 'object'
+      ? metadata.catalog as Record<string, unknown>
+      : {};
+    const raw =
+      metadata.maxActiveQueries
+      ?? metadata.max_active_queries
+      ?? metadata.queryConcurrency
+      ?? metadata.query_concurrency
+      ?? catalog.maxActiveQueries
+      ?? catalog.max_active_queries
+      ?? catalog.queryConcurrency
+      ?? catalog.query_concurrency;
+    if (raw === undefined || raw === null || raw === '') return null;
+    const parsed = Number(raw);
+    if (parsed === 0) return 0;
+    return Number.isFinite(parsed) && parsed > 0
+      ? Math.min(MAX_ACTIVE_QUERIES_PER_AGENT, Math.floor(parsed))
+      : null;
+  }
+
+  private getMaxActiveQueriesForAgent(agent?: AgentRow | null, teamName?: string): number {
+    const metadata = ((agent?.metadata as AgentMetadata | null | undefined) ?? {});
+    const metadataCap = this.parseAgentQueryCap(metadata);
+    if (metadataCap !== null) return metadataCap;
+
     const raw = process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
     if (raw === '0') return 0;
-    const parsed = raw ? Number(raw) : DEFAULT_MAX_ACTIVE_QUERIES_PER_AGENT;
-    return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : DEFAULT_MAX_ACTIVE_QUERIES_PER_AGENT;
+    if (raw !== undefined && raw !== '') {
+      const parsed = Number(raw);
+      return Number.isFinite(parsed) && parsed > 0
+        ? Math.min(MAX_ACTIVE_QUERIES_PER_AGENT, Math.floor(parsed))
+        : DEFAULT_MAX_ACTIVE_QUERIES_PER_AGENT;
+    }
+
+    if (agent && teamName && this.isConfiguredTeamLead(teamName, agent)) {
+      const leadRaw =
+        process.env.ID_MAX_ACTIVE_QUERIES_PER_LEAD
+        ?? process.env.ID_LEAD_QUERY_CONCURRENCY
+        ?? process.env.ID_AGENT_LEAD_QUERY_CONCURRENCY;
+      if (leadRaw === '0') return 0;
+      const parsed = leadRaw ? Number(leadRaw) : DEFAULT_MAX_ACTIVE_QUERIES_PER_LEAD;
+      return Number.isFinite(parsed) && parsed > 0
+        ? Math.min(MAX_ACTIVE_QUERIES_PER_AGENT, Math.floor(parsed))
+        : DEFAULT_MAX_ACTIVE_QUERIES_PER_LEAD;
+    }
+
+    return DEFAULT_MAX_ACTIVE_QUERIES_PER_AGENT;
   }
 
   private canRunStalledProbe(key: string, nowMs: number, renudgeMs: number, maxProbes: number): boolean {
@@ -1268,7 +1313,7 @@ export class AgentManagerDb {
     const configured = this.configuredTeamLeadNames[teamName] || [];
     if (configured.includes(owner.name)) return true;
     const meta = (owner.metadata as AgentMetadata | null | undefined) ?? {};
-    if (meta.primaryLead === true) return true;
+    if (meta.primaryLead === true || meta.lead === true) return true;
     const roleText = this.agentLeadRoleText(owner);
     const roleNameText = this.agentLeadRoleNameText(owner);
     if (this.agentNameLooksLikeLead(owner)) return true;
@@ -11655,7 +11700,7 @@ Return this JSON shape:
             },
           };
         }
-        const maxActiveQueries = this.getMaxActiveQueriesPerAgent();
+        const maxActiveQueries = this.getMaxActiveQueriesForAgent(a, teamName);
         if (maxActiveQueries > 0) {
           const activeQueries = await this.countActiveQueries(a.id);
           if (activeQueries >= maxActiveQueries) {

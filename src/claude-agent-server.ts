@@ -45,6 +45,19 @@ type ExternalStopQueryStatus = 'cancelled' | 'expired' | 'failed';
 const EXTERNAL_STOP_QUERY_STATUSES = new Set<ExternalStopQueryStatus>(['cancelled', 'expired', 'failed']);
 
 const DEFAULT_NEWS_TRIGGER_MESSAGE_CHAR_LIMIT = 2400;
+const DEFAULT_AGENT_QUERY_CONCURRENCY = 1;
+const DEFAULT_LEAD_QUERY_CONCURRENCY = 3;
+const MAX_AGENT_QUERY_CONCURRENCY = 16;
+
+function parsePositiveInteger(value: unknown): number | null {
+  if (value === undefined || value === null || value === '') return null;
+  const parsed = Number.parseInt(String(value), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function clampQueryConcurrency(value: number): number {
+  return Math.max(1, Math.min(MAX_AGENT_QUERY_CONCURRENCY, Math.floor(value)));
+}
 
 function getNewsTriggerMessageCharLimit(): number {
   const parsed = Number.parseInt(process.env.ID_AGENT_NEWS_TRIGGER_MESSAGE_CHARS || '', 10);
@@ -667,12 +680,13 @@ export class AgentRestServer {
   private sharedDirectory: string;
   private allowedTools: string[];
   private agentName: string | undefined;
-  private agentIdentity: { name?: string; team?: string; metadata?: any; tokenId?: string; domain?: string } | undefined;
+  private agentIdentity: { name?: string; team?: string; network?: string; metadata?: any; tokenId?: string; domain?: string } | undefined;
   private maxNewsItems: number = 100; // Keep last 100 news items
   private newsCleanupInterval: NodeJS.Timeout;
   private httpServer: http.Server | undefined;
 
-  // Query queue - serializes query processing to prevent concurrent harness execution
+  // Query queue - bounded per-agent worker pool. Workers default to one slot;
+  // lead-like agents get a small parallel intake cap.
   private queryQueue: Array<{
     queryId: string;
     prompt: string;
@@ -682,11 +696,16 @@ export class AgentRestServer {
     priority: QueryQueuePriority;
   }> = [];
   private isProcessingQuery: boolean = false;
+  private activeQueryWorkers = 0;
+  private queryConcurrency = DEFAULT_AGENT_QUERY_CONCURRENCY;
   private currentQueryExecution: CurrentQueryExecution | undefined;
+  private currentQueryExecutions: Map<string, CurrentQueryExecution> = new Map();
   private db: Db | undefined;
   private dbTeamId: string | undefined;
   private dbAgentId: string | undefined;
   private harness: AgentHarness;
+  private queryHarnessFactory: () => AgentHarness;
+  private activeHarnessesByQuery: Map<string, AgentHarness> = new Map();
   private harnessType: HarnessType;
   private xmtp: XmtpMessagingType | null = null;
 
@@ -734,6 +753,10 @@ export class AgentRestServer {
     // Initialize harness based on ID_HARNESS env var (defaults to 'claude-agent-sdk')
     this.harnessType = resolvedRuntime as HarnessType;
     this.harness = options.harness || createHarness(this.harnessType);
+    this.queryHarnessFactory = options.harness
+      ? () => options.harness!
+      : () => createHarness(this.harnessType);
+    this.queryConcurrency = this.resolveQueryConcurrency();
 
     // Note: do NOT set process.env.AGENT_NAME here (shared process; multiple agents).
 
@@ -769,6 +792,74 @@ export class AgentRestServer {
         this.newsItems = this.newsItems.slice(0, this.maxNewsItems);
       }
     }, 5 * 60 * 1000);
+  }
+
+  private getIdentityTeam(): string {
+    return String(
+      this.agentIdentity?.team
+      || this.agentIdentity?.network
+      || process.env.ID_TEAM
+      || process.env.ID_PROJECT
+      || '',
+    ).trim().toLowerCase();
+  }
+
+  private isLeadLikeIdentity(): boolean {
+    const metadata = this.agentIdentity?.metadata || {};
+    const catalog = metadata.catalog && typeof metadata.catalog === 'object'
+      ? metadata.catalog as Record<string, unknown>
+      : {};
+    if (metadata.primaryLead === true || metadata.lead === true) return true;
+    if (String(process.env.ID_AGENT_PRIMARY_LEAD || '').toLowerCase() === 'true') return true;
+
+    const name = String(this.agentIdentity?.name || this.agentName || '').trim().toLowerCase();
+    const team = this.getIdentityTeam();
+    if (team === 'default' && name === 'lead') return true;
+    if (name === 'lead' || /(^|[-_\s])(lead|coordinator|router)$/.test(name)) return true;
+
+    const roleText = [
+      metadata.role,
+      metadata.description,
+      catalog.role,
+      catalog.description,
+    ].map((value) => String(value || '').toLowerCase()).join('\n');
+    return /\b(lead|coordinator|router|supervisor|orchestrat(?:e|es|ion)|delegat(?:e|es|ion))\b/.test(roleText);
+  }
+
+  private metadataQueryConcurrency(): number | null {
+    const metadata = this.agentIdentity?.metadata || {};
+    const catalog = metadata.catalog && typeof metadata.catalog === 'object'
+      ? metadata.catalog as Record<string, unknown>
+      : {};
+    return parsePositiveInteger(metadata.queryConcurrency)
+      ?? parsePositiveInteger(metadata.query_concurrency)
+      ?? parsePositiveInteger(metadata.maxActiveQueries)
+      ?? parsePositiveInteger(metadata.max_active_queries)
+      ?? parsePositiveInteger(catalog.queryConcurrency)
+      ?? parsePositiveInteger(catalog.query_concurrency)
+      ?? parsePositiveInteger(catalog.maxActiveQueries)
+      ?? parsePositiveInteger(catalog.max_active_queries);
+  }
+
+  private resolveQueryConcurrency(): number {
+    const metadataValue = this.metadataQueryConcurrency();
+    if (metadataValue !== null) return clampQueryConcurrency(metadataValue);
+
+    const globalValue =
+      parsePositiveInteger(process.env.ID_AGENT_QUERY_CONCURRENCY)
+      ?? parsePositiveInteger(process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT);
+    if (globalValue !== null) return clampQueryConcurrency(globalValue);
+
+    if (this.isLeadLikeIdentity()) {
+      const leadValue =
+        parsePositiveInteger(process.env.ID_AGENT_LEAD_QUERY_CONCURRENCY)
+        ?? parsePositiveInteger(process.env.ID_LEAD_QUERY_CONCURRENCY)
+        ?? parsePositiveInteger(process.env.ID_MAX_ACTIVE_QUERIES_PER_LEAD)
+        ?? DEFAULT_LEAD_QUERY_CONCURRENCY;
+      return clampQueryConcurrency(leadValue);
+    }
+
+    return DEFAULT_AGENT_QUERY_CONCURRENCY;
   }
 
   private async fetchRoutedAgentTarget(
@@ -936,9 +1027,10 @@ export class AgentRestServer {
 
   private startExternalQueryStopWatcher(
     queryId: string,
+    harness: AgentHarness,
     onStop: (error: ExternalQueryStopError) => void,
   ): () => void {
-    if (!this.db || !this.dbTeamId || typeof this.harness.cancel !== 'function') {
+    if (!this.db || !this.dbTeamId || typeof harness.cancel !== 'function') {
       return () => {};
     }
 
@@ -959,7 +1051,7 @@ export class AgentRestServer {
           const error = new ExternalQueryStopError(queryId, status);
           console.log(`${logTime()} [Agent] ${error.message}; cancelling local harness`);
           onStop(error);
-          this.harness.cancel?.();
+          harness.cancel?.();
         }
       } catch (err: any) {
         if (!warned) {
@@ -1473,24 +1565,30 @@ export class AgentRestServer {
       }
     });
 
-    // Cancel endpoint - cancel the currently running query
+    // Cancel endpoint - cancel active query harnesses
     this.app.post('/cancel', async (req, res) => {
       try {
-        // Check if harness supports cancellation
-        if (typeof this.harness.cancel !== 'function') {
+        const activeHarnesses = Array.from(new Set(this.activeHarnessesByQuery.values()));
+        const cancellableHarnesses = activeHarnesses.filter((harness) => typeof harness.cancel === 'function');
+        if (cancellableHarnesses.length === 0 && typeof this.harness.cancel !== 'function') {
           return res.status(501).json({
             error: 'Cancellation not supported by this harness',
             harness: this.harnessType
           });
         }
 
-        // Try to cancel the running process
-        const cancelled = this.harness.cancel();
+        let cancelled = false;
+        if (cancellableHarnesses.length > 0) {
+          for (const harness of cancellableHarnesses) {
+            cancelled = harness.cancel?.() === true || cancelled;
+          }
+        } else {
+          cancelled = this.harness.cancel?.() === true;
+        }
 
         if (cancelled) {
-          // Find the currently processing query and mark it as cancelled
-          const processingQuery = Array.from(this.activeQueries.values()).find(q => q.status === 'processing');
-          if (processingQuery && processingQuery.status === 'processing') {
+          const processingQueries = Array.from(this.activeQueries.values()).filter(q => q.status === 'processing');
+          for (const processingQuery of processingQueries) {
             processingQuery.status = 'failed';
             processingQuery.completed = Date.now();
             processingQuery.error = 'Query was cancelled';
@@ -2305,23 +2403,32 @@ Produce the smallest useful action/result for this inbound wake.`;
   private async getPeerBusyDeferReason(from: string): Promise<'agent_busy' | 'primary_lead_busy' | undefined> {
     const sender = from.trim().toLowerCase();
     if (sender === 'manager' || sender === 'remote' || sender === 'operator' || sender === 'checkin-service') return undefined;
-    if (!this.isAgentBusy() && !(await this.hasDbActiveQuery())) return undefined;
+    const activeLoad = await this.getActiveQueryLoad();
+    if (activeLoad === 0) return undefined;
     return this.isPrimaryLeadIdentity() ? 'primary_lead_busy' : 'agent_busy';
   }
 
   private isAgentBusy(): boolean {
-    return this.isProcessingQuery || this.queryQueue.length > 0 || this.activeQueries.size > 0;
+    return this.localActiveQueryLoad() > 0;
   }
 
-  private async hasDbActiveQuery(): Promise<boolean> {
-    if (!this.db || !this.dbAgentId) return false;
+  private localActiveQueryLoad(): number {
+    return Math.max(this.activeQueryWorkers, this.activeQueries.size) + this.queryQueue.length;
+  }
+
+  private async countDbActiveQueries(): Promise<number> {
+    if (!this.db || !this.dbAgentId) return 0;
     try {
       const rows = await this.db.queries.getPending(this.dbAgentId);
-      return rows.some((row) => row.status === 'pending' || row.status === 'processing');
+      return rows.filter((row) => row.status === 'pending' || row.status === 'processing').length;
     } catch (err: any) {
       console.warn(`${logTime()} [Agent] Failed to check DB active queries before triggered wake:`, err?.message || err);
-      return false;
+      return 0;
     }
+  }
+
+  private async getActiveQueryLoad(): Promise<number> {
+    return Math.max(this.localActiveQueryLoad(), await this.countDbActiveQueries());
   }
 
   private isPrimaryLeadIdentity(): boolean {
@@ -2331,7 +2438,7 @@ Produce the smallest useful action/result for this inbound wake.`;
     if (String(process.env.ID_AGENT_PRIMARY_LEAD || '').toLowerCase() === 'true') return true;
 
     const name = String(this.agentIdentity?.name || this.agentName || '').trim().toLowerCase();
-    const team = String(this.agentIdentity?.team || process.env.ID_TEAM || process.env.ID_PROJECT || '').trim().toLowerCase();
+    const team = this.getIdentityTeam();
 
     // Rebuilt local agents receive team/name directly, but only a catalog subset of
     // persisted metadata. Keep default/lead protected even if the primaryLead flag
@@ -2478,24 +2585,32 @@ Produce the smallest useful action/result for this inbound wake.`;
   }
 
   private async processQueryQueue() {
-    // If already processing, the current processor will handle the queue
-    if (this.isProcessingQuery) {
-      return;
-    }
-
-    // Process all queued queries sequentially
-    while (this.queryQueue.length > 0) {
-      this.isProcessingQuery = true;
+    while (this.activeQueryWorkers < this.queryConcurrency && this.queryQueue.length > 0) {
       const { queryId, prompt, resume, from, options, priority } = this.queryQueue.shift()!;
+      this.activeQueryWorkers += 1;
+      this.isProcessingQuery = true;
 
-      try {
-        await this.executeQuery(queryId, prompt, resume, from, options, priority);
-      } catch (error) {
-        console.error(`[Query Queue] Error processing ${queryId}:`, error);
-      }
+      void this.runQueuedQuery({ queryId, prompt, resume, from, options, priority });
     }
+  }
 
-    this.isProcessingQuery = false;
+  private async runQueuedQuery(item: {
+    queryId: string;
+    prompt: string;
+    resume?: string;
+    from?: string;
+    options?: QueryOptions;
+    priority: QueryQueuePriority;
+  }) {
+    try {
+      await this.executeQuery(item.queryId, item.prompt, item.resume, item.from, item.options, item.priority);
+    } catch (error) {
+      console.error(`[Query Queue] Error processing ${item.queryId}:`, error);
+    } finally {
+      this.activeQueryWorkers = Math.max(0, this.activeQueryWorkers - 1);
+      this.isProcessingQuery = this.activeQueryWorkers > 0;
+      this.processQueryQueue();
+    }
   }
 
   private async executeQuery(
@@ -2515,7 +2630,11 @@ Produce the smallest useful action/result for this inbound wake.`;
 
     this.activeQueries.set(queryId, query);
     await this.dbUpsertQuery(query);
-    this.currentQueryExecution = { queryId, prompt, from };
+    const currentExecution = { queryId, prompt, from };
+    this.currentQueryExecution = currentExecution;
+    this.currentQueryExecutions.set(queryId, currentExecution);
+    const queryHarness = this.queryHarnessFactory();
+    this.activeHarnessesByQuery.set(queryId, queryHarness);
 
     // Track whether we should send an auto-reply (default: yes if from is set)
     const shouldAutoReply = from && !options?.noAutoReply;
@@ -2613,11 +2732,11 @@ ${prompt}`
         console.log(`${logTime()} [Agent] ${timeoutKind} timeout for ${queryId}: ${executionTimeoutMs}ms`);
       }
 
-      stopExternalQueryWatcher = this.startExternalQueryStopWatcher(queryId, (error) => {
+      stopExternalQueryWatcher = this.startExternalQueryStopWatcher(queryId, queryHarness, (error) => {
         externalStopError ??= error;
       });
 
-      const harnessMessages = this.harness.run(enhancedPrompt, {
+      const harnessMessages = queryHarness.run(enhancedPrompt, {
         model: this.model,
         allowedTools,
         workingDirectory: this.workingDirectory,
@@ -2633,7 +2752,7 @@ ${prompt}`
         timeoutMs: executionTimeoutMs,
         onTimeout: () => {
           console.warn(`${logTime()} [Agent] Query timeout hit for ${queryId}; cancelling harness`);
-          this.harness.cancel?.();
+          queryHarness.cancel?.();
         },
       })) {
         if (externalStopError) throw externalStopError;
@@ -2870,8 +2989,11 @@ ${prompt}`
     } finally {
       stopExternalQueryWatcher?.();
       if (this.currentQueryExecution?.queryId === queryId) {
-        this.currentQueryExecution = undefined;
+        const nextCurrent = Array.from(this.currentQueryExecutions.values()).find((item) => item.queryId !== queryId);
+        this.currentQueryExecution = nextCurrent;
       }
+      this.currentQueryExecutions.delete(queryId);
+      this.activeHarnessesByQuery.delete(queryId);
       if (this.db) {
         this.activeQueries.delete(queryId);
       } else {
@@ -3010,6 +3132,7 @@ ${prompt}`
         console.log(`================================`);
         console.log(`Harness: ${this.harnessType}`);
         console.log(`Model: ${this.model}`);
+        console.log(`Query concurrency: ${this.queryConcurrency}`);
         console.log(`Working Directory: ${this.workingDirectory}`);
         console.log(`Tools: ${this.allowedTools.join(', ')}`);
         console.log(`\nListening on http://localhost:${port}`);
@@ -3127,7 +3250,12 @@ ${inbound.content}`;
     // parking/restarts SIGTERM the local-agent-server; without this, CLI
     // harness children can be reparented to launchd and keep burning tokens.
     try {
-      this.harness.cancel?.();
+      const activeHarnesses = Array.from(new Set(this.activeHarnessesByQuery.values()));
+      if (activeHarnesses.length > 0) {
+        for (const harness of activeHarnesses) harness.cancel?.();
+      } else {
+        this.harness.cancel?.();
+      }
     } catch (err: any) {
       console.warn(`${logTime()} [Agent] Failed to cancel active harness during stop: ${err?.message || err}`);
     }

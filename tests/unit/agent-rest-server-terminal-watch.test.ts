@@ -57,6 +57,7 @@ describe('AgentRestServer external query terminal watcher', () => {
   afterEach(() => {
     delete process.env.ID_AGENT_QUERY_TERMINAL_POLL_MS;
     delete process.env.ID_HARNESS;
+    delete process.env.ID_AGENT_LEAD_QUERY_CONCURRENCY;
   });
 
   it.each([
@@ -171,6 +172,71 @@ describe('AgentRestServer external query terminal watcher', () => {
       );
     } finally {
       await harness.done;
+      await server.stop();
+    }
+  });
+
+  it('cancels every active query harness for parallel lead work', async () => {
+    process.env.ID_HARNESS = 'claude-code-cli';
+    process.env.ID_AGENT_LEAD_QUERY_CONCURRENCY = '2';
+
+    const fallbackHarness = new CancellableHarness();
+    const activeHarnesses: CancellableHarness[] = [];
+    const db: any = {
+      queries: {
+        upsert: vi.fn(async () => {}),
+        getByQueryIdForTeam: vi.fn(async (_teamId: string, queryId: string) => ({
+          ...queryRow('processing'),
+          query_id: queryId,
+        })),
+      },
+      news: {
+        add: vi.fn(async () => {}),
+      },
+    };
+
+    const server = new AgentRestServer({
+      agentName: 'lead',
+      agentIdentity: { name: 'lead', team: 'default', metadata: { primaryLead: true } },
+      db: { db, teamId: 'team-1', agentId: 'agent-1' },
+      harness: fallbackHarness,
+    });
+    (server as any).queryHarnessFactory = () => {
+      const harness = new CancellableHarness();
+      activeHarnesses.push(harness);
+      return harness;
+    };
+
+    try {
+      await server.start(0);
+      const port = ((server as any).httpServer.address() as AddressInfo).port;
+      await (server as any).startQuery('query-1', 'first prompt', undefined, 'manager');
+      await (server as any).startQuery('query-2', 'second prompt', undefined, 'manager');
+      await vi.waitFor(() => {
+        expect(activeHarnesses).toHaveLength(2);
+      });
+
+      const res = await fetch(`http://127.0.0.1:${port}/cancel`, { method: 'POST' });
+      expect(res.status).toBe(200);
+
+      await vi.waitFor(() => {
+        expect(activeHarnesses[0].cancelCalls).toBeGreaterThan(0);
+        expect(activeHarnesses[1].cancelCalls).toBeGreaterThan(0);
+      });
+      await Promise.all(activeHarnesses.map((harness) => harness.done));
+      expect(db.queries.upsert).toHaveBeenCalledWith(
+        'team-1',
+        'agent-1',
+        expect.objectContaining({ query_id: 'query-1', status: 'failed', error: 'Query was cancelled' }),
+      );
+      expect(db.queries.upsert).toHaveBeenCalledWith(
+        'team-1',
+        'agent-1',
+        expect.objectContaining({ query_id: 'query-2', status: 'failed', error: 'Query was cancelled' }),
+      );
+    } finally {
+      for (const harness of activeHarnesses) harness.cancel();
+      await Promise.all(activeHarnesses.map((harness) => harness.done).filter(Boolean));
       await server.stop();
     }
   });

@@ -1653,7 +1653,60 @@ new org text from sidecar
     }
   });
 
-  it('defaults to a low active-query cap to avoid lead backlog fan-out', async () => {
+  it('allows lead-like agents to receive multiple active /ask queries by default', async () => {
+    const savedEnv = {
+      maxActive: process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT,
+      leadMaxActive: process.env.ID_MAX_ACTIVE_QUERIES_PER_LEAD,
+      brainDisabled: process.env.BRAIN_CONTEXT_DISABLED,
+    };
+    let talkServer: Awaited<ReturnType<typeof startTalkServer>> | null = null;
+    delete process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
+    delete process.env.ID_MAX_ACTIVE_QUERIES_PER_LEAD;
+    process.env.BRAIN_CONTEXT_DISABLED = 'true';
+    try {
+      const { manager, db, workDir } = await makeManager();
+      dbs.push(db);
+      workDirs.push(workDir);
+      talkServer = await startTalkServer({ query_id: 'lead-new-query' });
+
+      const teamId = await db.teams.getOrCreateTeamId('default');
+      await db.agents.create({
+        ...agentRow({
+          team_id: teamId,
+          id: 'agent-default-lead',
+          name: 'lead',
+          port: 4112,
+          status: 'running',
+          endpoint: talkServer.endpoint,
+          metadata: { primaryLead: true, runtime: 'codex' },
+        }),
+      });
+      await db.queries.upsert(teamId, 'agent-default-lead', {
+        query_id: 'lead-existing-processing',
+        status: 'processing',
+        prompt: 'current work',
+        created: Date.now(),
+        owner_kind: 'agent',
+        owner_id: 'agent-default-lead',
+      });
+
+      const result = await (manager as any).executeRemoteCommand('/ask lead do one more thing', teamId, 'default');
+
+      expect(result.ok).toBe(true);
+      expect(result.result?.queryId).toBe('lead-new-query');
+      expect(talkServer.talkBodies).toHaveLength(1);
+    } finally {
+      await talkServer?.close();
+      if (savedEnv.maxActive === undefined) delete process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
+      else process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT = savedEnv.maxActive;
+      if (savedEnv.leadMaxActive === undefined) delete process.env.ID_MAX_ACTIVE_QUERIES_PER_LEAD;
+      else process.env.ID_MAX_ACTIVE_QUERIES_PER_LEAD = savedEnv.leadMaxActive;
+      if (savedEnv.brainDisabled === undefined) delete process.env.BRAIN_CONTEXT_DISABLED;
+      else process.env.BRAIN_CONTEXT_DISABLED = savedEnv.brainDisabled;
+    }
+  });
+
+  it('keeps non-lead agents capped at one active /ask query by default', async () => {
     const saved = process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
     delete process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
     try {
@@ -1665,23 +1718,23 @@ new org text from sidecar
       await db.agents.create({
         ...agentRow({
           team_id: teamId,
-          id: 'agent-default-busy',
-          name: 'default-busy-lead',
+          id: 'agent-default-worker',
+          name: 'default-worker',
           port: 4112,
           status: 'running',
         }),
       });
-      await db.queries.upsert(teamId, 'agent-default-busy', {
-        query_id: 'default-busy-processing',
+      await db.queries.upsert(teamId, 'agent-default-worker', {
+        query_id: 'default-worker-processing',
         status: 'processing',
         prompt: 'current work',
         created: Date.now(),
         owner_kind: 'agent',
-        owner_id: 'agent-default-busy',
+        owner_id: 'agent-default-worker',
       });
       const fetchSpy = vi.spyOn(globalThis, 'fetch');
 
-      const result = await (manager as any).executeRemoteCommand('/ask default-busy-lead do one more thing', teamId, 'default');
+      const result = await (manager as any).executeRemoteCommand('/ask default-worker do one more thing', teamId, 'default');
 
       expect(result.ok).toBe(false);
       expect(result.error).toContain('already has 1 active query');
