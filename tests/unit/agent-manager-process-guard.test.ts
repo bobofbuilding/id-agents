@@ -2093,11 +2093,27 @@ new org text from sidecar
       owner_kind: 'agent',
       owner_id: 'agent-supervised',
     });
+    await db.queries.upsert(teamId, 'agent-supervised', {
+      query_id: 'processing-lead-kickoff',
+      status: 'processing',
+      prompt: 'Lead delegation kickoff: task #tm12345 ("Codify validation decisions") is assigned to you as the team coordinator.',
+      created: now + 18000,
+      owner_kind: 'agent',
+      owner_id: 'agent-supervised',
+    });
+    await db.queries.upsert(teamId, 'agent-supervised', {
+      query_id: 'pending-task-manager-assignment',
+      status: 'pending',
+      prompt: 'Task-manager triage assigned existing legal task #tm12345 (Codify validation decisions) to you. Scope: codify the validator decision rubric.',
+      created: now + 19000,
+      owner_kind: 'agent',
+      owner_id: 'agent-supervised',
+    });
 
     const result = await (manager as any).sweepStaleQueries();
 
-    expect(result.duplicateTaskAsk).toBe(9);
-    expect(result.total).toBe(9);
+    expect(result.duplicateTaskAsk).toBe(10);
+    expect(result.total).toBe(10);
     expect((await db.queries.getByQueryIdForTeam(teamId, 'older-pending-supervision'))?.status).toBe('expired');
     expect((await db.queries.getByQueryIdForTeam(teamId, 'active-processing-supervision'))?.status).toBe('processing');
     expect((await db.queries.getByQueryIdForTeam(teamId, 'other-task-supervision'))?.status).toBe('pending');
@@ -2116,6 +2132,8 @@ new org text from sidecar
     expect((await db.queries.getByQueryIdForTeam(teamId, 'processing-sweep-ack'))?.status).toBe('processing');
     expect((await db.queries.getByQueryIdForTeam(teamId, 'pending-sweep-ack'))?.status).toBe('expired');
     expect((await db.queries.getByQueryIdForTeam(teamId, 'pending-sweep-reworded'))?.status).toBe('expired');
+    expect((await db.queries.getByQueryIdForTeam(teamId, 'processing-lead-kickoff'))?.status).toBe('processing');
+    expect((await db.queries.getByQueryIdForTeam(teamId, 'pending-task-manager-assignment'))?.status).toBe('expired');
   });
 
   it('expires active control prompts that reference already done tasks', async () => {
@@ -2409,6 +2427,44 @@ new org text from sidecar
     expect(result.ok).toBe(true);
     expect(result.result?.queryId).toBe('existing-task-delegation');
     expect(result.result?.deduped).toBe(true);
+  });
+
+  it('dedupes task-manager assignment prompts against active lead kickoff by task marker', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const teamId = await db.teams.getOrCreateTeamId('legal');
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-hr-manager',
+        name: 'hr-manager',
+        port: 4115,
+        status: 'running',
+        endpoint: 'http://127.0.0.1:9',
+      }),
+    });
+    await db.queries.upsert(teamId, 'agent-hr-manager', {
+      query_id: 'existing-lead-kickoff',
+      status: 'processing',
+      prompt: 'Lead delegation kickoff: task #f7d643d3 ("Codify validation decisions") is assigned to you as the team coordinator.',
+      created: Date.now(),
+      owner_kind: 'agent',
+      owner_id: 'agent-hr-manager',
+    });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+    const result = await (manager as any).executeRemoteCommand(
+      '/ask hr-manager Task-manager triage assigned existing legal task #f7d643d3 (Codify validation decisions) to you. Scope: codify the validator decision rubric.',
+      teamId,
+      'legal',
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.result?.queryId).toBe('existing-lead-kickoff');
+    expect(result.result?.deduped).toBe(true);
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 
   it('dedupes exact active assignment-sweep /ask prompts before dispatching', async () => {

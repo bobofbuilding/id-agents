@@ -14871,6 +14871,7 @@ Return this JSON shape:
     const text = String(prompt ?? '').trim();
     const lower = text.toLowerCase();
     const managedTaskAsk = lower.startsWith('task delegation')
+      || lower.startsWith('task-manager triage assigned existing')
       || lower.startsWith('supervision:')
       || lower.startsWith('supervision routing:')
       || lower.startsWith('supervision probe from manager:')
@@ -15032,6 +15033,7 @@ Return this JSON shape:
            OR LOWER(prompt) LIKE 'team objective:%'
            OR LOWER(prompt) LIKE 'urgent delegation probe:%'
            OR LOWER(prompt) LIKE 'task delegation%'
+           OR LOWER(prompt) LIKE 'task-manager triage assigned existing%'
            OR LOWER(prompt) LIKE 'resume and complete task #%'
            OR LOWER(prompt) LIKE 'backlog guard:%'
            OR LOWER(prompt) LIKE 'backlog guard alert:%'
