@@ -139,6 +139,7 @@ const CONTROL_PLANE_READONLY_TOOLS = new Set(['Read', 'Glob', 'Grep']);
 const CONTROL_PLANE_DELEGATION_TOOLS = new Set(['Read', 'Bash', 'Glob', 'Grep']);
 const DEFAULT_CONTROL_PLANE_QUERY_TIMEOUT_MS = 90_000;
 const DEFAULT_VALIDATION_CONTROL_PLANE_QUERY_TIMEOUT_MS = 180_000;
+const DEFAULT_OPERATOR_DIRECT_RESPONSE_QUERY_TIMEOUT_MS = 180_000;
 const MIN_CONTROL_PLANE_QUERY_TIMEOUT_MS = 15_000;
 const MAX_CONTROL_PLANE_QUERY_TIMEOUT_MS = 600_000;
 const DEFAULT_DELEGATION_QUERY_TIMEOUT_MS = 12 * 60_000;
@@ -192,6 +193,65 @@ function readDelegationTimeoutEnv(): number {
 function isValidationControlPlanePrompt(prompt: string): boolean {
   const text = String(prompt || '').trimStart();
   return VALIDATION_CONTROL_PLANE_PROMPT_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+const OPERATOR_DIRECT_RESPONSE_SENDERS = new Set(['remote', 'operator', 'human', 'user']);
+
+const OPERATOR_DIRECT_RESPONSE_PROMPT_PATTERNS = [
+  /^Create a clear, structured implementation plan\b/i,
+  /\b(?:generate|write|draft|produce)\s+(?:me\s+)?(?:a\s+)?(?:clear,\s*structured\s+)?(?:implementation\s+)?plan\b/i,
+  /\bcreate\s+(?:me\s+)?(?:a\s+)?(?:clear,\s*structured\s+)?(?:implementation\s+)?plan\b/i,
+  /\b(?:explain|summarize|summarise)\s+(?:this|that|why|how|what)\b/i,
+  /\bwhat(?:'s| is)\s+happening\b/i,
+  /\bwhy\s+(?:does|is|are|did|do)\b/i,
+];
+
+const OPERATOR_DIRECT_RESPONSE_EXCLUDED_PROMPT_PATTERNS = [
+  /\b(?:implement|fix|refactor|patch|edit|commit|push|release|deploy|publish|run the repo|run tests?|rebuild|restart|sync|delete|remove)\b/i,
+  /\b(?:create|assign|delegate|start|jump-?start|triage)\s+(?:a\s+|the\s+)?(?:task|work|agent|team|stalled task)\b/i,
+  /\b(?:claim|complete|close)\s+(?:a\s+|the\s+)?task\b/i,
+  /\bfull\s+(?:refactor|cleanup|triage)\b/i,
+  /(?:^|\n)\s*Task:\s+/i,
+  /\bclaim URL:\s*https?:\/\//i,
+  /\bdone URL:\s*https?:\/\//i,
+];
+
+function normalizeSender(from?: string): string {
+  return String(from || '').trim().toLowerCase();
+}
+
+export function isOperatorDirectResponseRequest(input: {
+  prompt: string;
+  from?: string;
+}): boolean {
+  const sender = normalizeSender(input.from);
+  if (!OPERATOR_DIRECT_RESPONSE_SENDERS.has(sender)) return false;
+
+  const text = String(input.prompt || '').trimStart();
+  if (!text) return false;
+  if (isDelegationPrompt(text) || shouldSuppressMcpForPrompt(text)) return false;
+  if (OPERATOR_DIRECT_RESPONSE_EXCLUDED_PROMPT_PATTERNS.some((pattern) => pattern.test(text))) return false;
+
+  return OPERATOR_DIRECT_RESPONSE_PROMPT_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function withOperatorDirectResponseBoundary(prompt: string): string {
+  return `OPERATOR FAST-LANE REQUEST:
+- Answer the operator directly in this turn.
+- Do not create, claim, delegate, validate, or close manager tasks for this request unless the operator explicitly asks for task workflow.
+- Do not wait on other agents.
+- Keep tool use minimal and read-only; if more work is needed, propose follow-up tasks instead of executing them.
+
+---
+
+${prompt}`;
+}
+
+function readOperatorDirectResponseTimeoutEnv(): number {
+  return readControlPlaneTimeoutEnv(
+    'ID_AGENT_OPERATOR_DIRECT_RESPONSE_QUERY_TIMEOUT_MS',
+    DEFAULT_OPERATOR_DIRECT_RESPONSE_QUERY_TIMEOUT_MS,
+  );
 }
 
 export function queryExecutionTimeoutMsForPrompt(prompt: string): number | undefined {
@@ -2507,10 +2567,14 @@ ${prompt}`
 
 ${prompt}`
         : prompt;
+      const operatorDirectResponse = isOperatorDirectResponseRequest({ prompt, from });
+      const promptForHarness = operatorDirectResponse
+        ? withOperatorDirectResponseBoundary(promptWithSender)
+        : promptWithSender;
 
       // Inject inter-agent communication skill into the prompt
       const enhancedPrompt = withInterAgentSkill(
-        promptWithSender,
+        promptForHarness,
         this.agentIdentity || this.agentName
       );
 
@@ -2522,22 +2586,28 @@ ${prompt}`
 
       // Read MCP servers from env (set by manager via buildLocalAgentEnv).
       // ID_MCP_SERVERS is a JSON array of McpServerSpec; parsing is tolerant.
-      const suppressMcp = shouldSuppressMcpForPrompt(promptWithSender);
-      const isDelegationControl = suppressMcp && isDelegationPrompt(promptWithSender);
-      const executionPolicy = suppressMcp && !isDelegationControl ? 'control-plane-readonly' : 'default';
-      const allowedTools = allowedToolsForPrompt(promptWithSender, this.allowedTools);
+      const suppressMcp = operatorDirectResponse || shouldSuppressMcpForPrompt(promptForHarness);
+      const isDelegationControl = suppressMcp && isDelegationPrompt(promptForHarness);
+      const executionPolicy = operatorDirectResponse || (suppressMcp && !isDelegationControl) ? 'control-plane-readonly' : 'default';
+      const allowedTools = operatorDirectResponse
+        ? this.allowedTools.filter((tool) => CONTROL_PLANE_READONLY_TOOLS.has(tool))
+        : allowedToolsForPrompt(promptForHarness, this.allowedTools);
       const mcpServers = suppressMcp ? undefined : parseMcpServersEnv(process.env.ID_MCP_SERVERS);
       if (suppressMcp && process.env.ID_MCP_SERVERS) {
         console.log(`${logTime()} [Agent] MCP suppressed for control-plane prompt ${queryId}`);
       }
-      if (suppressMcp && isDelegationControl) {
+      if (operatorDirectResponse) {
+        console.log(`${logTime()} [Agent] Operator fast-lane tool policy for ${queryId}: ${allowedTools.join(', ') || '(none)'}`);
+      } else if (suppressMcp && isDelegationControl) {
         console.log(`${logTime()} [Agent] Delegation control tool policy for ${queryId}: ${allowedTools.join(', ') || '(none)'}`);
       } else if (suppressMcp) {
         console.log(`${logTime()} [Agent] Read-only control-plane tool policy for ${queryId}: ${allowedTools.join(', ') || '(none)'}`);
       }
-      const executionTimeoutMs = queryExecutionTimeoutMsForPrompt(promptWithSender);
+      const executionTimeoutMs = operatorDirectResponse
+        ? readOperatorDirectResponseTimeoutEnv()
+        : queryExecutionTimeoutMsForPrompt(promptForHarness);
       if (executionTimeoutMs) {
-        const timeoutKind = isDelegationControl ? 'Delegation' : suppressMcp ? 'Control-plane' : 'Delegation';
+        const timeoutKind = operatorDirectResponse ? 'Operator fast-lane' : isDelegationControl ? 'Delegation' : suppressMcp ? 'Control-plane' : 'Delegation';
         console.log(`${logTime()} [Agent] ${timeoutKind} timeout for ${queryId}: ${executionTimeoutMs}ms`);
       }
 

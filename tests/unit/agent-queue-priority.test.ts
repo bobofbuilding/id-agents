@@ -7,6 +7,7 @@ import {
   AgentRestServer,
   classifyPrimaryLeadValidatorWakeSuppression,
   classifyQueryQueuePriority,
+  isOperatorDirectResponseRequest,
   shouldUseImplicitDefaultConversation,
   shouldSuppressPrimaryLeadValidatorNoopWake,
 } from '../../src/claude-agent-server.js';
@@ -91,6 +92,33 @@ Team objective: Decompose this objective into member-owned work.`,
     })).toBe('background');
   });
 
+  it('identifies direct operator planning/explanation requests for the fast lane', () => {
+    expect(isOperatorDirectResponseRequest({
+      prompt: 'Create a clear, structured implementation plan for this request.',
+      from: 'remote',
+    })).toBe(true);
+
+    expect(isOperatorDirectResponseRequest({
+      prompt: 'why does the lead take so long to respond?',
+      from: 'operator',
+    })).toBe(true);
+
+    expect(isOperatorDirectResponseRequest({
+      prompt: 'Create a clear, structured implementation plan for this request.',
+      from: 'manager',
+    })).toBe(false);
+
+    expect(isOperatorDirectResponseRequest({
+      prompt: 'fix the task delegation bug and run the tests',
+      from: 'remote',
+    })).toBe(false);
+
+    expect(isOperatorDirectResponseRequest({
+      prompt: 'Task: implement-x\nclaim URL: http://127.0.0.1:4100/tasks/implement-x/claim',
+      from: 'remote',
+    })).toBe(false);
+  });
+
   it('keeps automated peer/control traffic out of the implicit default session', () => {
     expect(shouldUseImplicitDefaultConversation({})).toBe(true);
     expect(shouldUseImplicitDefaultConversation({ from: 'operator' })).toBe(true);
@@ -145,6 +173,42 @@ Team objective: Decompose this objective into member-owned work.`,
 
       expect(res.status).toBe(202);
       await sleep(20);
+      expect(harness.options[0]?.executionPolicy).toBe('control-plane-readonly');
+      expect(harness.options[0]?.allowedTools).toEqual(['Read', 'Glob', 'Grep']);
+      expect(harness.options[0]?.mcpServers).toBeUndefined();
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('runs direct operator planning prompts as read-only no-MCP fast-lane work', async () => {
+    process.env.ID_MCP_SERVERS = JSON.stringify([
+      { name: 'slow-server', transport: 'stdio', command: 'node', args: ['server.js'] },
+    ]);
+    const harness = new RecordingHarness();
+    const server = new AgentRestServer({
+      agentName: 'lead',
+      agentIdentity: { name: 'lead', team: 'default', metadata: { primaryLead: true } },
+      harness,
+    });
+
+    try {
+      await server.start(0);
+      const port = ((server as any).httpServer.address() as AddressInfo).port;
+
+      const res = await fetch(`http://127.0.0.1:${port}/talk`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          from: 'remote',
+          message: 'Create a clear, structured implementation plan for this request. Request: build an agent portal.',
+        }),
+      });
+
+      expect(res.status).toBe(202);
+      await viWaitFor(() => expect(harness.prompts).toHaveLength(1));
+      expect(harness.prompts[0]).toContain('OPERATOR FAST-LANE REQUEST');
+      expect(harness.prompts[0]).toContain('Do not create, claim, delegate, validate, or close manager tasks');
       expect(harness.options[0]?.executionPolicy).toBe('control-plane-readonly');
       expect(harness.options[0]?.allowedTools).toEqual(['Read', 'Glob', 'Grep']);
       expect(harness.options[0]?.mcpServers).toBeUndefined();
