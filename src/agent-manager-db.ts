@@ -5318,6 +5318,27 @@ Return this JSON shape:
     return Number.isFinite(n) ? n : null;
   }
 
+  private brainContextResponse(context?: BrainVolunteerContext | null): Record<string, unknown> | null {
+    if (!context) return null;
+    const cited = context.cited || {};
+    return {
+      cited: {
+        entity_ids: Array.isArray(cited.entity_ids) ? cited.entity_ids.slice(0, 50) : [],
+        fact_ids: Array.isArray(cited.fact_ids) ? cited.fact_ids.slice(0, 50) : [],
+        text_unit_ids: Array.isArray(cited.text_unit_ids) ? cited.text_unit_ids.slice(0, 50) : [],
+        canonical_source_ids: Array.isArray(cited.canonical_source_ids) ? cited.canonical_source_ids.slice(0, 80) : [],
+      },
+      timelineEventId: context.timelineEventId,
+      context_package_id: context.context_package_id ?? context.contextPackageId,
+      instructions: (context.instructions || []).slice(0, 10).map((instruction) => ({
+        source_id: instruction.source_id,
+        memory_id: instruction.memory_id,
+        key: instruction.key,
+        scope: instruction.scope,
+      })),
+    };
+  }
+
   private positiveIntEnv(name: string, fallback: number): number {
     const parsed = Number.parseInt(process.env[name] || '', 10);
     return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
@@ -5798,7 +5819,7 @@ Return this JSON shape:
           query_id: queryId,
           delivered_to: targetDisplayId,
           status: 'delivered',
-          ...(brainContext ? { brain_context: { cited: brainContext.cited, timelineEventId: brainContext.timelineEventId, context_package_id: brainContext.context_package_id ?? brainContext.contextPackageId, instructions: brainContext.instructions || [] } } : {}),
+          ...(brainContext ? { brain_context: this.brainContextResponse(brainContext) } : {}),
         });
       }
 
@@ -12074,7 +12095,7 @@ Return this JSON shape:
             queryId: askQueryId,
             status: 'processing',
             agent: agentName,
-            ...(brainContext ? { brain_context: { cited: brainContext.cited, timelineEventId: brainContext.timelineEventId, context_package_id: brainContext.context_package_id ?? brainContext.contextPackageId, instructions: brainContext.instructions || [] } } : {}),
+            ...(brainContext ? { brain_context: this.brainContextResponse(brainContext) } : {}),
           }
         };
       }

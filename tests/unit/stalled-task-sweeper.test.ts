@@ -1276,6 +1276,51 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('compacts Brain context before returning dispatch responses', () => {
+    const manager = new AgentManagerDb('/tmp/id-agents-brain-context-response-test', fakeDb(), { libraryRoot: null }) as any;
+
+    const response = manager.brainContextResponse({
+      bundles: [],
+      cited: {
+        canonical_source_ids: ['memory:101'],
+        entity_ids: ['entity:task:1'],
+        fact_ids: [9],
+        text_unit_ids: [12],
+        source_origins: {
+          'memory:101': ['shared_memory', 'lexical'],
+        },
+      },
+      timelineEventId: 123,
+      context_package_id: 456,
+      instructions: [{
+        source_id: 'memory:101',
+        memory_id: 101,
+        key: 'org:policy',
+        content: 'large instruction body that should already be in the prompt and query metadata',
+        scope: { project: 'default', task_id: '', session_id: '', user_id: '', turn_id: '' },
+      }],
+    });
+
+    expect(response).toMatchObject({
+      cited: {
+        canonical_source_ids: ['memory:101'],
+        entity_ids: ['entity:task:1'],
+        fact_ids: [9],
+        text_unit_ids: [12],
+      },
+      timelineEventId: 123,
+      context_package_id: 456,
+      instructions: [{
+        source_id: 'memory:101',
+        memory_id: 101,
+        key: 'org:policy',
+      }],
+    });
+    expect(response.cited.source_origins).toBeUndefined();
+    expect(response.instructions[0].content).toBeUndefined();
+    expect(response.bundles).toBeUndefined();
+  });
+
   it('accepts comma-separated delegated task names for team-lead completion packets', async () => {
     const lead = agent({ id: 'lead-1', name: 'research-lead', metadata: { lead: true } });
     const worker = agent({ id: 'worker-1', name: 'analyst' });
