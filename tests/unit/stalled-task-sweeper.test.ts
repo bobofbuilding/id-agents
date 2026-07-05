@@ -1390,6 +1390,74 @@ describe('stalled task sweeper', () => {
     expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
   });
 
+  it('wakes a stopped local teammate before auto-assigning stale unowned work', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const stoppedWorker = agent({
+      id: 'agent-stopped-worker',
+      name: 'stopped-worker',
+      status: 'stopped',
+      port: 4217,
+      type: 'claude',
+      runtime: 'claude-code-cli',
+    });
+    const queued = task({
+      id: 'queued-task',
+      name: 'queued-task',
+      uuid: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+      title: 'Queued task',
+      description: 'Expected output: produce the bounded routing checklist and cite blockers.',
+      status: 'todo',
+      owner: null,
+      updated_at: nowSec - 900,
+    });
+    const db = fakeDb({
+      agents: {
+        list: vi.fn(async () => [stoppedWorker]),
+        getById: vi.fn(async (id: string) => id === stoppedWorker.id ? stoppedWorker : null),
+        updateStatus: vi.fn(async () => {}),
+      },
+      tasks: {
+        list: vi.fn(async () => []),
+        getByNameForTeam: vi.fn(async () => queued),
+        claim: vi.fn(async () => true),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-wake-autoassign-test', db, { libraryRoot: null }) as any;
+    manager.spawnLocalAgentProcess = vi.fn(async () => ({ success: true, pid: 22222, logFile: '/tmp/stopped-worker.log' }));
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const result = await manager.assignUnownedTodoTask(queued, team(), NOW_MS);
+
+    expect(result).toMatchObject({ assigned: true, owner: expect.objectContaining({ id: stoppedWorker.id }) });
+    expect(manager.spawnLocalAgentProcess).toHaveBeenCalledWith(
+      TEAM_ID,
+      'default',
+      expect.objectContaining({
+        id: stoppedWorker.id,
+        name: 'stopped-worker',
+        port: 4217,
+      }),
+    );
+    expect(db.agents.updateStatus).toHaveBeenCalledWith(stoppedWorker.id, 'running');
+    expect(db.tasks.claim).toHaveBeenCalledWith('queued-task', stoppedWorker.id, nowSec, { maxDoingForTeam: expect.any(Number) });
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'stopped-worker',
+      expect.stringContaining('TASK DELEGATION from manager'),
+    );
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'agent:started',
+      actor_agent_id: stoppedWorker.id,
+      data: expect.objectContaining({
+        agent: 'stopped-worker',
+        task_name: queued.name,
+        task_uuid: queued.uuid,
+        reason: 'task-assign',
+        pid: 22222,
+      }),
+    }));
+  });
+
   it('asks a live team lead to delegate when a lead-owned task has no real child tasks', async () => {
     const nowSec = Math.floor(NOW_MS / 1000);
     const lead = agent({

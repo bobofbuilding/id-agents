@@ -14895,21 +14895,39 @@ Return this JSON shape:
         (activeByOwner.get(a.id) ?? 0) - (activeByOwner.get(b.id) ?? 0)
         || a.name.localeCompare(b.name),
       );
+    const wakeCandidates = agents
+      .filter((agent) =>
+        !this.isConfiguredTeamLead(teamRow.name, agent)
+        && !this.isIdleParkingProtectedAgent(agent, teamRow.name)
+        && this.canWakeAssignedTaskOwner(agent),
+      )
+      .sort((a, b) =>
+        (activeByOwner.get(a.id) ?? 0) - (activeByOwner.get(b.id) ?? 0)
+        || a.name.localeCompare(b.name),
+      );
 
-    for (const owner of candidates) {
+    const tryAssign = async (
+      owner: AgentRow,
+      assignOpts: { wakeBeforeClaim?: boolean } = {},
+    ): Promise<{ assigned: boolean; reason: string; owner?: AgentRow; dispatched?: boolean }> => {
       const stalledBacklog = await this.stalledOwnerBacklogGuard({
         teamId: teamRow.id,
         teamName: teamRow.name,
         owner,
       });
-      if (stalledBacklog) continue;
-      if ((activeByOwner.get(owner.id) ?? 0) > 0) continue;
-      if ((await this.countOpenOwnedTasks(owner.id)) > 0) continue;
-      if ((await this.countActiveCheckins(owner.id)) > 0) continue;
-      if (await this.hasAnyActiveQuery(owner)) continue;
+      if (stalledBacklog) return { assigned: false, reason: 'owner_has_stalled_backlog' };
+      if ((activeByOwner.get(owner.id) ?? 0) > 0) return { assigned: false, reason: 'owner_has_active_task' };
+      if ((await this.countOpenOwnedTasks(owner.id)) > 0) return { assigned: false, reason: 'owner_has_open_task' };
+      if ((await this.countActiveCheckins(owner.id)) > 0) return { assigned: false, reason: 'owner_has_active_checkin' };
+      if (await this.hasAnyActiveQuery(owner)) return { assigned: false, reason: 'owner_has_active_query' };
       const current = await this.db.tasks.getByNameForTeam(task.name, teamRow.id).catch(() => null);
       if (!current || current.status !== 'todo' || current.owner) {
         return { assigned: false, reason: 'task_changed' };
+      }
+
+      if (assignOpts.wakeBeforeClaim) {
+        const wake = await this.wakeAssignedTaskOwner(teamRow.id, teamRow.name, current, owner, 'task-assign');
+        if (wake.status !== 'started') return { assigned: false, reason: `wake_${wake.status}_${wake.reason}` };
       }
 
       const nowSec = Math.floor(nowMs / 1000);
@@ -14942,6 +14960,16 @@ Return this JSON shape:
         if (!sent) this.managerLog(`Auto-assigned task ${updated.name} to ${owner.name}, but the delegation prompt could not be delivered`);
       }
       return { assigned: true, reason: 'assigned', owner, dispatched };
+    };
+
+    for (const owner of candidates) {
+      const assignment = await tryAssign(owner);
+      if (assignment.assigned) return assignment;
+    }
+
+    for (const owner of wakeCandidates) {
+      const assignment = await tryAssign(owner, { wakeBeforeClaim: true });
+      if (assignment.assigned) return assignment;
     }
 
     return { assigned: false, reason: 'no_idle_live_member' };
