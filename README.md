@@ -545,6 +545,8 @@ See [Skills README](./skills/README.md) for the full skill directory listing.
 | `ID_MAX_ACTIVE_QUERIES_PER_LEAD` | No | Manager-side `/ask` admission cap for lead-like agents; unset or `0` means uncapped |
 | `ID_MAX_ACTIVE_QUERIES_PER_AGENT` | No | Worker `/ask` cap override; leave unset to keep workers at `1`. Configured leads do not inherit this worker cap. |
 
+Generic per-agent metadata caps (`maxActiveQueries`, `queryConcurrency`) apply to non-lead workers only. Use `leadMaxActiveQueries` or `leadQueryConcurrency` metadata when a lead must be intentionally throttled.
+
 **Per-agent environment (set automatically by the manager):**
 
 | Variable | Description |

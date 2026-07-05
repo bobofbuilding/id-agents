@@ -202,7 +202,11 @@ Team objective: Decompose this objective into member-owned work.`,
     const harness = new BlockingHarness();
     const server = new AgentRestServer({
       agentName: 'lead',
-      agentIdentity: { name: 'lead', team: 'default', metadata: { primaryLead: true } },
+      agentIdentity: {
+        name: 'lead',
+        team: 'default',
+        metadata: { primaryLead: true, maxActiveQueries: 1, queryConcurrency: 1 },
+      },
       harness,
     });
 
@@ -245,6 +249,40 @@ Team objective: Decompose this objective into member-owned work.`,
       expect(harness.prompts[2]).toContain('third lead request');
       expect(harness.prompts[3]).toContain('fourth lead request');
       expect(harness.options.map((options) => options.resume)).toEqual([undefined, undefined, undefined, undefined]);
+    } finally {
+      harness.releaseAll();
+      await server.stop();
+    }
+  });
+
+  it('honors lead-specific metadata concurrency without inheriting generic worker metadata', async () => {
+    const harness = new BlockingHarness();
+    const server = new AgentRestServer({
+      agentName: 'lead',
+      agentIdentity: {
+        name: 'lead',
+        team: 'default',
+        metadata: {
+          primaryLead: true,
+          maxActiveQueries: 1,
+          queryConcurrency: 1,
+          leadQueryConcurrency: 2,
+        },
+      },
+      harness,
+    });
+
+    try {
+      await (server as any).startQuery('q1', 'first lead request', 'lead-session-1', 'remote');
+      await (server as any).startQuery('q2', 'second lead request', 'lead-session-2', 'remote');
+      await (server as any).startQuery('q3', 'third lead request', 'lead-session-3', 'remote');
+
+      await viWaitFor(() => expect(harness.started).toBe(2));
+      expect(harness.prompts[0]).toContain('first lead request');
+      expect(harness.prompts[1]).toContain('second lead request');
+
+      harness.releaseAll();
+      await viWaitFor(() => expect(harness.started).toBe(3));
     } finally {
       harness.releaseAll();
       await server.stop();

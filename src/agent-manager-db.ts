@@ -778,10 +778,30 @@ export class AgentManagerDb {
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : 5 * 60 * 1000;
   }
 
-  private parseAgentQueryCap(metadata: AgentMetadata): number | null {
+  private parseQueryCapValue(raw: unknown): number | null {
+    if (raw === undefined || raw === null || raw === '') return null;
+    const parsed = Number(raw);
+    if (parsed === 0) return 0;
+    return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : null;
+  }
+
+  private parseAgentQueryCap(metadata: AgentMetadata, opts: { lead?: boolean } = {}): number | null {
     const catalog = metadata.catalog && typeof metadata.catalog === 'object'
       ? metadata.catalog as Record<string, unknown>
       : {};
+    const leadRaw =
+      metadata.leadMaxActiveQueries
+      ?? metadata.lead_max_active_queries
+      ?? metadata.leadQueryConcurrency
+      ?? metadata.lead_query_concurrency
+      ?? catalog.leadMaxActiveQueries
+      ?? catalog.lead_max_active_queries
+      ?? catalog.leadQueryConcurrency
+      ?? catalog.lead_query_concurrency;
+    const leadCap = this.parseQueryCapValue(leadRaw);
+    if (leadCap !== null) return leadCap;
+    if (opts.lead) return null;
+
     const raw =
       metadata.maxActiveQueries
       ?? metadata.max_active_queries
@@ -791,18 +811,16 @@ export class AgentManagerDb {
       ?? catalog.max_active_queries
       ?? catalog.queryConcurrency
       ?? catalog.query_concurrency;
-    if (raw === undefined || raw === null || raw === '') return null;
-    const parsed = Number(raw);
-    if (parsed === 0) return 0;
-    return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : null;
+    return this.parseQueryCapValue(raw);
   }
 
   private getMaxActiveQueriesForAgent(agent?: AgentRow | null, teamName?: string): number {
     const metadata = ((agent?.metadata as AgentMetadata | null | undefined) ?? {});
-    const metadataCap = this.parseAgentQueryCap(metadata);
+    const isLead = Boolean(agent && teamName && this.isConfiguredTeamLead(teamName, agent));
+    const metadataCap = this.parseAgentQueryCap(metadata, { lead: isLead });
     if (metadataCap !== null) return metadataCap;
 
-    if (agent && teamName && this.isConfiguredTeamLead(teamName, agent)) {
+    if (isLead) {
       const leadRaw =
         process.env.ID_MAX_ACTIVE_QUERIES_PER_LEAD
         ?? process.env.ID_LEAD_QUERY_CONCURRENCY

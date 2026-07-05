@@ -827,11 +827,23 @@ export class AgentRestServer {
     return /\b(lead|coordinator|router|supervisor|orchestrat(?:e|es|ion)|delegat(?:e|es|ion))\b/.test(roleText);
   }
 
-  private metadataQueryConcurrency(): number | null {
+  private metadataQueryConcurrency(opts: { leadLike?: boolean } = {}): number | null {
     const metadata = this.agentIdentity?.metadata || {};
     const catalog = metadata.catalog && typeof metadata.catalog === 'object'
       ? metadata.catalog as Record<string, unknown>
       : {};
+    const leadValue =
+      parseQueryConcurrency(metadata.leadQueryConcurrency)
+      ?? parseQueryConcurrency(metadata.lead_query_concurrency)
+      ?? parseQueryConcurrency(metadata.leadMaxActiveQueries)
+      ?? parseQueryConcurrency(metadata.lead_max_active_queries)
+      ?? parseQueryConcurrency(catalog.leadQueryConcurrency)
+      ?? parseQueryConcurrency(catalog.lead_query_concurrency)
+      ?? parseQueryConcurrency(catalog.leadMaxActiveQueries)
+      ?? parseQueryConcurrency(catalog.lead_max_active_queries);
+    if (leadValue !== null) return leadValue;
+    if (opts.leadLike) return null;
+
     return parseQueryConcurrency(metadata.queryConcurrency)
       ?? parseQueryConcurrency(metadata.query_concurrency)
       ?? parseQueryConcurrency(metadata.maxActiveQueries)
@@ -843,10 +855,11 @@ export class AgentRestServer {
   }
 
   private resolveQueryConcurrency(): number {
-    const metadataValue = this.metadataQueryConcurrency();
+    const leadLike = this.isLeadLikeIdentity();
+    const metadataValue = this.metadataQueryConcurrency({ leadLike });
     if (metadataValue !== null) return normalizeQueryConcurrency(metadataValue);
 
-    if (this.isLeadLikeIdentity()) {
+    if (leadLike) {
       const leadValue =
         parseQueryConcurrency(process.env.ID_AGENT_LEAD_QUERY_CONCURRENCY)
         ?? parseQueryConcurrency(process.env.ID_LEAD_QUERY_CONCURRENCY)

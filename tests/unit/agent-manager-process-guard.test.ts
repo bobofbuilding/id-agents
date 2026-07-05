@@ -1678,7 +1678,12 @@ new org text from sidecar
           port: 4112,
           status: 'running',
           endpoint: talkServer.endpoint,
-          metadata: { primaryLead: true, runtime: 'codex' },
+          metadata: {
+            primaryLead: true,
+            runtime: 'codex',
+            maxActiveQueries: 3,
+            queryConcurrency: 1,
+          },
         }),
       });
       await db.queries.upsert(teamId, 'agent-default-lead', {
@@ -1705,6 +1710,62 @@ new org text from sidecar
       expect(result.ok).toBe(true);
       expect(result.result?.queryId).toBe('lead-new-query');
       expect(talkServer.talkBodies).toHaveLength(1);
+    } finally {
+      await talkServer?.close();
+      if (savedEnv.maxActive === undefined) delete process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
+      else process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT = savedEnv.maxActive;
+      if (savedEnv.leadMaxActive === undefined) delete process.env.ID_MAX_ACTIVE_QUERIES_PER_LEAD;
+      else process.env.ID_MAX_ACTIVE_QUERIES_PER_LEAD = savedEnv.leadMaxActive;
+      if (savedEnv.brainDisabled === undefined) delete process.env.BRAIN_CONTEXT_DISABLED;
+      else process.env.BRAIN_CONTEXT_DISABLED = savedEnv.brainDisabled;
+    }
+  });
+
+  it('honors lead-specific metadata caps without inheriting worker caps', async () => {
+    const savedEnv = {
+      maxActive: process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT,
+      leadMaxActive: process.env.ID_MAX_ACTIVE_QUERIES_PER_LEAD,
+      brainDisabled: process.env.BRAIN_CONTEXT_DISABLED,
+    };
+    let talkServer: Awaited<ReturnType<typeof startTalkServer>> | null = null;
+    process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT = '1';
+    delete process.env.ID_MAX_ACTIVE_QUERIES_PER_LEAD;
+    process.env.BRAIN_CONTEXT_DISABLED = 'true';
+    try {
+      const { manager, db, workDir } = await makeManager();
+      dbs.push(db);
+      workDirs.push(workDir);
+      talkServer = await startTalkServer({ query_id: 'lead-should-not-run' });
+
+      const teamId = await db.teams.getOrCreateTeamId('default');
+      await db.agents.create({
+        ...agentRow({
+          team_id: teamId,
+          id: 'agent-default-lead',
+          name: 'lead',
+          port: 4112,
+          status: 'running',
+          endpoint: talkServer.endpoint,
+          metadata: { primaryLead: true, runtime: 'codex', leadMaxActiveQueries: 2 },
+        }),
+      });
+      for (let i = 1; i <= 2; i++) {
+        await db.queries.upsert(teamId, 'agent-default-lead', {
+          query_id: `lead-existing-processing-${i}`,
+          status: 'processing',
+          prompt: `current work ${i}`,
+          created: Date.now(),
+          owner_kind: 'agent',
+          owner_id: 'agent-default-lead',
+        });
+      }
+
+      const result = await (manager as any).executeRemoteCommand('/ask lead do one more thing', teamId, 'default');
+
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain('already has 2 active queries');
+      expect(result.error).toContain('limit 2');
+      expect(talkServer.talkBodies).toHaveLength(0);
     } finally {
       await talkServer?.close();
       if (savedEnv.maxActive === undefined) delete process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
