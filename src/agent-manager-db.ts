@@ -1518,6 +1518,7 @@ export class AgentManagerDb {
     owner: AgentRow | null;
     excludeTaskId?: string;
     onlyTaskId?: string;
+    includeBelowThreshold?: boolean;
     nowMs?: number;
   }): Promise<Array<{ task: TaskRow; ref: string; stalledMinutes: number }>> {
     if (!params.owner) return [];
@@ -1534,7 +1535,7 @@ export class AgentManagerDb {
         ref: this.taskShortRef(task),
         stalledMinutes: Math.max(0, Math.round((nowMs - this.taskLastActivityMs(task)) / 60000)),
       }))
-      .filter((item) => nowMs - this.taskLastActivityMs(item.task) >= stallMs)
+      .filter((item) => params.includeBelowThreshold || nowMs - this.taskLastActivityMs(item.task) >= stallMs)
       .sort((a, b) => this.taskLastActivityMs(a.task) - this.taskLastActivityMs(b.task));
   }
 
@@ -1946,6 +1947,7 @@ export class AgentManagerDb {
       owner: params.owner,
       excludeTaskId: params.excludeTaskId,
       onlyTaskId: params.onlyTaskId,
+      includeBelowThreshold: Boolean(params.onlyTaskId && params.forceTriage),
       nowMs,
     });
     if (!blockers.length) return null;

@@ -976,6 +976,45 @@ describe('stalled task sweeper', () => {
     expect(db.tasks.claim).not.toHaveBeenCalled();
   });
 
+  it('force-jumpstarts an exact doing task before the automatic stall threshold', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const selected = task({
+      uuid: 'abcdef12-3456-4abc-8abc-abcdef123456',
+      updated_at: nowSec - 35 * 60,
+    });
+    const db = fakeDb({
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => status === 'doing' ? [selected] : []),
+        getByUuidPrefix: vi.fn(async (prefix: string) => prefix === 'abcdef12' ? [selected] : []),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-task-ref-force-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const result = await manager.executeRemoteCommand('/task jumpstart-stalled #abcdef12 --force', TEAM_ID, 'default');
+
+    expect(result).toMatchObject({
+      ok: true,
+      result: {
+        scannedOwners: 1,
+        triagedOwners: 1,
+        items: [
+          {
+            team: 'default',
+            owner: 'worker',
+            blockers: ['#abcdef12'],
+            triage: { status: 'sent_owner', taskRef: '#abcdef12', actor: 'worker' },
+          },
+        ],
+      },
+    });
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'worker',
+      expect.stringContaining('35m'),
+    );
+  });
+
   it('exposes a manager-owned command to assign exact unowned todo refs without lead planning', async () => {
     const nowSec = Math.floor(NOW_MS / 1000);
     const selected = task({
