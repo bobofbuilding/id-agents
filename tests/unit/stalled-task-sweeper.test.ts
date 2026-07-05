@@ -359,6 +359,74 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('routes parked blocked control replies to task-master triage', async () => {
+    const staleTask = task();
+    const opsTeam = team({ id: 'ops-team-id', name: 'ops-team' });
+    const taskMaster = agent({
+      id: 'task-master-id',
+      team_id: opsTeam.id,
+      name: 'task-master',
+      status: 'running',
+    });
+    const db = fakeDb({
+      teams: {
+        getTeamByName: vi.fn(async (name: string) => {
+          if (name === 'ops-team') return opsTeam;
+          if (name === 'default') return team();
+          return null;
+        }),
+      },
+      agents: {
+        getByName: vi.fn(async (teamId: string, name: string) =>
+          teamId === opsTeam.id && name === 'task-master' ? taskMaster : null,
+        ),
+        list: vi.fn(async (teamId: string) => teamId === opsTeam.id ? [taskMaster] : [agent()]),
+      },
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [staleTask]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-blocked-control-task-manager-route-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery(staleTask.owner!, {
+        query_id: 'guard-blocked',
+        prompt: 'Backlog guard: task #12345678 ("Stalled work") has been active 60m with no progress update. Reply with one line: DONE, BLOCKED: <reason>, NEEDS-REASSIGNMENT, or IN-PROGRESS: <next update>.',
+        status: 'completed',
+      }),
+      { result: 'BLOCKED: missing source evidence' },
+      NOW_MS,
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(staleTask.id, expect.objectContaining({
+      owner: null,
+      status: 'todo',
+      completed_at: null,
+    }));
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'ops-team',
+      'task-master',
+      expect.stringContaining('task-manager triage for default task #12345678'),
+    );
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'ops-team',
+      'task-master',
+      expect.stringContaining('task has no owner'),
+    );
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      team_id: TEAM_ID,
+      topic: 'task:triaged',
+      actor_agent_id: 'task-master-id',
+      data: expect.objectContaining({
+        reason: 'unclaimed',
+        stalled_minutes: 60,
+      }),
+    }));
+  });
+
   it('assigns a routed control reply to the named live teammate', async () => {
     const routedTask = task({
       status: 'todo',

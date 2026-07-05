@@ -1706,6 +1706,33 @@ export class AgentManagerDb {
     return lastBlocked;
   }
 
+  private async routeParkedControlReplyTaskToTaskManager(params: {
+    teamId: string;
+    teamName: string;
+    task: TaskRow;
+    ref: string;
+    stalledMinutes: number;
+    nowMs: number;
+    action: 'blocked' | 'reassign';
+  }): Promise<void> {
+    const fallback = await this.routeStalledTaskToTaskManagerFallback({
+      teamId: params.teamId,
+      teamName: params.teamName,
+      task: params.task,
+      ref: params.ref,
+      stalledMinutes: params.stalledMinutes,
+      ownerName: 'unclaimed',
+      nowMs: params.nowMs,
+      renudgeMs: this.getStallRenudgeMs(),
+      maxProbes: this.getMaxStalledTaskProbes(),
+      reason: 'unclaimed',
+      eventReason: 'unclaimed',
+    });
+    if (fallback?.status === 'sent_task_manager') {
+      this.managerLog(`Routed ${params.action} task ${params.task.name} to ${fallback.actorTeam}/${fallback.actor} for triage`);
+    }
+  }
+
   private async countRecentOwnerControlFailures(params: {
     teamId: string;
     owner: AgentRow;
@@ -3614,15 +3641,23 @@ Return this JSON shape:
       }
     }
 
-    await this.db.tasks.updateFields(task.id, {
+    const parkedTask: TaskRow = {
+      ...task,
       owner: null,
       status: 'todo',
       completed_at: null,
-      description: this.appendTaskTriageNote(task.description, `control_reply_${effectiveParsed.action}`, fallbackNote, occurredAt),
       updated_at: nowSec,
+      description: this.appendTaskTriageNote(task.description, `control_reply_${effectiveParsed.action}`, fallbackNote, occurredAt),
+    };
+    await this.db.tasks.updateFields(task.id, {
+      owner: parkedTask.owner,
+      status: parkedTask.status,
+      completed_at: parkedTask.completed_at,
+      description: parkedTask.description,
+      updated_at: parkedTask.updated_at,
     });
     await this.recordTaskSupervision(
-      task,
+      parkedTask,
       taskTeamRow?.id || queryRow.team_id,
       actorAgentId,
       effectiveParsed.action === 'blocked' ? 'control_reply_blocked' : 'control_reply_reassign',
@@ -3630,6 +3665,19 @@ Return this JSON shape:
       occurredAt,
     );
     await this.markTaskControlReplyApplied({ teamId: queryRow.team_id, queryId: queryRow.query_id, agentId: actorAgentId, occurredAt, task, action: effectiveParsed.action });
+    if (taskTeamRow) {
+      void this.routeParkedControlReplyTaskToTaskManager({
+        teamId: taskTeamRow.id,
+        teamName: taskTeamRow.name,
+        task: parkedTask,
+        ref: this.taskShortRef(parkedTask),
+        stalledMinutes,
+        nowMs: occurredAt,
+        action: effectiveParsed.action,
+      }).catch((err) => {
+        console.warn(`[Supervision] Task-manager triage route failed for ${task.name}: ${err?.message || err}`);
+      });
+    }
     this.managerLog(`Applied ${effectiveParsed.action} control reply for task ${task.name} from query ${queryRow.query_id}`);
     return { applied: true, action: effectiveParsed.action, task: task.name };
   }
