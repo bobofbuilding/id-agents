@@ -177,10 +177,11 @@ describe('stalled task sweeper', () => {
     delete process.env.LEAD_DELEGATION_KICKOFF_GRACE_MS;
   });
 
-  it('defaults automatic stalled-task sweeps to a quieter cadence', () => {
+  it('defaults automatic stalled-task sweeps to a responsive assignment cadence', () => {
     const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', fakeDb(), { libraryRoot: null }) as any;
 
-    expect(manager.getStallSweepIntervalMs()).toBe(15 * 60 * 1000);
+    expect(manager.getStallSweepIntervalMs()).toBe(2 * 60 * 1000);
+    expect(manager.unownedAssignMinMs()).toBe(60 * 1000);
   });
 
   it('allows stalled-task sweep cadence overrides with a one-minute floor', () => {

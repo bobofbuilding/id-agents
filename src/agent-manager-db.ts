@@ -749,7 +749,7 @@ export class AgentManagerDb {
     const raw = Number(process.env.STALL_SWEEP_INTERVAL_MS || process.env.ID_STALL_SWEEP_INTERVAL_MS);
     return Number.isFinite(raw) && raw > 0
       ? Math.max(60_000, Math.floor(raw))
-      : 15 * 60 * 1000;
+      : 2 * 60 * 1000;
   }
 
   private getStallSweepScanLimit(): number {
@@ -15747,7 +15747,7 @@ Return this JSON shape:
     const MAX_PER_SWEEP = Math.max(1, Number(process.env.STALL_SWEEP_MAX_PER_SWEEP) || 2);
     const UNOWNED_ASSIGN_MAX_PER_SWEEP = Math.max(
       0,
-      Math.min(MAX_PER_SWEEP, Number(process.env.ID_UNOWNED_ASSIGN_MAX_PER_SWEEP) || 1),
+      Math.min(MAX_PER_SWEEP, Number(process.env.ID_UNOWNED_ASSIGN_MAX_PER_SWEEP) || 2),
     );
     const SCAN_LIMIT = this.getStallSweepScanLimit();
     const MAX_PROBES = this.getMaxStalledTaskProbes();
@@ -17701,7 +17701,7 @@ Return this JSON shape:
   }
 
   private unownedAssignMinMs(): number {
-    return Math.max(60_000, Number(process.env.ID_UNOWNED_ASSIGN_MIN_MS) || 5 * 60 * 1000);
+    return Math.max(60_000, Number(process.env.ID_UNOWNED_ASSIGN_MIN_MS) || 60_000);
   }
 
   private async dispatchManagedSchedule(
