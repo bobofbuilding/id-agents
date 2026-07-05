@@ -1601,6 +1601,8 @@ export class AgentManagerDb {
     ownerName: string;
     reason: 'no_live_lead' | 'lead_busy' | 'owner_busy' | 'owner_unresponsive' | 'lead_delegation_required' | 'lead_capacity' | 'unclaimed';
     leadName?: string;
+    blockerNote?: string | null;
+    sourceAction?: 'blocked' | 'reassign' | null;
   }): string {
     const ownerState = params.reason === 'owner_busy'
       ? `owner ${params.ownerName} already has another active query`
@@ -1624,7 +1626,18 @@ export class AgentManagerDb {
             : params.reason === 'lead_capacity'
               ? 'task-manager capacity triage is required before waking the lead'
               : 'manual jumpstart was requested';
-    return `TASK DELEGATION from manager: You are assigned task-manager triage for ${params.teamName} task ${params.ref} ("${params.task.title}"). The task has been active ${params.stalledMinutes}m, ${ownerState}, and ${leadState}. New task assignment to that owner is held until this is triaged. Use the manager task flow to restart or replace the owner, reassign the task, split it into member-owned work, or park it as todo with a clear blocker. Do not create duplicate objectives; mutate only the existing task or the minimum child tasks required to unblock it.`;
+    const blocker = String(params.blockerNote || '')
+      .trim()
+      .replace(/\s+/g, ' ')
+      .replace(/^(?:BLOCKED|BLOCKER|NEEDS-REASSIGNMENT|REASSIGN|ROUTE|UNBLOCK)\s*:?\s*/i, '')
+      .slice(0, 360);
+    const source = params.sourceAction
+      ? ` The owner replied ${params.sourceAction.toUpperCase()}${blocker ? `: ${blocker}` : ''}.`
+      : '';
+    const unblock = blocker
+      ? ' If the blocker requires the lead, project manager, or user, create or update the relevant inbox/decision item with the exact missing decision and next owner; do not leave this as an unexplained retry.'
+      : '';
+    return `TASK DELEGATION from manager: You are assigned task-manager triage for ${params.teamName} task ${params.ref} ("${params.task.title}"). The task has been active ${params.stalledMinutes}m, ${ownerState}, and ${leadState}.${source} New task assignment to that owner is held until this is triaged. Return a solution-oriented outcome: ROUTE to a live owner with why, SPLIT into member-owned work, ASK-USER with the exact missing decision, or PARK with a clear blocker and unblock owner.${unblock} Do not create duplicate objectives; mutate only the existing task or the minimum child tasks required to unblock it.`;
   }
 
   private taskManagerFallbackLaneKey(teamId: string): string {
@@ -1669,6 +1682,8 @@ export class AgentManagerDb {
     reason: 'no_live_lead' | 'lead_busy' | 'owner_busy' | 'owner_unresponsive' | 'lead_delegation_required' | 'lead_capacity' | 'unclaimed';
     eventReason: 'owner_unavailable' | 'owner_busy' | 'lead_delegation_required' | 'probe_limit_reached' | 'unclaimed';
     leadName?: string;
+    blockerNote?: string | null;
+    sourceAction?: 'blocked' | 'reassign' | null;
   }): Promise<{ status: string; taskRef: string; actor?: string; actorTeam?: string; attempt?: number } | null> {
     const taskManagers = await this.findTaskManagerFallbacks().catch(() => []);
     if (!taskManagers.length) return null;
@@ -1762,6 +1777,7 @@ export class AgentManagerDb {
     stalledMinutes: number;
     nowMs: number;
     action: 'blocked' | 'reassign';
+    blockerNote?: string | null;
   }): Promise<void> {
     const fallback = await this.routeStalledTaskToTaskManagerFallback({
       teamId: params.teamId,
@@ -1775,6 +1791,8 @@ export class AgentManagerDb {
       maxProbes: this.getMaxStalledTaskProbes(),
       reason: 'unclaimed',
       eventReason: 'unclaimed',
+      blockerNote: params.blockerNote,
+      sourceAction: params.action,
     });
     if (fallback?.status === 'sent_task_manager') {
       this.managerLog(`Routed ${params.action} task ${params.task.name} to ${fallback.actorTeam}/${fallback.actor} for triage`);
@@ -3708,6 +3726,7 @@ Return this JSON shape:
         stalledMinutes,
         nowMs: occurredAt,
         action: effectiveParsed.action,
+        blockerNote: fallbackNote,
       }).catch((err) => {
         console.warn(`[Supervision] Task-manager triage route failed for ${task.name}: ${err?.message || err}`);
       });

@@ -416,6 +416,16 @@ describe('stalled task sweeper', () => {
       'task-master',
       expect.stringContaining('task has no owner'),
     );
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'ops-team',
+      'task-master',
+      expect.stringContaining('The owner replied BLOCKED: missing source evidence'),
+    );
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'ops-team',
+      'task-master',
+      expect.stringContaining('ASK-USER with the exact missing decision'),
+    );
     expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
       team_id: TEAM_ID,
       topic: 'task:triaged',
