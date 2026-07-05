@@ -1432,12 +1432,86 @@ export class AgentManagerDb {
     return this.tasksShareGoal(parent, candidate) || this.taskTitlesLookRelated(parent, candidate);
   }
 
-  private async delegatedChildTaskSummary(child: TaskRow, ownerLookup?: Map<string, AgentRow>): Promise<Record<string, unknown>> {
+  private queryResultMessage(result: unknown): string | null {
+    if (result == null) return null;
+    let parsed = result;
+    if (typeof parsed === 'string') {
+      const raw = parsed;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        return raw.trim() || null;
+      }
+    }
+    if (parsed && typeof parsed === 'object') {
+      const candidate = parsed as Record<string, unknown>;
+      if (typeof candidate.result === 'string') return candidate.result.trim() || null;
+      if (typeof candidate.message === 'string') return candidate.message.trim() || null;
+      try {
+        return JSON.stringify(candidate);
+      } catch {
+        return null;
+      }
+    }
+    return String(parsed).trim() || null;
+  }
+
+  private async delegatedChildCompletionEvidence(child: TaskRow, teamId: string): Promise<Array<{ queryId: string; completedAt: number | null; excerpt: string }>> {
+    const terms = [
+      this.taskShortRef(child),
+      child.uuid ? child.uuid.replace(/-/g, '').slice(0, 8) : null,
+      child.name,
+    ].filter((term): term is string => Boolean(term && term.trim()));
+    if (!terms.length) return [];
+
+    const clauses: string[] = [];
+    const params: unknown[] = [teamId];
+    if (child.owner) {
+      clauses.push('agent_id = ?');
+      params.push(child.owner);
+    }
+    const matchClauses = terms.flatMap(() => ['prompt LIKE ?', 'CAST(result AS TEXT) LIKE ?']);
+    for (const term of terms) {
+      const like = `%${term}%`;
+      params.push(like, like);
+    }
+    const ownerClause = clauses.length ? `AND ${clauses.join(' AND ')}` : '';
+    const { rows } = await this.db.adapter.query<{
+      query_id: string;
+      completed: number | null;
+      result: unknown;
+    }>(
+      `SELECT query_id, completed, result
+         FROM queries
+        WHERE team_id = ?
+          ${ownerClause}
+          AND status = 'completed'
+          AND (${matchClauses.join(' OR ')})
+        ORDER BY COALESCE(completed, created) DESC
+        LIMIT 3`,
+      params,
+    ).catch(() => ({ rows: [] as Array<{ query_id: string; completed: number | null; result: unknown }> }));
+
+    return rows.flatMap((row) => {
+      const message = this.queryResultMessage(row.result);
+      if (!message) return [];
+      return [{
+        queryId: row.query_id,
+        completedAt: row.completed ?? null,
+        excerpt: this.compactBrainContextText(message, 900),
+      }];
+    });
+  }
+
+  private async delegatedChildTaskSummary(child: TaskRow, teamId: string, ownerLookup?: Map<string, AgentRow>): Promise<Record<string, unknown>> {
     let ownerName: string | null = null;
     if (child.owner) {
       const owner = ownerLookup?.get(child.owner) || await this.db.agents.getById(child.owner);
       ownerName = owner ? ((owner.metadata as any)?.alias || owner.name) : null;
     }
+    const completionEvidence = child.status === 'done'
+      ? await this.delegatedChildCompletionEvidence(child, teamId)
+      : [];
     return {
       ref: this.taskShortRef(child),
       name: child.name,
@@ -1446,24 +1520,34 @@ export class AgentManagerDb {
       ownerName,
       updatedAt: child.updated_at,
       completedAt: child.completed_at,
+      completionEvidence,
     };
   }
 
   private async delegatedChildrenCompletePrompt(parent: TaskRow, children: TaskRow[], ownerLookup?: Map<string, AgentRow>): Promise<string> {
     const parentRef = this.taskShortRef(parent);
-    const childSummaries = await Promise.all(children.map((child) => this.delegatedChildTaskSummary(child, ownerLookup)));
-    const childLines = childSummaries.map((summary) => {
+    const childSummaries = await Promise.all(children.map((child) => this.delegatedChildTaskSummary(child, parent.team_id || '', ownerLookup)));
+    const childBlocks = childSummaries.map((summary) => {
       const ref = String(summary.ref || summary.name || 'child');
       const owner = summary.ownerName ? ` owner=${summary.ownerName}` : '';
       const title = summary.title ? ` title="${String(summary.title).slice(0, 120)}"` : '';
-      return `- ${ref} status=${summary.status || 'unknown'}${owner}${title}`;
+      const lines = [`- ${ref} status=${summary.status || 'unknown'}${owner}${title}`];
+      const evidence = Array.isArray(summary.completionEvidence) ? summary.completionEvidence : [];
+      for (const item of evidence.slice(0, 2)) {
+        if (!item || typeof item !== 'object') continue;
+        const row = item as { queryId?: unknown; excerpt?: unknown };
+        const queryId = row.queryId ? ` (${String(row.queryId)})` : '';
+        const excerpt = row.excerpt ? String(row.excerpt).trim() : '';
+        if (excerpt) lines.push(`  completion${queryId}: ${excerpt}`);
+      }
+      return lines.join('\n');
     }).join('\n');
     return [
       `Supervision: Manager DB confirms parent task ${parentRef} ("${parent.title}") exists and all detected delegated child tasks are done.`,
       `Parent task name: ${parent.name}. Parent task uuid: ${parent.uuid || 'unknown'}.`,
-      'Completed delegated children:',
-      childLines || '- none detected',
-      'Reconcile the child outputs now and mark the parent done with child_task_names/delegated_task_names, or reply BLOCKED: <reason> if a concrete blocker remains.',
+      'Completed delegated children and available completion evidence:',
+      childBlocks || '- none detected',
+      'Reconcile from the embedded child completion evidence above; do not require cross-agent workspace file access. Mark the parent done with child_task_names/delegated_task_names, or reply BLOCKED: <reason> if a concrete blocker remains.',
       `Do not answer that ${parentRef} has no trace; this prompt is the authoritative task record. Do not create new tasks from this control prompt.`,
     ].join('\n');
   }
@@ -1535,7 +1619,7 @@ export class AgentManagerDb {
     const childTasks = await this.findDelegatedChildTasks(task, teamId, owner);
     const childTaskRefs = childTasks.map((child) => child.uuid ? `#${child.uuid.replace(/-/g, '').slice(0, 8)}` : child.name);
     const childTaskSummaries = childTasks.length
-      ? await Promise.all(childTasks.map((child) => this.delegatedChildTaskSummary(child, ownerLookup)))
+      ? await Promise.all(childTasks.map((child) => this.delegatedChildTaskSummary(child, teamId, ownerLookup)))
       : [];
     if (childTaskRefs.length > 0) {
       return {

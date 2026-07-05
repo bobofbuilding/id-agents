@@ -642,6 +642,23 @@ describe('stalled task sweeper', () => {
       tasks: {
         list: vi.fn(async ({ status }: { status?: string } = {}) => status === 'doing' ? [parent] : [parent, child]),
       },
+      adapter: {
+        query: vi.fn(async (sql: string) => {
+          if (sql.includes('FROM queries')) {
+            return {
+              rows: [{
+                query_id: 'query-child-complete',
+                completed: NOW_MS,
+                result: {
+                  result: 'Done. Output: ./output/memory-architecture-canonical-v1.md. Summary: canonical memory plan is ready.',
+                },
+              }],
+              rowCount: 1,
+            };
+          }
+          return { rows: [], rowCount: 0 };
+        }),
+      },
     });
     const manager = new AgentManagerDb('/tmp/id-agents-delegated-parent-ready-test', db, { libraryRoot: null }) as any;
     manager.sendSupervisionAsk = vi.fn(async () => true);
@@ -668,6 +685,11 @@ describe('stalled task sweeper', () => {
       'research',
       'research-lead',
       expect.stringContaining('#33333333 status=done owner=analyst'),
+    );
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'research',
+      'research-lead',
+      expect.stringContaining('completion (query-child-complete): Done. Output: ./output/memory-architecture-canonical-v1.md. Summary: canonical memory plan is ready.'),
     );
     expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
       'research',
