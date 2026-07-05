@@ -1347,6 +1347,55 @@ export class AgentManagerDb {
     };
   }
 
+  private async wakeDelegatedParentLeadIfReady(params: {
+    teamId: string;
+    teamName: string;
+    child: TaskRow;
+    occurredAt: number;
+  }): Promise<number> {
+    if (params.child.status !== 'done') return 0;
+    const doing = await this.db.tasks.list({ teamId: params.teamId, status: 'doing' }).catch(() => [] as TaskRow[]);
+    const ownerCache = new Map<string, AgentRow>();
+    let sent = 0;
+
+    for (const parent of doing) {
+      if (parent.id === params.child.id || !parent.owner) continue;
+      let owner: AgentRow | null | undefined = ownerCache.get(parent.owner);
+      if (!owner) {
+        owner = await this.db.agents.getById(parent.owner).catch(() => null) as AgentRow | null;
+        if (owner) ownerCache.set(parent.owner, owner);
+      }
+      if (!owner || !this.isConfiguredTeamLead(params.teamName, owner)) continue;
+
+      const children = await this.findDelegatedChildTasks(parent, params.teamId, owner);
+      if (!children.some((candidate) => candidate.id === params.child.id)) continue;
+      if (!children.length || children.some((candidate) => candidate.status !== 'done')) continue;
+      if (await this.hasAnyActiveQuery(owner)) continue;
+
+      const childSummaries = await Promise.all(children.map((child) => this.delegatedChildTaskSummary(child, ownerCache)));
+      const childText = childSummaries.map((summary) => {
+        const ref = String(summary.ref || summary.name || 'child');
+        const childOwner = summary.ownerName ? ` by ${summary.ownerName}` : '';
+        return `${ref}:${summary.status || 'unknown'}${childOwner}`;
+      }).join(', ');
+      const parentRef = this.taskShortRef(parent);
+      const message = `Supervision: task ${parentRef} ("${parent.title}") has all delegated child tasks done (${childText}). Reconcile the child outputs, then mark the parent done with child_task_names, or reply BLOCKED: <reason>. Do not create new tasks from this control prompt.`;
+      const status = await this.sendRecentThrottledSupervisionAsk({
+        teamId: params.teamId,
+        teamName: params.teamName,
+        recipient: owner,
+        message,
+        nowMs: params.occurredAt,
+      });
+      if (status === 'sent') {
+        await this.recordTaskSupervision(parent, params.teamId, owner.id, 'delegated_children_complete', 0, params.occurredAt);
+        sent++;
+      }
+    }
+
+    return sent;
+  }
+
   private async findDelegatedChildTasks(task: TaskRow, teamId: string, owner: AgentRow | null): Promise<TaskRow[]> {
     const allTasks = await this.db.tasks.list({ teamId });
     return allTasks.filter((candidate) => {
@@ -3333,6 +3382,17 @@ Return this JSON shape:
         actorAgentId,
         occurredAt,
       });
+      const teamRow = await this.db.teams.getTeam(queryRow.team_id).catch(() => null);
+      if (teamRow) {
+        void this.wakeDelegatedParentLeadIfReady({
+          teamId: queryRow.team_id,
+          teamName: teamRow.name,
+          child: { ...task, status: 'done', completed_at: nowSec, updated_at: nowSec },
+          occurredAt,
+        }).catch((err) => {
+          console.warn(`[Supervision] Delegated parent wake failed for ${task.name}: ${err?.message || err}`);
+        });
+      }
       await this.recordTaskSupervision(task, queryRow.team_id, actorAgentId, 'control_reply_done', stalledMinutes, occurredAt);
       await this.markTaskControlReplyApplied({ teamId: queryRow.team_id, queryId: queryRow.query_id, agentId: actorAgentId, occurredAt, task, action: effectiveParsed.action });
       this.managerLog(`Applied DONE control reply for task ${task.name} from query ${queryRow.query_id}`);
@@ -9705,6 +9765,14 @@ Return this JSON shape:
           actorAgentId: callerAgent?.id ?? updated!.owner ?? null,
           occurredAt: completedAt,
         });
+        void this.wakeDelegatedParentLeadIfReady({
+          teamId,
+          teamName,
+          child: updated!,
+          occurredAt: completedAt,
+        }).catch((err) => {
+          console.warn(`[Supervision] Delegated parent wake failed for ${updated!.name}: ${err?.message || err}`);
+        });
         void this.maybeTriggerValidatorRecommendationLoop({
           teamId,
           teamName,
@@ -13879,6 +13947,16 @@ Return this JSON shape:
           });
 
           const updated = await this.db.tasks.getByNameForTeam(task.name, teamId);
+          if (updated) {
+            void this.wakeDelegatedParentLeadIfReady({
+              teamId,
+              teamName: teamRow?.name || 'default',
+              child: updated,
+              occurredAt: now * 1000,
+            }).catch((err) => {
+              console.warn(`[Supervision] Delegated parent wake failed for ${updated.name}: ${err?.message || err}`);
+            });
+          }
           return { ok: true, result: { task: await this.buildTaskResult(updated!, teamId), completion_validation: completion.validation } };
         }
 
@@ -14610,7 +14688,7 @@ Return this JSON shape:
     task: TaskRow,
     teamId: string,
     actorAgentId: string | null,
-    reason: 'owner_refresh' | 'owner_unavailable' | 'owner_busy' | 'unclaimed' | 'checkin_heartbeat_probe' | 'probe_limit_reached' | 'validator_stalled_terminal' | 'lead_delegation_required' | 'lead_owner_unavailable' | 'control_reply_done' | 'control_reply_in_progress' | 'control_reply_delegated' | 'control_reply_claimed' | 'control_reply_blocked' | 'control_reply_reassign' | 'control_reply_route_assigned',
+    reason: 'owner_refresh' | 'owner_unavailable' | 'owner_busy' | 'unclaimed' | 'checkin_heartbeat_probe' | 'probe_limit_reached' | 'validator_stalled_terminal' | 'lead_delegation_required' | 'lead_owner_unavailable' | 'delegated_children_complete' | 'control_reply_done' | 'control_reply_in_progress' | 'control_reply_delegated' | 'control_reply_claimed' | 'control_reply_blocked' | 'control_reply_reassign' | 'control_reply_route_assigned',
     stalledMinutes: number,
     nowMs: number,
   ): Promise<void> {
@@ -14632,6 +14710,7 @@ Return this JSON shape:
       || reason === 'control_reply_delegated'
       || reason === 'control_reply_claimed'
       || reason === 'control_reply_route_assigned'
+      || reason === 'delegated_children_complete'
     ) {
       await emitTaskRefreshed(this.db.events, input);
     } else {

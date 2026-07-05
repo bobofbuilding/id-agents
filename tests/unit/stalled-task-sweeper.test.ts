@@ -456,6 +456,78 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('wakes the parent lead when all delegated child tasks are done', async () => {
+    const lead = agent({ id: 'lead-1', name: 'research-lead', team_id: TEAM_ID, metadata: { lead: true } });
+    const worker = agent({ id: 'worker-1', name: 'analyst', team_id: TEAM_ID });
+    const parent = task({
+      id: 'parent-task',
+      name: 'map-active-goal-bindings',
+      uuid: '87654321-1234-1234-1234-123456789abc',
+      title: 'Map active goal bindings',
+      owner: lead.id,
+      created_by: lead.id,
+      created_at: Math.floor(NOW_MS / 1000) - 600,
+      updated_at: Math.floor(NOW_MS / 1000) - 600,
+    });
+    const child = task({
+      id: 'child-task',
+      name: 'map-goal-label-owner-routes',
+      uuid: '33333333-3333-4333-8333-333333333333',
+      title: 'Map goal label owner routes',
+      description: 'Child of #87654321',
+      owner: worker.id,
+      created_by: lead.id,
+      status: 'done',
+      created_at: Math.floor(NOW_MS / 1000) - 500,
+      updated_at: Math.floor(NOW_MS / 1000) - 100,
+      completed_at: Math.floor(NOW_MS / 1000) - 100,
+    });
+    const db = fakeDb({
+      teams: {
+        getTeam: vi.fn(async () => team({ name: 'research' })),
+      },
+      agents: {
+        getById: vi.fn(async (id: string) => id === lead.id ? lead : id === worker.id ? worker : null),
+      },
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => status === 'doing' ? [parent] : [parent, child]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-delegated-parent-ready-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const sent = await manager.wakeDelegatedParentLeadIfReady({
+      teamId: TEAM_ID,
+      teamName: 'research',
+      child,
+      occurredAt: NOW_MS,
+    });
+
+    expect(sent).toBe(1);
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'research',
+      'research-lead',
+      expect.stringContaining('has all delegated child tasks done'),
+    );
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'research',
+      'research-lead',
+      expect.stringContaining('#87654321'),
+    );
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'research',
+      'research-lead',
+      expect.stringContaining('#33333333:done by analyst'),
+    );
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:refreshed',
+      subject_id: parent.uuid,
+      data: expect.objectContaining({
+        reason: 'delegated_children_complete',
+      }),
+    }));
+  });
+
   it('marks a task done when a delegation reply starts with completed-task prose', async () => {
     const staleTask = task();
     const db = fakeDb({
