@@ -112,6 +112,7 @@ function fakeDb(overrides: Record<string, any> = {}): any {
       getByUuidPrefix: vi.fn(async () => [task()]),
       claim: vi.fn(async () => true),
       updateFields: vi.fn(async () => {}),
+      listEventLinksForTask: vi.fn(async () => []),
       ...overrides.tasks,
     },
     checkins: {
@@ -1112,6 +1113,91 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('closes a control reply when only the local manager done call was refused', async () => {
+    const staleTask = task({
+      name: 'audit-canceled-item-reason',
+      title: 'Audit canceled item reason',
+    });
+    const db = fakeDb({
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [staleTask]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-control-reply-manager-url-refused-close-test', db, { libraryRoot: null }) as any;
+
+    await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery(staleTask.owner!, {
+        query_id: 'manager-url-refused-clean-close',
+        prompt: 'Supervision: task #12345678 ("Audit canceled item reason") has been in progress 60m. Reply with one line: DONE, BLOCKED: <reason>, NEEDS-REASSIGNMENT, or IN-PROGRESS: <next update>.',
+        status: 'completed',
+      }),
+      {
+        result: [
+          'BLOCKED: I could not mark `audit-canceled-item-reason` done because `$MANAGER_URL` (`http://127.0.0.1:4100`) refused the completion POST.',
+          '',
+          'Reconciliation is complete from the embedded evidence: delegated child `verify-skillmesh-bucket-replacement-evidence` passed.',
+        ].join('\n'),
+      },
+      NOW_MS,
+    );
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(staleTask.id, {
+      status: 'done',
+      completed_at: Math.floor(NOW_MS / 1000),
+      updated_at: Math.floor(NOW_MS / 1000),
+    });
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:completed',
+      subject_id: staleTask.uuid,
+      data: expect.objectContaining({
+        failure_note: expect.stringContaining('Manager-applied closure after local done-call failure'),
+      }),
+    }));
+  });
+
+  it('keeps a manager-url-refused control reply blocked when evidence is still missing', async () => {
+    const staleTask = task({
+      name: 'audit-missing-output',
+      title: 'Audit missing output',
+    });
+    const db = fakeDb({
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [staleTask]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-control-reply-manager-url-real-blocker-test', db, { libraryRoot: null }) as any;
+
+    await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery(staleTask.owner!, {
+        query_id: 'manager-url-refused-real-blocker',
+        prompt: 'Supervision: task #12345678 ("Audit missing output") has been in progress 60m. Reply with one line: DONE, BLOCKED: <reason>, NEEDS-REASSIGNMENT, or IN-PROGRESS: <next update>.',
+        status: 'completed',
+      }),
+      {
+        result: [
+          'BLOCKED: I could not mark the task done because `$MANAGER_URL` refused the connection.',
+          '',
+          'The child output artifact is missing, so I cannot reconcile acceptance.',
+        ].join('\n'),
+      },
+      NOW_MS,
+    );
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(staleTask.id, expect.objectContaining({
+      owner: null,
+      status: 'todo',
+      completed_at: null,
+      updated_at: Math.floor(NOW_MS / 1000),
+    }));
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:triaged',
+      subject_id: staleTask.uuid,
+      data: expect.objectContaining({
+        reason: 'control_reply_blocked',
+      }),
+    }));
+  });
+
   it('applies a blocked control reply even when context precedes the control line', async () => {
     const staleTask = task();
     const db = fakeDb({
@@ -1955,6 +2041,92 @@ describe('stalled task sweeper', () => {
     );
     expect(create).not.toHaveBeenCalled();
     expect(db.tasks.claim).not.toHaveBeenCalled();
+  });
+
+  it('keeps explicit lead-coordination task creation owned by the team lead despite delegation backlog', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const lead = agent({
+      id: 'engineering-lead-1',
+      name: 'engineering-lead',
+      metadata: { role: 'team lead' },
+      last_seen: NOW_MS,
+    });
+    const worker = agent({ id: 'architect-1', name: 'architect', last_seen: NOW_MS });
+    const existingLeadParent = task({
+      id: 'existing-lead-parent',
+      name: 'existing-lead-parent',
+      uuid: '11111111-2222-4333-8444-555555555555',
+      team_id: TEAM_ID,
+      title: 'Existing lead parent',
+      status: 'doing',
+      owner: lead.id,
+      created_at: nowSec - 20 * 60,
+      updated_at: nowSec - 20 * 60,
+    });
+    let createdTask: TaskRow | null = null;
+    const create = vi.fn(async (row: TaskRow) => {
+      createdTask = row;
+    });
+    const db = fakeDb({
+      teams: {
+        getTeam: vi.fn(async () => team({ name: 'engineering-team' })),
+        getTeamByName: vi.fn(async (name: string) => name === 'engineering-team' ? team({ name }) : null),
+      },
+      agents: {
+        getById: vi.fn(async (id: string) => id === lead.id ? lead : worker),
+        getByName: vi.fn(async (name: string) => name === lead.name ? lead : name === worker.name ? worker : null),
+        resolve: vi.fn(async (_teamId: string, ref: string) => {
+          if (ref === lead.name) return [lead];
+          if (ref === worker.name) return [worker];
+          return [];
+        }),
+        list: vi.fn(async () => [lead, worker]),
+      },
+      tasks: {
+        list: vi.fn(async ({ status, owner }: { status?: string; owner?: string } = {}) => {
+          if (status === 'doing' && owner === lead.id) return [existingLeadParent];
+          if (status === 'doing') return [existingLeadParent];
+          return [];
+        }),
+        getByNameForTeam: vi.fn(async (name: string) => {
+          if (name === existingLeadParent.name) return existingLeadParent;
+          if (createdTask && name === createdTask.name) return createdTask;
+          return null;
+        }),
+        getByUuidPrefix: vi.fn(async () => []),
+        create,
+        claim: vi.fn(async () => true),
+        updateFields: vi.fn(async () => {}),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-lead-coordination-create-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+    manager.wakeAssignedTaskOwner = vi.fn(async () => ({ status: 'started' }));
+
+    const result = await manager.executeRemoteCommand(
+      '/task create "Coordinate goal fanout" --owner engineering-lead --lead-coordination --goal goal_autopilot_fanout --expected-output "Lead creates child tasks and reports refs." --acceptance "Child task refs are cited." --validation-path "coder,researcher" --out-of-scope "Direct lead execution." --backlog-policy "Optional follow-ups stay backlog." --relevance "medium - improves managed-agent throughput."',
+      TEAM_ID,
+      'engineering-team',
+    );
+
+    expect(result).toMatchObject({ ok: true });
+    expect(create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: 'Coordinate goal fanout',
+        status: 'doing',
+        owner: lead.id,
+      }),
+      undefined,
+    );
+    expect(result.result.task.ownerName).toBe('engineering-lead');
+    expect(result.result.warning).toBeUndefined();
+    expect(manager.wakeAssignedTaskOwner).toHaveBeenCalled();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'engineering-team',
+      'engineering-lead',
+      expect.stringContaining('Lead delegation kickoff'),
+    );
   });
 
   it('does not attach Brain context to control-plane status prompts', async () => {

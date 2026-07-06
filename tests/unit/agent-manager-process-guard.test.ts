@@ -497,6 +497,41 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     expect(invalidOwner.processOwner).toBeNull();
   });
 
+  it('derives catalog profileStatus from live status without mutating stored catalog metadata', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const stoppedRow = agentRow({
+      status: 'stopped',
+      metadata: {
+        runtime: 'codex',
+        catalog: { role: 'architecture-engineer', profileStatus: 'active' },
+      },
+    });
+    const stopped = (manager as any).agentToResponse(stoppedRow);
+    expect(stopped.metadata.catalog.profileStatus).toBe('blocked-runtime-stopped');
+    expect((stoppedRow.metadata as any).catalog.profileStatus).toBe('active');
+
+    const runningRow = agentRow({
+      status: 'running',
+      metadata: {
+        pid: 12345,
+        runtime: 'codex',
+        processOwner: 'adopted',
+        processParentPid: 1,
+        catalog: { role: 'engineering-lead', profileStatus: 'blocked-runtime-stopped' },
+      },
+    });
+    const running = (manager as any).agentToResponse(runningRow);
+    expect(running.metadata.catalog.profileStatus).toBe('active');
+    expect((runningRow.metadata as any).catalog.profileStatus).toBe('blocked-runtime-stopped');
+
+    (manager as any).healthStatus.set('team-1:agent-1', { status: 'offline', lastCheck: 123 });
+    const offlineHealth = (manager as any).agentToResponse(runningRow);
+    expect(offlineHealth.metadata.catalog.profileStatus).toBe('blocked-runtime-stopped');
+  });
+
   it('clears all local process metadata together', async () => {
     const { manager, db, workDir } = await makeManager();
     dbs.push(db);

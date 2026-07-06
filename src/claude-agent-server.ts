@@ -877,6 +877,15 @@ export class AgentRestServer {
     return DEFAULT_AGENT_QUERY_CONCURRENCY;
   }
 
+  private catalogResponse(): Record<string, any> {
+    return {
+      name: this.agentIdentity?.name || this.agentName,
+      tokenId: this.agentIdentity?.tokenId,
+      ...this.catalog,
+      profileStatus: 'active',
+    };
+  }
+
   private async fetchRoutedAgentTarget(
     managerUrl: string,
     headers: Record<string, string>,
@@ -1272,7 +1281,8 @@ export class AgentRestServer {
       // Build agent identity from catalog and identity info
       const agentInfo: Record<string, any> = {
         name: this.agentIdentity?.name || this.agentName || `${getRuntimeDisplayName(this.harnessType)} Agent`,
-        ...this.catalog  // Include all catalog fields (description, role, expertise, etc.)
+        ...this.catalog,  // Include all catalog fields (description, role, expertise, etc.)
+        profileStatus: 'active',
       };
 
       // Add tokenId if available
@@ -1409,11 +1419,7 @@ export class AgentRestServer {
 
     // GET /catalog - read current catalog
     this.app.get('/catalog', (req, res) => {
-      res.json({
-        name: this.agentIdentity?.name || this.agentName,
-        tokenId: this.agentIdentity?.tokenId,
-        ...this.catalog
-      });
+      res.json(this.catalogResponse());
     });
 
     // PATCH /catalog - update agent catalog fields
@@ -1445,11 +1451,7 @@ export class AgentRestServer {
       console.log(`${logTime()} [Agent] 📋 Catalog updated:`, this.catalog);
       res.json({
         ok: true,
-        catalog: {
-          name: this.agentIdentity?.name || this.agentName,
-          tokenId: this.agentIdentity?.tokenId,
-          ...this.catalog
-        }
+        catalog: this.catalogResponse()
       });
     });
 

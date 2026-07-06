@@ -3615,6 +3615,59 @@ Return this JSON shape:
     };
   }
 
+  private inferToolOnlyTaskClosureReply(
+    prompt: string | null | undefined,
+    message: string,
+    parsed: { action: 'done' | 'in_progress' | 'blocked' | 'reassign' | 'claim' | 'delegated' | null; note: string; target: string | null },
+  ): { action: 'done'; note: string; target: null } | null {
+    if (!this.taskControlReplyPrompt(prompt)) return null;
+    if (parsed.action !== 'blocked') return null;
+
+    const text = String(message || '').trim();
+    if (!text) return null;
+    const normalized = text.replace(/[\u2013\u2014]/g, '-');
+    const firstLine = normalized
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find(Boolean) || 'Task completion evidence reconciled; manager applied closure.';
+
+    const toolOnlyClosureBlock = (
+      /\b(?:manager_url|manager api|local manager|tasks?\/[^\s`'"]+\/done|\/tasks\/[^\s`'"]+\/done)\b/i.test(normalized)
+      && /\b(?:connection refused|refused connections?|econnrefused|curl(?:\s+http)?\s+status\s+`?000`?|failed to connect|could not post|could not mark|unable to post|post(?:s)?\s+to)\b/i.test(normalized)
+    ) || (
+      /\b(?:no|without|lacking|lacks)\b.{0,100}\b(?:tool|bash|shell|http|curl|post|request|write access|manager api)\b/i.test(normalized)
+      || /\b(?:can't|cannot|unable|could not)\b.{0,140}\b(?:post|execute|issue|make|call|close|mark)\b.{0,100}\b(?:done|closure|http|request|manager api|tasks?\/)/i.test(normalized)
+      || /\bno way\b.{0,120}\b(?:post|manager api|done endpoint|closure call)\b/i.test(normalized)
+    );
+    if (!toolOnlyClosureBlock) return null;
+
+    const completionSignal = (
+      /\b(?:evidence|embedded evidence|child evidence|supplied evidence)\b.{0,180}\b(?:reconciles?|reconcile)\b.{0,80}\b(?:cleanly|clear|complete|done|ready)\b/i.test(normalized)
+      || /\breconciliation\b.{0,100}\b(?:is\s+)?(?:complete|clean|done|clear)\b/i.test(normalized)
+      || /\b(?:substantively|otherwise)\b.{0,80}\b(?:ready to close|ready for closure|complete|done)\b/i.test(normalized)
+      || /\b(?:ready to close|ready for closure|objective is complete|task is complete|task is done)\b/i.test(normalized)
+      || /\b(?:intended closeout payload|closeout payload)\b/i.test(normalized)
+      || /\b(?:no blocker|no concrete blocker|no corrections needed|no contradicting source)\b/i.test(normalized)
+    );
+    if (!completionSignal) return null;
+
+    const realTaskBlocker = (
+      /\b(?:missing|not found|unavailable)\b.{0,100}\b(?:artifact|output|evidence|source|deliverable|child output|workspace state|record|trace)\b/i.test(normalized)
+      || /\bno\s+(?:artifact|output|evidence|deliverable|child output|record|trace)\b/i.test(normalized)
+      || /\bmismatch\b/i.test(normalized)
+      || /\bnot a clean pass\b/i.test(normalized)
+      || /\brequires additional information\b/i.test(normalized)
+      || /\b(?:cannot|can't|unable)\b.{0,120}\breconcile\b/i.test(normalized)
+    );
+    if (realTaskBlocker) return null;
+
+    return {
+      action: 'done',
+      note: `Manager-applied closure after local done-call failure: ${firstLine.slice(0, 520)}`,
+      target: null,
+    };
+  }
+
   private inferTaskDelegationArtifactReply(
     prompt: string | null | undefined,
     message: string,
@@ -3820,7 +3873,9 @@ Return this JSON shape:
     const { task } = await this.resolveTaskRef(marker, queryRow.team_id).catch(() => ({ task: undefined }));
     if (!task) return { applied: false, action: parsed.action ?? undefined, reason: 'task_not_found' };
     const delegatedParentCompletion = this.inferDelegatedParentCompletionReply(queryRow.prompt, message, parsed);
+    const toolOnlyClosure = this.inferToolOnlyTaskClosureReply(queryRow.prompt, message, parsed);
     const effectiveParsed = delegatedParentCompletion
+      ?? toolOnlyClosure
       ?? (parsed.action
         ? parsed
         : this.inferTaskDelegationArtifactReply(queryRow.prompt, message, task, marker)
@@ -4237,12 +4292,22 @@ Return this JSON shape:
       delete metadata.processInspectedAt;
     }
 
+    const localHealthFields = this.getHealthForAgent(a);
+    const remoteHealth = isRemote ? this.deriveRemoteHealth(a) : null;
+    const profileStatus = this.deriveCatalogProfileStatus(a, remoteHealth ?? localHealthFields.health);
+    if (metadata.catalog && typeof metadata.catalog === 'object' && !Array.isArray(metadata.catalog)) {
+      metadata.catalog = {
+        ...(metadata.catalog as Record<string, unknown>),
+        profileStatus,
+      };
+    }
+
     // Remote-endpoint agents have no local port or pid; health is derived from probe columns.
     const remoteFields = isRemote ? {
       port: null,
       pid: null,
       deploymentShape: 'remote-endpoint' as const,
-      health: this.deriveRemoteHealth(a),
+      health: remoteHealth,
       customer_domain: a.customer_domain,
       public_endpoint_url: a.public_endpoint_url,
       internal_endpoint_url: a.internal_endpoint_url,
@@ -4286,7 +4351,7 @@ Return this JSON shape:
       domain,
       displayId,
       // Health monitoring (overridden for remote agents above)
-      ...this.getHealthForAgent(a),
+      ...localHealthFields,
       // Runtime shape — remote-endpoint agents override port/pid/health
       ...remoteFields,
     };
@@ -13683,6 +13748,7 @@ Return this JSON shape:
           let bittreesRelevance: string | undefined;
           let parentTask: string | undefined;
           let validationPurpose: string | undefined;
+          let leadCoordination = false;
           const eventIds: string[] = [];
 
           for (let i = 0; i < rawArgs.length; i++) {
@@ -13705,6 +13771,7 @@ Return this JSON shape:
             if (token === '--bittrees-relevance' || token === '--relevance') { bittreesRelevance = rawArgs[++i]; continue; }
             if (token === '--parent-task' || token === '--parent-ref') { parentTask = rawArgs[++i]; continue; }
             if (token === '--validation-purpose') { validationPurpose = rawArgs[++i]; continue; }
+            if (token === '--lead-coordination' || token === '--coordination-parent') { leadCoordination = true; continue; }
             if (!title) { title = token; continue; }
           }
 
@@ -13800,12 +13867,13 @@ Return this JSON shape:
                 },
               };
             } else if (await this.hasDoingTaskRoom(taskTeamId)) {
+              const effectiveTeamName = taskTeamRow?.name || teamName;
               const leadBacklog = await this.leadDelegationBacklogGuard({
                 teamId: taskTeamId,
-                teamName: taskTeamRow?.name || teamName,
+                teamName: effectiveTeamName,
                 owner: agent,
               });
-              if (leadBacklog) {
+              if (leadBacklog && !(leadCoordination && this.isConfiguredTeamLead(effectiveTeamName, agent))) {
                 leadDelegationWarning = leadBacklog.message;
               } else {
                 ownerId = agent.id;
@@ -14638,6 +14706,16 @@ Return this JSON shape:
     if (a.consecutive_failures === 0) return 'online';
     if (a.consecutive_failures <= 2) return 'unstable';
     return 'offline';
+  }
+
+  /**
+   * Catalog profile status is a read model over live runtime state. Keep it out
+   * of persisted catalog metadata so YAML seeds and runtime PATCHes remain
+   * descriptive inputs, not stale operational truth.
+   */
+  private deriveCatalogProfileStatus(a: AgentRow, health: string): 'active' | 'blocked-runtime-stopped' {
+    if (a.status === 'running' && health !== 'offline') return 'active';
+    return 'blocked-runtime-stopped';
   }
 
   /**

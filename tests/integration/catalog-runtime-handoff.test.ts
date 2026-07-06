@@ -13,7 +13,8 @@
  *     port, a temp SQLite path, and a base64 ID_AGENT_CATALOG seed;
  *   - waits for the child's HTTP listener to come up;
  *   - asserts `GET http://127.0.0.1:<port>/catalog` returns the seeded fields
- *     (role, expertise, costTier, status) before any PATCH is issued;
+ *     (role, expertise, costTier, status) before any PATCH is issued, while
+ *     deriving live `profileStatus` from the running process;
  *   - tears the child down and cleans up its temp files.
  *
  * No live daemon is touched. Manager registration is intentionally pointed
@@ -91,6 +92,7 @@ describe('catalog runtime handoff', () => {
       costTier: 'low',
       notSuitableFor: ['security-key-handling'],
       status: 'available',
+      profileStatus: 'blocked-runtime-stopped',
     };
     const catalogEnv = Buffer.from(JSON.stringify(seed), 'utf8').toString('base64');
 
@@ -136,6 +138,7 @@ describe('catalog runtime handoff', () => {
     expect(body.costTier).toBe('low');
     expect(body.notSuitableFor).toEqual(['security-key-handling']);
     expect(body.status).toBe('available');
+    expect(body.profileStatus).toBe('active');
     expect(body.description).toBe('Seeded via env var');
 
     child.kill('SIGTERM');
