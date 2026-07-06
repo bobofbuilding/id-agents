@@ -83,6 +83,32 @@ agents:
         - on-chain-sync
       costTier: high
       status: available
+      contributorTitle: "SkillMesh Team Lead"
+      profileVersion: "v1"
+      profileStatus: "active"
+      lastReviewedOn: "2026-07-04"
+      reviewOwner: "lead"
+      bittreesLanes:
+        - "DISCOVERY"
+        - "OPS_GOVERNANCE"
+      bittreesPrimaryLane: "DISCOVERY"
+      bittreesSecondaryLanes:
+        - "OPS_GOVERNANCE"
+      bittreesContext: "SkillMesh protocol operations; grows and maintains the skill catalog that surfaces Bittrees contributor capabilities"
+      weeklyOutput: "SkillMesh ops summary: catalog updates, protocol events, member task completions."
+      weeklyContributionTarget: "1 validated artifact per assigned primary lane"
+      contributionTypes:
+        - "catalog update"
+        - "opportunity brief"
+        - "capability map"
+        - "operational task"
+        - "implementation packet"
+        - "governance or maintenance report"
+      notSuitableFor:
+        - "direct implementation"
+        - "standalone research without delegation"
+        - "long-running batch jobs"
+      bittreesReviewPacketRequired: true
 
   # ── Marketplace Ops (source: skillmesh-ops.yaml) ───────────────────────────
   - name: marketplace-manager
@@ -100,6 +126,31 @@ agents:
         - inventory
         - demand-analysis
       costTier: high
+      contributorTitle: "Marketplace Health Agent"
+      profileVersion: "v1"
+      profileStatus: "blocked-runtime-stopped"
+      lastReviewedOn: "2026-07-04"
+      reviewOwner: "skillmesh-ops-lead"
+      bittreesLanes:
+        - "DISCOVERY"
+        - "AWARENESS"
+      bittreesPrimaryLane: "DISCOVERY"
+      bittreesSecondaryLanes:
+        - "AWARENESS"
+      bittreesContext: "Marketplace health monitoring; surfaces demand signals and opportunity gaps in Bittrees skill economy"
+      weeklyOutput: "Marketplace demand report: top listings, pricing gaps, opportunity recommendations."
+      weeklyContributionTarget: "1 validated artifact per assigned primary lane"
+      contributionTypes:
+        - "catalog update"
+        - "opportunity brief"
+        - "capability map"
+        - "source-grounded update"
+        - "documentation packet"
+        - "publishable summary"
+      notSuitableFor:
+        - "work outside assigned Bittrees lanes without owning-lead approval"
+        - "live onchain or treasury execution"
+      bittreesReviewPacketRequired: true
 
   - name: skill-master
     description: >
@@ -114,6 +165,27 @@ agents:
         - on-chain-publishing
         - catalog-growth
       costTier: medium
+      contributorTitle: "Skill Catalog Growth Agent"
+      profileVersion: "v1"
+      profileStatus: "blocked-runtime-stopped"
+      lastReviewedOn: "2026-07-04"
+      reviewOwner: "skillmesh-ops-lead"
+      bittreesLanes:
+        - "DISCOVERY"
+      bittreesPrimaryLane: "DISCOVERY"
+      bittreesSecondaryLanes:
+      bittreesContext: "Skill catalog growth; publishes validated skills to SkillMesh so Bittrees contributors can discover and monetize capabilities"
+      weeklyOutput: "New or updated skill entries published to SkillMesh catalog with CID references."
+      weeklyContributionTarget: "1 validated artifact per assigned primary lane"
+      contributionTypes:
+        - "catalog update"
+        - "opportunity brief"
+        - "capability map"
+      notSuitableFor:
+        - "work outside assigned Bittrees lanes without owning-lead approval"
+        - "live onchain or treasury execution"
+        - "external publication or public-facing claims without validation"
+      bittreesReviewPacketRequired: true
 
   - name: skill-tester
     description: >
@@ -132,6 +204,33 @@ agents:
         - schema-validation
         - failure-analysis
       costTier: medium
+      contributorTitle: "Skill QA Agent"
+      profileVersion: "v1"
+      profileStatus: "active"
+      lastReviewedOn: "2026-07-04"
+      reviewOwner: "skillmesh-ops-lead"
+      bittreesLanes:
+        - "DISCOVERY"
+        - "OPS_GOVERNANCE"
+      bittreesPrimaryLane: "DISCOVERY"
+      bittreesSecondaryLanes:
+        - "OPS_GOVERNANCE"
+      bittreesContext: "Skill QA; ensures published skills meet reliability standards before Bittrees contributors adopt them"
+      weeklyOutput: "Skill test run results with pass/fail rates and promoted/demoted skills list."
+      weeklyContributionTarget: "1 validated artifact per assigned primary lane"
+      contributionTypes:
+        - "catalog update"
+        - "opportunity brief"
+        - "capability map"
+        - "operational task"
+        - "implementation packet"
+        - "governance or maintenance report"
+      notSuitableFor:
+        - "skill publishing"
+        - "onchain execution"
+        - "market analysis"
+        - "multi-team coordination"
+      bittreesReviewPacketRequired: true
 
   - name: skill-rater
     description: >
@@ -149,6 +248,32 @@ agents:
         - ratings
         - anomaly-detection
       costTier: medium
+      contributorTitle: "Skill Reputation & Rating Agent"
+      profileVersion: "v1"
+      profileStatus: "active"
+      lastReviewedOn: "2026-07-04"
+      reviewOwner: "skillmesh-ops-lead"
+      bittreesLanes:
+        - "DISCOVERY"
+        - "RESEARCH"
+      bittreesPrimaryLane: "DISCOVERY"
+      bittreesSecondaryLanes:
+        - "RESEARCH"
+      bittreesContext: "Skill quality ratings; maintains catalog trust so Bittrees contributors can rely on skill recommendations"
+      weeklyOutput: "Rating snapshot report: top-rated skills, low-rated flag list, creator reputation delta."
+      weeklyContributionTarget: "1 validated artifact per assigned primary lane"
+      contributionTypes:
+        - "catalog update"
+        - "opportunity brief"
+        - "capability map"
+        - "source-grounded memo"
+        - "validation packet"
+        - "market/protocol analysis"
+      notSuitableFor:
+        - "onchain execution"
+        - "skill publishing without review"
+        - "cross-team coordination"
+      bittreesReviewPacketRequired: true
 
   # ── Research Stack (source: research-stack.yaml) ───────────────────────────
   - name: research-analyst
@@ -310,6 +435,32 @@ agents:
         - incident-reporting
         - alert-dispatch
       costTier: medium
+      contributorTitle: "Protocol Stack Monitor"
+      profileVersion: "v1"
+      profileStatus: "blocked-runtime-stopped"
+      lastReviewedOn: "2026-07-04"
+      reviewOwner: "skillmesh-ops-lead"
+      bittreesLanes:
+        - "OPS_GOVERNANCE"
+        - "RESEARCH"
+      bittreesPrimaryLane: "OPS_GOVERNANCE"
+      bittreesSecondaryLanes:
+        - "RESEARCH"
+      bittreesContext: "Protocol health monitoring; detects anomalies in SkillMesh/Bittrees on-chain activity before they escalate"
+      weeklyOutput: "Protocol health report: baseline metrics, anomaly count, incidents raised and resolved."
+      weeklyContributionTarget: "1 validated artifact per assigned primary lane"
+      contributionTypes:
+        - "operational task"
+        - "implementation packet"
+        - "governance or maintenance report"
+        - "source-grounded memo"
+        - "validation packet"
+        - "market/protocol analysis"
+      notSuitableFor:
+        - "work outside assigned Bittrees lanes without owning-lead approval"
+        - "live onchain or treasury execution"
+        - "external publication or public-facing claims without validation"
+      bittreesReviewPacketRequired: true
 
   - name: event-watcher
     description: >
@@ -324,6 +475,32 @@ agents:
         - event-streaming
         - contract-monitoring
       costTier: low
+      contributorTitle: "On-Chain Event Monitor"
+      profileVersion: "v1"
+      profileStatus: "blocked-runtime-stopped"
+      lastReviewedOn: "2026-07-04"
+      reviewOwner: "skillmesh-ops-lead"
+      bittreesLanes:
+        - "OPS_GOVERNANCE"
+        - "RESEARCH"
+      bittreesPrimaryLane: "OPS_GOVERNANCE"
+      bittreesSecondaryLanes:
+        - "RESEARCH"
+      bittreesContext: "On-chain event monitoring; captures protocol activity relevant to Bittrees contracts and governance"
+      weeklyOutput: "Event stream summary: event types observed, handler routing log, unrecognized event triage."
+      weeklyContributionTarget: "1 validated artifact per assigned primary lane"
+      contributionTypes:
+        - "operational task"
+        - "implementation packet"
+        - "governance or maintenance report"
+        - "source-grounded memo"
+        - "validation packet"
+        - "market/protocol analysis"
+      notSuitableFor:
+        - "work outside assigned Bittrees lanes without owning-lead approval"
+        - "live onchain or treasury execution"
+        - "external publication or public-facing claims without validation"
+      bittreesReviewPacketRequired: true
 
   - name: anomaly-classifier
     description: >
@@ -338,6 +515,32 @@ agents:
         - classification
         - baseline-analysis
       costTier: low
+      contributorTitle: "Chain Activity Anomaly Classifier"
+      profileVersion: "v1"
+      profileStatus: "active"
+      lastReviewedOn: "2026-07-04"
+      reviewOwner: "skillmesh-ops-lead"
+      bittreesLanes:
+        - "RESEARCH"
+        - "OPS_GOVERNANCE"
+      bittreesPrimaryLane: "RESEARCH"
+      bittreesSecondaryLanes:
+        - "OPS_GOVERNANCE"
+      bittreesContext: "Chain anomaly classification; provides structured severity ratings for Bittrees protocol risk events"
+      weeklyOutput: "Anomaly classification log: flagged events, severity distribution, false-positive rate."
+      weeklyContributionTarget: "1 validated artifact per assigned primary lane"
+      contributionTypes:
+        - "source-grounded memo"
+        - "validation packet"
+        - "market/protocol analysis"
+        - "operational task"
+        - "implementation packet"
+        - "governance or maintenance report"
+      notSuitableFor:
+        - "work outside assigned Bittrees lanes without owning-lead approval"
+        - "live onchain or treasury execution"
+        - "external publication or public-facing claims without validation"
+      bittreesReviewPacketRequired: true
 
   - name: incident-summarizer
     description: >
@@ -427,6 +630,32 @@ agents:
         - balance-alerts
         - gas-management
       costTier: low
+      contributorTitle: "Fleet Wallet Balance Monitor"
+      profileVersion: "v1"
+      profileStatus: "blocked-runtime-stopped"
+      lastReviewedOn: "2026-07-04"
+      reviewOwner: "skillmesh-ops-lead"
+      bittreesLanes:
+        - "TREASURY"
+        - "OPS_GOVERNANCE"
+      bittreesPrimaryLane: "TREASURY"
+      bittreesSecondaryLanes:
+        - "OPS_GOVERNANCE"
+      bittreesContext: "Fleet wallet monitoring; tracks ETH/AST balances to keep Bittrees agent operations funded"
+      weeklyOutput: "Balance report: wallet addresses, current ETH/AST balances, threshold alerts."
+      weeklyContributionTarget: "1 validated artifact per assigned primary lane"
+      contributionTypes:
+        - "treasury analysis"
+        - "wallet or settlement report"
+        - "onchain risk memo"
+        - "operational task"
+        - "implementation packet"
+        - "governance or maintenance report"
+      notSuitableFor:
+        - "work outside assigned Bittrees lanes without owning-lead approval"
+        - "external publication or public-facing claims without validation"
+        - "live fund movement or signer action without explicit operator and legal approval"
+      bittreesReviewPacketRequired: true
 
   - name: settlement-watcher
     description: >
@@ -441,6 +670,27 @@ agents:
         - settlement
         - session-management
       costTier: low
+      contributorTitle: "Compute Escrow Settlement Agent"
+      profileVersion: "v1"
+      profileStatus: "blocked-runtime-stopped"
+      lastReviewedOn: "2026-07-04"
+      reviewOwner: "skillmesh-ops-lead"
+      bittreesLanes:
+        - "TREASURY"
+      bittreesPrimaryLane: "TREASURY"
+      bittreesSecondaryLanes:
+      bittreesContext: "Compute escrow settlement; ensures stalled compute sessions are resolved to maintain Bittrees treasury flow"
+      weeklyOutput: "Settlement scan results: sessions resolved, stalled sessions flagged, recovery actions taken."
+      weeklyContributionTarget: "1 validated artifact per assigned primary lane"
+      contributionTypes:
+        - "treasury analysis"
+        - "wallet or settlement report"
+        - "onchain risk memo"
+      notSuitableFor:
+        - "work outside assigned Bittrees lanes without owning-lead approval"
+        - "external publication or public-facing claims without validation"
+        - "live fund movement or signer action without explicit operator and legal approval"
+      bittreesReviewPacketRequired: true
 
   - name: gas-oracle
     description: >
@@ -501,6 +751,32 @@ agents:
         - cid-verification
         - data-integrity
       costTier: low
+      contributorTitle: "IPFS Data Integrity Agent"
+      profileVersion: "v1"
+      profileStatus: "blocked-runtime-stopped"
+      lastReviewedOn: "2026-07-04"
+      reviewOwner: "skillmesh-ops-lead"
+      bittreesLanes:
+        - "OPS_GOVERNANCE"
+        - "DISCOVERY"
+      bittreesPrimaryLane: "OPS_GOVERNANCE"
+      bittreesSecondaryLanes:
+        - "DISCOVERY"
+      bittreesContext: "IPFS data integrity; ensures all published Bittrees skill artifacts remain accessible and pinned"
+      weeklyOutput: "CID health report: verified count, re-pinned count, unresolvable alerts."
+      weeklyContributionTarget: "1 validated artifact per assigned primary lane"
+      contributionTypes:
+        - "operational task"
+        - "implementation packet"
+        - "governance or maintenance report"
+        - "catalog update"
+        - "opportunity brief"
+        - "capability map"
+      notSuitableFor:
+        - "work outside assigned Bittrees lanes without owning-lead approval"
+        - "live onchain or treasury execution"
+        - "external publication or public-facing claims without validation"
+      bittreesReviewPacketRequired: true
 
   - name: deployment-watcher
     description: >
@@ -599,6 +875,32 @@ agents:
         - multisig-operations
         - transaction-monitoring
       costTier: low
+      contributorTitle: "Multisig Safety Monitor"
+      profileVersion: "v1"
+      profileStatus: "blocked-runtime-stopped"
+      lastReviewedOn: "2026-07-04"
+      reviewOwner: "skillmesh-ops-lead"
+      bittreesLanes:
+        - "OPS_GOVERNANCE"
+        - "TREASURY"
+      bittreesPrimaryLane: "OPS_GOVERNANCE"
+      bittreesSecondaryLanes:
+        - "TREASURY"
+      bittreesContext: "Multisig safety monitoring; protects Bittrees governance wallets from unexpected configuration changes"
+      weeklyOutput: "Multisig health report: pending txs, signer changes, threshold drift alerts."
+      weeklyContributionTarget: "1 validated artifact per assigned primary lane"
+      contributionTypes:
+        - "operational task"
+        - "implementation packet"
+        - "governance or maintenance report"
+        - "treasury analysis"
+        - "wallet or settlement report"
+        - "onchain risk memo"
+      notSuitableFor:
+        - "work outside assigned Bittrees lanes without owning-lead approval"
+        - "external publication or public-facing claims without validation"
+        - "live fund movement or signer action without explicit operator and legal approval"
+      bittreesReviewPacketRequired: true
 
   - name: alchemy-agent
     description: >
@@ -652,3 +954,29 @@ agents:
         - self-improvement
         - wallet-health
       costTier: high
+      contributorTitle: "Autonomous Self-Improvement Agent"
+      profileVersion: "v1"
+      profileStatus: "active"
+      lastReviewedOn: "2026-07-04"
+      reviewOwner: "skillmesh-ops-lead"
+      bittreesLanes:
+        - "DISCOVERY"
+        - "AWARENESS"
+      bittreesPrimaryLane: "DISCOVERY"
+      bittreesSecondaryLanes:
+        - "AWARENESS"
+      bittreesContext: "Autonomous skill gap audits; surfaces emerging contributor capability needs across the Bittrees agent fleet"
+      weeklyOutput: "Skill gap audit report + proposed new skill titles with rationale."
+      weeklyContributionTarget: "1 validated artifact per assigned primary lane"
+      contributionTypes:
+        - "catalog update"
+        - "opportunity brief"
+        - "capability map"
+        - "source-grounded update"
+        - "documentation packet"
+        - "publishable summary"
+      notSuitableFor:
+        - "multi-team coordination"
+        - "final catalog publishing without validation"
+        - "onchain execution"
+      bittreesReviewPacketRequired: true
