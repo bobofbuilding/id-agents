@@ -15,6 +15,7 @@ The agent ships the full Foundry skill pack inline under `skills/`:
 - `solidity-style-modern`
 - `foundry-scripting-and-deploy`
 - `gas-optimization-foundry`
+- `fuzz-suite-generation`
 
 A team config referencing `agent: foundry-dev` picks these up automatically during Step A of sync, no `skills:` overlay needed.
 
