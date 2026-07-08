@@ -1166,6 +1166,45 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('closes control replies when shell/http tool access is the only blocker', async () => {
+    const staleTask = task({
+      name: 'publish-plan-status-update',
+      title: 'Publish plan status update',
+    });
+    const db = fakeDb({
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [staleTask]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-control-reply-read-only-tooling-close-test', db, { libraryRoot: null }) as any;
+
+    await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery(staleTask.owner!, {
+        query_id: 'read-only-tooling-clean-close',
+        prompt: 'Supervision: task #12345678 ("Publish plan status update") has been in progress 60m. Reply with one line: DONE, BLOCKED: <reason>, NEEDS-REASSIGNMENT, or IN-PROGRESS: <next update>.',
+        status: 'completed',
+      }),
+      {
+        result: [
+          'BLOCKED: this session has no shell/HTTP execution tool (only file read/search tools are available), so I cannot POST the completion to the manager.',
+          '',
+          'Reconciliation is complete: the supplied evidence is clean, the task is complete, and there is no concrete blocker other than the local done-call limitation.',
+        ].join('\n'),
+      },
+      NOW_MS,
+    );
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(staleTask.id, {
+      status: 'done',
+      completed_at: Math.floor(NOW_MS / 1000),
+      updated_at: Math.floor(NOW_MS / 1000),
+    });
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:completed',
+      subject_id: staleTask.uuid,
+    }));
+  });
+
   it('closes delegated parent reconciliation when children reconcile cleanly despite validation routing prose', async () => {
     const parent = task({
       name: 'review-brain-snapshot-hook-risks',

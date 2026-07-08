@@ -3867,7 +3867,10 @@ Return this JSON shape:
 
     const toolOnlyClosureBlock = (
       /\b(?:no|without|lacking|lacks)\b.{0,100}\b(?:tool|bash|shell|http|curl|post|request|write access|manager api)\b/i.test(normalized)
+      || /\bno\b.{0,80}\b(?:shell|http|curl|post|execution)\b.{0,80}\btool\b/i.test(normalized)
+      || /\bonly\b.{0,80}\b(?:file|read|search|grep|glob)\b.{0,80}\btools?\b.{0,120}\bavailable\b/i.test(normalized)
       || /\b(?:can't|cannot|unable|could not)\b.{0,140}\b(?:post|execute|issue|make|call|close|mark)\b.{0,100}\b(?:done|closure|http|request|manager api|tasks?\/)/i.test(normalized)
+      || /\b(?:can't|cannot|unable|could not)\b.{0,120}\bPOST\b.{0,120}\b(?:manager|remote|task|done|closure|http|endpoint|request)\b/i.test(normalized)
       || /\b(?:manager_url|manager api|local manager|tasks?\/[^\s`'"]+\/done|\/tasks\/[^\s`'"]+\/done)\b.{0,180}\b(?:not reachable|failed to connect|connection refused|refused connections?|econnrefused|curl(?:\s+http)?\s+status\s+`?000`?)\b/i.test(normalized)
       || /\bno way\b.{0,120}\b(?:post|manager api|done endpoint|closure call)\b/i.test(normalized)
     );
@@ -3910,7 +3913,10 @@ Return this JSON shape:
       && /\b(?:connection refused|refused connections?|econnrefused|curl(?:\s+http)?\s+status\s+`?000`?|failed to connect|could not post|could not mark|unable to post|post(?:s)?\s+to)\b/i.test(normalized)
     ) || (
       /\b(?:no|without|lacking|lacks)\b.{0,100}\b(?:tool|bash|shell|http|curl|post|request|write access|manager api)\b/i.test(normalized)
+      || /\bno\b.{0,80}\b(?:shell|http|curl|post|execution)\b.{0,80}\btool\b/i.test(normalized)
+      || /\bonly\b.{0,80}\b(?:file|read|search|grep|glob)\b.{0,80}\btools?\b.{0,120}\bavailable\b/i.test(normalized)
       || /\b(?:can't|cannot|unable|could not)\b.{0,140}\b(?:post|execute|issue|make|call|close|mark)\b.{0,100}\b(?:done|closure|http|request|manager api|tasks?\/)/i.test(normalized)
+      || /\b(?:can't|cannot|unable|could not)\b.{0,120}\bPOST\b.{0,120}\b(?:manager|remote|task|done|closure|http|endpoint|request)\b/i.test(normalized)
       || /\bno way\b.{0,120}\b(?:post|manager api|done endpoint|closure call)\b/i.test(normalized)
     );
     if (!toolOnlyClosureBlock) return null;

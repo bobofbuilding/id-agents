@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.1.102]
+
+- Treat read-only shell/HTTP tool limitations in manager supervision replies as manager-applied task closures when the embedded reconciliation evidence is complete, preventing fake BLOCKED activity rows from leaving completed parent tasks looking stuck.
+
 ## [0.1.101]
 
 - Release manager hardening updates for IDACC: bounded active-goal autopilot fanout, Brain/manager task-claim context sync, runtime fallback guards, resource limits, release-schema validation, provider/runtime routing fixes, specialist routing, and workspace cleanup tooling.
