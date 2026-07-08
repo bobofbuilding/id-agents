@@ -228,6 +228,78 @@ describe('stalled task sweeper', () => {
     }), NOW_MS)).toBe(false);
   });
 
+  it('builds stable duplicate keys for repeated Learn routing prompts', () => {
+    const manager = new AgentManagerDb('/tmp/id-agents-learn-route-dedup-key-test', fakeDb(), { libraryRoot: null }) as any;
+
+    const first = manager.learnRoutingDedupKey(
+      'Recursive Learn follow-up for `github: graphiti` (https://github.com/getzep/graphiti). Reuse existing work.',
+      'research-lead-id',
+    );
+    const second = manager.learnRoutingDedupKey(
+      'Operator re-fired IDACC Learn routing for github: graphiti at https://github.com/getzep/graphiti. Do not create a duplicate task.',
+      'research-lead-id',
+    );
+    const otherRecipient = manager.learnRoutingDedupKey(
+      'Recursive Learn follow-up for `github: graphiti` (https://github.com/getzep/graphiti). Reuse existing work.',
+      'engineering-lead-id',
+    );
+    const primaryLeadIngest = manager.learnRoutingDedupKey(
+      'IDACC Learn has ingested new material. You are the PRIMARY lead.\n\nTitle: github: graphiti\nSource: https://github.com/getzep/graphiti',
+      'research-lead-id',
+    );
+    const flattenedRemotePrompt = manager.learnRoutingDedupKey(
+      'IDACC Learn has ingested new material. You are the PRIMARY lead.nnTitle: github: graphitinSource: https://github.com/getzep/graphitinTopics: research',
+      'research-lead-id',
+    );
+
+    expect(first).toBeTruthy();
+    expect(first).toBe(second);
+    expect(first).toBe(primaryLeadIngest);
+    expect(first).toBe(flattenedRemotePrompt);
+    expect(first).not.toBe(otherRecipient);
+    expect(manager.learnRoutingDedupKey('normal task delegation with no Learn routing', 'research-lead-id')).toBeNull();
+  });
+
+  it('finds recent duplicate Learn routing queries before redispatch', async () => {
+    const previousPrompt = 'Recursive Learn follow-up for `github: graphiti` (https://github.com/getzep/graphiti). Reuse existing work.';
+    const db = fakeDb({
+      adapter: {
+        query: vi.fn(async () => ({
+          rows: [{
+            team_id: TEAM_ID,
+            agent_id: 'research-lead-id',
+            query_id: 'query-existing-learn',
+            status: 'completed',
+            prompt: previousPrompt,
+            created: NOW_MS - 60_000,
+            completed: NOW_MS - 30_000,
+            result: null,
+            error: null,
+            session_id: null,
+            owner_kind: 'agent',
+            owner_id: 'research-lead-id',
+            metadata: null,
+          }],
+          rowCount: 1,
+        })),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-learn-route-dedup-query-test', db, { libraryRoot: null }) as any;
+    const dedupKey = manager.learnRoutingDedupKey(
+      'Operator re-fired IDACC Learn routing for github: graphiti at https://github.com/getzep/graphiti.',
+      'research-lead-id',
+    );
+
+    const duplicate = await manager.findRecentDuplicateLearnRoutingQuery({
+      teamId: TEAM_ID,
+      agentId: 'research-lead-id',
+      dedupKey,
+      nowMs: NOW_MS,
+    });
+
+    expect(duplicate?.query_id).toBe('query-existing-learn');
+  });
+
   it('prompts fresh lead delegation kickoff immediately by default', async () => {
     vi.restoreAllMocks();
 
@@ -302,6 +374,36 @@ describe('stalled task sweeper', () => {
     expect(db.events.insert).not.toHaveBeenCalled();
   });
 
+  it('bumps task activity when the stalled sweeper sends an owner supervision prompt', async () => {
+    const staleTask = task();
+    const db = fakeDb({
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => status === 'doing' ? [staleTask] : []),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-activity-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.sweepStalledTasks();
+
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'worker',
+      expect.stringContaining('Supervision: task #12345678'),
+    );
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(staleTask.id, {
+      updated_at: Math.floor(NOW_MS / 1000),
+    });
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:refreshed',
+      subject_id: staleTask.uuid,
+      data: expect.objectContaining({
+        reason: 'owner_refresh',
+        stalled_minutes: 60,
+      }),
+    }));
+  });
+
   it('bumps task activity when a backlog guard reply reports in progress', async () => {
     const staleTask = task();
     const db = fakeDb({
@@ -330,6 +432,126 @@ describe('stalled task sweeper', () => {
       data: expect.objectContaining({
         reason: 'control_reply_in_progress',
         stalled_minutes: 60,
+      }),
+    }));
+  });
+
+  it('parks repeated in-progress replies that do not change approach', async () => {
+    const staleTask = task();
+    const db = fakeDb({
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [staleTask]),
+      },
+      adapter: {
+        query: vi.fn(async (sql: string) => {
+          if (sql.includes("topic = 'task:attempt-approach'")) {
+            return {
+              rows: [{
+                occurred_at: NOW_MS - 60_000,
+                actor_agent_id: staleTask.owner,
+                data: JSON.stringify({
+                  action: 'in_progress',
+                  note: 'reviewing the artifact now',
+                }),
+              }],
+              rowCount: 1,
+            };
+          }
+          return { rows: [], rowCount: 0 };
+        }),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-repeat-approach-test', db, { libraryRoot: null }) as any;
+
+    const result = await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery(staleTask.owner!, {
+        query_id: 'guard-repeat-in-progress',
+        prompt: 'Backlog guard: task #12345678 ("Stalled work") has been active 60m with no progress update. Reply with one line: DONE, BLOCKED: <reason>, NEEDS-REASSIGNMENT, or IN-PROGRESS: <next update>.',
+        status: 'completed',
+      }),
+      { result: 'IN-PROGRESS: reviewing the artifact now' },
+      NOW_MS,
+    );
+
+    expect(result).toEqual(expect.objectContaining({
+      applied: true,
+      action: 'repeat_attempt_blocked',
+      reason: 'repeated_attempt_without_changed_approach',
+    }));
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(staleTask.id, expect.objectContaining({
+      owner: null,
+      status: 'todo',
+      completed_at: null,
+      description: expect.stringContaining('REPEATED-ATTEMPT'),
+    }));
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:attempt-approach',
+      subject_id: staleTask.uuid,
+      data: expect.objectContaining({
+        action: 'repeat_attempt_blocked',
+        repeated: true,
+      }),
+    }));
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:triaged',
+      subject_id: staleTask.uuid,
+      data: expect.objectContaining({
+        reason: 'control_reply_repeated_attempt',
+      }),
+    }));
+  });
+
+  it('allows a repeated task reply when the agent states a changed approach', async () => {
+    const staleTask = task();
+    const db = fakeDb({
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [staleTask]),
+      },
+      adapter: {
+        query: vi.fn(async (sql: string) => {
+          if (sql.includes("topic = 'task:attempt-approach'")) {
+            return {
+              rows: [{
+                occurred_at: NOW_MS - 60_000,
+                actor_agent_id: staleTask.owner,
+                data: JSON.stringify({
+                  action: 'in_progress',
+                  note: 'reviewing the artifact now',
+                }),
+              }],
+              rowCount: 1,
+            };
+          }
+          return { rows: [], rowCount: 0 };
+        }),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-changed-approach-test', db, { libraryRoot: null }) as any;
+
+    const result = await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery(staleTask.owner!, {
+        query_id: 'guard-changed-in-progress',
+        prompt: 'Backlog guard: task #12345678 ("Stalled work") has been active 60m with no progress update. Reply with one line: DONE, BLOCKED: <reason>, NEEDS-REASSIGNMENT, or IN-PROGRESS: <next update>.',
+        status: 'completed',
+      }),
+      { result: 'IN-PROGRESS: switching to a different source log instead of reviewing the artifact again' },
+      NOW_MS,
+    );
+
+    expect(result).toEqual(expect.objectContaining({
+      applied: true,
+      action: 'in_progress',
+    }));
+    expect(db.tasks.updateFields).not.toHaveBeenCalledWith(staleTask.id, expect.objectContaining({
+      owner: null,
+      status: 'todo',
+    }));
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:attempt-approach',
+      subject_id: staleTask.uuid,
+      data: expect.objectContaining({
+        action: 'in_progress',
+        changed_approach: true,
       }),
     }));
   });
@@ -1155,6 +1377,54 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('closes delegated parent reconciliation when only the manager done callback is unreachable', async () => {
+    const parent = task({
+      name: 'investigate-release-v0-1-622',
+      title: 'Investigate missing release asset for v0.1.622',
+      uuid: '16b2d2e5-bcf9-48be-9810-74cf051d8541',
+    });
+    const db = fakeDb({
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [parent]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-delegated-parent-manager-url-unreachable-close-test', db, { libraryRoot: null }) as any;
+
+    await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery(parent.owner!, {
+        query_id: 'delegated-parent-manager-url-unreachable',
+        prompt: [
+          'Supervision: Manager DB confirms parent task #16b2d2e5 ("Investigate missing release asset for v0.1.622") exists and all detected delegated child tasks are done.',
+          'Completed delegated children and available completion evidence:',
+          '- #43b9e9d9 status=done owner=content-moderator title="Verify release asset state for v0.1.622"',
+          '- #4351513e status=done owner=maintainer title="Verify local IDACC publish tooling for v0.1.622"',
+          '- #9fc94d45 status=done owner=deployer title="Assess safe publish action or blocker for v0.1.622"',
+        ].join('\n'),
+        status: 'completed',
+      }),
+      {
+        result: [
+          'BLOCKED: I reconciled the embedded child evidence, but I cannot mark parent task `investigate-release-v0-1-622` done because `MANAGER_URL=http://127.0.0.1:4100` is not reachable from this sandbox (`curl: failed to connect to 127.0.0.1 port 4100`).',
+          '',
+          'Completion decision, ready to post: parent investigation is complete. Child tasks done: `assess-safe-publish-action-v0-1-622`, `verify-release-v0-1-622-assets`, `verify-idacc-publish-tooling-v0-1-622`.',
+          '',
+          'Reconciled finding: GitHub tag `v0.1.622` exists, but no public GitHub release/assets exist for `v0.1.622`; latest public release remains `v0.1.621`. This workspace is not publish-capable, so safe publish is blocked here.',
+        ].join('\n'),
+      },
+      NOW_MS,
+    );
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(parent.id, {
+      status: 'done',
+      completed_at: Math.floor(NOW_MS / 1000),
+      updated_at: Math.floor(NOW_MS / 1000),
+    });
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:completed',
+      subject_id: parent.uuid,
+    }));
+  });
+
   it('keeps a manager-url-refused control reply blocked when evidence is still missing', async () => {
     const staleTask = task({
       name: 'audit-missing-output',
@@ -1233,6 +1503,79 @@ describe('stalled task sweeper', () => {
     expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
       topic: 'task:triaged',
       subject_id: staleTask.uuid,
+    }));
+  });
+
+  it('does not promote vague human-intervention blocked replies into the manager inbox', async () => {
+    const db = fakeDb({
+      agents: {
+        getById: vi.fn(async () => agent({ name: 'coder' })),
+      },
+      queries: {
+        getByQueryIdForTeam: vi.fn(async () => null),
+        create: vi.fn(async () => {}),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-human-blocker-inbox-test', db, { libraryRoot: null }) as any;
+
+    await manager.promoteHumanDecisionBlockerToManagerInbox(
+      activeQuery('agent-1', {
+        query_id: 'query-source-1',
+        prompt: 'Audit the engineering prompt issue and resolve any blockers.',
+        status: 'completed',
+      }),
+      { result: 'BLOCKED: Task requires human intervention to resolve the engineering prompt audit issue.' },
+      NOW_MS,
+    );
+
+    expect(db.queries.create).not.toHaveBeenCalled();
+    expect(db.news.add).not.toHaveBeenCalled();
+  });
+
+  it('promotes explicit human-decision blocked replies into the manager inbox', async () => {
+    const db = fakeDb({
+      agents: {
+        getById: vi.fn(async () => agent({ name: 'coder' })),
+      },
+      queries: {
+        getByQueryIdForTeam: vi.fn(async () => null),
+        create: vi.fn(async () => {}),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-human-blocker-inbox-test', db, { libraryRoot: null }) as any;
+
+    await manager.promoteHumanDecisionBlockerToManagerInbox(
+      activeQuery('agent-1', {
+        query_id: 'query-source-1',
+        prompt: 'Audit the engineering prompt issue and resolve any blockers.',
+        status: 'completed',
+      }),
+      { result: 'BLOCKED: ASK-USER: Should we approve the engineering prompt audit as complete before closing this task?' },
+      NOW_MS,
+    );
+
+    expect(db.queries.create).toHaveBeenCalledWith(
+      TEAM_ID,
+      'manager_blocked_query-source-1',
+      null,
+      expect.stringContaining('[From: coder] BLOCKED: ASK-USER: Should we approve'),
+      NOW_MS,
+      undefined,
+      { owner_kind: 'manager', owner_id: TEAM_ID },
+      expect.objectContaining({
+        source: 'human_decision_blocker',
+        source_query_id: 'query-source-1',
+        source_agent_id: 'agent-1',
+        source_agent_name: 'coder',
+      }),
+    );
+    expect(db.news.add).toHaveBeenCalledWith(TEAM_ID, null, expect.objectContaining({
+      type: 'query.received',
+      query_id: 'manager_blocked_query-source-1',
+      kind: 'talk',
+      reply_expected: true,
+      owner_kind: 'manager',
+      owner_id: TEAM_ID,
     }));
   });
 
@@ -1546,7 +1889,9 @@ describe('stalled task sweeper', () => {
       'worker',
       expect.stringContaining('probe 1/3'),
     );
-    expect(db.tasks.updateFields).not.toHaveBeenCalled();
+    expect(db.tasks.updateFields).toHaveBeenCalledWith('task-1', {
+      updated_at: Math.floor(NOW_MS / 1000),
+    });
     expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
       team_id: TEAM_ID,
       topic: 'task:refreshed',
@@ -2143,7 +2488,7 @@ describe('stalled task sweeper', () => {
     expect(manager.shouldAttachBrainContext('Lead delegation kickoff: task #12345678 is assigned to you as the team coordinator.')).toBe(false);
     expect(manager.shouldAttachBrainContext('Team objective: Decompose this objective into member-owned work.')).toBe(false);
     expect(manager.shouldAttachBrainContext('You are the team lead. Break the objective below into a small set of concrete, independently-actionable sub-tasks.')).toBe(false);
-    expect(manager.shouldAttachBrainContext('IDACC Learn routed this material to the default team lead for digestion.')).toBe(false);
+    expect(manager.shouldAttachBrainContext('IDACC Learn routed this material to the default team lead for digestion.')).toBe(true);
     expect(manager.shouldAttachBrainContext('You have 2 stalled doing tasks from before a team outage that need to be closed.')).toBe(false);
     expect(manager.shouldAttachBrainContext('Assignment sweep complete (Jul 4). Assigned: 0.')).toBe(false);
     expect(manager.shouldAttachBrainContext('Task assignment sweep: inspect unassigned todo tasks across all teams.')).toBe(false);
@@ -2156,6 +2501,10 @@ describe('stalled task sweeper', () => {
     expect(manager.shouldAttachBrainContext('AUTO-RELEASE shipped v0.1.585. Please verify the asset and self-update smoke.')).toBe(false);
     expect(manager.shouldAttachBrainContext('Resume and complete task #12345678: inventory MCP servers.')).toBe(true);
     expect(manager.shouldAttachBrainContext('Please inspect the repository and run the integration tests.')).toBe(true);
+    expect(manager.shouldAttachBrainContext('TASK DELEGATION from manager: You are assigned task #be3463dd ("Audit SkillMesh plugin/skill gaps").')).toBe(true);
+    expect(manager.shouldAttachBrainContext('Team objective: Decompose this submission intake and contribution review workflow into member-owned work.')).toBe(true);
+    expect(manager.shouldAttachBrainContext('Lead delegation kickoff: task #654690fd is assigned to you as the team coordinator. Inspect Brain connectivity and skill optimization.')).toBe(true);
+    expect(manager.shouldAttachBrainContext('You are the team lead. Break the objective below into knowledge graph and skills-catalog follow-up tasks.')).toBe(true);
   });
 
   it('expires duplicate active control-plane relay prompts after restart', async () => {
@@ -2756,7 +3105,9 @@ describe('stalled task sweeper', () => {
     await manager.sweepStalledTasks();
 
     expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
-    expect(db.tasks.updateFields).not.toHaveBeenCalled();
+    expect(db.tasks.updateFields).toHaveBeenCalledWith('lead-task-1', {
+      updated_at: Math.floor(NOW_MS / 1000),
+    });
     expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
       team_id: TEAM_ID,
       topic: 'task:triaged',
@@ -2913,7 +3264,9 @@ describe('stalled task sweeper', () => {
       await manager.sweepStalledTasks();
 
       expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
-      expect(db.tasks.updateFields).not.toHaveBeenCalled();
+      expect(db.tasks.updateFields).toHaveBeenCalledWith(leadTask.id, {
+        updated_at: Math.floor(NOW_MS / 1000),
+      });
       expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
         topic: 'task:triaged',
         actor_agent_id: ownerCase.agent.id,
@@ -3528,7 +3881,9 @@ describe('stalled task sweeper', () => {
       'lead',
       expect.stringContaining('triage probe 1/3'),
     );
-    expect(db.tasks.updateFields).not.toHaveBeenCalled();
+    expect(db.tasks.updateFields).toHaveBeenCalledWith('task-1', {
+      updated_at: Math.floor(NOW_MS / 1000),
+    });
     expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
       team_id: TEAM_ID,
       topic: 'task:triaged',
@@ -4703,7 +5058,9 @@ describe('stalled task sweeper', () => {
     await manager.sweepStalledTasks();
 
     expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
-    expect(db.tasks.updateFields).not.toHaveBeenCalled();
+    expect(db.tasks.updateFields).toHaveBeenCalledWith('research-task-1', {
+      updated_at: Math.floor(NOW_MS / 1000),
+    });
     expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
       team_id: TEAM_ID,
       topic: 'task:triaged',
@@ -4835,7 +5192,9 @@ describe('stalled task sweeper', () => {
       next_fire_at: NOW_MS,
       updated_at: NOW_MS,
     });
-    expect(db.tasks.updateFields).not.toHaveBeenCalled();
+    expect(db.tasks.updateFields).toHaveBeenCalledWith('task-1', {
+      updated_at: Math.floor(NOW_MS / 1000),
+    });
     expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
       team_id: TEAM_ID,
       topic: 'task:refreshed',

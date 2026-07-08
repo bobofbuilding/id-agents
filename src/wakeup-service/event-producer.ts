@@ -107,6 +107,7 @@ export interface QueryExpiredInput {
   queryId: string;
   agentId: string | null;
   occurredAt: number;
+  reason?: 'pending_timeout' | 'processing_timeout' | 'duplicate_task_ask' | 'terminal_task_ask' | 'stale_plan_decision' | 'queued_peer_wake' | string;
 }
 
 export async function emitTaskClaimed(
@@ -261,6 +262,7 @@ export async function emitQueryExpired(
       status: 'expired',
       agent: input.agentId,
       completed_at: input.occurredAt,
+      ...(input.reason ? { expiry_reason: input.reason } : {}),
     },
   });
 }

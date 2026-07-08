@@ -66,9 +66,11 @@ export class AntigravityHarness implements AgentHarness {
     if (options.model && options.model !== 'default') console.log(`[Antigravity] Model: ${options.model}`);
 
     const launchPrompt = [
-      'Read the full ID Agents task from this private local file, then complete it in the current working directory:',
+      'This wrapper message is not the task.',
+      'Read the full ID Agents task from this private local file and treat that file as the only user request:',
       promptFile,
-      'Do not print the file path unless it is needed for debugging.',
+      'Do not investigate or explain Antigravity CLI behavior unless the task file explicitly asks for that.',
+      'Do not print the file path unless it is needed for debugging. Complete the task from the file in the current working directory.',
     ].join('\n');
 
     const args: string[] = [

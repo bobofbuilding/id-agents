@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.1.101]
+
+- Release manager hardening updates for IDACC: bounded active-goal autopilot fanout, Brain/manager task-claim context sync, runtime fallback guards, resource limits, release-schema validation, provider/runtime routing fixes, specialist routing, and workspace cleanup tooling.
+
 ## 0.1.100-beta
 
 ### Fixes

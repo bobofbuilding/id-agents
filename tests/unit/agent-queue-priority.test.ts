@@ -61,6 +61,21 @@ class BlockingHarness implements AgentHarness {
   }
 }
 
+class SessionRecordingHarness implements AgentHarness {
+  readonly type = 'codex' as HarnessType;
+  prompts: string[] = [];
+  options: HarnessOptions[] = [];
+  private nextSession = 1;
+
+  async *run(prompt: string, _options: HarnessOptions): AsyncGenerator<HarnessMessage> {
+    this.prompts.push(prompt);
+    this.options.push(_options);
+    const sessionId = _options.resume || `runtime-session-${this.nextSession++}`;
+    yield { type: 'system', subtype: 'init', session_id: sessionId };
+    yield { type: 'result', result: 'ok', session_id: sessionId };
+  }
+}
+
 describe('agent query queue priority', () => {
   afterEach(() => {
     delete process.env.MANAGER_URL;
@@ -224,6 +239,32 @@ Team objective: Decompose this objective into member-owned work.`,
       expect(harness.prompts[2]).toContain('third lead request');
     } finally {
       harness.releaseAll();
+      await server.stop();
+    }
+  });
+
+  it('maps caller conversation ids to isolated runtime sessions', async () => {
+    process.env.ID_AGENT_LEAD_QUERY_CONCURRENCY = '1';
+    const harness = new SessionRecordingHarness();
+    const server = new AgentRestServer({ agentName: 'lead', harness });
+
+    try {
+      await (server as any).startQuery('q1', 'first message in chat A', 'desktop-chat-a', 'remote');
+      await viWaitFor(() => expect(harness.prompts).toHaveLength(1));
+      expect(harness.options[0]?.resume).toBeUndefined();
+
+      await (server as any).startQuery('q2', 'first message in chat B', 'desktop-chat-b', 'remote');
+      await viWaitFor(() => expect(harness.prompts).toHaveLength(2));
+      expect(harness.options[1]?.resume).toBeUndefined();
+
+      await (server as any).startQuery('q3', 'second message in chat A', 'desktop-chat-a', 'remote');
+      await viWaitFor(() => expect(harness.prompts).toHaveLength(3));
+      expect(harness.options[2]?.resume).toBe('runtime-session-1');
+
+      await (server as any).startQuery('q4', 'second message in chat B', 'desktop-chat-b', 'remote');
+      await viWaitFor(() => expect(harness.prompts).toHaveLength(4));
+      expect(harness.options[3]?.resume).toBe('runtime-session-2');
+    } finally {
       await server.stop();
     }
   });

@@ -238,6 +238,45 @@ describe('GET /manager/inbox/pending', () => {
     expect(row!.message).toContain('Backlog guard clear');
     expect((row!.data as any).notify_only_reason).toBe('manager_status_ack');
   });
+
+  it('/talk manager stores ping probes as notify-only', async () => {
+    const notifyTeam = 'inbox-talk-probe-notify-test';
+    const teamId = await db.teams.getOrCreateTeamId(notifyTeam);
+
+    const res = await fetch(`${baseUrl}/talk`, {
+      method: 'POST',
+      headers: teamHeaders(notifyTeam),
+      body: JSON.stringify({
+        from: 'security-router',
+        message: 'ping-probe',
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as {
+      status: string;
+      delivered_to: string;
+      notify_only?: boolean;
+      query_id?: string;
+    };
+    expect(body).toMatchObject({
+      status: 'delivered',
+      delivered_to: 'manager',
+      notify_only: true,
+    });
+    expect(body.query_id).toBeUndefined();
+
+    const pending = await db.queries.getPendingByOwner(teamId, 'manager', teamId);
+    expect(pending).toHaveLength(0);
+
+    const newsRows = await db.news.pollByOwner(teamId, 'manager', teamId, 0, { limit: 10 });
+    const row = newsRows.find((item) => item.type === 'message');
+    expect(row).toBeTruthy();
+    expect(Boolean(row!.reply_expected)).toBe(false);
+    expect(row!.kind).toBe('notify');
+    expect(row!.message).toBe('ping-probe');
+    expect((row!.data as any).from).toBe('security-router');
+    expect((row!.data as any).notify_only_reason).toBe('manager_status_ack');
+  });
 });
 
 describe('POST /manager/inbox/respond', () => {

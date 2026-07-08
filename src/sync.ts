@@ -33,6 +33,7 @@ const DIFF_FIELDS = [
   'plugins',
   'agent',
   'skills',
+  'mcpServers',
   'heartbeat',
   'allowedTools',
   'description',
@@ -100,6 +101,22 @@ function normalizeAllowedTools(tools?: string[] | null): string {
   return [...tools].sort().join(',');
 }
 
+function normalizeMcpServers(servers?: unknown): string {
+  if (!Array.isArray(servers) || servers.length === 0) return '';
+  const normalized = servers
+    .filter((server): server is Record<string, unknown> => !!server && typeof server === 'object')
+    .map((server) => {
+      const ordered: Record<string, unknown> = {};
+      for (const key of ['name', 'transport', 'command', 'args', 'url', 'env', 'headers']) {
+        const value = server[key];
+        if (value !== undefined) ordered[key] = value;
+      }
+      return ordered;
+    })
+    .sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+  return JSON.stringify(normalized);
+}
+
 function normalizeRuntime(runtime: string | undefined, defaultRuntime?: string): string {
   return resolveRuntime((runtime || defaultRuntime) as HarnessType);
 }
@@ -120,6 +137,7 @@ function configFields(spec: AgentSpec, defaultModel?: string): Record<string, st
     plugins: normalizePlugins(spec.plugins),
     agent: spec.agent || '',
     skills: normalizeSkills(spec.skills),
+    mcpServers: normalizeMcpServers(spec.mcpServers),
     heartbeat: spec.heartbeat ? (typeof spec.heartbeat === 'number' ? String(spec.heartbeat) : JSON.stringify({ interval: spec.heartbeat.interval, message: spec.heartbeat.message })) : '',
     allowedTools: normalizeAllowedTools(spec.allowedTools),
     description: spec.description || '',
@@ -141,6 +159,7 @@ function runningFields(row: AgentRow): Record<string, string> {
     plugins: normalizePlugins(meta.plugins),
     agent: meta.agent || '',
     skills: normalizeMetadataSkills(meta.skills),
+    mcpServers: normalizeMcpServers(meta.mcpServers),
     heartbeat: meta.heartbeat === true ? 'enabled' : '',
     allowedTools: normalizeAllowedTools(meta.allowed_tools),
     description: meta.description || '',

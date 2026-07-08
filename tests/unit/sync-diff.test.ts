@@ -129,6 +129,29 @@ describe('diffAgent', () => {
     expect(changes).toContain('allowedTools');
   });
 
+  it('detects MCP server drift and ignores server ordering differences', () => {
+    const servers = [
+      { name: 'brain', transport: 'stdio' as const, command: 'node', args: ['/workspace/projects/brain/brain-mcp.mjs'] },
+      { name: 'docs', transport: 'http' as const, url: 'http://127.0.0.1:4300/mcp' },
+    ];
+    const spec = makeAgentSpec({ mcpServers: servers });
+    const row = makeAgentRow({
+      metadata: {
+        ...makeAgentRow().metadata,
+        mcpServers: [...servers].reverse(),
+      },
+    });
+    expect(diffAgent(spec, row)).not.toContain('mcpServers');
+
+    const drifted = makeAgentRow({
+      metadata: {
+        ...makeAgentRow().metadata,
+        mcpServers: [{ name: 'brain', transport: 'stdio', command: 'node', args: ['/old/brain-mcp.mjs'] }],
+      },
+    });
+    expect(diffAgent(spec, drifted)).toContain('mcpServers');
+  });
+
   it('detects heartbeat added', () => {
     const spec = makeAgentSpec({
       heartbeat: { interval: 300, message: 'check in' },

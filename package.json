@@ -1,6 +1,6 @@
 {
   "name": "id-agents",
-  "version": "0.1.100",
+  "version": "0.1.101",
   "description": "Multi-agent orchestration platform with REST-AP interfaces",
   "type": "module",
   "main": "dist/index.js",
@@ -24,7 +24,9 @@
     "build:core": "tsc",
     "build:tui": "tsc -p src/tui/tsconfig.json",
     "build": "npm run build:core && npm run build:tui",
-    "prepublishOnly": "npm run build",
+    "verify:release-schema": "tsx src/release-schema-cli.ts",
+    "workspace:gc": "node scripts/workspace-gc.mjs",
+    "prepublishOnly": "npm run verify:release-schema && npm run build",
     "dev": "tsc --watch",
     "agent:server": "npm run build && node dist/start-agent-rest-server.js",
     "agent:talk": "npm run build && node dist/agent-restap-cli.js",

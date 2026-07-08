@@ -20,6 +20,7 @@ import { SqliteAdapter } from '../../src/db/sqlite-adapter.js';
 import { migrateSqlite } from '../../src/db/migrations/sqlite.js';
 import { SqliteTeamsRepo } from '../../src/db/repos/sqlite/teams-repo.js';
 import { SqliteEventsRepo } from '../../src/db/repos/sqlite/events-repo.js';
+import { SqliteQueriesRepo } from '../../src/db/repos/sqlite/queries-repo.js';
 import {
   DEFAULT_RETENTION_COUNT,
   sweepEventLogRetention,
@@ -31,6 +32,7 @@ describe('event_log retention sweep', () => {
   let adapter: SqliteAdapter;
   let teams: SqliteTeamsRepo;
   let events: SqliteEventsRepo;
+  let queries: SqliteQueriesRepo;
   let teamId: string;
   let otherTeamId: string;
 
@@ -39,6 +41,7 @@ describe('event_log retention sweep', () => {
     await migrateSqlite(adapter);
     teams = new SqliteTeamsRepo(adapter);
     events = new SqliteEventsRepo(adapter);
+    queries = new SqliteQueriesRepo(adapter);
     teamId = await teams.getOrCreateTeamId('retention-team');
     otherTeamId = await teams.getOrCreateTeamId('other-team');
   });
@@ -217,5 +220,43 @@ describe('event_log retention sweep', () => {
     const remaining = await events.query({ teamId: tinyCapTeamId, sinceSeq: 0, limit: 100 });
     const remainingSeqs = remaining.map((r) => r.seq).sort((a, b) => a - b);
     expect(remainingSeqs).toEqual(inserted.slice(1));
+  });
+
+  it('query sweep: deletes old terminal query rows while preserving active work', async () => {
+    const queryTeamId = await teams.getOrCreateTeamId('query-retention-team');
+    const now = 1_777_600_000_000;
+    const oldDone = 'query_old_done';
+    const oldPending = 'query_old_pending';
+    const freshDone = 'query_fresh_done';
+    const oldAt = now - 10 * DAY_MS;
+    const freshAt = now - 1 * DAY_MS;
+    const owner = { owner_kind: 'manager' as const, owner_id: queryTeamId };
+
+    await queries.create(queryTeamId, oldDone, null, 'old completed prompt', oldAt, undefined, owner);
+    await queries.complete(queryTeamId, oldDone, oldAt, { result: 'old completed result' });
+    await queries.create(queryTeamId, oldPending, null, 'old pending prompt', oldAt, undefined, owner);
+    await queries.create(queryTeamId, freshDone, null, 'fresh completed prompt', freshAt, undefined, owner);
+    await queries.complete(queryTeamId, freshDone, freshAt, { result: 'fresh completed result' });
+
+    const teamsStub = {
+      async listTeams() {
+        return [
+          { id: queryTeamId, name: 'query-retention-team', config: {}, port_start: 0, port_end: 0, created_at: '2026-01-01' },
+        ];
+      },
+    } as any;
+
+    const result = await sweepEventLogRetention({
+      events,
+      queries,
+      teams: teamsStub,
+      now,
+      config: { retentionDays: 365, retentionCount: DEFAULT_RETENTION_COUNT, queryRetentionDays: 7, queryRetentionCount: 100 },
+    });
+
+    expect(result.queryAgedDeleted).toBe(1);
+    expect(await queries.getByQueryIdForTeam(queryTeamId, oldDone)).toBeNull();
+    expect(await queries.getByQueryIdForTeam(queryTeamId, oldPending)).not.toBeNull();
+    expect(await queries.getByQueryIdForTeam(queryTeamId, freshDone)).not.toBeNull();
   });
 });

@@ -29,11 +29,12 @@ const REQUEST_TIMEOUT_MS = Number(process.env.OLLAMA_REQUEST_TIMEOUT_MS ?? 60000
 // Ollama's built-in default is 128 tokens, which truncates most real responses.
 const MAX_TOKENS = Number(process.env.OLLAMA_MAX_TOKENS ?? -1);
 
-// Global semaphore shared across all OllamaHarness instances.
-// Ollama queues requests internally, but unlimited concurrent HTTP connections
-// cause timeouts before the model even starts. Limit to 3 in-flight requests
-// so slow qwen3:4b responses don't starve the connection pool.
-const MAX_CONCURRENT = Number(process.env.OLLAMA_MAX_CONCURRENT ?? 3);
+// Global semaphore shared across all OllamaHarness instances in this process.
+// The manager already coordinates local-model fanout across agents; keep each
+// agent process at one in-flight Ollama request by default so a single agent
+// cannot make Ollama load/serve multiple generations concurrently. Operators can
+// raise this explicitly with OLLAMA_MAX_CONCURRENT when they have enough RAM/VRAM.
+const MAX_CONCURRENT = Number(process.env.OLLAMA_MAX_CONCURRENT ?? 1);
 let _activeCount = 0;
 const _queue: Array<() => void> = [];
 

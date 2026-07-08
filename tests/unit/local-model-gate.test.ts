@@ -79,4 +79,23 @@ describe('LocalModelGate', () => {
     expect(nextGranted).toBe(true); // self-healed
     expect(gate.holding('stuck')).toBe(false);
   });
+
+  it('cancels queued timed-out acquires without consuming a later slot', async () => {
+    const gate = new LocalModelGate(1);
+    await gate.acquire('active');
+
+    await expect(gate.acquire('timed-out', 10)).rejects.toThrow('local_model_gate_timeout');
+    expect(gate.activeCount).toBe(1);
+
+    let nextGranted = false;
+    const next = gate.acquire('next').then(() => (nextGranted = true));
+    await Promise.resolve();
+    expect(nextGranted).toBe(false);
+
+    gate.release('active');
+    await next;
+    expect(nextGranted).toBe(true);
+    expect(gate.holding('timed-out')).toBe(false);
+    expect(gate.holding('next')).toBe(true);
+  });
 });

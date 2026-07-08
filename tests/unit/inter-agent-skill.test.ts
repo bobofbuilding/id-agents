@@ -91,6 +91,16 @@ describe('INTER_AGENT_SKILL — catalog-aware delegation flow', () => {
     // And the section that previously told you to "always use this name" should now redirect to the catalog flow.
     expect(INTER_AGENT_SKILL).toContain('Catalog-check before delegating');
   });
+
+  it('routes cross-team /ask through manager /remote and forbids POST /ask', () => {
+    expect(INTER_AGENT_SKILL).toContain('## Cross-team delegation');
+    expect(INTER_AGENT_SKILL).toContain('$MANAGER_URL/remote');
+    expect(INTER_AGENT_SKILL).toContain('/ask other-team/agent-name');
+    expect(INTER_AGENT_SKILL).toContain('Never `POST $MANAGER_URL/ask`');
+    expect(INTER_AGENT_SKILL_LIGHT).toContain('## Cross-Team Delegation');
+    expect(INTER_AGENT_SKILL_LIGHT).toContain('$MANAGER_URL/remote');
+    expect(INTER_AGENT_SKILL_LIGHT).toContain('Never POST to `$MANAGER_URL/ask`');
+  });
 });
 
 describe('INTER_AGENT_SKILL — single source of truth (skills/inter-agent/SKILL.md)', () => {

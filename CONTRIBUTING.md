@@ -58,6 +58,19 @@ configs/
 
 ## Making Changes
 
+### Versioning and Publishing
+
+ID Agents follows the same release-version schema as IDACC:
+
+- `package.json` must carry the strict `X.Y.Z` version being published.
+- `CHANGELOG.md` must include a `## [X.Y.Z]` heading for that version.
+- The release commit subject must start with `vX.Y.Z: `.
+- The release commit must be tagged `vX.Y.Z`.
+
+`npm publish` runs `npm run verify:release-schema` through `prepublishOnly` before
+building, so a release that does not match those fields fails before it is
+published.
+
 ### Code Style
 
 - Use TypeScript for all new code

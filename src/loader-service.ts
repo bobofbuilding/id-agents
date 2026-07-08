@@ -12,6 +12,7 @@ import http from 'node:http';
 import { execFileSync, spawn } from 'node:child_process';
 import { readFileSync, openSync, closeSync } from 'node:fs';
 import path from 'node:path';
+import { nodeOptionsForManager } from './lib/resource-limits.js';
 
 const LOADER_PORT = parseInt(process.env.LOADER_PORT || '3100');
 const MANAGER_PORT = parseInt(process.env.AGENT_MANAGER_PORT || '4100');
@@ -127,7 +128,10 @@ function startManager(): { pid: number | undefined } {
   const logFd = openSync(LOG_FILE, 'a');
   const child = spawn('node', [managerScript], {
     cwd: WORK_DIR,
-    env,
+    env: {
+      ...env,
+      NODE_OPTIONS: nodeOptionsForManager(env.NODE_OPTIONS),
+    },
     stdio: ['ignore', logFd, logFd],
     detached: true,
   });

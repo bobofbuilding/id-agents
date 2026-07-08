@@ -49,4 +49,13 @@ describe('Brain context prompt appendix budget', () => {
     expect(message).not.toContain('should not be injected in full');
     expect(message).toContain('Cite used Brain sources as used_source_ids: memory:1, fact:2 (+2 more)');
   });
+
+  it('adds a Brain workflow directive for required submission/knowledge/skill work even without volunteered sources', () => {
+    const manager = makeManager();
+    const message = manager.withBrainContextAppendix('Review this submission.', null, 'submission');
+
+    expect(message).toContain('Brain workflow required for submission work:');
+    expect(message).toContain('use the brain skill / Brain endpoints');
+    expect(message).toContain('save it back to Brain/shared memory');
+  });
 });

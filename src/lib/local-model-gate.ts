@@ -46,7 +46,7 @@ export function isLocalModelRuntime(runtime?: string | null, providerBaseUrl?: s
 export class LocalModelGate {
   private active = 0;
   private concurrency: number;
-  private readonly queue: Array<() => void> = [];
+  private readonly queue: Array<{ grant: () => void; reject: (err: Error) => void; cancelled: boolean; timeout?: ReturnType<typeof setTimeout> }> = [];
   private readonly holds = new Map<string, ReturnType<typeof setTimeout>>();
 
   /**
@@ -68,16 +68,17 @@ export class LocalModelGate {
   /** Change the cap at runtime; raising it immediately admits queued waiters. */
   setConcurrency(n: number): void {
     this.concurrency = Math.max(1, Math.floor(n) || 1);
-    while (this.active < this.concurrency && this.queue.length > 0) {
-      this.queue.shift()!();
-    }
+    this.drainQueue();
   }
 
   /** Acquire a slot for `key`; resolves when one is free. Idempotent per key. */
-  acquire(key: string): Promise<void> {
+  acquire(key: string, timeoutMs?: number): Promise<void> {
     if (this.holds.has(key)) return Promise.resolve();
-    return new Promise<void>((resolve) => {
+    return new Promise<void>((resolve, reject) => {
+      let entry: { grant: () => void; reject: (err: Error) => void; cancelled: boolean; timeout?: ReturnType<typeof setTimeout> } | null = null;
       const grant = () => {
+        if (entry?.cancelled) return;
+        if (entry?.timeout) clearTimeout(entry.timeout);
         this.active++;
         const timer = setTimeout(() => this.release(key), this.maxHoldMs);
         // Don't keep the event loop alive just for the safety timer.
@@ -86,7 +87,25 @@ export class LocalModelGate {
         resolve();
       };
       if (this.active < this.concurrency) grant();
-      else this.queue.push(grant);
+      else {
+        entry = {
+          grant,
+          cancelled: false,
+          reject,
+        };
+        this.queue.push(entry);
+        if (timeoutMs !== undefined && timeoutMs > 0) {
+          entry.timeout = setTimeout(() => {
+            if (!entry || entry.cancelled) return;
+            entry.cancelled = true;
+            entry.reject(new Error('local_model_gate_timeout'));
+          }, timeoutMs);
+          (entry.timeout as { unref?: () => void }).unref?.();
+        }
+      }
+    }).catch((err) => {
+      this.drainQueue();
+      throw err;
     });
   }
 
@@ -97,8 +116,7 @@ export class LocalModelGate {
     clearTimeout(timer);
     this.holds.delete(key);
     this.active = Math.max(0, this.active - 1);
-    const next = this.queue.shift();
-    if (next) next();
+    this.drainQueue();
   }
 
   get activeCount(): number {
@@ -110,5 +128,13 @@ export class LocalModelGate {
   /** True if this key currently holds (or is mid-hold on) a slot. */
   holding(key: string): boolean {
     return this.holds.has(key);
+  }
+
+  private drainQueue(): void {
+    while (this.active < this.concurrency && this.queue.length > 0) {
+      const next = this.queue.shift()!;
+      if (next.cancelled) continue;
+      next.grant();
+    }
   }
 }

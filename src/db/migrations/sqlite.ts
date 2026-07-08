@@ -3,6 +3,36 @@
 import crypto from 'crypto';
 import type { SqliteAdapter } from '../sqlite-adapter.js';
 
+const OWNER_BACKFILL_MARKER = 'sqlite-owner-kind-owner-id-backfill-v1';
+const MANAGER_SHADOW_CLEANUP_MARKER = 'sqlite-manager-shadow-agent-cleanup-v1';
+const MIGRATION_MARKERS_TABLE = 'id_agents_migration_markers';
+
+async function ensureSqliteMigrationMarkers(adapter: SqliteAdapter): Promise<void> {
+  adapter.exec(`
+    CREATE TABLE IF NOT EXISTS id_agents_migration_markers (
+      name TEXT PRIMARY KEY,
+      applied_at INTEGER NOT NULL
+    );
+  `);
+}
+
+async function hasSqliteMigrationMarker(adapter: SqliteAdapter, name: string): Promise<boolean> {
+  await ensureSqliteMigrationMarkers(adapter);
+  const { rows } = await adapter.query<{ name: string }>(
+    `SELECT name FROM ${MIGRATION_MARKERS_TABLE} WHERE name = ? LIMIT 1`,
+    [name],
+  );
+  return rows.length > 0;
+}
+
+async function setSqliteMigrationMarker(adapter: SqliteAdapter, name: string): Promise<void> {
+  await ensureSqliteMigrationMarkers(adapter);
+  await adapter.query(
+    `INSERT OR REPLACE INTO ${MIGRATION_MARKERS_TABLE} (name, applied_at) VALUES (?, ?)`,
+    [name, Date.now()],
+  );
+}
+
 /** PK (team_id, query_id); nullable agent_id for manager inbox rows. */
 async function migrateQueriesTeamQueryPkSqlite(adapter: SqliteAdapter): Promise<void> {
   const { rows } = await adapter.query<{ sql: string }>(
@@ -102,6 +132,8 @@ async function migrateNewsItemsNullableAgentSqlite(adapter: SqliteAdapter): Prom
  * Hard-fails if orphan refs would violate integrity (runs after PK/nullable migrations).
  */
 export async function migrateDeleteManagerShadowAgentsSqlite(adapter: SqliteAdapter): Promise<void> {
+  if (await hasSqliteMigrationMarker(adapter, MANAGER_SHADOW_CLEANUP_MARKER)) return;
+
   const probe = async (sql: string): Promise<number> => {
     try {
       const r = await adapter.query<{ c: number }>(sql);
@@ -199,9 +231,11 @@ export async function migrateDeleteManagerShadowAgentsSqlite(adapter: SqliteAdap
   }
 
   await adapter.query(`DELETE FROM agents WHERE id GLOB 'manager-*' OR id = 'virtual_manager'`);
+  await setSqliteMigrationMarker(adapter, MANAGER_SHADOW_CLEANUP_MARKER);
 }
 
 export async function migrateSqlite(adapter: SqliteAdapter): Promise<void> {
+  await ensureSqliteMigrationMarkers(adapter);
   adapter.exec(`
     CREATE TABLE IF NOT EXISTS teams (
       id TEXT PRIMARY KEY,
@@ -510,23 +544,26 @@ export async function migrateSqlite(adapter: SqliteAdapter): Promise<void> {
   } catch {
     // Column already exists in upgraded databases.
   }
-  await adapter.query(`
-    UPDATE queries SET
-      owner_kind = CASE WHEN agent_id GLOB 'manager-*' THEN 'manager' ELSE 'agent' END,
-      owner_id = CASE WHEN agent_id GLOB 'manager-*' THEN team_id ELSE agent_id END
-    WHERE owner_id = ''
-  `);
-  await adapter.query(`
-    UPDATE news_items SET
-      owner_kind = CASE WHEN agent_id GLOB 'manager-*' THEN 'manager' ELSE 'agent' END,
-      owner_id = CASE WHEN agent_id GLOB 'manager-*' THEN team_id ELSE agent_id END
-    WHERE owner_id = ''
-  `);
   adapter.exec(`
     CREATE INDEX IF NOT EXISTS queries_team_owner_idx ON queries(team_id, owner_kind, owner_id);
     CREATE INDEX IF NOT EXISTS news_items_team_owner_time_idx ON news_items(team_id, owner_kind, owner_id, timestamp);
     CREATE INDEX IF NOT EXISTS news_items_owner_query_idx ON news_items(team_id, owner_kind, owner_id, query_id);
   `);
+  if (!(await hasSqliteMigrationMarker(adapter, OWNER_BACKFILL_MARKER))) {
+    await adapter.query(`
+      UPDATE queries SET
+        owner_kind = CASE WHEN agent_id GLOB 'manager-*' THEN 'manager' ELSE 'agent' END,
+        owner_id = CASE WHEN agent_id GLOB 'manager-*' THEN team_id ELSE agent_id END
+      WHERE owner_id = ''
+    `);
+    await adapter.query(`
+      UPDATE news_items SET
+        owner_kind = CASE WHEN agent_id GLOB 'manager-*' THEN 'manager' ELSE 'agent' END,
+        owner_id = CASE WHEN agent_id GLOB 'manager-*' THEN team_id ELSE agent_id END
+      WHERE owner_id = ''
+    `);
+    await setSqliteMigrationMarker(adapter, OWNER_BACKFILL_MARKER);
+  }
 
   // Remote endpoint columns for public-agent-remote registry entries (Phase 2).
   // All four columns are nullable so existing rows stay intact (backfill-safe).

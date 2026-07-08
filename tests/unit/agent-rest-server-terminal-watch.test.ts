@@ -35,6 +35,30 @@ class CancellableHarness implements AgentHarness {
   }
 }
 
+class TimeoutOnceHarness implements AgentHarness {
+  readonly type = 'claude-code-cli' as HarnessType;
+  runs = 0;
+  cancelCalls = 0;
+  private releaseFirst: (() => void) | null = null;
+
+  async *run(_prompt: string, _options: HarnessOptions): AsyncGenerator<HarnessMessage> {
+    this.runs += 1;
+    if (this.runs === 1) {
+      await new Promise<void>((resolve) => {
+        this.releaseFirst = resolve;
+      });
+      return;
+    }
+    yield { type: 'result', result: 'ok after retry' };
+  }
+
+  cancel(): boolean {
+    this.cancelCalls += 1;
+    this.releaseFirst?.();
+    return true;
+  }
+}
+
 function queryRow(status: string) {
   return {
     team_id: 'team-1',
@@ -58,6 +82,9 @@ describe('AgentRestServer external query terminal watcher', () => {
     delete process.env.ID_AGENT_QUERY_TERMINAL_POLL_MS;
     delete process.env.ID_HARNESS;
     delete process.env.ID_AGENT_LEAD_QUERY_CONCURRENCY;
+    delete process.env.ID_AGENT_DELEGATION_QUERY_TIMEOUT_MS;
+    delete process.env.ID_AGENT_QUERY_TIMEOUT_RETRIES;
+    vi.useRealTimers();
   });
 
   it.each([
@@ -237,6 +264,63 @@ describe('AgentRestServer external query terminal watcher', () => {
     } finally {
       for (const harness of activeHarnesses) harness.cancel();
       await Promise.all(activeHarnesses.map((harness) => harness.done).filter(Boolean));
+      await server.stop();
+    }
+  });
+
+  it('requeues a timed-out execution once and completes the same query id on retry', async () => {
+    vi.useFakeTimers();
+    process.env.ID_HARNESS = 'claude-code-cli';
+    process.env.ID_AGENT_DELEGATION_QUERY_TIMEOUT_MS = '60000';
+    process.env.ID_AGENT_QUERY_TIMEOUT_RETRIES = '1';
+
+    const harness = new TimeoutOnceHarness();
+    const db: any = {
+      queries: {
+        upsert: vi.fn(async () => {}),
+        getByQueryIdForTeam: vi.fn(async () => queryRow('processing')),
+      },
+      news: {
+        add: vi.fn(async () => {}),
+      },
+    };
+
+    const server = new AgentRestServer({
+      agentName: 'worker',
+      db: { db, teamId: 'team-1', agentId: 'agent-1' },
+      harness,
+    });
+
+    try {
+      await (server as any).startQuery('query-timeout', 'Team objective: retry this timed-out task', undefined, 'manager');
+      await vi.waitFor(() => expect(harness.runs).toBe(1));
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      await vi.waitFor(() => expect(harness.cancelCalls).toBe(1));
+      await vi.waitFor(() => expect(harness.runs).toBe(2));
+      await vi.waitFor(() => {
+        expect(db.queries.upsert).toHaveBeenCalledWith(
+          'team-1',
+          'agent-1',
+          expect.objectContaining({
+            query_id: 'query-timeout',
+            status: 'completed',
+            result: expect.objectContaining({ result: 'ok after retry' }),
+          }),
+        );
+      });
+
+      expect(db.news.add).toHaveBeenCalledWith(
+        'team-1',
+        'agent-1',
+        expect.objectContaining({
+          type: 'query.timeout_retry',
+          query_id: 'query-timeout',
+          data: expect.objectContaining({ retry_attempt: 1, max_retries: 1 }),
+        }),
+      );
+      expect(db.queries.upsert.mock.calls.some((call: any[]) => call[2]?.query_id === 'query-timeout' && call[2]?.status === 'failed')).toBe(false);
+    } finally {
       await server.stop();
     }
   });

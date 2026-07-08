@@ -13,6 +13,7 @@
 import express from 'express';
 import crypto from 'crypto';
 import path from 'path';
+import Database from 'better-sqlite3';
 import { createServer as createHttpServer, type Server as HttpServer } from 'http';
 import { existsSync, mkdirSync, rmSync, readFileSync, writeFileSync, readdirSync, copyFileSync, statSync, openSync, closeSync } from 'fs';
 import { execFileSync, spawn, type ChildProcess } from 'child_process';
@@ -27,6 +28,7 @@ import { defaultDeliverFn, redactSshTarget, type DeliverFn } from './lib/ssh-del
 import { probeRemoteAgent, defaultHealthProbeFn, type HealthProbeFn } from './lib/remote-heartbeat.js';
 import { filterClaudeEnvVars } from './lib/env-hygiene.js';
 import { LocalModelGate, isLocalModelRuntime } from './lib/local-model-gate.js';
+import { withDesktopResourceLimits } from './lib/resource-limits.js';
 import { ccCapabilities } from './control-center/manifest.js';
 import { loadMasterKey, deriveKeyAtIndex } from './lib/skillmesh-key-manager.js';
 import { type Db } from './db/db-service.js';
@@ -112,7 +114,8 @@ import {
   normalizeLearningLoopCapture,
   type LearningLoopCapture,
 } from './core/learning-loop-capture.js';
-import type { HarnessType } from './harness/types.js';
+import { appendSpecialistRoutingNote, inferSpecialistOwnerTeam } from './core/specialist-routing.js';
+import type { HarnessType, McpServerSpec } from './harness/types.js';
 import { SchedulerService } from './scheduling/scheduler-service.js';
 import type { DispatchResult, DispatchTarget, DueRun } from './scheduling/schedule-types.js';
 import { heartbeatToSchedule, calendarToSchedule, validateIntervalSeconds, HEARTBEAT_GENERIC_MESSAGE } from './scheduling/schedule-config.js';
@@ -127,6 +130,7 @@ import {
   isSupportedRuntimeSpecifier,
   resolveRuntime,
   runtimeIssueHint,
+  supportsMcpTools,
   validateRuntimePreflight,
 } from './runtime/registry.js';
 import { resolveModelAlias } from './core/model-aliases.js';
@@ -165,6 +169,31 @@ interface StalledOwnerTriageReport {
   triagedOwners: number;
   skippedOwners: Array<{ team: string; owner?: string; reason: string }>;
   items: StalledOwnerTriageReportItem[];
+}
+
+interface BrainAutopilotGoal {
+  id: string;
+  name: string;
+  status: string | null;
+  data: Record<string, any>;
+  updatedAt: number;
+  teamName: string;
+  priority: string;
+  agentName: string | null;
+  lastRunAt: number | null;
+  taskRefs: string[];
+}
+
+interface GoalAutopilotSyncResult {
+  ok: boolean;
+  enabled: boolean;
+  dryRun: boolean;
+  consideredGoals: number;
+  drivenGoals: number;
+  tasksSpawned: number;
+  skipped: Array<{ goal: string; reason: string; team?: string; owner?: string }>;
+  created: Array<{ goal: string; team: string; owner: string; task: string; shortId: string | null }>;
+  errors: Array<{ goal?: string; error: string }>;
 }
 
 function looksLikeShortTaskRef(value: string | undefined): boolean {
@@ -481,6 +510,19 @@ function pluginLooksLikeSkillmesh(plugin: unknown): boolean {
     .some(value => /(^|[/_.-])skillmesh([/_.-]|$)/i.test(value));
 }
 
+function metadataSkills(metadata: AgentMetadata | null | undefined): string[] {
+  const raw = metadata?.skills;
+  if (Array.isArray(raw)) return raw.filter((skill): skill is string => typeof skill === 'string');
+  if (typeof raw === 'string') {
+    return raw.split(',').map((skill) => skill.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+function hasBrainSkill(metadata: AgentMetadata | null | undefined): boolean {
+  return metadataSkills(metadata).includes('brain');
+}
+
 // WebSocket client tracking
 interface WSClient {
   ws: WebSocket;
@@ -670,6 +712,10 @@ export class AgentManagerDb {
   private querySweepInFlight: Promise<StaleQuerySweepResult> | null = null;
   private lastQuerySweepAt = 0;
   private stalledSweepInterval: NodeJS.Timeout | null = null;
+  private stalledSweepInFlight: Promise<void> | null = null;
+  private goalAutopilotSyncInterval: NodeJS.Timeout | null = null;
+  private goalAutopilotSyncInitialTimeout: NodeJS.Timeout | null = null;
+  private goalAutopilotSyncInFlight: Promise<GoalAutopilotSyncResult> | null = null;
   private idleParkingInterval: NodeJS.Timeout | null = null;
   private idleParkingInitialTimeout: NodeJS.Timeout | null = null;
   private runtimeLaneCooldowns: Map<string, RuntimeLaneCooldown> = new Map();
@@ -677,6 +723,9 @@ export class AgentManagerDb {
   private defaultRuntimeCredentialPool: RuntimeCredentialPoolConfig | null = null;
   private providerRuntimeAssignments: Map<string, ProviderRuntimeAssignment> = new Map();
   private runtimeFailoverRetryOf: Map<string, string> = new Map();
+  private installedOllamaModelsCache: { at: number; models: string[] } | null = null;
+  private runtimeFallbackRestoreInFlight: Promise<void> | null = null;
+  private lastRuntimeFallbackRestoreSweepAt = 0;
   private agentLifecycleLocks: Map<string, Promise<void>> = new Map();
   private validatorRecommendationLoopLocks: Map<string, Promise<void>> = new Map();
   private taskOwnerWakeAttempts: Map<string, number> = new Map();
@@ -2748,7 +2797,7 @@ export class AgentManagerDb {
     teamName: string,
     task: TaskRow,
     owner: AgentRow | null,
-    reason: 'task-create' | 'task-assign' | 'task-claim' | 'stalled-owner' | 'lead-delegation-capacity',
+    reason: 'task-create' | 'task-assign' | 'task-claim' | 'stalled-owner' | 'lead-delegation-capacity' | 'goal-autopilot-sync',
   ): Promise<{ status: 'started' | 'skipped' | 'failed'; reason: string; pid?: number; logFile?: string }> {
     if (!owner) return { status: 'skipped', reason: 'no_owner' };
     if (owner.status === 'running') return { status: 'skipped', reason: 'already_running' };
@@ -3205,9 +3254,54 @@ Return this JSON shape:
 
     // Copy plugin directory recursively
     this.copyDirRecursive(sourcePath, targetDir);
+    this.mirrorPluginSkillsToAgent(plugin.name, targetDir, agentWorkDir);
     console.log(`[AgentManager] Copied plugin ${plugin.name} to ${targetDir}`);
 
     return targetDir;
+  }
+
+  private runtimeNeutralSkillRoots(agentWorkDir: string): string[] {
+    return [
+      path.join(agentWorkDir, '.claude', 'skills'),
+      path.join(agentWorkDir, '.agents', 'skills'),
+      path.join(agentWorkDir, '.cursor', 'skills'),
+    ];
+  }
+
+  private mirrorSkillDirToRuntimeRoots(skillName: string, sourceDir: string, agentWorkDir: string): number {
+    if (!/^[a-z0-9][a-z0-9._-]*$/i.test(skillName)) return 0;
+    if (!existsSync(path.join(sourceDir, 'SKILL.md'))) return 0;
+    let copied = 0;
+    for (const root of this.runtimeNeutralSkillRoots(agentWorkDir)) {
+      const target = path.join(root, skillName);
+      this.copyDirRecursive(sourceDir, target);
+      copied++;
+    }
+    return copied;
+  }
+
+  private mirrorPluginSkillsToAgent(pluginName: string, pluginDir: string, agentWorkDir: string): void {
+    try {
+      let mirrored = 0;
+      if (existsSync(path.join(pluginDir, 'SKILL.md'))) {
+        mirrored += this.mirrorSkillDirToRuntimeRoots(pluginName, pluginDir, agentWorkDir);
+      }
+
+      const nestedSkillsDir = path.join(pluginDir, 'skills');
+      if (existsSync(nestedSkillsDir) && statSync(nestedSkillsDir).isDirectory()) {
+        for (const name of readdirSync(nestedSkillsDir)) {
+          const sourceDir = path.join(nestedSkillsDir, name);
+          if (!statSync(sourceDir).isDirectory()) continue;
+          mirrored += this.mirrorSkillDirToRuntimeRoots(name, sourceDir, agentWorkDir);
+        }
+      }
+
+      if (mirrored > 0) {
+        console.log(`[AgentManager] Mirrored plugin ${pluginName} skills to runtime skill folders (${mirrored} copies)`);
+      }
+    } catch (err: any) {
+      console.warn(`[AgentManager] Could not mirror plugin skills for ${pluginName}: ${err?.message || err}`);
+    }
   }
 
   /**
@@ -3356,6 +3450,7 @@ Return this JSON shape:
     resultPayload: Record<string, unknown>;
     waiterReply: { from: string; message: string };
     messagePreview: string | null;
+    recoverFailedRateLimit?: boolean;
   }): Promise<void> {
     const { teamId, queryId, occurredAt, resultPayload, waiterReply, messagePreview } = params;
 
@@ -3398,11 +3493,22 @@ Return this JSON shape:
       : resultPayload;
     const learnedArtifact = this.learnedArtifactFromPayload(completionPayload);
 
-    const transitioned = await this.db.queries.complete(teamId, queryId, occurredAt, completionPayload);
+    let transitioned = await this.db.queries.complete(teamId, queryId, occurredAt, completionPayload);
 
-    const completedRow = await this.db.queries
+    let completedRow = await this.db.queries
       .getByQueryIdForTeam(teamId, queryId)
       .catch(() => null);
+    if (!transitioned && params.recoverFailedRateLimit && completedRow?.status === 'failed' && this.isRecoverableRateLimitFailure(completedRow)) {
+      transitioned = await this.completeFailedRateLimitRecoveredQuery({
+        teamId,
+        queryId,
+        occurredAt,
+        resultPayload: completionPayload,
+      });
+      completedRow = await this.db.queries
+        .getByQueryIdForTeam(teamId, queryId)
+        .catch(() => null);
+    }
     if (transitioned && completedRow && completedRow.status === 'completed') {
       const brainContext = this.queryBrainContext.get(queryId)
         || ((completedRow.metadata as any)?.brain_context as BrainVolunteerContext | undefined)
@@ -3454,6 +3560,7 @@ Return this JSON shape:
         learningLoop: queryLearningLoop,
         learnedArtifact,
       });
+      await this.promoteHumanDecisionBlockerToManagerInbox(completedRow, completionPayload, occurredAt);
     }
 
     if (transitioned || completedRow?.status === 'completed') {
@@ -3471,6 +3578,61 @@ Return this JSON shape:
 
     this.wakeQueryWaiters(teamId, queryId, waiterReply);
     this.releaseLocalGate(queryId); // #7: free the local-model slot on success
+  }
+
+  private isRecoverableRateLimitFailure(queryRow: QueryRow): boolean {
+    const text = `${queryRow.error || ''}\n${queryRow.prompt || ''}`;
+    return /rate_limit|rate limit|usage limit|session limit|codex\/settings\/usage/i.test(text);
+  }
+
+  private async completeFailedRateLimitRecoveredQuery(params: {
+    teamId: string;
+    queryId: string;
+    occurredAt: number;
+    resultPayload: Record<string, unknown>;
+  }): Promise<boolean> {
+    const dialect = this.db.adapter.dialect;
+    const p = (n: number) => dialect === 'postgres' ? `$${n}` : '?';
+    const resultValue = dialect === 'postgres'
+      ? params.resultPayload
+      : JSON.stringify(params.resultPayload);
+    const metadataPatch = {
+      rate_limit_recovered: true,
+      recovered_at: params.occurredAt,
+      recovered_by: 'runtime_failover_retry',
+      retry_query_id: typeof (params.resultPayload as any).failover_retry_query_id === 'string'
+        ? (params.resultPayload as any).failover_retry_query_id
+        : undefined,
+    };
+    const metadataValue = dialect === 'postgres'
+      ? metadataPatch
+      : JSON.stringify(metadataPatch);
+    const metadataSet = dialect === 'postgres'
+      ? `metadata = COALESCE(metadata, '{}'::jsonb) || ${p(3)}::jsonb`
+      : `metadata = CASE
+                WHEN metadata IS NULL THEN ${p(3)}
+                ELSE json_patch(metadata, ${p(3)})
+              END`;
+    const { rowCount } = await this.db.adapter.query(
+      `UPDATE queries
+          SET status = 'completed',
+              completed = ${p(1)},
+              result = ${p(2)},
+              error = NULL,
+              ${metadataSet}
+        WHERE team_id = ${p(4)}
+          AND query_id = ${p(5)}
+          AND status = 'failed'
+          AND (
+            LOWER(COALESCE(error, '')) LIKE '%rate_limit%'
+            OR LOWER(COALESCE(error, '')) LIKE '%rate limit%'
+            OR LOWER(COALESCE(error, '')) LIKE '%usage limit%'
+            OR LOWER(COALESCE(error, '')) LIKE '%session limit%'
+            OR LOWER(COALESCE(error, '')) LIKE '%codex/settings/usage%'
+          )`,
+      [params.occurredAt, resultValue, metadataValue, params.teamId, params.queryId],
+    );
+    return (rowCount ?? 0) > 0;
   }
 
   private taskControlReplyPrompt(prompt: string | null | undefined): boolean {
@@ -3499,6 +3661,115 @@ Return this JSON shape:
       if (typeof nestedMessage === 'string') return nestedMessage;
     }
     return '';
+  }
+
+  private humanDecisionBlockerMessage(message: string): boolean {
+    const text = String(message || '').trim();
+    if (!text) return false;
+    const blockerSignal = /(^|\n)\s*(?:BLOCKED|BLOCKER)\s*:/i.test(text)
+      || /\b(?:blocked|blocker)\b.{0,160}\b(?:human|user|operator|manager|lead|decision|approval|input|intervention)\b/i.test(text);
+    if (!blockerSignal) return false;
+    const explicitAsk = /\b(?:ASK[-\s]?USER|USER[-\s]?DECISION|DECISION NEEDED|APPROVAL NEEDED|CONFIRMATION NEEDED)\b\s*:?\s*\S/i.test(text)
+      || /\b(?:approve|approval|confirm|confirmation|authorize|authorization|choose|select|decide|decision|should we|may we|can we|which option|what should)\b[^?\n]{0,220}\?/i.test(text)
+      || /\b(?:needs?|requires?|awaiting)\s+(?:your |a |the )?(?:approval|confirmation|authorization|decision|routing instruction)\b.{0,220}\b(?:for|to|whether|which|before)\b/i.test(text)
+      || /\bmissing\s+(?:decision|approval|confirmation|authorization|routing instruction|user input)\b.{0,220}\b(?:for|to|whether|which|before)\b/i.test(text);
+    if (explicitAsk) return true;
+
+    // Vague "human intervention" blockers are not actionable user questions.
+    // They should remain in automated task-manager triage, which already sees
+    // the BLOCKED control reply and can re-route, split, or park the task.
+    return false;
+  }
+
+  private managerBlockedDecisionQueryId(queryId: string): string {
+    const safe = String(queryId || 'unknown')
+      .replace(/[^a-zA-Z0-9_-]+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .slice(-96) || 'unknown';
+    return `manager_blocked_${safe}`;
+  }
+
+  private async promoteHumanDecisionBlockerToManagerInbox(
+    queryRow: QueryRow,
+    payload: Record<string, unknown>,
+    occurredAt: number,
+  ): Promise<void> {
+    if (queryRow.owner_kind === 'manager') return;
+
+    const message = this.replyMessageFromPayload(payload);
+    if (!this.humanDecisionBlockerMessage(message)) return;
+
+    const team = await this.db.teams.getTeam(queryRow.team_id).catch(() => null);
+    if (!team) return;
+
+    const managerInbox = this.getManagerInboxRef(queryRow.team_id, team.name);
+    const promotedQueryId = this.managerBlockedDecisionQueryId(queryRow.query_id);
+    const existing = await this.db.queries.getByQueryIdForTeam(queryRow.team_id, promotedQueryId).catch(() => null);
+    if (existing) return;
+
+    const agent = queryRow.agent_id
+      ? await this.db.agents.getById(queryRow.agent_id).catch(() => null)
+      : null;
+    const from = agent?.name || queryRow.agent_id || 'agent';
+    const sourcePrompt = String(queryRow.prompt || '').trim().replace(/\s+/g, ' ');
+    const sourceExcerpt = sourcePrompt ? sourcePrompt.slice(0, 700) : 'No original prompt recorded.';
+    const blockerExcerpt = message.trim().slice(0, 1200);
+    const prompt = [
+      `[From: ${from}] ${blockerExcerpt}`,
+      '',
+      `This agent reply was promoted because it says the work is blocked on human input or a decision.`,
+      `Original query: ${queryRow.query_id}`,
+      `Original request: ${sourceExcerpt}`,
+      '',
+      `Reply with the decision, approval, missing input, or routing instruction needed to unblock the work. Dismiss only if this was already resolved elsewhere.`,
+    ].join('\n');
+
+    await this.db.queries.create(
+      queryRow.team_id,
+      promotedQueryId,
+      null,
+      prompt,
+      occurredAt,
+      queryRow.session_id || undefined,
+      { owner_kind: managerInbox.ownerKind, owner_id: managerInbox.ownerId },
+      {
+        source: 'human_decision_blocker',
+        source_query_id: queryRow.query_id,
+        source_agent_id: queryRow.agent_id,
+        source_agent_name: from,
+      },
+    );
+
+    await this.db.news.add(queryRow.team_id, null, {
+      timestamp: occurredAt,
+      type: 'query.received',
+      message: `Decision needed from ${from}: ${blockerExcerpt.slice(0, 140)}${blockerExcerpt.length > 140 ? '...' : ''}`,
+      data: {
+        from,
+        message,
+        query_id: promotedQueryId,
+        source_query_id: queryRow.query_id,
+        source_agent_id: queryRow.agent_id,
+        reason: 'human_decision_blocker',
+      },
+      query_id: promotedQueryId,
+      kind: 'talk',
+      reply_expected: true,
+      owner_kind: managerInbox.ownerKind,
+      owner_id: managerInbox.ownerId,
+    });
+
+    this.broadcastNews(queryRow.team_id, {
+      type: 'query.received',
+      from,
+      message: `Decision needed: ${blockerExcerpt}`,
+      data: {
+        query_id: promotedQueryId,
+        source_query_id: queryRow.query_id,
+        reason: 'human_decision_blocker',
+      },
+      timestamp: occurredAt,
+    });
   }
 
   private parseTaskControlReply(message: string): {
@@ -3581,6 +3852,8 @@ Return this JSON shape:
       || /\breconciliation\b.{0,80}\b(?:done|complete|completed)\b/i.test(normalized)
       || /\bmark(?:ing|ed)?\s+parent task\b.{0,160}\bdone\b/i.test(normalized)
       || /\bmark(?:ing|ed)?\s+(?:the\s+)?parent\b.{0,160}\bdone\b/i.test(normalized)
+      || /\bcompletion decision\b.{0,80}\bready to post\b/i.test(normalized)
+      || /\bchild tasks?\b.{0,80}\bdone\b/i.test(normalized)
       || /\bdelegated children\b.{0,80}\breconcile cleanly\b/i.test(normalized)
       || /\b(?:both|all)\b.{0,80}\bchildren\b.{0,80}\breconcile cleanly\b/i.test(normalized)
       || /\ball\b.{0,80}\bdelegated children\b.{0,80}\b(?:are\s+)?done\b/i.test(normalized)
@@ -3594,7 +3867,8 @@ Return this JSON shape:
 
     const toolOnlyClosureBlock = (
       /\b(?:no|without|lacking|lacks)\b.{0,100}\b(?:tool|bash|shell|http|curl|post|request|write access|manager api)\b/i.test(normalized)
-      || /\b(?:can't|cannot|unable)\b.{0,140}\b(?:post|execute|issue|make|call|close)\b.{0,100}\b(?:done|closure|http|request|manager api|tasks?\/)/i.test(normalized)
+      || /\b(?:can't|cannot|unable|could not)\b.{0,140}\b(?:post|execute|issue|make|call|close|mark)\b.{0,100}\b(?:done|closure|http|request|manager api|tasks?\/)/i.test(normalized)
+      || /\b(?:manager_url|manager api|local manager|tasks?\/[^\s`'"]+\/done|\/tasks\/[^\s`'"]+\/done)\b.{0,180}\b(?:not reachable|failed to connect|connection refused|refused connections?|econnrefused|curl(?:\s+http)?\s+status\s+`?000`?)\b/i.test(normalized)
       || /\bno way\b.{0,120}\b(?:post|manager api|done endpoint|closure call)\b/i.test(normalized)
     );
     const realTaskBlocker = (
@@ -3855,6 +4129,164 @@ Return this JSON shape:
     });
   }
 
+  private taskAttemptApproachWindowMs(): number {
+    const raw = Number(process.env.ID_TASK_ATTEMPT_APPROACH_WINDOW_MS || 6 * 60 * 60 * 1000);
+    return Number.isFinite(raw) && raw >= 0 ? raw : 6 * 60 * 60 * 1000;
+  }
+
+  private normalizeTaskAttemptApproach(note: string | null | undefined): string {
+    return String(note || '')
+      .toLowerCase()
+      .replace(/^\s*(?:in[-\s]?progress|delegated|done|blocked|needs[-\s]?reassignment)\s*[:=-]?\s*/, '')
+      .replace(/https?:\/\/\S+/g, ' url ')
+      .replace(/#[a-f0-9-]{6,}/g, ' task-ref ')
+      .replace(/\b[a-f0-9]{8,}\b/g, ' id ')
+      .replace(/\b\d+(?:\.\d+)?\s*(?:ms|s|sec|secs|seconds?|m|min|mins|minutes?|h|hr|hrs|hours?|tokens?)\b/g, ' amount ')
+      .replace(/\b\d+\b/g, ' amount ')
+      .replace(/[`"'()[\]{}:;,./\\|!?_*~<>-]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 600);
+  }
+
+  private taskAttemptTokens(approachKey: string): Set<string> {
+    const stop = new Set(['the', 'and', 'for', 'with', 'that', 'this', 'from', 'into', 'will', 'now', 'task', 'work', 'still', 'again']);
+    return new Set(
+      approachKey
+        .split(/\s+/)
+        .map((token) => token.trim())
+        .filter((token) => token.length > 2 && !stop.has(token)),
+    );
+  }
+
+  private taskAttemptSimilarity(left: string, right: string): number {
+    if (!left || !right) return 0;
+    if (left === right) return 1;
+    const leftTokens = this.taskAttemptTokens(left);
+    const rightTokens = this.taskAttemptTokens(right);
+    if (!leftTokens.size || !rightTokens.size) return 0;
+    let shared = 0;
+    for (const token of leftTokens) {
+      if (rightTokens.has(token)) shared += 1;
+    }
+    const union = new Set([...leftTokens, ...rightTokens]);
+    return shared / union.size;
+  }
+
+  private replyDeclaresChangedApproach(note: string | null | undefined): boolean {
+    const text = String(note || '').toLowerCase();
+    return /\b(different|new approach|alternate|alternative|instead|switch(?:ed|ing)?|changed?|rather than|fallback|plan b|new hypothesis|root cause|reframe|try a new|try another)\b/.test(text);
+  }
+
+  private async loadRecentTaskAttemptApproaches(
+    teamId: string,
+    task: TaskRow,
+    sinceMs: number,
+  ): Promise<Array<{ action: string; approachKey: string; note: string; occurredAt: number; actorAgentId: string | null }>> {
+    if (!task.uuid) return [];
+    const dialect = this.db.adapter.dialect;
+    const p = (n: number) => dialect === 'postgres' ? `$${n}` : '?';
+    const { rows } = await this.db.adapter.query<{
+      data?: string | Record<string, unknown> | null;
+      occurred_at?: number | string | null;
+      actor_agent_id?: string | null;
+    }>(
+      `SELECT data, occurred_at, actor_agent_id
+         FROM event_log
+        WHERE team_id = ${p(1)}
+          AND topic = 'task:attempt-approach'
+          AND subject_kind = 'task'
+          AND subject_id = ${p(2)}
+          AND occurred_at >= ${p(3)}
+        ORDER BY occurred_at DESC
+        LIMIT 8`,
+      [teamId, task.uuid, sinceMs],
+    ).catch(() => ({ rows: [] as Array<{ data?: string | Record<string, unknown> | null; occurred_at?: number | string | null; actor_agent_id?: string | null }> }));
+
+    return rows.flatMap((row) => {
+      let data: Record<string, unknown> = {};
+      if (typeof row.data === 'string') {
+        try {
+          data = JSON.parse(row.data) as Record<string, unknown>;
+        } catch {
+          data = {};
+        }
+      } else if (row.data && typeof row.data === 'object') {
+        data = row.data;
+      }
+      const note = String(data.note || '');
+      const approachKey = String(data.approach_key || this.normalizeTaskAttemptApproach(note));
+      if (!approachKey) return [];
+      return [{
+        action: String(data.action || ''),
+        approachKey,
+        note,
+        occurredAt: Number(row.occurred_at || 0),
+        actorAgentId: row.actor_agent_id ?? null,
+      }];
+    });
+  }
+
+  private async repeatedTaskAttemptWithoutChangedApproach(params: {
+    teamId: string;
+    task: TaskRow;
+    action: 'in_progress' | 'delegated';
+    note: string;
+    occurredAt: number;
+  }): Promise<{ previousNote: string; previousAction: string; similarity: number } | null> {
+    const approachKey = this.normalizeTaskAttemptApproach(params.note);
+    if (!approachKey || this.replyDeclaresChangedApproach(params.note)) return null;
+    const windowMs = this.taskAttemptApproachWindowMs();
+    if (windowMs <= 0) return null;
+    const recent = await this.loadRecentTaskAttemptApproaches(params.teamId, params.task, params.occurredAt - windowMs);
+    for (const prior of recent) {
+      if (prior.action && prior.action !== params.action) continue;
+      const similarity = this.taskAttemptSimilarity(approachKey, prior.approachKey);
+      if (similarity >= 0.82) {
+        return {
+          previousNote: prior.note || prior.approachKey,
+          previousAction: prior.action || params.action,
+          similarity,
+        };
+      }
+    }
+    return null;
+  }
+
+  private async recordTaskAttemptApproach(params: {
+    teamId: string;
+    task: TaskRow;
+    actorAgentId: string | null;
+    queryId: string;
+    action: 'in_progress' | 'delegated' | 'repeat_attempt_blocked';
+    note: string;
+    occurredAt: number;
+    repeated?: boolean;
+  }): Promise<void> {
+    if (!params.task.uuid) return;
+    await this.db.events.insert({
+      team_id: params.teamId,
+      topic: 'task:attempt-approach',
+      actor_agent_id: params.actorAgentId,
+      subject_kind: 'task',
+      subject_id: params.task.uuid,
+      occurred_at: params.occurredAt,
+      data: {
+        task_name: params.task.name,
+        task_uuid: params.task.uuid,
+        query_id: params.queryId,
+        action: params.action,
+        approach_key: this.normalizeTaskAttemptApproach(params.note),
+        note: params.note.trim().replace(/\s+/g, ' ').slice(0, 500),
+        changed_approach: this.replyDeclaresChangedApproach(params.note),
+        repeated: params.repeated === true,
+      },
+    }).catch((err) => {
+      this.managerLog(`Failed to record task attempt approach for ${params.task.name}: ${err?.message || err}`);
+      return { seq: 0 };
+    });
+  }
+
   private async applyTaskControlReplyFromCompletedQuery(
     queryRow: QueryRow,
     payload: Record<string, unknown>,
@@ -3929,7 +4361,84 @@ Return this JSON shape:
     }
 
     if (effectiveParsed.action === 'in_progress' || effectiveParsed.action === 'delegated') {
+      const attemptNote = effectiveParsed.note || message;
+      const repeatedAttempt = await this.repeatedTaskAttemptWithoutChangedApproach({
+        teamId: queryRow.team_id,
+        task,
+        action: effectiveParsed.action,
+        note: attemptNote,
+        occurredAt,
+      });
+      if (repeatedAttempt) {
+        const taskTeamId = task.team_id || queryRow.team_id;
+        const taskTeamRow = await this.db.teams.getTeam(taskTeamId).catch(() => null);
+        const repeatNote = [
+          `REPEATED-ATTEMPT: ${effectiveParsed.action} reply repeats the prior approach (${Math.round(repeatedAttempt.similarity * 100)}% overlap).`,
+          'The next retry must use a materially different path, new evidence source, reassignment, or explicit blocker.',
+          `Latest reply: ${attemptNote}`,
+          `Prior reply: ${repeatedAttempt.previousNote}`,
+        ].join(' ');
+        const parkedTask: TaskRow = {
+          ...task,
+          owner: null,
+          status: 'todo',
+          completed_at: null,
+          updated_at: nowSec,
+          description: this.appendTaskTriageNote(task.description, 'control_reply_repeated_attempt', repeatNote, occurredAt),
+        };
+        await this.db.tasks.updateFields(task.id, {
+          owner: parkedTask.owner,
+          status: parkedTask.status,
+          completed_at: parkedTask.completed_at,
+          description: parkedTask.description,
+          updated_at: parkedTask.updated_at,
+        });
+        await this.recordTaskAttemptApproach({
+          teamId: queryRow.team_id,
+          task,
+          actorAgentId,
+          queryId: queryRow.query_id,
+          action: 'repeat_attempt_blocked',
+          note: attemptNote,
+          occurredAt,
+          repeated: true,
+        });
+        await this.recordTaskSupervision(
+          parkedTask,
+          taskTeamRow?.id || queryRow.team_id,
+          actorAgentId,
+          'control_reply_repeated_attempt',
+          stalledMinutes,
+          occurredAt,
+        );
+        await this.markTaskControlReplyApplied({ teamId: queryRow.team_id, queryId: queryRow.query_id, agentId: actorAgentId, occurredAt, task, action: 'repeat_attempt_blocked' });
+        if (taskTeamRow) {
+          void this.routeParkedControlReplyTaskToTaskManager({
+            teamId: taskTeamRow.id,
+            teamName: taskTeamRow.name,
+            task: parkedTask,
+            ref: this.taskShortRef(parkedTask),
+            stalledMinutes,
+            nowMs: occurredAt,
+            action: 'blocked',
+            blockerNote: repeatNote,
+          }).catch((err) => {
+            console.warn(`[Supervision] Repeated-attempt triage route failed for ${task.name}: ${err?.message || err}`);
+          });
+        }
+        this.managerLog(`Blocked repeated ${effectiveParsed.action} control reply for task ${task.name} from query ${queryRow.query_id}`);
+        return { applied: true, action: 'repeat_attempt_blocked', task: task.name, reason: 'repeated_attempt_without_changed_approach' };
+      }
       await this.db.tasks.updateFields(task.id, { updated_at: nowSec });
+      await this.recordTaskAttemptApproach({
+        teamId: queryRow.team_id,
+        task,
+        actorAgentId,
+        queryId: queryRow.query_id,
+        action: effectiveParsed.action,
+        note: attemptNote,
+        occurredAt,
+      });
       await this.recordTaskSupervision(
         task,
         queryRow.team_id,
@@ -3951,14 +4460,26 @@ Return this JSON shape:
           completed_at: null,
           updated_at: nowSec,
         });
-        await emitTaskClaimed(this.db.events, {
-          teamId: queryRow.team_id,
-          taskUuid: task.uuid,
-          taskName: task.name,
-          title: task.title,
-          ownerAgentId: actorAgentId,
-          occurredAt,
-        });
+        const ownerAgent = await this.db.agents.getById(actorAgentId).catch(() => null);
+        const taskTeamRow = await this.db.teams.getTeam(queryRow.team_id).catch(() => null);
+        if (ownerAgent && taskTeamRow) {
+          await this.emitTaskClaimedWithBrainContext({
+            teamId: queryRow.team_id,
+            teamName: taskTeamRow.name,
+            task,
+            owner: ownerAgent,
+            occurredAt,
+          });
+        } else {
+          await emitTaskClaimed(this.db.events, {
+            teamId: queryRow.team_id,
+            taskUuid: task.uuid,
+            taskName: task.name,
+            title: task.title,
+            ownerAgentId: actorAgentId,
+            occurredAt,
+          });
+        }
       } else {
         await this.db.tasks.updateFields(task.id, { updated_at: nowSec });
       }
@@ -4018,12 +4539,11 @@ Return this JSON shape:
             completed_at: null,
             updated_at: nowSec,
           };
-          await emitTaskClaimed(this.db.events, {
+          await this.emitTaskClaimedWithBrainContext({
             teamId: taskTeamId,
-            taskUuid: routedTask.uuid,
-            taskName: routedTask.name,
-            title: routedTask.title,
-            ownerAgentId: route.agent.id,
+            teamName: route.team.name,
+            task: routedTask,
+            owner: route.agent,
             occurredAt,
           });
           await this.recordTaskSupervision(
@@ -4342,6 +4862,7 @@ Return this JSON shape:
       runtime: runtimeDisplay,
       url,
       metadata,
+      brainTools: this.brainToolStatusForAgent(a),
       last_seen: a.last_seen ?? null,
       last_probed_at: a.last_probed_at ?? null,
       last_error: a.last_error ?? null,
@@ -4455,10 +4976,23 @@ Return this JSON shape:
     if (!cooldown.agentId) return { attempted: false };
     const agent = await this.dbQueryAgentById(teamId, cooldown.agentId).catch(() => null);
     const runtime = resolveRuntime(agent?.runtime || cooldown.runtime);
-    if (!agent || (runtime !== 'claude-code-cli' && runtime !== 'claude-code-local')) return { attempted: false };
+    if (!agent || isRemoteEndpointRuntime(agent.runtime)) return { attempted: false };
+
+    const metadata = (agent.metadata as Record<string, unknown>) || {};
+    const providerRuntime = this.providerRuntimeForAgent(agent, metadata);
+    if (isLocalModelRuntime(runtime, providerRuntime?.baseUrl)) return { attempted: false };
+
+    if (runtime !== 'claude-code-cli' && runtime !== 'claude-code-local') {
+      const localFallback = await this.handleRuntimeRateLimitLocalFallback(teamId, teamName, agent, runtime, cooldown);
+      return localFallback.attempted ? localFallback : { attempted: false };
+    }
 
     const nextLane = this.chooseRuntimeCredentialLane(runtime, cooldown.laneId, teamId, true);
-    const metadata = (agent.metadata as Record<string, unknown>) || {};
+    if (nextLane.kind === 'metered-api') {
+      const localFallback = await this.handleRuntimeRateLimitLocalFallback(teamId, teamName, agent, runtime, cooldown);
+      if (localFallback.attempted) return localFallback;
+    }
+
     await this.db.agents.updateMetadata(agent.id, {
       ...metadata,
       runtimeCredentialLane: nextLane.id,
@@ -4514,6 +5048,310 @@ Return this JSON shape:
     }
 
     return { attempted: true, success: true, pid: spawnResult.pid, retryQueryId: retryQueryId ? String(retryQueryId) : undefined, laneId: nextLane.id };
+  }
+
+  private isRateLimitLocalFallbackEnabled(): boolean {
+    return !/^(0|false|off|no)$/i.test(String(process.env.ID_RATE_LIMIT_LOCAL_FALLBACK ?? '1').trim());
+  }
+
+  private resolveRateLimitLocalFallback(agent: AgentRow): { runtime: HarnessType; model: string; laneId: string } | null {
+    if (!this.isRateLimitLocalFallbackEnabled()) return null;
+    const runtime = 'ollama' as HarnessType;
+    const metadata = (agent.metadata as Record<string, unknown>) || {};
+    const configuredModel = String(
+      metadata.rateLimitLocalModel
+        || metadata.localFallbackModel
+        || process.env.ID_RATE_LIMIT_LOCAL_MODEL
+        || process.env.ID_LOCAL_FALLBACK_MODEL
+        || '',
+    ).trim();
+    const model = configuredModel || this.chooseInstalledOllamaFallbackModel(agent) || getDefaultModelForRuntime(runtime);
+    if (!model) return null;
+    return { runtime, model, laneId: `${runtime}:rate-limit-local` };
+  }
+
+  private listInstalledOllamaModels(): string[] {
+    const now = Date.now();
+    if (this.installedOllamaModelsCache && now - this.installedOllamaModelsCache.at < 60_000) {
+      return this.installedOllamaModelsCache.models;
+    }
+
+    try {
+      const out = execFileSync('ollama', ['list'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+      const models = out
+        .split('\n')
+        .slice(1)
+        .map((line) => line.trim().split(/\s+/)[0])
+        .filter(Boolean);
+      this.installedOllamaModelsCache = { at: now, models };
+      return models;
+    } catch {
+      this.installedOllamaModelsCache = { at: now, models: [] };
+      return [];
+    }
+  }
+
+  private chooseInstalledOllamaFallbackModel(agent: AgentRow): string | null {
+    const models = this.listInstalledOllamaModels();
+    if (!models.length) return null;
+
+    const pick = (...preferred: string[]): string | null => preferred.find((model) => models.includes(model)) || null;
+    const metadata = (agent.metadata as Record<string, unknown>) || {};
+    const catalog = metadata.catalog && typeof metadata.catalog === 'object'
+      ? metadata.catalog as Record<string, unknown>
+      : {};
+    const text = [
+      agent.name,
+      agent.type,
+      agent.model,
+      agent.runtime,
+      metadata.role,
+      metadata.description,
+      metadata.skills,
+      metadata.expertise,
+      catalog.role,
+      catalog.description,
+      catalog.expertise,
+      catalog.contributorTitle,
+      catalog.bittreesPrimaryLane,
+      catalog.bittreesSecondaryLanes,
+    ].map((value) => Array.isArray(value) ? value.join(' ') : String(value || '')).join('\n').toLowerCase();
+
+    const agentName = agent.name.toLowerCase();
+    if (metadata.primaryLead === true || agentName === 'lead' || /^primary[-_\s]?lead$/.test(agentName)) {
+      return pick('qwen3:14b', 'qwen3:4b', 'qwen2.5-coder:7b') || models[0] || null;
+    }
+
+    if (/\b(contracts?-counsel|general-counsel|compliance|ip-counsel|legal-researcher|contract-auditor|fact-checker|risk-analyst|token-economist|architect|audit)\b/.test(text)) {
+      return pick('qwen3:14b', 'qwen3:4b', 'qwen2.5-coder:7b') || models[0] || null;
+    }
+
+    if (/\b(coder|code|implementation|engineer|backend|frontend|integration|smart-contract|solidity|wallet-engineer|deployment|deployer|git|maintenance|ci|sqlite|node|api|reverse|vulnerability|security)\b/.test(text)) {
+      return pick('qwen2.5-coder:7b', 'qwen2.5-coder:1.5b', 'qwen3:14b', 'qwen3:4b') || models[0] || null;
+    }
+
+    if (/\b(lead|coordinat|orchestrat|delegat|router|routing|manager|task-master|supervisor|hr|staffing)\b/.test(text)) {
+      return pick('qwen3:4b', 'qwen3:14b', 'qwen3:1.7b') || models[0] || null;
+    }
+
+    if (/\b(monitor|watcher|guardian|classifier|moderator|triage|health|incident|settlement|ipfs|wallet-monitoring|balance-alerts|event-streaming|indexing|data-indexing)\b/.test(text)) {
+      return pick('qwen3:1.7b', 'llama3.2:1b', 'qwen3:4b', 'llama3.2:latest') || models[0] || null;
+    }
+
+    if (/\b(content|writer|publishing|report|evidence|documentation|summary|summarization|narrative)\b/.test(text)) {
+      return pick('gemma3:4b', 'qwen3:4b', 'llama3.2:latest') || models[0] || null;
+    }
+
+    if (/\b(research|analysis|analyst|synthesis|source|protocol|market|opportunity|tokenomics)\b/.test(text)) {
+      return pick('qwen3:4b', 'qwen3:14b', 'gemma3:4b') || models[0] || null;
+    }
+
+    if (/\b(vision|image|screenshot|ocr|visual)\b/.test(text)) {
+      return pick('gemma3:4b', 'moondream:1.8b', 'qwen3:4b') || models[0] || null;
+    }
+
+    return pick('qwen3:4b', 'qwen3:1.7b', 'llama3.2:latest') || models[0] || null;
+  }
+
+  private async handleRuntimeRateLimitLocalFallback(
+    teamId: string,
+    teamName: string,
+    agent: AgentRow,
+    fromRuntime: HarnessType | string,
+    cooldown: RuntimeLaneCooldown,
+  ): Promise<{ attempted: boolean; success?: boolean; pid?: number; retryQueryId?: string; laneId?: string; error?: string }> {
+    const fallback = this.resolveRateLimitLocalFallback(agent);
+    if (!fallback) return { attempted: false };
+
+    const metadata = (agent.metadata as Record<string, unknown>) || {};
+    const nextMetadata: Record<string, unknown> = {
+      ...metadata,
+      runtimeRateLimitFailover: {
+        fromLaneId: cooldown.laneId,
+        toLaneId: fallback.laneId,
+        fromRuntime,
+        toRuntime: fallback.runtime,
+        fromModel: agent.model,
+        toModel: fallback.model,
+        queryId: cooldown.queryId,
+        observedAtMs: Date.now(),
+      },
+      previousRuntimeBeforeRateLimit: agent.runtime,
+      previousModelBeforeRateLimit: agent.model,
+    };
+    delete nextMetadata.runtimeCredentialLane;
+
+    await this.db.agents.updateStatus(agent.id, 'pending', {
+      runtime: fallback.runtime,
+      model: fallback.model,
+      metadata: nextMetadata,
+    });
+
+    const fallbackAgent = {
+      ...agent,
+      runtime: fallback.runtime,
+      model: fallback.model,
+      metadata: nextMetadata,
+    };
+    const spawnResult = await this.rebuildLocalClaudeAgent(teamId, teamName, fallbackAgent);
+    if (!spawnResult.success) {
+      return { attempted: true, success: false, pid: spawnResult.pid, laneId: fallback.laneId, error: spawnResult.error };
+    }
+
+    if (!cooldown.queryId) {
+      return { attempted: true, success: true, pid: spawnResult.pid, laneId: fallback.laneId };
+    }
+
+    const query = await this.db.queries.getByQueryIdForTeam(teamId, cooldown.queryId).catch(() => null);
+    if (!query || !query.prompt) {
+      return { attempted: true, success: true, pid: spawnResult.pid, laneId: fallback.laneId, error: 'original query not found for local runtime replay' };
+    }
+
+    const targetUrl = `http://localhost:${agent.port}`;
+    const result = await this.forwardToAgent(targetUrl, query.prompt, 'manager', query.session_id ?? undefined);
+    if (!result.ok) {
+      return { attempted: true, success: false, pid: spawnResult.pid, laneId: fallback.laneId, error: result.error };
+    }
+
+    const retryQueryId = result.data?.query_id;
+    if (retryQueryId) {
+      this.runtimeFailoverRetryOf.set(String(retryQueryId), cooldown.queryId);
+      await this.db.queries.create(
+        teamId,
+        String(retryQueryId),
+        agent.id,
+        query.prompt,
+        Date.now(),
+        query.session_id ?? undefined,
+        undefined,
+        {
+          ...(query.metadata || {}),
+          retry_of: cooldown.queryId,
+          runtime: fallback.runtime,
+          model: fallback.model,
+          runtimeCredentialLane: fallback.laneId,
+          failedRuntimeCredentialLane: cooldown.laneId,
+        },
+      );
+    }
+
+    return { attempted: true, success: true, pid: spawnResult.pid, retryQueryId: retryQueryId ? String(retryQueryId) : undefined, laneId: fallback.laneId };
+  }
+
+  private isRuntimeLaneCooling(laneId: string | undefined, now: number = Date.now()): boolean {
+    if (!laneId) return false;
+    const cooldown = this.runtimeLaneCooldowns.get(laneId);
+    return Boolean(cooldown && cooldown.coolingUntilMs > now);
+  }
+
+  private async sweepRuntimeRateLimitFallbackRestores(force: boolean = false): Promise<void> {
+    const now = Date.now();
+    const intervalMs = Math.max(30_000, Number(process.env.ID_RATE_LIMIT_RESTORE_SWEEP_MS || 60_000) || 60_000);
+    if (!force && now - this.lastRuntimeFallbackRestoreSweepAt < intervalMs) return;
+    if (this.runtimeFallbackRestoreInFlight) return this.runtimeFallbackRestoreInFlight;
+
+    this.lastRuntimeFallbackRestoreSweepAt = now;
+    this.runtimeFallbackRestoreInFlight = this.sweepRuntimeRateLimitFallbackRestoresUnlocked(now)
+      .catch((err) => {
+        this.managerLog(`Runtime fallback restore sweep failed: ${err?.message || err}`);
+      })
+      .finally(() => {
+        this.runtimeFallbackRestoreInFlight = null;
+      });
+    return this.runtimeFallbackRestoreInFlight;
+  }
+
+  private async sweepRuntimeRateLimitFallbackRestoresUnlocked(now: number): Promise<void> {
+    await this.hydrateRuntimeStateFromTeams().catch(() => {});
+    const teams = await this.db.teams.listTeams();
+    for (const team of teams) {
+      const agents = await this.db.agents.list(team.id, true).catch(() => [] as AgentRow[]);
+      for (const agent of agents) {
+        await this.restoreAgentFromRateLimitFallbackIfReady(team.id, team.name, agent, now).catch((err) => {
+          this.managerLog(`Runtime fallback restore failed for ${team.name}/${agent.name}: ${err?.message || err}`);
+        });
+      }
+    }
+  }
+
+  private async restoreAgentFromRateLimitFallbackIfReady(
+    teamId: string,
+    teamName: string,
+    agent: AgentRow,
+    now: number,
+  ): Promise<boolean> {
+    const metadata = (agent.metadata as Record<string, unknown>) || {};
+    const failover = metadata.runtimeRateLimitFailover && typeof metadata.runtimeRateLimitFailover === 'object'
+      ? metadata.runtimeRateLimitFailover as Record<string, unknown>
+      : null;
+    if (!failover) return false;
+    if (failover.toRuntime !== 'ollama' && agent.runtime !== 'ollama') return false;
+
+    const fromRuntime = typeof failover.fromRuntime === 'string'
+      ? failover.fromRuntime
+      : typeof metadata.previousRuntimeBeforeRateLimit === 'string'
+      ? metadata.previousRuntimeBeforeRateLimit
+      : undefined;
+    const fromModel = typeof failover.fromModel === 'string'
+      ? failover.fromModel
+      : typeof metadata.previousModelBeforeRateLimit === 'string'
+      ? metadata.previousModelBeforeRateLimit
+      : undefined;
+    const fromLaneId = typeof failover.fromLaneId === 'string' ? failover.fromLaneId : undefined;
+    if (!fromRuntime || !fromModel) return false;
+    if (this.isRuntimeLaneCooling(fromLaneId, now)) return false;
+
+    const nextMetadata: Record<string, unknown> = {
+      ...metadata,
+      runtimeRateLimitRestore: {
+        fromRuntime: agent.runtime,
+        fromModel: agent.model,
+        toRuntime: fromRuntime,
+        toModel: fromModel,
+        laneId: fromLaneId,
+        observedAtMs: now,
+      },
+    };
+    delete nextMetadata.runtimeRateLimitFailover;
+    delete nextMetadata.runtimeRateLimit;
+    delete nextMetadata.previousRuntimeBeforeRateLimit;
+    delete nextMetadata.previousModelBeforeRateLimit;
+    delete nextMetadata.runtimeCredentialLane;
+
+    const shouldRestart = agent.status !== 'stopped';
+    await this.db.agents.updateStatus(agent.id, shouldRestart ? 'pending' : 'stopped', {
+      runtime: fromRuntime,
+      model: fromModel,
+      metadata: nextMetadata,
+    });
+
+    if (!shouldRestart) return true;
+
+    const spawnResult = await this.rebuildLocalClaudeAgent(teamId, teamName, {
+      ...agent,
+      runtime: fromRuntime,
+      model: fromModel,
+      metadata: nextMetadata,
+    });
+    if (!spawnResult.success) {
+      await this.db.agents.updateStatus(agent.id, 'offline').catch(() => {});
+      this.managerLog(`Runtime fallback restore rebuild failed for ${teamName}/${agent.name}: ${spawnResult.error || 'unknown error'}`);
+      return false;
+    }
+
+    await this.db.news.add(teamId, agent.id, {
+      timestamp: now,
+      type: 'runtime.restore',
+      message: `Runtime rate-limit cooldown ended; restored ${agent.name} to ${fromRuntime} / ${fromModel}`,
+      data: {
+        fromRuntime: agent.runtime,
+        fromModel: agent.model,
+        toRuntime: fromRuntime,
+        toModel: fromModel,
+        laneId: fromLaneId,
+      },
+    }).catch(() => {});
+    return true;
   }
 
   /**
@@ -4941,14 +5779,24 @@ Return this JSON shape:
   private readonly localGateByQuery = new Map<string, { token: string; agent?: string }>();
   private readonly localGateByAgent = new Map<string, string>();
 
+  private remoteAskLocalGateWaitMs(): number {
+    const raw = Number(process.env.ID_REMOTE_ASK_LOCAL_GATE_WAIT_MS || 2500);
+    return Number.isFinite(raw) && raw >= 0 ? raw : 2500;
+  }
+
+  private remoteAskTalkTimeoutMs(): number {
+    const raw = Number(process.env.ID_REMOTE_ASK_TALK_TIMEOUT_MS || 15_000);
+    return Number.isFinite(raw) && raw > 0 ? raw : 15_000;
+  }
+
   /** Acquire a local-model slot before dispatching to `agent`. Returns a token or undefined. */
-  private async acquireLocalGate(agent?: AgentRow | null): Promise<string | undefined> {
+  private async acquireLocalGate(agent?: AgentRow | null, timeoutMs?: number): Promise<string | undefined> {
     if (!agent) return undefined;
     const metadata = (agent.metadata || {}) as AgentMetadata;
     const providerRuntime = this.providerRuntimeForAgent(agent, metadata);
     if (!isLocalModelRuntime(agent.runtime || (metadata as any).runtime, providerRuntime?.baseUrl)) return undefined;
     const token = `lmg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    await this.localModelGate.acquire(token);
+    await this.localModelGate.acquire(token, timeoutMs);
     return token;
   }
   /** Bind a token to its queryId so completion releases it; release immediately if no query. */
@@ -5038,6 +5886,63 @@ Return this JSON shape:
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (process.env.BRAIN_TOKEN) headers.Authorization = `Bearer ${process.env.BRAIN_TOKEN}`;
     return headers;
+  }
+
+  private defaultBrainMcpServer(): McpServerSpec | null {
+    if (envFlagDisabled(process.env.ID_AUTO_ATTACH_BRAIN_MCP)) return null;
+    const explicit = process.env.BRAIN_MCP_COMMAND;
+    const command = explicit && explicit.trim() ? explicit.trim() : process.execPath;
+    const explicitArgs = process.env.BRAIN_MCP_ARGS;
+    const defaultScript = path.join(this.baseWorkDir, 'projects', 'brain', 'brain-mcp.mjs');
+    const args = explicitArgs && explicitArgs.trim()
+      ? explicitArgs.split(/\s+/).filter(Boolean)
+      : [defaultScript];
+    if (!explicit && !existsSync(defaultScript)) return null;
+    return {
+      name: 'brain',
+      transport: 'stdio',
+      command,
+      args,
+      env: {
+        BRAIN_MCP_BASE_URL: this.brainUrl(),
+        ...(process.env.BRAIN_TOKEN ? { BRAIN_TOKEN: process.env.BRAIN_TOKEN } : {}),
+      },
+    };
+  }
+
+  private effectiveMcpServersForAgent(metadata: AgentMetadata | null | undefined): McpServerSpec[] {
+    const explicit = Array.isArray(metadata?.mcpServers)
+      ? (metadata!.mcpServers as McpServerSpec[]).filter((server) => server && typeof server.name === 'string' && server.name.trim())
+      : [];
+    const byName = new Map<string, McpServerSpec>();
+    for (const server of explicit) byName.set(server.name, server);
+    if (hasBrainSkill(metadata) && !byName.has('brain')) {
+      const brain = this.defaultBrainMcpServer();
+      if (brain) byName.set(brain.name, brain);
+    }
+    return [...byName.values()];
+  }
+
+  private brainToolStatusForAgent(a: AgentRow): Record<string, unknown> {
+    const metadata = (a.metadata as AgentMetadata | null | undefined) || {};
+    const explicit = Array.isArray(metadata.mcpServers) ? metadata.mcpServers as McpServerSpec[] : [];
+    const effective = this.effectiveMcpServersForAgent(metadata);
+    const explicitBrain = explicit.some((server) => server?.name === 'brain');
+    const effectiveBrain = effective.some((server) => server?.name === 'brain');
+    const runtime = resolveRuntime(a.runtime);
+    const providerRuntime = this.providerRuntimeForAgent(a, metadata);
+    const localRuntime = runtime === 'ollama' || isLocalModelRuntime(runtime, providerRuntime?.baseUrl);
+    const runtimeSupportsMcp = supportsMcpTools(a.runtime);
+    return {
+      skillInstalled: hasBrainSkill(metadata),
+      contextInjection: !envFlagDisabled(process.env.BRAIN_CONTEXT_DISABLED),
+      mcpExplicit: explicitBrain,
+      mcpAttached: effectiveBrain,
+      mcpServerCount: effective.length,
+      localRuntime,
+      runtimeSupportsMcp,
+      activeToolAccess: effectiveBrain && runtimeSupportsMcp,
+    };
   }
 
   private normalizeProviderRuntimeAssignment(runtime: string, raw: unknown): ProviderRuntimeAssignment {
@@ -5233,6 +6138,7 @@ Return this JSON shape:
     if (!cooldownRepo?.pruneExpired || !cooldownRepo?.listActive) return;
 
     await cooldownRepo.pruneExpired(now);
+    this.runtimeLaneCooldowns.clear();
     const activeCooldowns = await cooldownRepo.listActive(now);
     for (const row of activeCooldowns) {
       this.runtimeLaneCooldowns.set(row.lane_id, {
@@ -5356,6 +6262,36 @@ Return this JSON shape:
     } catch {
       return null;
     }
+  }
+
+  private async emitTaskClaimedWithBrainContext(input: {
+    teamId: string;
+    teamName: string;
+    task: TaskRow;
+    owner: AgentRow;
+    occurredAt?: number;
+  }): Promise<BrainVolunteerContext | null> {
+    const brainContext = await this.volunteerBrainContext({
+      taskId: `task:${input.task.uuid}`,
+      agentId: input.owner.id,
+      text: [input.task.title, input.task.description].filter(Boolean).join('\n\n'),
+      project: input.teamName,
+    });
+    await emitTaskClaimed(this.db.events, {
+      teamId: input.teamId,
+      taskUuid: input.task.uuid,
+      taskName: input.task.name,
+      title: input.task.title,
+      ownerAgentId: input.owner.id,
+      occurredAt: input.occurredAt ?? Date.now(),
+      volunteeredSourceIds: brainContext?.cited?.canonical_source_ids || [],
+      brainContext: brainContext ? {
+        cited: brainContext.cited,
+        timelineEventId: brainContext.timelineEventId,
+        context_package_id: brainContext.context_package_id ?? brainContext.contextPackageId,
+      } : null,
+    });
+    return brainContext;
   }
 
   private async postBrain(pathname: string, body: Record<string, unknown>): Promise<void> {
@@ -5608,19 +6544,44 @@ Return this JSON shape:
     }
   }
 
-  private withBrainContextAppendix(message: string, context: BrainVolunteerContext | null): string {
-    if (!context?.bundles?.length && !context?.instructions?.length) return message;
+  private brainContextRequiredIntent(message: string): string | null {
+    const text = String(message || '').toLowerCase();
+    if (!text.trim()) return null;
+    if (/\b(?:submission|submissions|submit|submitted|intake|proposal|proposals|contribution|contributions|external agent|review queue)\b/.test(text)) {
+      return 'submission';
+    }
+    if (/\b(?:knowledge|brain|memory|memories|recall|remember|learned material|learn material|source material|materials|facts|fact-context|context package|persistent knowledge)\b/.test(text)) {
+      return 'knowledge';
+    }
+    if (/\b(?:skill|skills|skillmesh|capabilit(?:y|ies)|catalog|tooling|tools|mcp|plugin|plugins|specialist routing)\b/.test(text)) {
+      return 'skills';
+    }
+    return null;
+  }
+
+  private brainUsageDirective(intent: string): string[] {
+    return [
+      `Brain workflow required for ${intent} work:`,
+      '- Before acting, use the brain skill / Brain endpoints to recall relevant shared memory, source context, facts, and skill recommendations.',
+      '- For submissions, knowledge, materials, skills, catalog, tools, MCP, plugin, or capability-selection work, prefer Brain-backed evidence over re-fetching or guessing.',
+      '- When you use Brain context, cite source ids as used_source_ids / used_instruction_ids in your result; when you produce reusable knowledge, save it back to Brain/shared memory.',
+    ];
+  }
+
+  private withBrainContextAppendix(message: string, context: BrainVolunteerContext | null, requiredIntent?: string | null): string {
+    if (!context?.bundles?.length && !context?.instructions?.length && !requiredIntent) return message;
     const lines = ['Brain context:'];
+    if (requiredIntent) lines.push(...this.brainUsageDirective(requiredIntent));
     const instructionChars = this.positiveIntEnv('BRAIN_CONTEXT_INSTRUCTION_CHARS', DEFAULT_BRAIN_CONTEXT_INSTRUCTION_CHARS);
     const canonicalLimit = this.positiveIntEnv('BRAIN_CONTEXT_CANONICAL_SOURCE_LIMIT', DEFAULT_BRAIN_CONTEXT_CANONICAL_SOURCE_LIMIT);
-    if (context.instructions?.length) {
+    if (context?.instructions?.length) {
       lines.push('Team instructions:');
       for (const instruction of context.instructions.slice(0, 5)) {
         lines.push(`- ${this.compactBrainContextText(instruction.content, instructionChars)} [${instruction.source_id}]`);
       }
       lines.push('Report instruction usefulness as used_instruction_ids, ignored_instruction_ids, or harmful_instruction_ids.');
     }
-    for (const bundle of context.bundles.slice(0, 3)) {
+    for (const bundle of (context?.bundles || []).slice(0, 3)) {
       lines.push(bundle.query ? `- Query: ${bundle.query}` : '- Related context');
       for (const entity of (bundle.entities || []).slice(0, 3)) {
         if (entity?.id) lines.push(`  Entity: ${entity.name || entity.id} [entity:${entity.id}]`);
@@ -5634,7 +6595,7 @@ Return this JSON shape:
         lines.push(`  Source: ${unit.title || unit.source_id || 'text unit'} [text:${unit.id}] ${excerpt}`);
       }
     }
-    const canonical = context.cited?.canonical_source_ids || [];
+    const canonical = context?.cited?.canonical_source_ids || [];
     if (canonical.length) {
       const shown = canonical.slice(0, canonicalLimit);
       const more = canonical.length > shown.length ? ` (+${canonical.length - shown.length} more)` : '';
@@ -5646,11 +6607,11 @@ Return this JSON shape:
   private shouldAttachBrainContext(message: string): boolean {
     const text = String(message || '').trimStart();
     if (!text) return false;
-    return ![
+    const requiredIntent = this.brainContextRequiredIntent(text);
+    return requiredIntent !== null || ![
       /^(?:Control ping|reply with OK|respond with OK|reply OK|respond OK)\b/i,
       /^Heartbeat:/,
       /^You are the team lead\./,
-      /^IDACC Learn routed this material\b/i,
       /^TASK DELEGATION\b/i,
       /^Supervision:/,
       /^Supervision probe on task\b/,
@@ -5687,7 +6648,59 @@ Return this JSON shape:
   private isManagerNotifyOnlyMessage(message: unknown): boolean {
     const text = String(message ?? '').trim().toLowerCase();
     return text.startsWith('backlog guard clear:')
-      || text.startsWith('backlog guard cleared:');
+      || text.startsWith('backlog guard cleared:')
+      || text === 'ping-probe'
+      || text.startsWith('control ping')
+      || text.startsWith('reply with ok')
+      || text.startsWith('respond with ok')
+      || text.startsWith('reply ok')
+      || text.startsWith('respond ok');
+  }
+
+  private learnRoutingDedupKey(message: string, targetAgentId: string | null | undefined): string | null {
+    const text = String(message || '');
+    if (!/\blearn\b/i.test(text)) return null;
+    if (!/(IDACC Learn routed|IDACC Learn has ingested|Recursive Learn follow-up|Learn coordination prompt|Retry\/route repair for Recursive Learn|Operator re-fired IDACC Learn routing)/i.test(text)) {
+      return null;
+    }
+    const url = [...text.matchAll(/https?:\/\/[^\s)`"'<>]+/gi)]
+      .map((match) => match[0]
+        .replace(/n(?:title|source|topics|priority|active-goal|summary|untrusted|reply|brain)(?::|$)[\s\S]*$/i, '')
+        .replace(/[),.;]+$/g, '')
+        .toLowerCase())
+      .find(Boolean);
+    const titleMatch = text.match(/(?:github|site|pdf|folder):\s*([A-Za-z0-9._/-]+)/i)
+      || text.match(/(?:for|material)\s+`([^`]+)`/i)
+      || text.match(/^Title:\s*(.+)$/im);
+    const material = url || (titleMatch ? titleMatch[1].toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 160) : '');
+    if (!material) return null;
+    const target = String(targetAgentId || '').trim() || 'unknown-target';
+    return crypto.createHash('sha256').update(`learn-routing:v1:${target}:${material}`).digest('hex').slice(0, 24);
+  }
+
+  private async findRecentDuplicateLearnRoutingQuery(params: {
+    teamId: string;
+    agentId: string;
+    dedupKey: string;
+    nowMs: number;
+  }): Promise<QueryRow | null> {
+    const windowMs = this.positiveIntEnv('ID_LEARN_ROUTING_DEDUP_WINDOW_MS', 24 * 60 * 60 * 1000);
+    if (windowMs <= 0) return null;
+    const dialect = this.db.adapter.dialect;
+    const p = (n: number) => dialect === 'postgres' ? `$${n}` : '?';
+    const { rows } = await this.db.adapter.query<QueryRow>(
+      `SELECT team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id, metadata
+         FROM queries
+        WHERE team_id = ${p(1)}
+          AND agent_id = ${p(2)}
+          AND created >= ${p(3)}
+          AND status IN ('pending', 'processing', 'completed', 'delivered')
+          AND (LOWER(prompt) LIKE '%learn%' OR LOWER(prompt) LIKE '%idacc learn%')
+        ORDER BY created DESC
+        LIMIT 80`,
+      [params.teamId, params.agentId, params.nowMs - windowMs],
+    ).catch(() => ({ rows: [] as QueryRow[] }));
+    return rows.find((row) => this.learnRoutingDedupKey(row.prompt || '', params.agentId) === params.dedupKey) || null;
   }
 
   private async handleMessage(req: express.Request, res: express.Response) {
@@ -5824,9 +6837,32 @@ Return this JSON shape:
         });
       }
 
+      const learnRoutingDedupKey = this.learnRoutingDedupKey(String(message), targetAgent.id);
+      if (learnRoutingDedupKey) {
+        const duplicate = await this.findRecentDuplicateLearnRoutingQuery({
+          teamId,
+          agentId: targetAgent.id,
+          dedupKey: learnRoutingDedupKey,
+          nowMs: Date.now(),
+        });
+        if (duplicate) {
+          this.managerLog(`Skipped duplicate Learn routing prompt to ${targetDisplayId}; already handled by ${duplicate.query_id}`);
+          return res.json({
+            success: true,
+            delivered_to: targetDisplayId,
+            status: 'skipped_duplicate',
+            duplicate_of: duplicate.query_id,
+            duplicate_status: duplicate.status,
+            reason: 'learn_routing_duplicate',
+            message: 'Learn routing for this material was already sent to this recipient recently; duplicate dispatch suppressed.',
+          });
+        }
+      }
+
       this.managerLog(`${shouldWait ? 'Forwarding' : 'Sending async'} message to ${targetDisplayId} at ${targetUrl}`);
       const autoAttach = (req as any)._autoAttach as { task?: TaskRow } | undefined;
       const taskIdForBrain = autoAttach?.task?.uuid ? `task:${autoAttach.task.uuid}` : null;
+      const brainRequiredIntent = this.brainContextRequiredIntent(String(message));
       const brainContext = this.shouldAttachBrainContext(String(message))
         ? await this.volunteerBrainContext({
             taskId: taskIdForBrain,
@@ -5836,7 +6872,7 @@ Return this JSON shape:
             sessionId: session_id || null,
           })
         : null;
-      const outgoingMessage = this.withBrainContextAppendix(String(message), brainContext);
+      const outgoingMessage = this.withBrainContextAppendix(String(message), brainContext, brainRequiredIntent);
 
       if (shouldWait && from && String(from).toLowerCase() !== 'manager') {
         this.releaseLocalGateForAgent(String(from));
@@ -6763,11 +7799,30 @@ Return this JSON shape:
     // Keyed by the task's shortId ("#" + dashless-uuid[:8]) so the control center can match cards.
     this.managementApp.get('/usage/by-task', async (req, res) => {
       try {
-        const { id: teamId } = await this.getTeam(req);
-        const records = this.readUsageRecords();
+        const { id: teamId, name: teamName } = await this.getTeam(req);
+        const records = this.readUsageRecords()
+          .filter((record) => !record.team || record.team === teamName);
+        if (!records.length) {
+          return res.json({ tasks: {}, query_window: { rows: 0, bounded: true } });
+        }
+        const minTs = Math.min(...records.map((record) => record.ts));
+        const maxTs = Math.max(...records.map((record) => record.ts));
+        const windowPadMs = 5 * 60 * 1000;
+        const queryWindowStart = Math.max(0, minTs - windowPadMs);
+        const queryWindowEnd = maxTs + windowPadMs;
+        const p = (n: number) => this.db.adapter.dialect === 'postgres' ? `$${n}` : '?';
         const { rows } = await this.db.adapter.query<{ query_id: string; agent_id: string | null; created: number; completed: number | null; prompt: string | null; metadata: unknown }>(
-          `SELECT query_id, agent_id, created, completed, prompt, metadata FROM queries WHERE team_id = $1`,
-          [teamId],
+          `SELECT query_id, agent_id, created, completed, SUBSTR(prompt, 1, 4000) AS prompt, metadata
+             FROM queries
+            WHERE team_id = ${p(1)}
+              AND (
+                created BETWEEN ${p(2)} AND ${p(3)}
+                OR COALESCE(completed, created) BETWEEN ${p(4)} AND ${p(5)}
+                OR (created <= ${p(6)} AND COALESCE(completed, ${p(7)}) >= ${p(8)})
+              )
+            ORDER BY created DESC
+            LIMIT 5000`,
+          [teamId, queryWindowStart, queryWindowEnd, queryWindowStart, queryWindowEnd, queryWindowEnd, queryWindowEnd, queryWindowStart],
         );
         // Resolve a task shortId ("#abc12345") for a query: the dispatch prompt always names the
         // task it's working (WORK_PROMPT / redispatch), so the prompt ref is the primary signal;
@@ -6827,7 +7882,7 @@ Return this JSON shape:
             .sort((a, b) => b.tokens - a.tokens);
           return this.sendCsv(res, 'usage-by-task.csv', csvRows);
         }
-        return res.json({ tasks });
+        return res.json({ tasks, query_window: { rows: rows.length, bounded: true, start: queryWindowStart, end: queryWindowEnd } });
       } catch (e: any) {
         return res.status(500).json({ error: e?.message || String(e) });
       }
@@ -7216,9 +8271,34 @@ Return this JSON shape:
         }
 
         const ts = Date.now();
-        const queryId = `query_${ts}_${Math.random().toString(36).slice(2, 9)}`;
         const managerInbox = this.getManagerInboxRef(teamId, teamName);
         const senderName = from || 'external';
+        const notifyOnly = this.isManagerNotifyOnlyMessage(message);
+
+        if (notifyOnly) {
+          await this.db.news.add(teamId, null, {
+            timestamp: ts,
+            type: 'message',
+            message,
+            data: {
+              from: senderName,
+              message,
+              notify_only_reason: 'manager_status_ack',
+            },
+            kind: 'notify',
+            reply_expected: false,
+            owner_kind: managerInbox.ownerKind,
+            owner_id: managerInbox.ownerId,
+          });
+          return res.status(200).json({
+            success: true,
+            delivered_to: 'manager',
+            status: 'delivered',
+            notify_only: true,
+          });
+        }
+
+        const queryId = `query_${ts}_${Math.random().toString(36).slice(2, 9)}`;
 
         // Store the query in the queries table. Dual-write window: every
         // manager-inbox row carries both legacy agent_id (= manager-<team>)
@@ -7628,6 +8708,7 @@ Return this JSON shape:
                 resultPayload: { from, message, ...data, failover_retry_query_id: in_reply_to },
                 waiterReply: { from: from || 'unknown', message: message || '' },
                 messagePreview: typeof message === 'string' ? message : null,
+                recoverFailedRateLimit: true,
               });
               this.runtimeFailoverRetryOf.delete(in_reply_to);
             }
@@ -8479,7 +9560,7 @@ Return this JSON shape:
         teamId = team.id;
         teamName = team.name;
 
-        const { name, type: agentType, model, runtime, allowedTools, pluginPath, plugins, skills, metadata: reqMetadata, local, agent, roleBody, heartbeat, openMode, workingDirectory: configWorkDir, verbose, dangerouslySkipPermissions, domain, tokenId, address, start } = req.body || {};
+        const { name, type: agentType, model, runtime, allowedTools, mcpServers, pluginPath, plugins, skills, metadata: reqMetadata, local, agent, roleBody, heartbeat, openMode, workingDirectory: configWorkDir, verbose, dangerouslySkipPermissions, domain, tokenId, address, start } = req.body || {};
         const agentOverlay = agent;
         if (!name) return res.status(400).json({ error: 'Missing name' });
         const agentNameCheck = validateName(name, 'agent');
@@ -8593,6 +9674,7 @@ Return this JSON shape:
           ...(agentOverlay && { agent: agentOverlay }),
           ...(normalizedSkills && { skills: normalizedSkills }),
           ...(allowedTools && { allowed_tools: allowedTools }),
+          ...(Array.isArray(mcpServers) && { mcpServers }),
           ...(isAutomator && { isAutomator: true }),
           // Flag that heartbeat is enabled (actual config read from HEARTBEAT.yaml)
           ...(heartbeat && { heartbeat: true }),
@@ -9916,6 +10998,7 @@ Return this JSON shape:
 
         // Resolve team — non-admin principals cannot create tasks in another team
         let taskTeamId: string = teamId;
+        let taskTeamName: string = teamName;
         if (teamRef) {
           const teamRow = await this.db.teams.getTeamByName(teamRef);
           if (!teamRow) return res.status(404).json({ error: `Team "${teamRef}" not found` });
@@ -9923,13 +11006,34 @@ Return this JSON shape:
             return res.status(403).json({ error: 'Cannot create task in another team without admin principal' });
           }
           taskTeamId = teamRow.id;
+          taskTeamName = teamRow.name;
         }
 
-        const taskDescription = appendTaskBriefFieldsToDescription(description, {
+        let taskDescription = appendTaskBriefFieldsToDescription(description, {
           ...body,
           title,
           description,
         });
+        let specialistRouting: ReturnType<typeof inferSpecialistOwnerTeam> = null;
+        if (principal === 'admin') {
+          specialistRouting = inferSpecialistOwnerTeam({
+            title,
+            name: rawName,
+            description: taskDescription,
+            currentTeam: taskTeamName,
+            explicitTeam: teamRef,
+          });
+          if (specialistRouting && specialistRouting.ownerTeam !== taskTeamName) {
+            const routedTeam = await this.db.teams.getTeamByName(specialistRouting.ownerTeam).catch(() => null);
+            if (routedTeam) {
+              taskDescription = appendSpecialistRoutingNote(taskDescription, taskTeamName, specialistRouting);
+              taskTeamId = routedTeam.id;
+              taskTeamName = routedTeam.name;
+            } else {
+              specialistRouting = null;
+            }
+          }
+        }
         const brief = this.validateIncomingTaskBrief({
           ...body,
           title,
@@ -10006,6 +11110,7 @@ Return this JSON shape:
         res.status(201).json({
           ok: true,
           task: await this.buildTaskResult(taskRow, teamId),
+          specialist_routing: specialistRouting || undefined,
           brief_validation: brief.validation,
         });
       } catch (err: any) {
@@ -12033,6 +13138,7 @@ Return this JSON shape:
         // Resolve the target agent. "<team>/<agent>" delegates ACROSS teams (#9);
         // a bare ref resolves within the current team.
         let a: AgentRow;
+        let targetTeamId = teamId;
         let targetTeamName = teamName;
         const slash = agentName.indexOf('/');
         if (slash > 0 && !agentName.startsWith('http')) {
@@ -12065,6 +13171,7 @@ Return this JSON shape:
             return { ok: false, error: `Agent "${namePart}" not found in team "${teamPart}"` };
           }
           a = found;
+          targetTeamId = targetTeam.id;
           targetTeamName = targetTeam.name;
           this.managerLog(`[delegate] ${teamId} → ${teamPart}/${namePart}`);
         } else {
@@ -12086,6 +13193,28 @@ Return this JSON shape:
           a = matches[0];
         }
         await this.sweepStaleQueriesIfDue(0);
+        const learnRoutingDedupKey = this.learnRoutingDedupKey(message, a.id);
+        if (learnRoutingDedupKey) {
+          const duplicate = await this.findRecentDuplicateLearnRoutingQuery({
+            teamId: targetTeamId,
+            agentId: a.id,
+            dedupKey: learnRoutingDedupKey,
+            nowMs: Date.now(),
+          });
+          if (duplicate) {
+            this.managerLog(`Skipped duplicate Learn /ask prompt to ${targetTeamName}/${a.name}; already handled by ${duplicate.query_id}`);
+            return {
+              ok: true,
+              result: {
+                queryId: duplicate.query_id,
+                status: duplicate.status,
+                agent: agentName,
+                deduped: true,
+                reason: 'learn_routing_duplicate',
+              },
+            };
+          }
+        }
         const duplicateTaskAsk = await this.findActiveDuplicateTaskAsk(teamId, a, message);
         if (duplicateTaskAsk) {
           return {
@@ -12114,6 +13243,7 @@ Return this JSON shape:
         // Discover REST-AP endpoints from the agent's catalog
         const endpoints = await discoverRestAPEndpoints(baseEndpoint);
         const talkUrl = `${baseEndpoint.replace(/\/+$/, '')}${endpoints.talk}`;
+        const brainRequiredIntent = this.brainContextRequiredIntent(message);
         const brainContext = this.shouldAttachBrainContext(message)
           ? await this.volunteerBrainContext({
               agentId: a.id,
@@ -12122,17 +13252,51 @@ Return this JSON shape:
               sessionId: callerSessionId || null,
             })
           : null;
-        const outgoingMessage = this.withBrainContextAppendix(message, brainContext);
+        const outgoingMessage = this.withBrainContextAppendix(message, brainContext, brainRequiredIntent);
 
         // Send message to agent's /talk endpoint
         const talkHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
         // Serialize local-model dispatch (#7).
-        const askGate = await this.acquireLocalGate(a);
-        const talkResp = await fetch(talkUrl, {
-          method: 'POST',
-          headers: talkHeaders,
-          body: JSON.stringify(callerSessionId ? { message: outgoingMessage, from: 'remote', session_id: callerSessionId } : { message: outgoingMessage, from: 'remote' })
-        });
+        let askGate: string | undefined;
+        try {
+          askGate = await this.acquireLocalGate(a, this.remoteAskLocalGateWaitMs());
+        } catch (err: any) {
+          if (err?.message === 'local_model_gate_timeout') {
+            return {
+              ok: false,
+              error: `Agent "${a.name}" is waiting on local-model capacity. Try again shortly or raise LOCAL_MODEL_CONCURRENCY if the machine can handle more parallel local inference.`,
+              result: {
+                code: 'local_model_dispatch_busy',
+                agent: agentName,
+                runtime: a.runtime,
+                activeLocalModelQueries: this.localModelGate.activeCount,
+                queuedLocalModelDispatches: this.localModelGate.queuedCount,
+              },
+            };
+          }
+          throw err;
+        }
+        let talkResp: Awaited<ReturnType<typeof fetch>>;
+        try {
+          talkResp = await fetch(talkUrl, {
+            method: 'POST',
+            headers: talkHeaders,
+            body: JSON.stringify(callerSessionId ? { message: outgoingMessage, from: 'remote', session_id: callerSessionId } : { message: outgoingMessage, from: 'remote' }),
+            signal: AbortSignal.timeout(this.remoteAskTalkTimeoutMs()),
+          });
+        } catch (err: any) {
+          this.bindLocalGate(askGate);
+          return {
+            ok: false,
+            error: `Timed out sending message to "${a.name}" at ${talkUrl}: ${err?.message || String(err)}`,
+            result: {
+              code: 'agent_talk_timeout',
+              agent: agentName,
+              runtime: a.runtime,
+              talkUrl,
+            },
+          };
+        }
 
         if (!talkResp.ok) {
           this.bindLocalGate(askGate); // dispatch failed → release now
@@ -12145,7 +13309,7 @@ Return this JSON shape:
         this.bindLocalGate(askGate, askQueryId, a.name); // released when the query completes/fails
         if (askQueryId) {
           await this.db.queries.create(
-            teamId,
+            targetTeamId,
             askQueryId,
             a.id,
             outgoingMessage,
@@ -12154,6 +13318,20 @@ Return this JSON shape:
             undefined,
             brainContext ? { brain_context: brainContext } : null,
           );
+          if (targetTeamId !== teamId) {
+            await this.db.queries.create(
+              teamId,
+              askQueryId,
+              a.id,
+              outgoingMessage,
+              Date.now(),
+              callerSessionId || undefined,
+              undefined,
+              brainContext
+                ? { brain_context: brainContext, shadow_of_team_id: targetTeamId, shadow_kind: 'cross_team_dispatch' }
+                : { shadow_of_team_id: targetTeamId, shadow_kind: 'cross_team_dispatch' },
+            );
+          }
           if (brainContext) this.queryBrainContext.set(askQueryId, brainContext);
         }
         this.bindLocalGate(askGate, askQueryId); // released when the query completes/fails
@@ -12461,6 +13639,7 @@ Return this JSON shape:
             agent: spec.agent,
             skills: normalizedSkills,
             allowed_tools: spec.allowedTools,
+            ...(spec.mcpServers && { mcpServers: spec.mcpServers }),
             description: spec.description,
             ...(spec.lead === true && { primaryLead: true }),
             ...(isAutomator && { isAutomator: true }),
@@ -12574,6 +13753,7 @@ Return this JSON shape:
               ...(spec.agent && { agent: spec.agent }),
               skills: normalizedSkills,
               allowed_tools: spec.allowedTools,
+              ...(spec.mcpServers && { mcpServers: spec.mcpServers }),
               description: spec.description,
               ...(spec.lead === true && { primaryLead: true }),
               ...(isAutomator && { isAutomator: true }),
@@ -12901,6 +14081,7 @@ Return this JSON shape:
               ...(agentConfig.agent && { agent: agentConfig.agent }),
               ...(normalizedSkills && { skills: normalizedSkills }),
               allowed_tools: agentConfig.allowedTools,
+              ...(agentConfig.mcpServers && { mcpServers: agentConfig.mcpServers }),
               description: agentConfig.description,
               ...(agentConfig.lead === true && { primaryLead: true }),
               ...(isAutomator && { isAutomator: true }),
@@ -13781,13 +14962,15 @@ Return this JSON shape:
 
           // Resolve optional team first (needed for name uniqueness check)
           let taskTeamId: string = teamId;
+          let taskTeamName: string = teamName;
           if (teamRef) {
             const teamRow = await this.db.teams.getTeamByName(teamRef);
             if (!teamRow) return { ok: false, error: `Team "${teamRef}" not found` };
             taskTeamId = teamRow.id;
+            taskTeamName = teamRow.name;
           }
 
-          const taskDescription = appendTaskBriefFieldsToDescription(description, {
+          let taskDescription = appendTaskBriefFieldsToDescription(description, {
             title,
             description,
             goal_id: goalId,
@@ -13800,6 +14983,23 @@ Return this JSON shape:
             parent_task: parentTask,
             validation_purpose: validationPurpose,
           });
+          let specialistRouting = inferSpecialistOwnerTeam({
+            title,
+            name,
+            description: taskDescription,
+            currentTeam: taskTeamName,
+            explicitTeam: teamRef,
+          });
+          if (specialistRouting && specialistRouting.ownerTeam !== taskTeamName) {
+            const routedTeam = await this.db.teams.getTeamByName(specialistRouting.ownerTeam).catch(() => null);
+            if (routedTeam) {
+              taskDescription = appendSpecialistRoutingNote(taskDescription, taskTeamName, specialistRouting);
+              taskTeamId = routedTeam.id;
+              taskTeamName = routedTeam.name;
+            } else {
+              specialistRouting = null;
+            }
+          }
           const brief = this.validateIncomingTaskBrief({
             title,
             description: taskDescription,
@@ -13958,8 +15158,16 @@ Return this JSON shape:
 
           await this.db.tasks.create(taskRow, eventIds.length > 0 ? eventIds : undefined);
           let ownerWake: Awaited<ReturnType<typeof this.wakeAssignedTaskOwner>> | undefined;
+          let brainContext: BrainVolunteerContext | null = null;
           if (ownerId && ownerAgentForGuard) {
             const taskTeamRow = await this.db.teams.getTeam(taskTeamId).catch(() => null);
+            brainContext = await this.emitTaskClaimedWithBrainContext({
+              teamId: taskTeamId,
+              teamName: taskTeamRow?.name || teamName,
+              task: taskRow,
+              owner: ownerAgentForGuard,
+              occurredAt: Date.now(),
+            });
             ownerWake = await this.wakeAssignedTaskOwner(
               taskTeamId,
               taskTeamRow?.name || teamName,
@@ -13985,13 +15193,46 @@ Return this JSON shape:
           return {
             ok: true,
             result: {
-              task: await this.buildTaskResult(taskRow, teamId),
-              owner_wake: ownerWake,
-              warning: warnings.length ? warnings.join(' ') : undefined,
-              stalled_task_triage: stalledOwnerTriage || undefined,
-              brief_validation: brief.validation,
+	              task: {
+                  ...(await this.buildTaskResult(taskRow, teamId)),
+                  ...(brainContext ? { brain_context: this.brainContextResponse(brainContext) } : {}),
+                },
+	              owner_wake: ownerWake,
+	              specialist_routing: specialistRouting || undefined,
+	              warning: warnings.length ? warnings.join(' ') : undefined,
+	              stalled_task_triage: stalledOwnerTriage || undefined,
+	              brief_validation: brief.validation,
             },
           };
+        }
+
+        if (subCmd === 'sync-autopilot-goals' || subCmd === 'autopilot-goals' || subCmd === 'goal-autopilot-sync') {
+          // /task sync-autopilot-goals [--dry-run] [--limit N] [--team <team>]
+          const rawArgs = args.slice(1);
+          let dryRun = false;
+          let limit: number | undefined;
+          let targetTeamName: string | undefined;
+          for (let i = 0; i < rawArgs.length; i++) {
+            const token = rawArgs[i];
+            if (token === '--dry-run' || token === '--check') { dryRun = true; continue; }
+            if (token === '--apply') { dryRun = false; continue; }
+            if (token === '--team') { targetTeamName = rawArgs[++i]; continue; }
+            if (token === '--limit') {
+              const parsed = Number(rawArgs[++i]);
+              if (!Number.isInteger(parsed) || parsed < 1 || parsed > 20) {
+                return { ok: false, error: '--limit must be an integer between 1 and 20' };
+              }
+              limit = parsed;
+              continue;
+            }
+            return { ok: false, error: `Unknown option ${token}` };
+          }
+          const report = await this.syncAutopilotGoals({
+            dryRun,
+            limit,
+            teamName: targetTeamName,
+          });
+          return { ok: report.ok, result: report };
         }
 
         if (subCmd === 'list') {
@@ -14391,6 +15632,13 @@ Return this JSON shape:
             ? await this.wakeAssignedTaskOwner(taskTeamIdForGuard, taskTeamRowForGuard?.name || teamName, updated, agent, 'task-assign')
             : undefined;
           if (updated) {
+            await this.emitTaskClaimedWithBrainContext({
+              teamId: taskTeamIdForGuard,
+              teamName: taskTeamRowForGuard?.name || teamName,
+              task: updated,
+              owner: agent,
+              occurredAt: Date.now(),
+            });
             void this.promptLeadForDelegationKickoff(
               taskTeamIdForGuard,
               taskTeamRowForGuard?.name || teamName,
@@ -14492,6 +15740,13 @@ Return this JSON shape:
             ? await this.wakeAssignedTaskOwner(teamId, teamName, updated, callerAgent, 'task-claim')
             : undefined;
           if (updated) {
+            await this.emitTaskClaimedWithBrainContext({
+              teamId,
+              teamName,
+              task: updated,
+              owner: callerAgent,
+              occurredAt: Date.now(),
+            });
             void this.promptLeadForDelegationKickoff(teamId, teamName, updated, callerAgent).catch((err) => {
               console.warn(`[Supervision] Lead delegation kickoff failed for ${updated.name}: ${err?.message || err}`);
             });
@@ -14689,7 +15944,7 @@ Return this JSON shape:
 
         return {
           ok: false,
-          error: 'Usage: /task <create|list|lead-backlog|triage-stalled|jumpstart-stalled|assign-unowned|prune-backlog|assign|claim|done|remove|delete> ...',
+          error: 'Usage: /task <create|sync-autopilot-goals|list|lead-backlog|triage-stalled|jumpstart-stalled|assign-unowned|prune-backlog|assign|claim|done|remove|delete> ...',
         };
       }
 
@@ -14780,6 +16035,339 @@ Return this JSON shape:
     const run = () => { this.sweepStalledTasks().catch((e) => console.error('[Manager] Stalled-task sweep failed:', e)); };
     setTimeout(run, 90_000); // let the fleet settle after boot before the first sweep
     this.stalledSweepInterval = setInterval(run, intervalMs);
+  }
+
+  private goalAutopilotSyncIntervalMs(): number {
+    const raw = Number(process.env.ID_GOAL_AUTOPILOT_SYNC_INTERVAL_MS || 10 * 60 * 1000);
+    return Number.isFinite(raw) && raw > 0 ? Math.max(60_000, Math.floor(raw)) : 10 * 60 * 1000;
+  }
+
+  private goalAutopilotSyncStaleMs(): number {
+    const raw = Number(process.env.ID_GOAL_AUTOPILOT_SYNC_STALE_MS || 30 * 60 * 1000);
+    return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 30 * 60 * 1000;
+  }
+
+  private goalAutopilotSyncMaxTasks(): number {
+    const raw = Number(process.env.ID_GOAL_AUTOPILOT_SYNC_MAX_TASKS || 3);
+    return Number.isFinite(raw) && raw > 0 ? Math.min(20, Math.floor(raw)) : 3;
+  }
+
+  private goalAutopilotSyncMaxOpenPerTeam(): number {
+    const raw = Number(process.env.ID_GOAL_AUTOPILOT_SYNC_MAX_OPEN_PER_TEAM || 4);
+    return Number.isFinite(raw) && raw > 0 ? Math.min(50, Math.floor(raw)) : 4;
+  }
+
+  private goalAutopilotSyncMaxOpenPerLead(): number {
+    const raw = Number(process.env.ID_GOAL_AUTOPILOT_SYNC_MAX_OPEN_PER_LEAD || 2);
+    return Number.isFinite(raw) && raw > 0 ? Math.min(20, Math.floor(raw)) : 2;
+  }
+
+  private goalAutopilotLeadBlockerLimit(): number {
+    const raw = Number(process.env.ID_GOAL_AUTOPILOT_LEAD_BLOCKER_LIMIT || 2);
+    return Number.isFinite(raw) && raw >= 0 ? Math.min(20, Math.floor(raw)) : 2;
+  }
+
+  private brainDbPath(): string {
+    return process.env.BRAIN_DB_PATH || path.join(this.baseWorkDir, 'projects', 'brain', 'brain.db');
+  }
+
+  private parseBrainGoalRow(row: any): BrainAutopilotGoal | null {
+    let data: Record<string, any> = {};
+    try {
+      data = row?.data ? JSON.parse(String(row.data)) : {};
+    } catch {
+      data = {};
+    }
+    if (data.autopilot !== true) return null;
+    const teamName = String(data.team || 'default').trim() || 'default';
+    const priority = String(data.priority || 'general').trim() || 'general';
+    const agentName = typeof data.agent === 'string' && data.agent.trim() ? data.agent.trim() : null;
+    const driver = data.driver && typeof data.driver === 'object' ? data.driver : {};
+    const rawLastRun = Number(driver.lastRunAt);
+    const lastRunAt = Number.isFinite(rawLastRun) && rawLastRun > 0 ? rawLastRun : null;
+    const taskRefs = Array.isArray(driver.taskRefs) ? driver.taskRefs.map(String).filter(Boolean) : [];
+    return {
+      id: String(row.id),
+      name: String(row.name || row.id),
+      status: row.status == null ? null : String(row.status),
+      data,
+      updatedAt: Number(row.updated_at || 0),
+      teamName,
+      priority,
+      agentName,
+      lastRunAt,
+      taskRefs,
+    };
+  }
+
+  private readBrainAutopilotGoals(): { goals: BrainAutopilotGoal[]; error?: string } {
+    const dbPath = this.brainDbPath();
+    if (!existsSync(dbPath)) return { goals: [], error: `Brain DB not found at ${dbPath}` };
+    let brainDb: Database.Database | null = null;
+    try {
+      brainDb = new Database(dbPath);
+      const rows = brainDb.prepare(`
+        SELECT id, name, status, data, updated_at
+          FROM entities
+         WHERE type='goal'
+           AND status='active'
+         ORDER BY updated_at DESC
+         LIMIT 100
+      `).all();
+      return {
+        goals: rows
+          .map((row) => this.parseBrainGoalRow(row))
+          .filter((goal): goal is BrainAutopilotGoal => Boolean(goal)),
+      };
+    } catch (err: any) {
+      return { goals: [], error: err?.message || String(err) };
+    } finally {
+      try { brainDb?.close(); } catch { /* best effort */ }
+    }
+  }
+
+  private updateBrainGoalDriver(goal: BrainAutopilotGoal, patch: Record<string, unknown>): void {
+    const dbPath = this.brainDbPath();
+    if (!existsSync(dbPath)) return;
+    let brainDb: Database.Database | null = null;
+    try {
+      brainDb = new Database(dbPath);
+      const nextData = {
+        ...goal.data,
+        driver: {
+          ...(goal.data.driver && typeof goal.data.driver === 'object' ? goal.data.driver : {}),
+          ...patch,
+        },
+      };
+      brainDb.prepare(`UPDATE entities SET data=?, updated_at=unixepoch() WHERE id=?`)
+        .run(JSON.stringify(nextData), goal.id);
+    } catch (err: any) {
+      console.warn(`[Manager] Failed to update Brain goal driver for ${goal.id}: ${err?.message || err}`);
+    } finally {
+      try { brainDb?.close(); } catch { /* best effort */ }
+    }
+  }
+
+  private async listOpenTasksForTeam(teamId: string): Promise<TaskRow[]> {
+    const [todo, doing] = await Promise.all([
+      this.db.tasks.list({ teamId, status: 'todo' }).catch(() => [] as TaskRow[]),
+      this.db.tasks.list({ teamId, status: 'doing' }).catch(() => [] as TaskRow[]),
+    ]);
+    return [...todo, ...doing];
+  }
+
+  private taskMentionsGoal(task: TaskRow, goalId: string): boolean {
+    const haystack = `${task.title}\n${task.description || ''}`.toLowerCase();
+    return haystack.includes(goalId.toLowerCase());
+  }
+
+  private isAutopilotGoalTask(task: TaskRow): boolean {
+    const haystack = `${task.title}\n${task.description || ''}`.toLowerCase();
+    return haystack.includes('autopilot source goal:') || haystack.includes('goal autopilot sync');
+  }
+
+  private async createAutopilotGoalTask(goal: BrainAutopilotGoal, team: TeamRow, lead: AgentRow): Promise<{ task: TaskRow; brainContext: BrainVolunteerContext | null }> {
+    const now = Math.floor(Date.now() / 1000);
+    const shortGoal = goal.id.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'goal';
+    const baseName = normalizeAlias(`autopilot-${shortGoal}`);
+    let name = baseName;
+    let suffix = 1;
+    while (await this.db.tasks.getByNameForTeam(name, team.id).catch(() => null)) {
+      name = `${baseName}-${suffix++}`;
+    }
+    const objective = this.compactBrainContextText(goal.name, 420);
+    const taskDescription = appendTaskBriefFieldsToDescription(
+      [
+        `Goal autopilot sync.`,
+        `Autopilot source goal: ${goal.id}`,
+        `Priority: ${goal.priority}`,
+        `Objective: ${objective}`,
+        `Team lead must decompose this into member-owned child tasks and close this parent only after child task refs are reported.`,
+      ].join('\n'),
+      {
+        title: `Advance autopilot goal: ${objective}`,
+        goal_id: goal.id,
+        expected_output: 'A small set of delegated child tasks or a precise blocker that prevents progress toward the active goal.',
+        acceptance_criteria: [
+          'At least one member-owned child task is created when actionable work exists.',
+          'If no task is created, the blocker and unblock owner are recorded.',
+          'Child tasks cite the active goal and avoid duplicate or unbounded fanout.',
+        ],
+        validation_path: 'team lead -> suitable team members -> completion refs reported to manager',
+        out_of_scope: 'Unbounded fanout, duplicate work, or lead doing all implementation work directly.',
+        backlog_policy: 'Create only the minimum child tasks needed now; park optional follow-ups as backlog.',
+        bittrees_relevance: 'high: active autopilot goal advancement and Brain-manager sync',
+      },
+    );
+    const taskRow: TaskRow = {
+      id: `task_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
+      name,
+      uuid: crypto.randomUUID(),
+      team_id: team.id,
+      title: `Advance autopilot goal: ${objective}`,
+      description: taskDescription,
+      status: 'doing',
+      created_by: null,
+      owner: lead.id,
+      created_at: now,
+      updated_at: now,
+      completed_at: null,
+    };
+    await this.db.tasks.create(taskRow);
+    const brainContext = await this.emitTaskClaimedWithBrainContext({
+      teamId: team.id,
+      teamName: team.name,
+      task: taskRow,
+      owner: lead,
+      occurredAt: Date.now(),
+    });
+    await this.wakeAssignedTaskOwner(team.id, team.name, taskRow, lead, 'goal-autopilot-sync').catch(() => undefined);
+    void this.promptLeadForDelegationKickoff(team.id, team.name, taskRow, lead).catch((err) => {
+      console.warn(`[Supervision] Lead delegation kickoff failed for ${taskRow.name}: ${err?.message || err}`);
+    });
+    return { task: taskRow, brainContext };
+  }
+
+  private async syncAutopilotGoals(options: { dryRun?: boolean; limit?: number; teamName?: string } = {}): Promise<GoalAutopilotSyncResult> {
+    const enabled = process.env.ID_GOAL_AUTOPILOT_SYNC_DISABLED !== 'true';
+    const result: GoalAutopilotSyncResult = {
+      ok: true,
+      enabled,
+      dryRun: options.dryRun === true,
+      consideredGoals: 0,
+      drivenGoals: 0,
+      tasksSpawned: 0,
+      skipped: [],
+      created: [],
+      errors: [],
+    };
+    if (!enabled) return result;
+
+    const read = this.readBrainAutopilotGoals();
+    if (read.error) result.errors.push({ error: read.error });
+    const nowMs = Date.now();
+    const staleMs = this.goalAutopilotSyncStaleMs();
+    const limit = Math.max(1, Math.min(options.limit ?? this.goalAutopilotSyncMaxTasks(), this.goalAutopilotSyncMaxTasks()));
+    const goals = read.goals
+      .filter((goal) => !options.teamName || goal.teamName === options.teamName)
+      .sort((a, b) => {
+        const rank = (goal: BrainAutopilotGoal) => goal.priority === 'primary' ? 0 : goal.priority === 'secondary' ? 1 : 2;
+        return rank(a) - rank(b) || (a.lastRunAt ?? 0) - (b.lastRunAt ?? 0);
+      });
+    result.consideredGoals = goals.length;
+
+    const openByTeam = new Map<string, TaskRow[]>();
+    for (const goal of goals) {
+      if (result.tasksSpawned >= limit) {
+        result.skipped.push({ goal: goal.id, team: goal.teamName, reason: 'run_limit_reached' });
+        continue;
+      }
+      if (goal.lastRunAt && nowMs - goal.lastRunAt < staleMs && goal.taskRefs.length > 0) {
+        result.skipped.push({ goal: goal.id, team: goal.teamName, reason: 'recent_driver_run' });
+        continue;
+      }
+      const team = await this.db.teams.getTeamByName(goal.teamName).catch(() => null);
+      if (!team) {
+        result.skipped.push({ goal: goal.id, team: goal.teamName, reason: 'team_not_found' });
+        continue;
+      }
+      if (!openByTeam.has(team.id)) openByTeam.set(team.id, await this.listOpenTasksForTeam(team.id));
+      const openTasks = openByTeam.get(team.id)!;
+      if (openTasks.some((task) => this.taskMentionsGoal(task, goal.id))) {
+        result.skipped.push({ goal: goal.id, team: team.name, reason: 'open_task_exists' });
+        continue;
+      }
+      const openAutopilotForTeam = openTasks.filter((task) => this.isAutopilotGoalTask(task)).length;
+      if (openAutopilotForTeam >= this.goalAutopilotSyncMaxOpenPerTeam()) {
+        result.skipped.push({ goal: goal.id, team: team.name, reason: 'team_autopilot_open_limit' });
+        continue;
+      }
+      if (!(await this.hasDoingTaskRoom(team.id))) {
+        result.skipped.push({ goal: goal.id, team: team.name, reason: 'doing_limit_full' });
+        continue;
+      }
+      const preferredLead = goal.agentName
+        ? await this.db.agents.getByName(team.id, goal.agentName).catch(() => null)
+        : null;
+      const lead = this.isLiveForSupervision(preferredLead) ? preferredLead : await this.findSupervisionLead(team.id);
+      if (!lead) {
+        result.skipped.push({ goal: goal.id, team: team.name, reason: 'no_live_lead' });
+        this.updateBrainGoalDriver(goal, { lastRunAt: nowMs, taskRefs: goal.taskRefs, note: 'no live lead available' });
+        continue;
+      }
+      const openForLead = openTasks.filter((task) => task.owner === lead.id && this.isAutopilotGoalTask(task)).length;
+      if (openForLead >= this.goalAutopilotSyncMaxOpenPerLead()) {
+        result.skipped.push({ goal: goal.id, team: team.name, owner: lead.name, reason: 'lead_autopilot_open_limit' });
+        continue;
+      }
+      const blockers = await this.findLeadDelegationBlockers(team.id, team.name, lead);
+      if (blockers.length >= this.goalAutopilotLeadBlockerLimit()) {
+        result.skipped.push({ goal: goal.id, team: team.name, owner: lead.name, reason: 'lead_delegation_backlog' });
+        continue;
+      }
+      if (!(await this.hasActiveQueryCapacity(lead, team.name))) {
+        result.skipped.push({ goal: goal.id, team: team.name, owner: lead.name, reason: 'lead_query_capacity' });
+        continue;
+      }
+
+      if (options.dryRun) {
+        result.drivenGoals += 1;
+        continue;
+      }
+
+      try {
+        const created = await this.createAutopilotGoalTask(goal, team, lead);
+        const shortId = this.taskShortRef(created.task);
+        openTasks.push(created.task);
+        result.tasksSpawned += 1;
+        result.drivenGoals += 1;
+        result.created.push({ goal: goal.id, team: team.name, owner: lead.name, task: created.task.name, shortId });
+        this.updateBrainGoalDriver(goal, {
+          lastRunAt: nowMs,
+          taskRefs: Array.from(new Set([...goal.taskRefs, shortId].filter(Boolean))),
+          note: `spawned bounded autopilot coordination task ${shortId}`,
+        });
+      } catch (err: any) {
+        result.ok = false;
+        result.errors.push({ goal: goal.id, error: err?.message || String(err) });
+      }
+    }
+    return result;
+  }
+
+  private startGoalAutopilotSync(): void {
+    if (process.env.ID_GOAL_AUTOPILOT_SYNC_DISABLED === 'true') return;
+    const intervalMs = this.goalAutopilotSyncIntervalMs();
+    const run = () => {
+      if (this.goalAutopilotSyncInFlight) return;
+      this.goalAutopilotSyncInFlight = this.syncAutopilotGoals()
+        .then((result) => {
+          if (result.tasksSpawned > 0 || result.errors.length > 0) {
+            console.log(`[Manager] Goal autopilot sync: spawned=${result.tasksSpawned}, considered=${result.consideredGoals}, errors=${result.errors.length}`);
+          }
+          return result;
+        })
+        .catch((err) => {
+          console.error('[Manager] Goal autopilot sync failed:', err);
+          return {
+            ok: false,
+            enabled: true,
+            dryRun: false,
+            consideredGoals: 0,
+            drivenGoals: 0,
+            tasksSpawned: 0,
+            skipped: [],
+            created: [],
+            errors: [{ error: err?.message || String(err) }],
+          };
+        })
+        .finally(() => {
+          this.goalAutopilotSyncInFlight = null;
+        });
+    };
+    const initialMs = Math.min(intervalMs, Math.max(60_000, Number(process.env.ID_GOAL_AUTOPILOT_SYNC_INITIAL_DELAY_MS || 2 * 60 * 1000)));
+    this.goalAutopilotSyncInitialTimeout = setTimeout(run, initialMs);
+    this.goalAutopilotSyncInterval = setInterval(run, intervalMs);
   }
 
   private startIdleParkingSweeper(): void {
@@ -15436,10 +17024,20 @@ Return this JSON shape:
     task: TaskRow,
     teamId: string,
     actorAgentId: string | null,
-    reason: 'owner_refresh' | 'owner_unavailable' | 'owner_busy' | 'unclaimed' | 'checkin_heartbeat_probe' | 'probe_limit_reached' | 'validator_stalled_terminal' | 'lead_delegation_required' | 'lead_owner_unavailable' | 'delegated_children_complete' | 'control_reply_done' | 'control_reply_in_progress' | 'control_reply_delegated' | 'control_reply_claimed' | 'control_reply_blocked' | 'control_reply_reassign' | 'control_reply_route_assigned',
+    reason: 'owner_refresh' | 'owner_unavailable' | 'owner_busy' | 'unclaimed' | 'checkin_heartbeat_probe' | 'probe_limit_reached' | 'validator_stalled_terminal' | 'lead_delegation_required' | 'lead_owner_unavailable' | 'delegated_children_complete' | 'control_reply_done' | 'control_reply_in_progress' | 'control_reply_delegated' | 'control_reply_claimed' | 'control_reply_blocked' | 'control_reply_reassign' | 'control_reply_route_assigned' | 'control_reply_repeated_attempt',
     stalledMinutes: number,
     nowMs: number,
   ): Promise<void> {
+    const nowSec = Math.floor(nowMs / 1000);
+    if (
+      task.id
+      && !this.isTerminalTaskStatus(task.status)
+      && this.taskTimestampMs(task.updated_at || 0) < nowMs
+    ) {
+      await this.db.tasks.updateFields(task.id, { updated_at: nowSec }).catch((err) => {
+        this.managerLog(`Failed to bump supervised task activity for ${task.name}: ${err?.message || err}`);
+      });
+    }
     const input = {
       teamId,
       taskUuid: task.uuid,
@@ -15672,12 +17270,11 @@ Return this JSON shape:
         status: 'doing' as const,
         updated_at: nowSec,
       };
-      await emitTaskClaimed(this.db.events, {
+      await this.emitTaskClaimedWithBrainContext({
         teamId: teamRow.id,
-        taskUuid: updated.uuid,
-        taskName: updated.name,
-        title: updated.title,
-        ownerAgentId: owner.id,
+        teamName: teamRow.name,
+        task: updated,
+        owner,
         occurredAt: nowMs,
       });
 
@@ -15949,6 +17546,17 @@ Return this JSON shape:
   }
 
   private async sweepStalledTasks(): Promise<void> {
+    if (this.stalledSweepInFlight) return;
+    const sweep = this.sweepStalledTasksImpl();
+    this.stalledSweepInFlight = sweep;
+    try {
+      await sweep;
+    } finally {
+      if (this.stalledSweepInFlight === sweep) this.stalledSweepInFlight = null;
+    }
+  }
+
+  private async sweepStalledTasksImpl(): Promise<void> {
     const STALL_MS = this.getStallSweepMs();       // 'doing' this long with no update
     const RENUDGE_MS = this.getStallRenudgeMs();   // don't re-nudge a task within this
     const UNOWNED_ASSIGN_MS = this.unownedAssignMinMs();
@@ -15960,6 +17568,8 @@ Return this JSON shape:
     const SCAN_LIMIT = this.getStallSweepScanLimit();
     const MAX_PROBES = this.getMaxStalledTaskProbes();
     const now = Date.now();
+    const leadDelegationDueMs = Math.max(0, this.teamLeadDelegationGraceSeconds * 1000);
+    const earliestDoingActionMs = Math.min(STALL_MS, leadDelegationDueMs);
     let nudged = 0;
     let unownedAssigned = 0;
     const assignedTodoTaskIds = new Set<string>();
@@ -16076,31 +17686,34 @@ Return this JSON shape:
       if (nudged >= MAX_PER_SWEEP) break;
       if (!t.owner) continue;
       const updated = this.taskLastActivityMs(t);
-      const [ownerAgent, teamRow, lead] = await Promise.all([
+      const ageMs = now - updated;
+      const [ownerAgent, teamRow] = await Promise.all([
         getOwnerAgent(t.owner),
         getTeamRow(t.team_id),
-        getLeadForTeam(t.team_id),
       ]);
       if (!teamRow) continue;
+      await this.transferCoordinatorCheckinsForAssignedTask(teamRow, t, ownerAgent, now);
+      if (ageMs < earliestDoingActionMs) continue;
+      const lead = await getLeadForTeam(t.team_id);
       const ownerName = ownerAgent?.name || t.owner;
       const teamName = teamRow.name || 'default';
       const ref = this.taskShortRef(t);
-      const mins = Math.round((now - updated) / 60000);
-      const [hasRecentSupervision, ownerPendingQueries] = await Promise.all([
-        this.hasRecentTaskSupervisionEvent(teamRow.id, t, now - RENUDGE_MS),
-        getPendingQueriesFor(ownerAgent),
-      ]);
-      await this.transferCoordinatorCheckinsForAssignedTask(teamRow, t, ownerAgent, now);
-      if (hasRecentSupervision) continue;
-      const ownerProbeState = this.supervisionQueryStateFromRows(teamRow.id, ownerPendingQueries, ref, ownerAgent, teamName);
+      const mins = Math.round(ageMs / 60000);
+      const isLeadOwnedTask = this.isConfiguredTeamLead(teamName, ownerAgent);
 
-      if (this.isLiveForSupervision(ownerAgent) && this.isConfiguredTeamLead(teamName, ownerAgent)) {
+      if (isLeadOwnedTask && ageMs >= leadDelegationDueMs && this.isLiveForSupervision(ownerAgent)) {
         const audit = await this.buildDelegationAudit(t, teamRow.id, teamName, ownerAgent);
         if (audit?.status === 'needs-delegation') {
           const nudgeKey = `task:${t.id}:lead-delegation`;
           const canRun = this.canRunStalledProbe(nudgeKey, now, RENUDGE_MS, MAX_PROBES);
           const canEscalate = !canRun && this.canEscalateStalledProbe(nudgeKey, MAX_PROBES);
           if (canRun || canEscalate) {
+            const [hasRecentSupervision, ownerPendingQueries] = await Promise.all([
+              this.hasRecentTaskSupervisionEvent(teamRow.id, t, now - RENUDGE_MS),
+              getPendingQueriesFor(ownerAgent),
+            ]);
+            if (hasRecentSupervision) continue;
+            const ownerProbeState = this.supervisionQueryStateFromRows(teamRow.id, ownerPendingQueries, ref, ownerAgent, teamName);
             if (ownerProbeState.hasActiveSupervisionAsk) continue;
             if (canRun) this.markStalledProbe(nudgeKey, now);
             if (canEscalate) this.markStalledProbeEscalated(nudgeKey, now);
@@ -16139,6 +17752,12 @@ Return this JSON shape:
         } else if (audit?.status === 'ok') {
           const children = await this.findDelegatedChildTasks(t, teamRow.id, ownerAgent);
           if (children.length && children.every((child) => child.status === 'done')) {
+            const [hasRecentSupervision, ownerPendingQueries] = await Promise.all([
+              this.hasRecentTaskSupervisionEvent(teamRow.id, t, now - RENUDGE_MS),
+              getPendingQueriesFor(ownerAgent),
+            ]);
+            if (hasRecentSupervision) continue;
+            const ownerProbeState = this.supervisionQueryStateFromRows(teamRow.id, ownerPendingQueries, ref, ownerAgent, teamName);
             if (ownerProbeState.hasActiveSupervisionAsk) continue;
             const message = await this.delegatedChildrenCompletePrompt(t, children);
             const sent = await this.sendRecentThrottledSupervisionAsk({
@@ -16158,9 +17777,10 @@ Return this JSON shape:
         }
       }
 
-      if (!this.isLiveForSupervision(ownerAgent) && this.isConfiguredTeamLead(teamName, ownerAgent)) {
+      if (isLeadOwnedTask && ageMs >= leadDelegationDueMs && !this.isLiveForSupervision(ownerAgent)) {
         const audit = await this.buildDelegationAudit(t, teamRow.id, teamName, ownerAgent);
         if (audit?.status === 'needs-delegation') {
+          if (await this.hasRecentTaskSupervisionEvent(teamRow.id, t, now - RENUDGE_MS)) continue;
           const taskManagerFallback = await this.routeStalledTaskToTaskManagerFallback({
             teamId: teamRow.id,
             teamName,
@@ -16194,7 +17814,14 @@ Return this JSON shape:
         }
       }
 
-      if (now - updated < STALL_MS) continue;
+      if (ageMs < STALL_MS) continue;
+
+      const [hasRecentSupervision, ownerPendingQueries] = await Promise.all([
+        this.hasRecentTaskSupervisionEvent(teamRow.id, t, now - RENUDGE_MS),
+        getPendingQueriesFor(ownerAgent),
+      ]);
+      if (hasRecentSupervision) continue;
+      const ownerProbeState = this.supervisionQueryStateFromRows(teamRow.id, ownerPendingQueries, ref, ownerAgent, teamName);
 
       // Heartbeat probes for checkin-supervised stalled work. A linked checkin
       // remains the single owner-facing supervisor; the sweeper only pulls its
@@ -16511,7 +18138,7 @@ Return this JSON shape:
    * Constants and env overrides live in src/wakeup-service/retention.ts.
    */
   private startEventLogRetentionSweep(): void {
-    this.retentionService = new RetentionService({ events: this.db.events, news: this.db.news, teams: this.db.teams });
+    this.retentionService = new RetentionService({ events: this.db.events, news: this.db.news, queries: this.db.queries, teams: this.db.teams });
     this.retentionService.start();
   }
 
@@ -16550,12 +18177,20 @@ Return this JSON shape:
     const count = expired.length;
     if (count > 0) {
       const occurredAt = now;
+      const expiryReasons = new Map<string, string>();
+      for (const row of expiredPending) expiryReasons.set(`${row.team_id}\u0001${row.query_id}`, 'pending_timeout');
+      for (const row of expiredProcessing) expiryReasons.set(`${row.team_id}\u0001${row.query_id}`, 'processing_timeout');
+      for (const row of expiredDuplicateTaskAsks) expiryReasons.set(`${row.team_id}\u0001${row.query_id}`, 'duplicate_task_ask');
+      for (const row of expiredTerminalTaskAsks) expiryReasons.set(`${row.team_id}\u0001${row.query_id}`, 'terminal_task_ask');
+      for (const row of expiredStalePlanDecisions) expiryReasons.set(`${row.team_id}\u0001${row.query_id}`, 'stale_plan_decision');
+      for (const row of expiredQueuedPeerWakes) expiryReasons.set(`${row.team_id}\u0001${row.query_id}`, 'queued_peer_wake');
       for (const row of expired) {
         await emitQueryExpired(this.db.events, {
           teamId: row.team_id,
           queryId: row.query_id,
           agentId: row.agent_id,
           occurredAt,
+          reason: expiryReasons.get(`${row.team_id}\u0001${row.query_id}`),
         }).catch((err) => {
           console.error('[Manager] Failed to emit query:expired event:', err);
         });
@@ -16629,6 +18264,7 @@ Return this JSON shape:
    */
   private async runHealthChecks(): Promise<void> {
     try {
+      await this.sweepRuntimeRateLimitFallbackRestores().catch(() => {});
       const teams = await this.db.teams.listTeams();
       for (const team of teams) {
         const agents = await this.dbListAgents(team.id, true);
@@ -16881,6 +18517,10 @@ Return this JSON shape:
         // depends on the control center sitting on the Work board.
         this.startStalledTaskSweeper();
 
+        // Keep Brain active goals with autopilot enabled producing bounded,
+        // manager-tracked coordination tasks without relying on the UI.
+        this.startGoalAutopilotSync();
+
         // Keep delegated/on-demand helper agents from accumulating after they finish.
         // The sweep only parks non-lead agents with no active query, task, schedule,
         // checkin, or recent query activity.
@@ -16973,6 +18613,14 @@ Return this JSON shape:
     if (this.stalledSweepInterval) {
       clearInterval(this.stalledSweepInterval);
       this.stalledSweepInterval = null;
+    }
+    if (this.goalAutopilotSyncInitialTimeout) {
+      clearTimeout(this.goalAutopilotSyncInitialTimeout);
+      this.goalAutopilotSyncInitialTimeout = null;
+    }
+    if (this.goalAutopilotSyncInterval) {
+      clearInterval(this.goalAutopilotSyncInterval);
+      this.goalAutopilotSyncInterval = null;
     }
     if (this.idleParkingInterval) {
       clearInterval(this.idleParkingInterval);
@@ -17534,8 +19182,8 @@ Return this JSON shape:
 
     // External MCP servers attached to this agent (Modules view → metadata).
     // Serialized as JSON for claude-agent-server to parse into HarnessOptions.
-    const mcpServers = (agentRow?.metadata as any)?.mcpServers;
-    const mcpEnv = Array.isArray(mcpServers) && mcpServers.length > 0
+    const mcpServers = this.effectiveMcpServersForAgent(metadata);
+    const mcpEnv = mcpServers.length > 0
       ? JSON.stringify(mcpServers)
       : undefined;
     const runtime = resolveRuntime((agentRow?.runtime || metadata.runtime) as string | undefined);
@@ -17565,7 +19213,7 @@ Return this JSON shape:
       ? metadata.skillmesh_creator_key
       : undefined;
 
-    return {
+    return withDesktopResourceLimits({
       PATH: process.env.PATH || '',
       HOME: process.env.HOME || '',
       SHELL: process.env.SHELL || '',
@@ -17607,7 +19255,7 @@ Return this JSON shape:
         SKILLMESH_RPC_URL: process.env.SKILLMESH_RPC_URL || 'https://sepolia.drpc.org',
       }),
       ...(skillmeshCreatorKey && { SKILLMESH_CREATOR_PRIVATE_KEY: skillmeshCreatorKey }),
-    };
+    });
   }
 
   /**
@@ -18084,6 +19732,18 @@ Return this JSON shape:
     return Number(rows[0]?.c ?? 0) || 0;
   }
 
+  private async countRecentScheduleRunsForAgent(agentId: string, sinceSec: number): Promise<number> {
+    const { rows } = await this.db.adapter.query<{ c: string | number }>(
+      `SELECT COUNT(*) AS c
+         FROM schedule_runs
+        WHERE agent_id = ?
+          AND fired_at >= ?
+          AND status IN ('pending', 'sent')`,
+      [agentId, sinceSec],
+    );
+    return Number(rows[0]?.c ?? 0) || 0;
+  }
+
   private async countActiveCheckins(agentId: string): Promise<number> {
     const { rows } = await this.db.adapter.query<{ c: string | number }>(
       `SELECT COUNT(*) AS c
@@ -18125,12 +19785,12 @@ Return this JSON shape:
     await this.sweepStaleQueriesIfDue();
     if ((await this.countActiveQueries(agentId)) > 0) return false;
     if (opts.source === 'schedule' && this.isTaskAssignmentSweepSchedule(opts.scheduleMessage)) {
-      const [openOwnedTasks, activeCheckins, stalledDoingTasks] = await Promise.all([
+      const [openOwnedTasks, activeCheckins] = await Promise.all([
         this.countOpenOwnedTasks(agentId),
         this.countActiveCheckins(agentId),
-        this.countFleetStalledDoingTasks(),
       ]);
-      if (openOwnedTasks > 0 || activeCheckins > 0 || stalledDoingTasks > 0) return false;
+      if (openOwnedTasks > 0 || activeCheckins > 0) return false;
+      return true;
     }
     const recentActivityMs = this.automatedWakeRecentActivityMs(opts);
     if (recentActivityMs <= 0) return true;
@@ -18229,10 +19889,6 @@ Return this JSON shape:
           rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: `owns_${openTasks}_open_task${openTasks === 1 ? '' : 's'}` });
           continue;
         }
-        if (!opts.includeScheduled && schedules > 0 && !this.canWakeScheduledAgent(agent)) {
-          rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: `has_${schedules}_active_schedule${schedules === 1 ? '' : 's'}_requires_live_runtime` });
-          continue;
-        }
         if (checkins > 0) {
           rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: `has_${checkins}_active_checkin${checkins === 1 ? '' : 's'}` });
           continue;
@@ -18242,6 +19898,19 @@ Return this JSON shape:
           continue;
         }
         const recentActivityMs = this.parkIdleRecentActivityMs();
+        if (!opts.includeScheduled && schedules > 0) {
+          if (!this.canWakeScheduledAgent(agent)) {
+            rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: `has_${schedules}_active_schedule${schedules === 1 ? '' : 's'}_requires_live_runtime` });
+            continue;
+          }
+          const recentScheduleRuns = recentActivityMs > 0
+            ? await this.countRecentScheduleRunsForAgent(agent.id, Math.floor((Date.now() - recentActivityMs) / 1000))
+            : 0;
+          if (recentScheduleRuns > 0) {
+            rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: `recent_schedule_activity_${recentScheduleRuns}_within_${Math.round(recentActivityMs / 60000)}m` });
+            continue;
+          }
+        }
         const recentQueries = recentActivityMs > 0
           ? await this.countRecentQueriesForAgent(agent.id, Date.now() - recentActivityMs)
           : 0;

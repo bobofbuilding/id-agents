@@ -49,6 +49,9 @@ const PROFILES: Record<RuntimeId, RuntimeProfile> = {
       supportsResume: true,
       supportsPlugins: true,
       supportsAllowedTools: true,
+      supportsMcp: true,
+      supportsSkillFiles: true,
+      supportsPluginSkillFallback: true,
     },
   },
   'claude-code-cli': {
@@ -67,6 +70,9 @@ const PROFILES: Record<RuntimeId, RuntimeProfile> = {
       supportsResume: true,
       supportsPlugins: true,
       supportsAllowedTools: true,
+      supportsMcp: true,
+      supportsSkillFiles: true,
+      supportsPluginSkillFallback: true,
     },
   },
   'claude-code-local': {
@@ -85,6 +91,9 @@ const PROFILES: Record<RuntimeId, RuntimeProfile> = {
       supportsResume: true,
       supportsPlugins: true,
       supportsAllowedTools: true,
+      supportsMcp: true,
+      supportsSkillFiles: true,
+      supportsPluginSkillFallback: true,
     },
   },
   codex: {
@@ -106,6 +115,9 @@ const PROFILES: Record<RuntimeId, RuntimeProfile> = {
       supportsResume: true,
       supportsPlugins: true,
       supportsAllowedTools: true,
+      supportsMcp: true,
+      supportsSkillFiles: true,
+      supportsPluginSkillFallback: true,
     },
   },
   'cursor-cli': {
@@ -124,6 +136,9 @@ const PROFILES: Record<RuntimeId, RuntimeProfile> = {
       supportsResume: true,
       supportsPlugins: false,
       supportsAllowedTools: false,
+      supportsMcp: false,
+      supportsSkillFiles: true,
+      supportsPluginSkillFallback: true,
     },
   },
   copilot: {
@@ -142,6 +157,9 @@ const PROFILES: Record<RuntimeId, RuntimeProfile> = {
       supportsResume: false,
       supportsPlugins: false,
       supportsAllowedTools: false,
+      supportsMcp: false,
+      supportsSkillFiles: true,
+      supportsPluginSkillFallback: true,
     },
   },
   grok: {
@@ -160,6 +178,9 @@ const PROFILES: Record<RuntimeId, RuntimeProfile> = {
       supportsResume: true,
       supportsPlugins: false,
       supportsAllowedTools: false,
+      supportsMcp: false,
+      supportsSkillFiles: true,
+      supportsPluginSkillFallback: true,
     },
   },
   antigravity: {
@@ -178,6 +199,9 @@ const PROFILES: Record<RuntimeId, RuntimeProfile> = {
       supportsResume: true,
       supportsPlugins: false,
       supportsAllowedTools: false,
+      supportsMcp: false,
+      supportsSkillFiles: true,
+      supportsPluginSkillFallback: true,
     },
   },
   'kiro-cli': {
@@ -196,6 +220,9 @@ const PROFILES: Record<RuntimeId, RuntimeProfile> = {
       supportsResume: true,
       supportsPlugins: false,
       supportsAllowedTools: false,
+      supportsMcp: false,
+      supportsSkillFiles: true,
+      supportsPluginSkillFallback: true,
     },
   },
   ollama: {
@@ -215,6 +242,9 @@ const PROFILES: Record<RuntimeId, RuntimeProfile> = {
       supportsResume: false,
       supportsPlugins: false,
       supportsAllowedTools: false,
+      supportsMcp: true,
+      supportsSkillFiles: true,
+      supportsPluginSkillFallback: true,
     },
   },
   'provider-api': {
@@ -234,6 +264,9 @@ const PROFILES: Record<RuntimeId, RuntimeProfile> = {
       supportsResume: false,
       supportsPlugins: false,
       supportsAllowedTools: false,
+      supportsMcp: true,
+      supportsSkillFiles: true,
+      supportsPluginSkillFallback: true,
     },
   },
   'public-agent-remote': {
@@ -251,6 +284,9 @@ const PROFILES: Record<RuntimeId, RuntimeProfile> = {
       supportsResume: false,
       supportsPlugins: false,
       supportsAllowedTools: false,
+      supportsMcp: false,
+      supportsSkillFiles: false,
+      supportsPluginSkillFallback: false,
     },
   },
 };
@@ -319,6 +355,18 @@ export function usesCliLogin(runtime: HarnessType | string | undefined): boolean
 
 export function supportsSessionResume(runtime: HarnessType | string | undefined): boolean {
   return getRuntimeProfile(runtime).capabilities.supportsResume;
+}
+
+export function supportsMcpTools(runtime: HarnessType | string | undefined): boolean {
+  return getRuntimeProfile(runtime).capabilities.supportsMcp;
+}
+
+export function supportsSkillFiles(runtime: HarnessType | string | undefined): boolean {
+  return getRuntimeProfile(runtime).capabilities.supportsSkillFiles;
+}
+
+export function supportsPluginSkillFallback(runtime: HarnessType | string | undefined): boolean {
+  return getRuntimeProfile(runtime).capabilities.supportsPluginSkillFallback;
 }
 
 /**

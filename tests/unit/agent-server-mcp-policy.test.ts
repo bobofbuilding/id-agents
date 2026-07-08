@@ -34,7 +34,7 @@ Control ping after manager restart: reply OK only.`)).toBe(true);
     expect(shouldSuppressMcpForPrompt('Lead delegation kickoff: task #12345678 is assigned to you as the team coordinator.')).toBe(true);
     expect(shouldSuppressMcpForPrompt('Team objective: Decompose this objective into member-owned work.')).toBe(true);
     expect(shouldSuppressMcpForPrompt('You are the team lead. Break the objective below into a small set of concrete, independently-actionable sub-tasks.')).toBe(true);
-    expect(shouldSuppressMcpForPrompt('IDACC Learn routed this material to the default team lead for digestion.')).toBe(true);
+    expect(shouldSuppressMcpForPrompt('IDACC Learn routed this material to the default team lead for digestion.')).toBe(false);
   });
 
   it('suppresses MCP for incoming-reply processing loops', () => {
@@ -143,7 +143,7 @@ You are the team lead. Break the objective below into a small set of concrete, i
     expect(shouldSuppressMcpForPrompt(`[Message from the manager (your owner/operator) | Query ID: query_10c]
 [Respond directly and helpfully — this is the person who manages you.]
 
-IDACC Learn routed this material to the default team lead for digestion.`)).toBe(true);
+IDACC Learn routed this material to the default team lead for digestion.`)).toBe(false);
 
     expect(shouldSuppressMcpForPrompt(`[Message from agent "task-master" | Query ID: query_11]
 [Note: task-master will poll for your reply for ~2 minutes.]
@@ -186,7 +186,7 @@ Please inspect the repository, edit the integration, and run the test suite.`)).
     expect(allowedToolsForPrompt('You are the team lead. Break the objective below into sub-tasks.', configured))
       .toEqual(['Read', 'Bash', 'Glob', 'Grep']);
     expect(allowedToolsForPrompt('IDACC Learn routed this material to the default team lead for digestion.', configured))
-      .toEqual(['Read', 'Glob', 'Grep']);
+      .toEqual(configured);
     expect(allowedToolsForPrompt(taskManagerTriage, configured))
       .toEqual(['Read', 'Bash', 'Glob', 'Grep']);
     expect(allowedToolsForPrompt('Implement a filesystem-backed MCP integration and cite the changed files.', configured))
@@ -219,7 +219,7 @@ Please inspect the repository, edit the integration, and run the test suite.`)).
       expect(queryExecutionTimeoutMsForPrompt('You are the team lead. Break the objective below into a small set of concrete, independently-actionable sub-tasks.'))
         .toBe(720_000);
       expect(queryExecutionTimeoutMsForPrompt('IDACC Learn routed this material to the default team lead for digestion.'))
-        .toBe(90_000);
+        .toBe(720_000);
       expect(queryExecutionTimeoutMsForPrompt('TASK DELEGATION from manager: You are assigned task-manager triage for engineering-team task #fdcc9380 ("Inventory engineering skills"). Use the manager task flow to reassign or park it.'))
         .toBe(720_000);
       expect(queryExecutionTimeoutMsForPrompt('[Incoming Reply from "coder"]\n\n{"validation_status":"approved","next_step_recommendations":[{"title":"Route approved follow-up","priority":"high"}]}'))

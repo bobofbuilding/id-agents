@@ -4,6 +4,8 @@ import type { DbAdapter } from '../../db-adapter.js';
 import type { QueriesRepository } from '../../db-service.js';
 import type { InboxOwnerKind, QueryRow } from '../../types.js';
 
+const TERMINAL_STATUSES = ['completed', 'failed', 'cancelled', 'expired'] as const;
+
 function resolveQueryOwnership(
   teamId: string,
   agentId: string | null,
@@ -77,6 +79,47 @@ export class PgQueriesRepo implements QueriesRepository {
       [Date.now(), cutoffCreated],
     );
     return rows;
+  }
+
+  async pruneTerminalByAge(teamId: string, beforeCompletedOrCreated: number): Promise<number> {
+    const r = await this.db.query(
+      `DELETE FROM queries
+       WHERE team_id = $1
+         AND status = ANY($2)
+         AND COALESCE(completed, created) < $3`,
+      [teamId, TERMINAL_STATUSES, beforeCompletedOrCreated],
+    );
+    return r.rowCount ?? 0;
+  }
+
+  async pruneTerminalByCount(teamId: string, keepCount: number): Promise<number> {
+    if (!Number.isFinite(keepCount) || keepCount <= 0) return 0;
+    const count = await this.db.query<{ c: string }>(
+      `SELECT COUNT(*)::text AS c
+       FROM queries
+       WHERE team_id = $1
+         AND status = ANY($2)`,
+      [teamId, TERMINAL_STATUSES],
+    );
+    const total = Number(count.rows[0]?.c ?? 0);
+    const excess = total - keepCount;
+    if (excess <= 0) return 0;
+
+    const r = await this.db.query(
+      `DELETE FROM queries q
+       USING (
+         SELECT team_id, query_id
+         FROM queries
+         WHERE team_id = $1
+           AND status = ANY($2)
+         ORDER BY COALESCE(completed, created) ASC, created ASC, query_id ASC
+         LIMIT $3
+       ) old
+       WHERE q.team_id = old.team_id
+         AND q.query_id = old.query_id`,
+      [teamId, TERMINAL_STATUSES, excess],
+    );
+    return r.rowCount ?? 0;
   }
 
   async create(

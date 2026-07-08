@@ -13,17 +13,21 @@
  *   EVENT_LOG_RETENTION_COUNT    (positive integer, rows per team)
  *   NEWS_ITEMS_RETENTION_DAYS    (positive integer, days)
  *   NEWS_ITEMS_RETENTION_COUNT   (positive integer, rows per team)
+ *   QUERIES_RETENTION_DAYS       (positive integer, days; terminal rows only)
+ *   QUERIES_RETENTION_COUNT      (positive integer, terminal rows per team)
  *
  * The sweep loop is wired into the manager daemon at boot
  * (see startEventLogRetentionSweep in agent-manager-db.ts).
  */
 
-import type { EventsRepository, NewsRepository, TeamsRepository } from '../db/db-service.js';
+import type { EventsRepository, NewsRepository, QueriesRepository, TeamsRepository } from '../db/db-service.js';
 
 export const DEFAULT_RETENTION_DAYS = 7;
 export const DEFAULT_RETENTION_COUNT = 100_000;
 export const DEFAULT_NEWS_RETENTION_DAYS = 7;
 export const DEFAULT_NEWS_RETENTION_COUNT = 50_000;
+export const DEFAULT_QUERY_RETENTION_DAYS = 14;
+export const DEFAULT_QUERY_RETENTION_COUNT = 10_000;
 export const DEFAULT_RETENTION_INTERVAL_MS = 5 * 60 * 1000;
 
 export interface RetentionConfig {
@@ -31,6 +35,8 @@ export interface RetentionConfig {
   retentionCount: number;
   newsRetentionDays: number;
   newsRetentionCount: number;
+  queryRetentionDays: number;
+  queryRetentionCount: number;
 }
 
 export interface RetentionSweepResult {
@@ -38,12 +44,15 @@ export interface RetentionSweepResult {
   countDeleted: number;
   newsAgedDeleted: number;
   newsCountDeleted: number;
+  queryAgedDeleted: number;
+  queryCountDeleted: number;
   teamsScanned: number;
 }
 
 export interface RetentionTickInput {
   events: EventsRepository;
   news?: NewsRepository;
+  queries?: Pick<QueriesRepository, 'pruneTerminalByAge' | 'pruneTerminalByCount'>;
   teams: TeamsRepository;
   now: number;
   config?: Partial<RetentionConfig>;
@@ -56,6 +65,8 @@ export function resolveRetentionConfig(env: NodeJS.ProcessEnv = process.env): Re
     retentionCount: parsePositiveInt(env.EVENT_LOG_RETENTION_COUNT, DEFAULT_RETENTION_COUNT),
     newsRetentionDays: parsePositiveInt(env.NEWS_ITEMS_RETENTION_DAYS, DEFAULT_NEWS_RETENTION_DAYS),
     newsRetentionCount: parsePositiveInt(env.NEWS_ITEMS_RETENTION_COUNT, DEFAULT_NEWS_RETENTION_COUNT),
+    queryRetentionDays: parsePositiveInt(env.QUERIES_RETENTION_DAYS, DEFAULT_QUERY_RETENTION_DAYS),
+    queryRetentionCount: parsePositiveInt(env.QUERIES_RETENTION_COUNT, DEFAULT_QUERY_RETENTION_COUNT),
   };
 }
 
@@ -81,12 +92,23 @@ export async function sweepEventLogRetention(
     retentionCount: input.config?.retentionCount ?? base.retentionCount,
     newsRetentionDays: input.config?.newsRetentionDays ?? base.newsRetentionDays,
     newsRetentionCount: input.config?.newsRetentionCount ?? base.newsRetentionCount,
+    queryRetentionDays: input.config?.queryRetentionDays ?? base.queryRetentionDays,
+    queryRetentionCount: input.config?.queryRetentionCount ?? base.queryRetentionCount,
   };
   const eventAgeCutoff = input.now - cfg.retentionDays * 24 * 60 * 60 * 1000;
   const newsAgeCutoff = input.now - cfg.newsRetentionDays * 24 * 60 * 60 * 1000;
+  const queryAgeCutoff = input.now - cfg.queryRetentionDays * 24 * 60 * 60 * 1000;
   const log = input.log ?? ((line: string) => console.log(line));
 
-  const result: RetentionSweepResult = { agedDeleted: 0, countDeleted: 0, newsAgedDeleted: 0, newsCountDeleted: 0, teamsScanned: 0 };
+  const result: RetentionSweepResult = {
+    agedDeleted: 0,
+    countDeleted: 0,
+    newsAgedDeleted: 0,
+    newsCountDeleted: 0,
+    queryAgedDeleted: 0,
+    queryCountDeleted: 0,
+    teamsScanned: 0,
+  };
 
   const teams = await input.teams.listTeams();
   for (const team of teams) {
@@ -95,13 +117,18 @@ export async function sweepEventLogRetention(
     const count = await input.events.pruneByCount(team.id, cfg.retentionCount);
     const newsAged = input.news ? await input.news.pruneByAge(team.id, newsAgeCutoff) : 0;
     const newsCount = input.news ? await input.news.pruneByCount(team.id, cfg.newsRetentionCount) : 0;
+    const queryAged = input.queries ? await input.queries.pruneTerminalByAge(team.id, queryAgeCutoff) : 0;
+    const queryCount = input.queries ? await input.queries.pruneTerminalByCount(team.id, cfg.queryRetentionCount) : 0;
     result.agedDeleted += aged;
     result.countDeleted += count;
     result.newsAgedDeleted += newsAged;
     result.newsCountDeleted += newsCount;
-    if (aged > 0 || count > 0 || newsAged > 0 || newsCount > 0) {
+    result.queryAgedDeleted += queryAged;
+    result.queryCountDeleted += queryCount;
+    if (aged > 0 || count > 0 || newsAged > 0 || newsCount > 0 || queryAged > 0 || queryCount > 0) {
       const newsPart = input.news ? ` news_aged=${newsAged} news_count=${newsCount}` : '';
-      log(`[wakeup-service] retention swept: aged=${aged} count=${count}${newsPart} team=${team.name}`);
+      const queryPart = input.queries ? ` query_aged=${queryAged} query_count=${queryCount}` : '';
+      log(`[wakeup-service] retention swept: aged=${aged} count=${count}${newsPart}${queryPart} team=${team.name}`);
     }
   }
   return result;
@@ -122,7 +149,7 @@ export class RetentionService {
   private readonly errorLog: (msg: string, err?: unknown) => void;
 
   constructor(
-    private readonly db: { events: EventsRepository; news?: NewsRepository; teams: TeamsRepository },
+    private readonly db: { events: EventsRepository; news?: NewsRepository; queries?: Pick<QueriesRepository, 'pruneTerminalByAge' | 'pruneTerminalByCount'>; teams: TeamsRepository },
     opts: {
       intervalMs?: number;
       config?: Partial<RetentionConfig>;
@@ -137,6 +164,8 @@ export class RetentionService {
       retentionCount: opts.config?.retentionCount ?? base.retentionCount,
       newsRetentionDays: opts.config?.newsRetentionDays ?? base.newsRetentionDays,
       newsRetentionCount: opts.config?.newsRetentionCount ?? base.newsRetentionCount,
+      queryRetentionDays: opts.config?.queryRetentionDays ?? base.queryRetentionDays,
+      queryRetentionCount: opts.config?.queryRetentionCount ?? base.queryRetentionCount,
     };
     this.log = opts.log ?? ((line) => console.log(line));
     this.errorLog =
@@ -173,6 +202,7 @@ export class RetentionService {
     return sweepEventLogRetention({
       events: this.db.events,
       news: this.db.news,
+      queries: this.db.queries,
       teams: this.db.teams,
       now,
       config: this.config,

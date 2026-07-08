@@ -16,6 +16,7 @@ defaults:
   runtime: codex
   model: gpt-5.4
   skills:
+    - brain
     - identity
     - inter-agent
     - catalog

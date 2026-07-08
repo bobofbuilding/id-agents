@@ -28,6 +28,7 @@ import {
   maybeRunWorkspaceUnsyncCli,
 } from './cli/workspace-sync.js';
 import { waitForAgentReady } from './cli/agent-readiness.js';
+import { nodeOptionsForManager, withDesktopResourceLimits } from './lib/resource-limits.js';
 
 const oneShotSyncExit = await maybeRunWorkspaceSyncCli(process.argv.slice(2));
 if (oneShotSyncExit !== null) {
@@ -932,7 +933,7 @@ async function startLocalAgentProcess(agentData: any): Promise<{ success: boolea
     }
 
     // Set environment variables
-    const localEnv = {
+    const localEnv = withDesktopResourceLimits({
       ...process.env,
       ID_TEAM: activeTeam,
       MANAGER_URL: MANAGER_URL,
@@ -940,7 +941,7 @@ async function startLocalAgentProcess(agentData: any): Promise<{ success: boolea
       ...(agentModel && { CLAUDE_MODEL: resolveModelAlias(agentModel) }),
       // Pass tokenId so agent knows its registry identity
       ...(agentTokenId && { ID_AGENT_TOKEN_ID: agentTokenId })
-    };
+    });
 
     // Create log file for the local agent
     const logsDir = path.join(process.env.ID_WORKSPACE_DIR || process.env.WORKSPACE_DIR || '/tmp/id-agents', 'logs');
@@ -1404,7 +1405,11 @@ async function handleLine(line: string) {
           const managerProc = spawn('node', [managerScript], {
             stdio: 'ignore',
             detached: true,
-            env: { ...process.env, AGENT_MANAGER_PORT: String(MANAGER_PORT) }
+            env: {
+              ...process.env,
+              NODE_OPTIONS: nodeOptionsForManager(process.env.NODE_OPTIONS),
+              AGENT_MANAGER_PORT: String(MANAGER_PORT),
+            }
           });
           managerProc.unref();
 
@@ -3935,7 +3940,11 @@ async function initializeCli() {
     spawn('node', [managerScript], {
       detached: true,
       stdio: 'ignore',
-      env: { ...process.env, AGENT_MANAGER_PORT: String(MANAGER_PORT) }
+      env: {
+        ...process.env,
+        NODE_OPTIONS: nodeOptionsForManager(process.env.NODE_OPTIONS),
+        AGENT_MANAGER_PORT: String(MANAGER_PORT),
+      }
     }).unref();
     managerRunning = await waitForManagerReady();
     if (!managerRunning) {
@@ -5032,7 +5041,7 @@ async function deployFromConfig(filePath: string, args: string[] = []) {
           }
 
           // Set environment variables
-          const localEnv = {
+          const localEnv = withDesktopResourceLimits({
             ...process.env,
             ID_TEAM: activeTeam,
             ID_AGENT_PORT: String(result.port),
@@ -5045,7 +5054,7 @@ async function deployFromConfig(filePath: string, args: string[] = []) {
             ...((agent.verbose === true || agent.verbose === 'true') && { ID_AGENT_VERBOSE: 'true' }),
             // Default to skip-permissions; honor explicit false from config
             ID_AGENT_SKIP_PERMISSIONS: agent.dangerouslySkipPermissions === false ? 'false' : 'true'
-          };
+          });
 
           // Create log file for the local agent
           const logsDir = path.join(process.env.ID_WORKSPACE_DIR || process.env.WORKSPACE_DIR || '/tmp/id-agents', 'logs');

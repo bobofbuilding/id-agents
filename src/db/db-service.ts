@@ -280,6 +280,18 @@ export interface QueriesRepository {
   expireQueuedPeerWakes(cutoffCreated: number): Promise<QueryRow[]>;
 
   /**
+   * Prune terminal query history for a team. Active pending/processing queries
+   * are never deleted by retention because they still drive live work.
+   */
+  pruneTerminalByAge(teamId: string, beforeCompletedOrCreated: number): Promise<number>;
+
+  /**
+   * Keep at most `keepCount` terminal query rows for a team, deleting the
+   * oldest excess. Active pending/processing queries are ignored.
+   */
+  pruneTerminalByCount(teamId: string, keepCount: number): Promise<number>;
+
+  /**
    * Insert-or-update a query row (ON CONFLICT by agent_id, query_id).
    * On conflict, updates status, completed, result, error, and session_id.
    */

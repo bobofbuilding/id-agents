@@ -18,6 +18,7 @@ import { spawn, ChildProcess } from 'child_process';
 import { AgentHarness, HarnessOptions, HarnessMessage, HarnessType, McpServerSpec } from './types.js';
 import { reportTurnUsage } from './usage-report.js';
 import { terminateChildProcessTree } from './claude-code-cli.js';
+import { detectClaudeCliRateLimit } from './rate-limit.js';
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -50,6 +51,14 @@ export function codexPermissionArgs(input: {
     return { args: [], label: 'resumed session policy (resume has no --full-auto)' };
   }
   return { args: ['--full-auto'], label: '--full-auto (config opt-out)' };
+}
+
+export function codexReasoningEffort(raw: string | undefined): 'low' | 'medium' | 'high' | undefined {
+  if (!raw || !/^(minimal|low|medium|high|xhigh)$/.test(raw)) return undefined;
+  if (raw === 'minimal') return 'low';
+  if (raw === 'xhigh') return 'high';
+  if (raw === 'low' || raw === 'medium' || raw === 'high') return raw;
+  return undefined;
 }
 
 function isExecutable(file: string): boolean {
@@ -323,12 +332,11 @@ export class CodexHarness implements AgentHarness {
     // Skip git repo check in case working dir isn't a git repo
     args.push('--skip-git-repo-check');
 
-    // Reasoning effort (set per-agent in the Control Center) — fewer reasoning tokens at
-    // lower effort. Non-secret config, so a `-c` override on argv is fine. codex accepts
-    // minimal|low|medium|high; map xhigh→high.
-    const effortRaw = process.env.ID_AGENT_EFFORT;
-    if (effortRaw && /^(minimal|low|medium|high|xhigh)$/.test(effortRaw)) {
-      const eff = effortRaw === 'xhigh' ? 'high' : effortRaw;
+    // Reasoning effort (set per-agent in the Control Center) — fewer reasoning
+    // tokens at lower effort. Codex rejects `minimal` when built-in tools like
+    // web_search/image_gen are available, so map minimal→low and xhigh→high.
+    const eff = codexReasoningEffort(process.env.ID_AGENT_EFFORT);
+    if (eff) {
       args.push('-c', `model_reasoning_effort="${eff}"`);
       console.log(`[Codex] Reasoning effort: ${eff}`);
     }
@@ -712,9 +720,12 @@ export class CodexHarness implements AgentHarness {
             }
 
             case 'error': {
+              const content = event.message || event.error || 'Unknown error';
+              const rateLimit = detectClaudeCliRateLimit({ stdout: JSON.stringify(event), stderr: content });
               yield {
                 type: 'error',
-                content: event.message || event.error || 'Unknown error',
+                content,
+                ...(rateLimit ? { rateLimit } : {}),
               };
               break;
             }
@@ -750,9 +761,11 @@ export class CodexHarness implements AgentHarness {
 
     // If no result was captured, check stderr
     if (!lastResult && stderrText) {
+      const rateLimit = detectClaudeCliRateLimit({ stderr: stderrText, exitCode: exitCode ?? undefined });
       yield {
         type: 'error',
-        content: stderrText.trim().slice(0, 500),
+        content: (rateLimit?.message || stderrText).trim().slice(0, 1000),
+        ...(rateLimit ? { rateLimit } : {}),
       };
     }
 

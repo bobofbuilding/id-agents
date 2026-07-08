@@ -16,6 +16,8 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_NEWS_RETENTION_COUNT,
   DEFAULT_NEWS_RETENTION_DAYS,
+  DEFAULT_QUERY_RETENTION_COUNT,
+  DEFAULT_QUERY_RETENTION_DAYS,
   DEFAULT_RETENTION_COUNT,
   DEFAULT_RETENTION_DAYS,
   resolveRetentionConfig,
@@ -23,8 +25,8 @@ import {
 } from '../../src/wakeup-service/retention.js';
 
 interface StubCall {
-  repo: 'events' | 'news';
-  fn: 'pruneByAge' | 'pruneByCount';
+  repo: 'events' | 'news' | 'queries';
+  fn: 'pruneByAge' | 'pruneByCount' | 'pruneTerminalByAge' | 'pruneTerminalByCount';
   teamId: string;
   arg: number;
 }
@@ -78,6 +80,23 @@ function makeStubNews(returns: { aged?: Record<string, number>; count?: Record<s
   };
 }
 
+function makeStubQueries(returns: { aged?: Record<string, number>; count?: Record<string, number> } = {}) {
+  const calls: StubCall[] = [];
+  return {
+    calls,
+    repo: {
+      async pruneTerminalByAge(teamId: string, beforeCompletedOrCreated: number) {
+        calls.push({ repo: 'queries', fn: 'pruneTerminalByAge', teamId, arg: beforeCompletedOrCreated });
+        return returns.aged?.[teamId] ?? 0;
+      },
+      async pruneTerminalByCount(teamId: string, keepCount: number) {
+        calls.push({ repo: 'queries', fn: 'pruneTerminalByCount', teamId, arg: keepCount });
+        return returns.count?.[teamId] ?? 0;
+      },
+    },
+  };
+}
+
 function makeStubTeams(teams: Array<{ id: string; name: string }>) {
   return {
     async listTeams() {
@@ -100,6 +119,8 @@ describe('resolveRetentionConfig', () => {
     expect(cfg.retentionCount).toBe(DEFAULT_RETENTION_COUNT);
     expect(cfg.newsRetentionDays).toBe(DEFAULT_NEWS_RETENTION_DAYS);
     expect(cfg.newsRetentionCount).toBe(DEFAULT_NEWS_RETENTION_COUNT);
+    expect(cfg.queryRetentionDays).toBe(DEFAULT_QUERY_RETENTION_DAYS);
+    expect(cfg.queryRetentionCount).toBe(DEFAULT_QUERY_RETENTION_COUNT);
   });
 
   it('reads positive integer overrides from env', () => {
@@ -108,11 +129,15 @@ describe('resolveRetentionConfig', () => {
       EVENT_LOG_RETENTION_COUNT: '50',
       NEWS_ITEMS_RETENTION_DAYS: '3',
       NEWS_ITEMS_RETENTION_COUNT: '5000',
+      QUERIES_RETENTION_DAYS: '21',
+      QUERIES_RETENTION_COUNT: '1234',
     } as any);
     expect(cfg.retentionDays).toBe(14);
     expect(cfg.retentionCount).toBe(50);
     expect(cfg.newsRetentionDays).toBe(3);
     expect(cfg.newsRetentionCount).toBe(5000);
+    expect(cfg.queryRetentionDays).toBe(21);
+    expect(cfg.queryRetentionCount).toBe(1234);
   });
 
   it('falls back to defaults on garbage / non-positive env values', () => {
@@ -121,11 +146,15 @@ describe('resolveRetentionConfig', () => {
       EVENT_LOG_RETENTION_COUNT: '-5',
       NEWS_ITEMS_RETENTION_DAYS: '0',
       NEWS_ITEMS_RETENTION_COUNT: 'banana',
+      QUERIES_RETENTION_DAYS: '-1',
+      QUERIES_RETENTION_COUNT: 'nope',
     } as any);
     expect(cfg.retentionDays).toBe(DEFAULT_RETENTION_DAYS);
     expect(cfg.retentionCount).toBe(DEFAULT_RETENTION_COUNT);
     expect(cfg.newsRetentionDays).toBe(DEFAULT_NEWS_RETENTION_DAYS);
     expect(cfg.newsRetentionCount).toBe(DEFAULT_NEWS_RETENTION_COUNT);
+    expect(cfg.queryRetentionDays).toBe(DEFAULT_QUERY_RETENTION_DAYS);
+    expect(cfg.queryRetentionCount).toBe(DEFAULT_QUERY_RETENTION_COUNT);
   });
 });
 
@@ -176,6 +205,29 @@ describe('sweepEventLogRetention', () => {
     ]);
   });
 
+  it('sweeps terminal query rows with the query-specific age and count caps when supplied', async () => {
+    const events = makeStubEvents();
+    const queries = makeStubQueries();
+    const teams = makeStubTeams([{ id: 'team-a', name: 'alpha' }]);
+    const now = 1_777_300_000_000;
+    await sweepEventLogRetention({
+      events: events.repo as any,
+      queries: queries.repo as any,
+      teams,
+      now,
+      config: { retentionDays: 7, retentionCount: 100, queryRetentionDays: 14, queryRetentionCount: 250 },
+    });
+
+    expect(events.calls).toEqual([
+      { repo: 'events', fn: 'pruneByAge', teamId: 'team-a', arg: now - 7 * 24 * 60 * 60 * 1000 },
+      { repo: 'events', fn: 'pruneByCount', teamId: 'team-a', arg: 100 },
+    ]);
+    expect(queries.calls).toEqual([
+      { repo: 'queries', fn: 'pruneTerminalByAge', teamId: 'team-a', arg: now - 14 * 24 * 60 * 60 * 1000 },
+      { repo: 'queries', fn: 'pruneTerminalByCount', teamId: 'team-a', arg: 250 },
+    ]);
+  });
+
   it('aggregates deletion counts across teams', async () => {
     const stub = makeStubEvents({
       aged: { 'team-a': 3, 'team-b': 0 },
@@ -191,7 +243,15 @@ describe('sweepEventLogRetention', () => {
       now: 1_777_300_000_000,
       config: { retentionDays: 7, retentionCount: 100 },
     });
-    expect(result).toEqual({ agedDeleted: 3, countDeleted: 5, newsAgedDeleted: 0, newsCountDeleted: 0, teamsScanned: 2 });
+    expect(result).toEqual({
+      agedDeleted: 3,
+      countDeleted: 5,
+      newsAgedDeleted: 0,
+      newsCountDeleted: 0,
+      queryAgedDeleted: 0,
+      queryCountDeleted: 0,
+      teamsScanned: 2,
+    });
   });
 
   it('aggregates news deletion counts across teams', async () => {
@@ -211,7 +271,43 @@ describe('sweepEventLogRetention', () => {
       now: 1_777_300_000_000,
       config: { retentionDays: 7, retentionCount: 100, newsRetentionDays: 7, newsRetentionCount: 100 },
     });
-    expect(result).toEqual({ agedDeleted: 0, countDeleted: 0, newsAgedDeleted: 4, newsCountDeleted: 6, teamsScanned: 2 });
+    expect(result).toEqual({
+      agedDeleted: 0,
+      countDeleted: 0,
+      newsAgedDeleted: 4,
+      newsCountDeleted: 6,
+      queryAgedDeleted: 0,
+      queryCountDeleted: 0,
+      teamsScanned: 2,
+    });
+  });
+
+  it('aggregates query deletion counts across teams', async () => {
+    const events = makeStubEvents();
+    const queries = makeStubQueries({
+      aged: { 'team-a': 7, 'team-b': 0 },
+      count: { 'team-a': 0, 'team-b': 9 },
+    });
+    const teams = makeStubTeams([
+      { id: 'team-a', name: 'alpha' },
+      { id: 'team-b', name: 'beta' },
+    ]);
+    const result = await sweepEventLogRetention({
+      events: events.repo as any,
+      queries: queries.repo as any,
+      teams,
+      now: 1_777_300_000_000,
+      config: { retentionDays: 7, retentionCount: 100, queryRetentionDays: 7, queryRetentionCount: 100 },
+    });
+    expect(result).toEqual({
+      agedDeleted: 0,
+      countDeleted: 0,
+      newsAgedDeleted: 0,
+      newsCountDeleted: 0,
+      queryAgedDeleted: 7,
+      queryCountDeleted: 9,
+      teamsScanned: 2,
+    });
   });
 
   it('logs only when a team actually deleted something', async () => {
@@ -244,7 +340,15 @@ describe('sweepEventLogRetention', () => {
       now: Date.now(),
       config: { retentionDays: 7, retentionCount: 100 },
     });
-    expect(result).toEqual({ agedDeleted: 0, countDeleted: 0, newsAgedDeleted: 0, newsCountDeleted: 0, teamsScanned: 0 });
+    expect(result).toEqual({
+      agedDeleted: 0,
+      countDeleted: 0,
+      newsAgedDeleted: 0,
+      newsCountDeleted: 0,
+      queryAgedDeleted: 0,
+      queryCountDeleted: 0,
+      teamsScanned: 0,
+    });
     expect(stub.calls).toEqual([]);
   });
 });

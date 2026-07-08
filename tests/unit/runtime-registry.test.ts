@@ -11,7 +11,10 @@ import {
   getRuntimeProfile,
   getRuntimeProviderName,
   resolveRuntime,
+  supportsMcpTools,
+  supportsPluginSkillFallback,
   supportsSessionResume,
+  supportsSkillFiles,
   usesCliLogin,
   validateRuntimeModelCompatibility,
 } from '../../src/runtime/registry.js';
@@ -244,5 +247,21 @@ describe('runtime registry', () => {
     expect(getRuntimeProviderName('provider:openrouter')).toBe('OpenAI-compatible API');
     expect(validateRuntimeModelCompatibility('provider:openrouter', 'anthropic/claude-sonnet-4.6')).toEqual([]);
     expect(validateRuntimeModelCompatibility('provider:openrouter', 'qwen/qwen3.5-397b-a17b')).toEqual([]);
+  });
+
+  it('centralizes portable capability support across runtimes', () => {
+    expect(supportsMcpTools('claude-code-cli')).toBe(true);
+    expect(supportsMcpTools('codex')).toBe(true);
+    expect(supportsMcpTools('ollama')).toBe(true);
+    expect(supportsMcpTools('provider:openrouter')).toBe(true);
+    expect(supportsMcpTools('cursor-cli')).toBe(false);
+
+    for (const runtime of ['claude-agent-sdk', 'claude-code-cli', 'codex', 'cursor-cli', 'grok', 'antigravity', 'copilot', 'kiro-cli', 'ollama', 'provider-api']) {
+      expect(supportsSkillFiles(runtime)).toBe(true);
+      expect(supportsPluginSkillFallback(runtime)).toBe(true);
+    }
+
+    expect(supportsSkillFiles('public-agent-remote')).toBe(false);
+    expect(supportsPluginSkillFallback('public-agent-remote')).toBe(false);
   });
 });

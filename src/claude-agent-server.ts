@@ -98,7 +98,6 @@ const MCP_CONTROL_PLANE_PROMPT_PATTERNS = [
   /^(?:Control ping|reply with OK|respond with OK|reply OK|respond OK)\b/i,
   /^Heartbeat:/,
   /^You are the team lead\./,
-  /^IDACC Learn routed this material\b/i,
   /^Supervision:/,
   /^Supervision probe on task\b/,
   /^Lead delegation kickoff:/,
@@ -131,7 +130,6 @@ const MCP_CONTROL_PLANE_PROMPT_PATTERNS = [
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\n(?:Control ping|reply with OK|respond with OK|reply OK|respond OK)\b/i,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nHeartbeat:/,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nYou are the team lead\./,
-  /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nIDACC Learn routed this material\b/i,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nSupervision:/,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nSupervision probe on task\b/,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nLead delegation kickoff:/,
@@ -159,6 +157,8 @@ const MAX_CONTROL_PLANE_QUERY_TIMEOUT_MS = 600_000;
 const DEFAULT_DELEGATION_QUERY_TIMEOUT_MS = 12 * 60_000;
 const MIN_DELEGATION_QUERY_TIMEOUT_MS = 60_000;
 const MAX_DELEGATION_QUERY_TIMEOUT_MS = 60 * 60_000;
+const DEFAULT_QUERY_TIMEOUT_RETRIES = 1;
+const MAX_QUERY_TIMEOUT_RETRIES = 5;
 
 const VALIDATION_CONTROL_PLANE_PROMPT_PATTERNS = [
   /^Please validate\b[\s\S]*\bagainst task\s+#?[a-z0-9_-]+/i,
@@ -202,6 +202,14 @@ function readDelegationTimeoutEnv(): number {
     MAX_DELEGATION_QUERY_TIMEOUT_MS,
     Math.max(MIN_DELEGATION_QUERY_TIMEOUT_MS, parsed),
   );
+}
+
+function readQueryTimeoutRetryEnv(): number {
+  const raw = process.env.ID_AGENT_QUERY_TIMEOUT_RETRIES;
+  if (raw === undefined || raw === '') return DEFAULT_QUERY_TIMEOUT_RETRIES;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_QUERY_TIMEOUT_RETRIES;
+  return Math.min(MAX_QUERY_TIMEOUT_RETRIES, parsed);
 }
 
 function isValidationControlPlanePrompt(prompt: string): boolean {
@@ -293,6 +301,11 @@ class QueryExecutionTimeoutError extends Error {
   }
 }
 
+function isQueryExecutionTimeoutError(error: unknown): error is QueryExecutionTimeoutError {
+  return error instanceof QueryExecutionTimeoutError
+    || (error instanceof Error && error.name === 'QueryExecutionTimeoutError');
+}
+
 async function* withQueryExecutionTimeout(
   iterator: AsyncGenerator<HarnessMessage>,
   params: {
@@ -343,6 +356,7 @@ export type QueryQueuePriority = 'operator' | 'delegation' | 'normal' | 'backgro
 type QueryOptions = {
   noAutoReply?: boolean;
   priority?: QueryQueuePriority;
+  timeoutRetryAttempt?: number;
 };
 
 const QUERY_PRIORITY_RANK: Record<QueryQueuePriority, number> = {
@@ -354,6 +368,7 @@ const QUERY_PRIORITY_RANK: Record<QueryQueuePriority, number> = {
 
 const DELEGATION_PROMPT_PATTERNS = [
   /^You are the team lead\./,
+  /^IDACC Learn (?:has ingested|routed this material)\b/i,
   /^Team objective:/,
   /^Lead delegation kickoff:/,
   /^Supervision:\s+Manager DB confirms parent task\b[\s\S]*\ball detected delegated child tasks are done\b/i,
@@ -365,6 +380,7 @@ const DELEGATION_PROMPT_PATTERNS = [
   /^\[Incoming Reply from "(?!checkin-service")[^"]+"\]/,
   /^\[Incoming Message from "(?!checkin-service")[^"]+"\]/,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nTeam objective:/,
+  /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nIDACC Learn (?:has ingested|routed this material)\b/i,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nLead delegation kickoff:/,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nTask delegation/i,
   /^\[Message from agent "[^"]+"\s*\|[^\n]*\]\s*\n[\s\S]*\n\[Incoming Reply from "(?!checkin-service")[^"]+"\]/,
@@ -2956,6 +2972,32 @@ ${prompt}`
         });
         console.log(`${logTime()} [Agent] ${stopError.message}; preserving manager terminal state`);
         return;
+      }
+
+      if (isQueryExecutionTimeoutError(error)) {
+        const attempt = Math.max(0, options?.timeoutRetryAttempt ?? 0);
+        const maxRetries = readQueryTimeoutRetryEnv();
+        if (attempt < maxRetries) {
+          const nextAttempt = attempt + 1;
+          query.status = 'pending';
+          query.completed = undefined;
+          query.error = undefined;
+          await this.dbUpsertQuery(query);
+          await this.addNews('query.timeout_retry', `Query ${queryId} timed out; retrying attempt ${nextAttempt}/${maxRetries}`, {
+            query_id: queryId,
+            timeout_ms: error.timeoutMs,
+            retry_attempt: nextAttempt,
+            max_retries: maxRetries,
+            priority,
+          });
+          console.warn(`${logTime()} [Agent] Query ${queryId} timed out; requeued retry ${nextAttempt}/${maxRetries}`);
+          await this.startQuery(queryId, prompt, resume, from, {
+            ...options,
+            timeoutRetryAttempt: nextAttempt,
+            priority,
+          });
+          return;
+        }
       }
 
       query.status = 'failed';

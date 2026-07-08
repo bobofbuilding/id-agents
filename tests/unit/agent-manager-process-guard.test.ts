@@ -249,7 +249,7 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     expect(result).toEqual({ killed: true, pids: [agentPid] });
   });
 
-  it('holds scheduled assignment sweeps while fleet doing work is stalled', async () => {
+  it('allows scheduled assignment sweeps while fleet doing work is stalled so managed triage can run', async () => {
     const { manager, db, workDir } = await makeManager();
     dbs.push(db);
     workDirs.push(workDir);
@@ -260,6 +260,15 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     const teamId = await db.teams.getOrCreateTeamId('ops-team');
     await db.agents.create(agentRow({ team_id: teamId, id: 'agent-task-master', name: 'task-master' }));
     await db.agents.create(agentRow({ team_id: teamId, id: 'agent-owner', name: 'ops-lead' }));
+    await db.queries.upsert(teamId, 'agent-task-master', {
+      query_id: 'query-recent-task-master',
+      status: 'completed',
+      prompt: 'recent task-master digest',
+      created: nowMs - 30_000,
+      completed: nowMs - 5_000,
+      owner_kind: 'agent',
+      owner_id: 'agent-task-master',
+    });
     await db.tasks.create(taskRow({
       team_id: teamId,
       id: 'task-stalled',
@@ -277,7 +286,7 @@ describe('AgentManagerDb killAgentProcess guards', () => {
       scheduleMessage: 'Task assignment sweep: inspect unassigned todo tasks across all teams.',
     });
 
-    expect(allowed).toBe(false);
+    expect(allowed).toBe(true);
   });
 
   it('triages stalled work instead of assigning unowned tasks during managed assignment sweeps', async () => {
@@ -809,6 +818,62 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     ]);
     expect((manager as any).killAgentProcess).toHaveBeenCalledTimes(1);
     expect((await db.agents.getById('agent-scheduled-worker'))?.status).toBe('stopped');
+  });
+
+  it('does not park a scheduled local agent with recent schedule activity', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+    const nowMs = 1_700_000_600_000;
+    const nowSec = Math.floor(nowMs / 1000);
+    vi.spyOn(Date, 'now').mockReturnValue(nowMs);
+
+    const teamId = await db.teams.getOrCreateTeamId('skillmesh');
+    await db.agents.create({
+      ...agentRow({
+        team_id: teamId,
+        id: 'agent-recent-scheduled-worker',
+        name: 'skill-discoverer',
+        port: 4118,
+        status: 'running',
+        metadata: { runtime: 'codex', pid: 55573, processOwner: 'manager-child', processParentPid: process.pid },
+      }),
+    });
+    const def = scheduleRow({
+      id: 'hb-agent-recent-scheduled-worker',
+      source_key: 'heartbeat:agent-recent-scheduled-worker',
+    });
+    await db.schedules.upsertDefinition(def);
+    await db.schedules.replaceTargets(def.id, ['agent-recent-scheduled-worker']);
+    await db.schedules.insertRun({
+      schedule_id: def.id,
+      agent_id: 'agent-recent-scheduled-worker',
+      scheduled_key: `heartbeat:${nowSec - 60}`,
+      scheduled_at: nowSec - 60,
+      fired_at: nowSec - 60,
+      status: 'sent',
+      error: null,
+    });
+
+    (manager as any).killAgentProcess = vi.fn(async () => ({ killed: true, pids: [55573] }));
+
+    const result = await (manager as any).parkIdleAgents({
+      teamId,
+      teamName: 'skillmesh',
+      confirmed: true,
+      allTeams: false,
+      includeDefault: false,
+      includeLeads: false,
+      includeScheduled: false,
+      includeActiveTeams: true,
+    });
+
+    expect(result.result.parked).toBe(0);
+    expect(result.result.agents).toEqual([
+      { team: 'skillmesh', name: 'skill-discoverer', status: 'skipped', reason: 'recent_schedule_activity_1_within_10m' },
+    ]);
+    expect((manager as any).killAgentProcess).not.toHaveBeenCalled();
+    expect((await db.agents.getById('agent-recent-scheduled-worker'))?.status).toBe('running');
   });
 
   it('keeps scheduled agents running when their lifecycle cannot be restarted on demand', async () => {
@@ -1575,6 +1640,7 @@ describe('AgentManagerDb killAgentProcess guards', () => {
 
       const events = await db.events.query({ teamId, topics: ['query:expired'], limit: 10 });
       expect(events.map((event) => event.subject_id).sort()).toEqual(['pending-old', 'processing-old']);
+      expect(events.map((event) => (event.data as any).expiry_reason).sort()).toEqual(['pending_timeout', 'processing_timeout']);
     } finally {
       await cancelServer?.close();
       if (savedEnv.legacy === undefined) delete process.env.ID_QUERY_EXPIRY_MINUTES;
@@ -1757,6 +1823,108 @@ new org text from sidecar
     }
   });
 
+  it('threads caller session ids from /ask into agent /talk and the query row', async () => {
+    const saved = process.env.BRAIN_CONTEXT_DISABLED;
+    let talkServer: Awaited<ReturnType<typeof startTalkServer>> | null = null;
+    process.env.BRAIN_CONTEXT_DISABLED = 'true';
+    try {
+      const { manager, db, workDir } = await makeManager();
+      dbs.push(db);
+      workDirs.push(workDir);
+      talkServer = await startTalkServer({ query_id: 'session-scoped-query' });
+
+      const teamId = await db.teams.getOrCreateTeamId('default');
+      await db.agents.create({
+        ...agentRow({
+          team_id: teamId,
+          id: 'agent-session-lead',
+          name: 'lead',
+          port: 4112,
+          status: 'running',
+          endpoint: talkServer.endpoint,
+          metadata: { primaryLead: true, runtime: 'codex' },
+        }),
+      });
+
+      const result = await (manager as any).executeRemoteCommand(
+        '/ask lead keep this chat scoped',
+        teamId,
+        'default',
+        'operator',
+        'desktop-chat-session-1',
+      );
+
+      expect(result.ok).toBe(true);
+      expect(result.result?.queryId).toBe('session-scoped-query');
+      expect(talkServer.talkBodies).toHaveLength(1);
+      expect(JSON.parse(talkServer.talkBodies[0] || '{}')).toMatchObject({
+        from: 'remote',
+        session_id: 'desktop-chat-session-1',
+      });
+      const row = await db.queries.getByQueryIdForTeam(teamId, 'session-scoped-query');
+      expect(row?.session_id).toBe('desktop-chat-session-1');
+    } finally {
+      await talkServer?.close();
+      if (saved === undefined) delete process.env.BRAIN_CONTEXT_DISABLED;
+      else process.env.BRAIN_CONTEXT_DISABLED = saved;
+    }
+  });
+
+  it('dedupes completed Learn ingest /ask prompts before waking the lead', async () => {
+    const saved = process.env.BRAIN_CONTEXT_DISABLED;
+    let talkServer: Awaited<ReturnType<typeof startTalkServer>> | null = null;
+    process.env.BRAIN_CONTEXT_DISABLED = 'true';
+    try {
+      const { manager, db, workDir } = await makeManager();
+      dbs.push(db);
+      workDirs.push(workDir);
+      talkServer = await startTalkServer({ query_id: 'learn-duplicate-should-not-run' });
+
+      const teamId = await db.teams.getOrCreateTeamId('default');
+      await db.agents.create({
+        ...agentRow({
+          team_id: teamId,
+          id: 'agent-default-lead',
+          name: 'lead',
+          port: 4112,
+          status: 'running',
+          endpoint: talkServer.endpoint,
+          metadata: { primaryLead: true, runtime: 'codex' },
+        }),
+      });
+      const prompt = [
+        'IDACC Learn has ingested new material. You are the PRIMARY lead: coordinate recursive learning against active goals.',
+        '',
+        'Title: github: graphiti',
+        'Source: https://github.com/getzep/graphiti',
+      ].join('\n');
+      await db.queries.upsert(teamId, 'agent-default-lead', {
+        query_id: 'existing-learn-ingest-query',
+        status: 'completed',
+        prompt,
+        created: Date.now() - 60_000,
+        completed: Date.now() - 30_000,
+        owner_kind: 'agent',
+        owner_id: 'agent-default-lead',
+      });
+
+      const result = await (manager as any).executeRemoteCommand(`/ask lead ${JSON.stringify(prompt)}`, teamId, 'default');
+
+      expect(result.ok).toBe(true);
+      expect(result.result).toMatchObject({
+        queryId: 'existing-learn-ingest-query',
+        status: 'completed',
+        deduped: true,
+        reason: 'learn_routing_duplicate',
+      });
+      expect(talkServer.talkBodies).toHaveLength(0);
+    } finally {
+      await talkServer?.close();
+      if (saved === undefined) delete process.env.BRAIN_CONTEXT_DISABLED;
+      else process.env.BRAIN_CONTEXT_DISABLED = saved;
+    }
+  });
+
   it('honors lead-specific metadata caps without inheriting worker caps', async () => {
     const savedEnv = {
       maxActive: process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT,
@@ -1856,6 +2024,14 @@ new org text from sidecar
       expect(result.ok).toBe(true);
       expect(result.result?.queryId).toBe('legal-lead-new-query');
       expect(talkServer.talkBodies).toHaveLength(1);
+      const targetRow = await db.queries.getByQueryIdForTeam(legalTeamId, 'legal-lead-new-query');
+      const sourceRow = await db.queries.getByQueryIdForTeam(defaultTeamId, 'legal-lead-new-query');
+      expect(targetRow?.agent_id).toBe('agent-legal-general-counsel');
+      expect((targetRow?.metadata as any)?.shadow_kind).toBeUndefined();
+      expect(sourceRow?.metadata).toMatchObject({
+        shadow_of_team_id: legalTeamId,
+        shadow_kind: 'cross_team_dispatch',
+      });
     } finally {
       await talkServer?.close();
       if (savedEnv.maxActive === undefined) delete process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
@@ -2169,6 +2345,8 @@ new org text from sidecar
     expect((await db.queries.getByQueryIdForTeam(teamId, 'pending-sweep-reworded'))?.status).toBe('expired');
     expect((await db.queries.getByQueryIdForTeam(teamId, 'processing-lead-kickoff'))?.status).toBe('processing');
     expect((await db.queries.getByQueryIdForTeam(teamId, 'pending-task-manager-assignment'))?.status).toBe('expired');
+    const events = await db.events.query({ teamId, topics: ['query:expired'], limit: 20 });
+    expect(events.filter((event) => event.subject_id === 'newer-task-delegation').map((event) => (event.data as any).expiry_reason)).toEqual(['duplicate_task_ask']);
   });
 
   it('expires active control prompts that reference already done tasks', async () => {
@@ -2237,6 +2415,8 @@ new org text from sidecar
     expect((await db.queries.getByQueryIdForTeam(teamId, 'terminal-lead-kickoff'))?.status).toBe('expired');
     expect((await db.queries.getByQueryIdForTeam(teamId, 'active-backlog-guard'))?.status).toBe('processing');
     expect((await db.queries.getByQueryIdForTeam(teamId, 'normal-done-task-mention'))?.status).toBe('processing');
+    const events = await db.events.query({ teamId, topics: ['query:expired'], limit: 10 });
+    expect(events.filter((event) => event.subject_id === 'terminal-lead-kickoff').map((event) => (event.data as any).expiry_reason)).toEqual(['terminal_task_ask']);
   });
 
   it('expires stale Work Plans decision prompts without touching normal lead work', async () => {

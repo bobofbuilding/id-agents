@@ -244,6 +244,9 @@ curl -s "http://127.0.0.1:4200/memory/market-parser/market:ETH-USD"
 
 ## When to use brain
 
+- **Required for submissions and contribution intake** — before accepting, rejecting, routing, or summarizing a submission/proposal/contribution, recall related Brain context and store durable outcomes back to Brain.
+- **Required for knowledge/material calls** — when asked what is known, what was learned, what sources say, or how material maps to active goals, query Brain first and cite `used_source_ids`.
+- **Required for skills/capability calls** — before recommending, composing, auditing, or invoking skills/tools/MCP/plugins/capabilities, use `/graph/recommend`, `/graph/nodes`, `/graph/compose`, or related graph endpoints and track selected skill usage.
 - **Before starting a task** — search skills by keyword/domain/tag to find what's available.
 - **After completing a task** — store what you learned (key="last-X") so you don't repeat work.
 - **When building a multi-skill workflow** — use neighbors to find complementary skills.

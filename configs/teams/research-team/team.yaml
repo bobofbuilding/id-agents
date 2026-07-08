@@ -17,6 +17,7 @@ defaults:
   local: true
   runtime: codex
   skills:
+    - brain
     - identity
     - inter-agent
     - catalog

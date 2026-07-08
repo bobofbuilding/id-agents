@@ -122,6 +122,19 @@ describe('Claude CLI rate-limit detector', () => {
     });
   });
 
+  it('detects Codex usage-limit text as a subscription cap', () => {
+    const found = detectClaudeCliRateLimit({
+      stdout: '',
+      stderr: "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Jul 10th, 2026 6:40 PM.",
+    });
+
+    expect(found).toMatchObject({
+      source: 'text-fallback',
+      reason: 'subscription_monthly_cap',
+      resetAt: expect.any(String),
+    });
+  });
+
   it('does not match bare rate_limit text outside structured events', () => {
     expect(detectClaudeCliRateLimit({
       stdout: '',

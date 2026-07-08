@@ -25,6 +25,12 @@ export interface RuntimeCapabilities {
   supportsResume: boolean;
   supportsPlugins: boolean;
   supportsAllowedTools: boolean;
+  /** Runtime can receive attached MCP servers as executable tools. */
+  supportsMcp: boolean;
+  /** Runtime discovers file-based skills from the deployed workspace. */
+  supportsSkillFiles: boolean;
+  /** Plugins with SKILL.md content can be exposed by mirroring them as skills. */
+  supportsPluginSkillFallback: boolean;
 }
 
 export type RuntimeInterfaceProtocol = 'rest-ap';

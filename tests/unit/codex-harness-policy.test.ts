@@ -2,7 +2,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { codexPermissionArgs } from '../../src/harness/codex.js';
+import { codexPermissionArgs, codexReasoningEffort } from '../../src/harness/codex.js';
 
 describe('Codex harness permission policy', () => {
   it('uses read-only sandbox config for control-plane prompts', () => {
@@ -20,5 +20,14 @@ describe('Codex harness permission policy', () => {
       args: ['--dangerously-bypass-approvals-and-sandbox'],
       label: '--dangerously-bypass-approvals-and-sandbox (default)',
     });
+  });
+
+  it('maps unsupported minimal effort to low for tool-capable Codex runs', () => {
+    expect(codexReasoningEffort('minimal')).toBe('low');
+    expect(codexReasoningEffort('low')).toBe('low');
+    expect(codexReasoningEffort('medium')).toBe('medium');
+    expect(codexReasoningEffort('high')).toBe('high');
+    expect(codexReasoningEffort('xhigh')).toBe('high');
+    expect(codexReasoningEffort('invalid')).toBeUndefined();
   });
 });

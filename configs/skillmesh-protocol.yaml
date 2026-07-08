@@ -12,6 +12,7 @@ defaults:
   runtime: ollama
   model: qwen3:4b
   skills:
+    - brain
     - identity
     - inter-agent
     - catalog

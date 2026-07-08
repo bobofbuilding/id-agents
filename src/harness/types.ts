@@ -43,7 +43,7 @@ export interface HarnessOptions {
   model?: string;
   workingDirectory?: string;
   plugins?: PluginConfig[];
-  /** External MCP servers to expose as tools (Claude runtimes only). */
+  /** External MCP servers to expose as tools when the selected runtime supports MCP/tool calls. */
   mcpServers?: McpServerSpec[];
   allowedTools?: string[];
   /**

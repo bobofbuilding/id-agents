@@ -56,6 +56,11 @@ Never page through the whole /news feed looking for a known query_id.
 curl -s {{MANAGER_URL}}/agents -H "X-Id-Team: $ID_TEAM" | jq '.agents[].name'
 \`\`\`
 
+## Cross-Team Delegation
+For another team's lead/member, send the CLI command through the manager:
+\`curl -s -X POST "$MANAGER_URL/remote" -H "Content-Type: application/json" -H "X-Id-Team: $ID_TEAM" -d '{"command":"/ask other-team/agent-name your scoped objective"}'\`
+Never POST to \`$MANAGER_URL/ask\`; that HTTP route does not exist.
+
 ## Key Rules
 1. Your response text is automatically sent back - no curl needed to reply
 2. Use /message only to START a conversation, not to reply
@@ -64,6 +69,7 @@ curl -s {{MANAGER_URL}}/agents -H "X-Id-Team: $ID_TEAM" | jq '.agents[].name'
 5. Team files: /workspace/teams/{{TEAM_NAME}}/
 6. Use the reserved manager channel directly; \`manager\` is not discovered from \`/agents\`
 7. For known query IDs, use \`/query/<id>?wait=30\` or \`/news?query_id=<id>\`, never broad \`/news\` pagination
+8. \`/ask\` is a CLI command inside \`POST $MANAGER_URL/remote\`, not a standalone HTTP endpoint
 `;
 
 /**

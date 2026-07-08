@@ -16,6 +16,7 @@ defaults:
   local: true
   runtime: claude-code-cli
   skills:
+    - brain
     - identity
     - inter-agent
     - catalog

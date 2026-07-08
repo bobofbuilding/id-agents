@@ -5,6 +5,8 @@ import type { InboxOwnerKind, QueryRow } from '../../types.js';
 import type { DbAdapter } from '../../db-adapter.js';
 import { parseJsonObject, stringifyJson } from '../../db-json.js';
 
+const TERMINAL_STATUSES = ['completed', 'failed', 'cancelled', 'expired'] as const;
+
 function resolveQueryOwnership(
   teamId: string,
   agentId: string | null,
@@ -108,6 +110,48 @@ export class SqliteQueriesRepo implements QueriesRepository {
       [Date.now(), cutoffCreated],
     );
     return r.rows.map((row) => this.parseQueryRow(row)!);
+  }
+
+  async pruneTerminalByAge(teamId: string, beforeCompletedOrCreated: number): Promise<number> {
+    const placeholders = TERMINAL_STATUSES.map(() => '?').join(', ');
+    const r = await this.db.query(
+      `DELETE FROM queries
+       WHERE team_id = ?
+         AND status IN (${placeholders})
+         AND COALESCE(completed, created) < ?`,
+      [teamId, ...TERMINAL_STATUSES, beforeCompletedOrCreated],
+    );
+    return r.rowCount ?? 0;
+  }
+
+  async pruneTerminalByCount(teamId: string, keepCount: number): Promise<number> {
+    if (!Number.isFinite(keepCount) || keepCount <= 0) return 0;
+    const placeholders = TERMINAL_STATUSES.map(() => '?').join(', ');
+    const count = await this.db.query<{ c: number }>(
+      `SELECT COUNT(*) AS c
+       FROM queries
+       WHERE team_id = ?
+         AND status IN (${placeholders})`,
+      [teamId, ...TERMINAL_STATUSES],
+    );
+    const total = Number(count.rows[0]?.c ?? 0);
+    const excess = total - keepCount;
+    if (excess <= 0) return 0;
+
+    const r = await this.db.query(
+      `DELETE FROM queries
+       WHERE team_id = ?
+         AND query_id IN (
+           SELECT query_id
+           FROM queries
+           WHERE team_id = ?
+             AND status IN (${placeholders})
+           ORDER BY COALESCE(completed, created) ASC, created ASC, query_id ASC
+           LIMIT ?
+         )`,
+      [teamId, teamId, ...TERMINAL_STATUSES, excess],
+    );
+    return r.rowCount ?? 0;
   }
 
   async create(

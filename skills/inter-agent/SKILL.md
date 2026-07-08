@@ -69,6 +69,19 @@ If the user or manager says "ask coder …", "can you ask x …", or requests yo
 
 The old `/message` endpoint on the manager is **deprecated** — it responds with an `X-Deprecated` header and will be removed. Use `/talk-to` or `/news-to` on your local wrapper instead.
 
+## Cross-team delegation
+
+For another team's lead/member, `/ask <team>/<agent> ...` is a manager CLI command, not a standalone HTTP route. Send it through `$MANAGER_URL/remote`:
+
+```bash
+curl -s -X POST "$MANAGER_URL/remote" \
+  -H "Content-Type: application/json" \
+  -H "X-Id-Team: $ID_TEAM" \
+  -d '{"command":"/ask other-team/agent-name your scoped objective"}'
+```
+
+Use the returned `queryId` with `GET $MANAGER_URL/query/<queryId>?wait=30`. Never `POST $MANAGER_URL/ask`; that route does not exist and will fail with `Cannot POST /ask`.
+
 ## Transport routing — inter-agent vs xmtp
 
 Use the right transport based on who the recipient is:

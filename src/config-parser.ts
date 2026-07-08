@@ -11,6 +11,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { HarnessType, isValidHarnessType, getAvailableHarnesses } from './harness/index.js';
+import type { McpServerSpec } from './harness/types.js';
 import {
   getDefaultRuntime,
   resolveRuntime,
@@ -78,6 +79,7 @@ export interface AgentSpec {
   plugins?: PluginConfig[];           // Skill plugins
   skills?: string[];                  // Skills to deploy (names match skills/<name>/SKILL.md)
   allowedTools?: string[];
+  mcpServers?: McpServerSpec[];       // External MCP servers exposed as tools.
   resources?: ResourceConfig;
   register?: boolean;                 // Auto-register onchain after deploy
   local?: boolean;                    // Run locally using the selected runtime's local auth flow
@@ -177,6 +179,7 @@ export interface DeployConfig {
     plugins?: PluginConfig[];           // Skill plugins
     skills?: string[];                  // Default skills for all agents
     allowedTools?: string[];
+    mcpServers?: McpServerSpec[];
     resources?: ResourceConfig;
     register?: boolean;                 // Auto-register all agents onchain (default: undefined, use onchain.register)
     local?: boolean;                    // Run all agents locally by default
@@ -1243,6 +1246,18 @@ export function mergeDefaults(agent: AgentSpec, defaults: DeployConfig['defaults
   // AllowedTools: agent overrides defaults entirely
   if (!merged.allowedTools && defaults.allowedTools) {
     merged.allowedTools = [...defaults.allowedTools];
+  }
+
+  // MCP servers: merge by name, agent entries override defaults.
+  if (defaults.mcpServers && defaults.mcpServers.length > 0) {
+    const byName = new Map<string, McpServerSpec>();
+    for (const server of defaults.mcpServers) {
+      if (server?.name) byName.set(server.name, { ...server });
+    }
+    for (const server of merged.mcpServers || []) {
+      if (server?.name) byName.set(server.name, { ...server });
+    }
+    merged.mcpServers = [...byName.values()];
   }
 
   // Resources: deep merge

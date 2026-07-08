@@ -27,6 +27,7 @@ export interface ClaudeCliExecutionResult {
 }
 
 const RESET_RE = /\bresets?\s+([^\n\r.]+)/i;
+const TRY_AGAIN_RE = /\btry again at\s+([^\n\r.]+)/i;
 
 function statusOf(value: unknown): number | undefined {
   const n = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
@@ -55,6 +56,8 @@ function classify(text: string): RuntimeRateLimitReason {
     ? 'subscription_daily_cap'
     : /session limit/i.test(text)
     ? 'subscription_session_cap_unknown_window'
+    : /usage limit|codex\/settings\/usage/i.test(text)
+    ? 'subscription_monthly_cap'
     : 'unknown_rate_limit';
 }
 
@@ -65,8 +68,19 @@ function reasonFor(status: number | undefined, errorType: string, message: strin
 }
 
 function resetTextFrom(text: string): string | undefined {
-  const match = text.match(RESET_RE);
+  const match = text.match(RESET_RE) || text.match(TRY_AGAIN_RE);
   return match?.[1]?.trim();
+}
+
+function resetAtFromText(text: string): string | undefined {
+  const resetText = resetTextFrom(text);
+  if (!resetText) return undefined;
+  const normalized = resetText
+    .replace(/\b(\d{1,2})(st|nd|rd|th)\b/gi, '$1')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const parsed = Date.parse(normalized);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : undefined;
 }
 
 function signal(
@@ -80,7 +94,7 @@ function signal(
     source,
     status,
     reason: reasonFor(status, options.errorType || '', message),
-    ...(options.resetAt && options.retryAfterSeconds === undefined ? { resetAt: options.resetAt } : {}),
+    ...((options.resetAt || resetAtFromText(message)) && options.retryAfterSeconds === undefined ? { resetAt: options.resetAt || resetAtFromText(message) } : {}),
     ...(options.retryAfterSeconds !== undefined ? { retryAfterSeconds: options.retryAfterSeconds } : {}),
     resetText: resetTextFrom(message),
     message,
@@ -136,7 +150,7 @@ export function detectClaudeCliRateLimit(result: ClaudeCliExecutionResult): Runt
   if (jsonSignal) return jsonSignal;
 
   const text = `${stdout}\n${stderr}`;
-  if (/You've hit your session limit/i.test(text)) {
+  if (/You've hit your (session|usage) limit/i.test(text) || /chatgpt\.com\/codex\/settings\/usage/i.test(text)) {
     return signal('text-fallback', undefined, text.trim().slice(0, 1000));
   }
 

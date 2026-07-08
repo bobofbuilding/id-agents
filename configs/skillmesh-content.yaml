@@ -13,6 +13,7 @@ defaults:
   runtime: claude-code-cli
   model: claude-sonnet-5
   skills:
+    - brain
     - identity
     - inter-agent
     - catalog
