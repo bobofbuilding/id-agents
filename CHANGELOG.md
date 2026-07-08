@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.1.103]
+
+- Increase SQLite busy waiting and add bounded retry/backoff for transient `SQLITE_BUSY`/`SQLITE_LOCKED` write contention so successful agent replies are not marked failed when concurrent manager or local-agent DB writes briefly lock the shared state database.
+
 ## [0.1.102]
 
 - Treat read-only shell/HTTP tool limitations in manager supervision replies as manager-applied task closures when the embedded reconciliation evidence is complete, preventing fake BLOCKED activity rows from leaving completed parent tasks looking stuck.
