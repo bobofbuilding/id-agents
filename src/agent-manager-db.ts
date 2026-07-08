@@ -4989,14 +4989,17 @@ Return this JSON shape:
     if (isLocalModelRuntime(runtime, providerRuntime?.baseUrl)) return { attempted: false };
 
     if (runtime !== 'claude-code-cli' && runtime !== 'claude-code-local') {
+      if (!this.canUseLocalFallbackForRuntimeRateLimit(cooldown)) return { attempted: false };
       const localFallback = await this.handleRuntimeRateLimitLocalFallback(teamId, teamName, agent, runtime, cooldown);
       return localFallback.attempted ? localFallback : { attempted: false };
     }
 
     const nextLane = this.chooseRuntimeCredentialLane(runtime, cooldown.laneId, teamId, true);
     if (nextLane.kind === 'metered-api') {
-      const localFallback = await this.handleRuntimeRateLimitLocalFallback(teamId, teamName, agent, runtime, cooldown);
-      if (localFallback.attempted) return localFallback;
+      if (this.canUseLocalFallbackForRuntimeRateLimit(cooldown)) {
+        const localFallback = await this.handleRuntimeRateLimitLocalFallback(teamId, teamName, agent, runtime, cooldown);
+        if (localFallback.attempted) return localFallback;
+      }
     }
 
     await this.db.agents.updateMetadata(agent.id, {
@@ -5058,6 +5061,11 @@ Return this JSON shape:
 
   private isRateLimitLocalFallbackEnabled(): boolean {
     return !/^(0|false|off|no)$/i.test(String(process.env.ID_RATE_LIMIT_LOCAL_FALLBACK ?? '1').trim());
+  }
+
+  private canUseLocalFallbackForRuntimeRateLimit(cooldown: RuntimeLaneCooldown): boolean {
+    return cooldown.kind === 'subscription'
+      && (cooldown.reason === 'subscription_daily_cap' || cooldown.reason === 'subscription_weekly_cap');
   }
 
   private resolveRateLimitLocalFallback(agent: AgentRow): { runtime: HarnessType; model: string; laneId: string } | null {

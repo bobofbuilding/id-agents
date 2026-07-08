@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.1.104]
+
+- Restrict automatic local-model failover to subscription daily/weekly caps only. Generic API limits, overloads, session caps, and monthly usage caps no longer pivot agents such as the primary lead to Ollama; eligible local fallback still records the previous subscription runtime/model and the restore sweeper returns the agent when the original lane cooldown clears.
+
 ## [0.1.103]
 
 - Increase SQLite busy waiting and add bounded retry/backoff for transient `SQLITE_BUSY`/`SQLITE_LOCKED` write contention so successful agent replies are not marked failed when concurrent manager or local-agent DB writes briefly lock the shared state database.

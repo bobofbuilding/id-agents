@@ -186,7 +186,7 @@ describe('runtime credential lanes', () => {
     expect(db.runtimeLaneCooldowns.listActive).toHaveBeenCalledWith(expect.any(Number));
   });
 
-  it('falls back to a local model before metered overflow when every subscription lane is unavailable', async () => {
+  it('falls back to a local model before metered overflow when every subscription lane hits a daily/weekly subscription cap', async () => {
     process.env.ID_RATE_LIMIT_LOCAL_MODEL = 'llama3.2:3b';
     const db = fakeDb({
       agents: {
@@ -253,7 +253,7 @@ describe('runtime credential lanes', () => {
       kind: 'subscription',
       coolingUntilMs: Date.now() + 60_000,
       observedAtMs: Date.now(),
-      reason: 'subscription_session_cap_unknown_window',
+      reason: 'subscription_weekly_cap',
       teamId: 'team-1',
     });
     manager.rebuildLocalClaudeAgent = vi.fn(async () => ({ success: true, pid: 1234 }));
@@ -265,7 +265,7 @@ describe('runtime credential lanes', () => {
       kind: 'subscription',
       coolingUntilMs: Date.now() + 60_000,
       observedAtMs: Date.now(),
-      reason: 'subscription_session_cap_unknown_window',
+      reason: 'subscription_weekly_cap',
       teamId: 'team-1',
       agentId: 'agent-1',
       queryId: 'query-original',
@@ -302,7 +302,7 @@ describe('runtime credential lanes', () => {
     );
   });
 
-  it('falls back to a local model for non-Claude cloud runtime rate limits', async () => {
+  it('falls back to a local model for non-Claude cloud subscription daily/weekly caps', async () => {
     process.env.ID_RATE_LIMIT_LOCAL_MODEL = 'qwen3:4b';
     const db = fakeDb({
       agents: {
@@ -365,7 +365,7 @@ describe('runtime credential lanes', () => {
       kind: 'subscription',
       coolingUntilMs: Date.now() + 60_000,
       observedAtMs: Date.now(),
-      reason: 'api_rate_limit',
+      reason: 'subscription_daily_cap',
       teamId: 'team-1',
       agentId: 'agent-1',
       queryId: 'query-original',
@@ -376,6 +376,159 @@ describe('runtime credential lanes', () => {
       runtime: 'ollama',
       model: 'qwen3:4b',
     }));
+  });
+
+  it('does not pivot to a local model for generic API rate limits', async () => {
+    process.env.ID_RATE_LIMIT_LOCAL_MODEL = 'qwen3:4b';
+    const db = fakeDb({
+      agents: {
+        getById: vi.fn(async () => ({
+          team_id: 'team-1',
+          id: 'agent-1',
+          name: 'lead',
+          type: 'claude',
+          model: 'gpt-5.5',
+          port: 4311,
+          endpoint: 'http://localhost:4311',
+          working_directory: '/tmp/agent-1',
+          status: 'running',
+          created_at: 1,
+          registry: null,
+          metadata: { primaryLead: true },
+          deleted_at: null,
+          runtime: 'codex',
+          token_id: null,
+          domain: null,
+          api_key: null,
+          customer_domain: null,
+          public_endpoint_url: null,
+          internal_endpoint_url: null,
+          ssh_target: null,
+          last_seen: null,
+          last_probed_at: null,
+          last_error: null,
+          consecutive_failures: 0,
+        })),
+        updateStatus: vi.fn(async () => {}),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-runtime-test', db, { libraryRoot: null }) as any;
+    manager.rebuildLocalClaudeAgent = vi.fn(async () => ({ success: true, pid: 1234 }));
+    manager.forwardToAgent = vi.fn(async () => ({ ok: true, data: { query_id: 'query-retry' } }));
+
+    const failover = await manager.handleRuntimeRateLimitFailover('team-1', 'default', {
+      laneId: 'codex:default',
+      runtime: 'codex',
+      kind: 'subscription',
+      coolingUntilMs: Date.now() + 60_000,
+      observedAtMs: Date.now(),
+      reason: 'api_rate_limit',
+      teamId: 'team-1',
+      agentId: 'agent-1',
+      queryId: 'query-original',
+    });
+
+    expect(failover).toEqual({ attempted: false });
+    expect(db.agents.updateStatus).not.toHaveBeenCalled();
+    expect(manager.rebuildLocalClaudeAgent).not.toHaveBeenCalled();
+    expect(manager.forwardToAgent).not.toHaveBeenCalled();
+  });
+
+  it('does not use local fallback for session or monthly caps when subscription lanes are unavailable', async () => {
+    process.env.ID_RATE_LIMIT_LOCAL_MODEL = 'qwen3:4b';
+    const db = fakeDb({
+      agents: {
+        getById: vi.fn(async () => ({
+          team_id: 'team-1',
+          id: 'agent-1',
+          name: 'lead',
+          type: 'claude',
+          model: 'sonnet',
+          port: 4311,
+          endpoint: 'http://localhost:4311',
+          working_directory: '/tmp/agent-1',
+          status: 'running',
+          created_at: 1,
+          registry: null,
+          metadata: { primaryLead: true },
+          deleted_at: null,
+          runtime: 'claude-code-cli',
+          token_id: null,
+          domain: null,
+          api_key: null,
+          customer_domain: null,
+          public_endpoint_url: null,
+          internal_endpoint_url: null,
+          ssh_target: null,
+          last_seen: null,
+          last_probed_at: null,
+          last_error: null,
+          consecutive_failures: 0,
+        })),
+        updateMetadata: vi.fn(async () => {}),
+        updateStatus: vi.fn(async () => {}),
+      },
+      queries: {
+        getByQueryIdForTeam: vi.fn(async () => ({
+          team_id: 'team-1',
+          agent_id: 'agent-1',
+          query_id: 'query-original',
+          status: 'pending',
+          prompt: 'do the work',
+          created: 1,
+          completed: null,
+          result: null,
+          error: null,
+          session_id: 'session-1',
+          owner_kind: 'agent',
+          owner_id: 'agent-1',
+          metadata: null,
+        })),
+        create: vi.fn(async () => {}),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-runtime-test', db, { libraryRoot: null }) as any;
+    manager.runtimeCredentialPoolByTeam.set('team-1', {
+      lanes: [
+        { id: 'sub-a', runtime: 'claude-code-cli', kind: 'subscription' },
+        { id: 'sub-b', runtime: 'claude-code-cli', kind: 'subscription' },
+        { id: 'metered', runtime: 'claude-code-cli', kind: 'metered-api', env: { ANTHROPIC_API_KEY: 'test-key' } },
+      ],
+    });
+    manager.runtimeLaneCooldowns.set('sub-b', {
+      laneId: 'sub-b',
+      runtime: 'claude-code-cli',
+      kind: 'subscription',
+      coolingUntilMs: Date.now() + 60_000,
+      observedAtMs: Date.now(),
+      reason: 'subscription_monthly_cap',
+      teamId: 'team-1',
+    });
+    manager.rebuildLocalClaudeAgent = vi.fn(async () => ({ success: true, pid: 1234 }));
+    manager.forwardToAgent = vi.fn(async () => ({ ok: true, data: { query_id: 'query-retry' } }));
+
+    const failover = await manager.handleRuntimeRateLimitFailover('team-1', 'default', {
+      laneId: 'sub-a',
+      runtime: 'claude-code-cli',
+      kind: 'subscription',
+      coolingUntilMs: Date.now() + 60_000,
+      observedAtMs: Date.now(),
+      reason: 'subscription_session_cap_unknown_window',
+      teamId: 'team-1',
+      agentId: 'agent-1',
+      queryId: 'query-original',
+    });
+
+    expect(failover).toMatchObject({ attempted: true, success: true, laneId: 'metered', retryQueryId: 'query-retry' });
+    expect(db.agents.updateStatus).not.toHaveBeenCalledWith('agent-1', 'pending', expect.objectContaining({ runtime: 'ollama' }));
+    expect(db.agents.updateMetadata).toHaveBeenCalledWith('agent-1', expect.objectContaining({
+      runtimeCredentialLane: 'metered',
+    }));
+    expect(manager.rebuildLocalClaudeAgent).toHaveBeenCalledWith(
+      'team-1',
+      'default',
+      expect.objectContaining({ runtime: 'claude-code-cli', model: 'sonnet' }),
+    );
   });
 
   it('selects local fallback models from agent responsibilities when no override is set', async () => {
