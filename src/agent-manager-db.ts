@@ -5299,7 +5299,24 @@ Return this JSON shape:
       ? metadata.runtimeRateLimitFailover as Record<string, unknown>
       : null;
     if (!failover) return false;
-    if (failover.toRuntime !== 'ollama' && agent.runtime !== 'ollama') return false;
+    if (failover.toRuntime !== 'ollama') return false;
+    if (agent.runtime !== 'ollama') {
+      const nextMetadata: Record<string, unknown> = {
+        ...metadata,
+        runtimeRateLimitRestore: {
+          ...(metadata.runtimeRateLimitRestore && typeof metadata.runtimeRateLimitRestore === 'object' ? metadata.runtimeRateLimitRestore as Record<string, unknown> : {}),
+          skippedAtMs: now,
+          reason: 'agent already left local fallback runtime',
+          currentRuntime: agent.runtime,
+          currentModel: agent.model,
+        },
+      };
+      delete nextMetadata.runtimeRateLimitFailover;
+      delete nextMetadata.previousRuntimeBeforeRateLimit;
+      delete nextMetadata.previousModelBeforeRateLimit;
+      await this.db.agents.updateMetadata(agent.id, nextMetadata).catch(() => {});
+      return false;
+    }
 
     const fromRuntime = typeof failover.fromRuntime === 'string'
       ? failover.fromRuntime

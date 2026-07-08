@@ -769,6 +769,78 @@ describe('runtime credential lanes', () => {
     expect(db.agents.updateStatus).not.toHaveBeenCalled();
   });
 
+  it('cleans stale local-fallback restore metadata when an agent already left Ollama', async () => {
+    const now = Date.now();
+    const agent = {
+      team_id: 'team-1',
+      id: 'agent-1',
+      name: 'lead',
+      type: 'claude',
+      model: 'gpt-5.5',
+      port: 4311,
+      endpoint: 'http://localhost:4311',
+      working_directory: '/tmp/agent-1',
+      status: 'running',
+      created_at: 1,
+      registry: null,
+      metadata: {
+        runtimeRateLimitFailover: {
+          fromLaneId: 'claude-code-cli:default',
+          toLaneId: 'ollama:rate-limit-local',
+          fromRuntime: 'claude-code-cli',
+          toRuntime: 'ollama',
+          fromModel: 'claude-fable-5',
+          toModel: 'qwen3:14b',
+        },
+        previousRuntimeBeforeRateLimit: 'claude-code-cli',
+        previousModelBeforeRateLimit: 'claude-fable-5',
+        runtimeRateLimitRestore: {
+          fromRuntime: 'ollama',
+          fromModel: 'qwen3:14b',
+          toRuntime: 'codex',
+          toModel: 'gpt-5.5',
+        },
+      },
+      deleted_at: null,
+      runtime: 'codex',
+      token_id: null,
+      domain: null,
+      api_key: null,
+      customer_domain: null,
+      public_endpoint_url: null,
+      internal_endpoint_url: null,
+      ssh_target: null,
+      last_seen: null,
+      last_probed_at: null,
+      last_error: null,
+      consecutive_failures: 0,
+    };
+    const db = fakeDb({
+      agents: {
+        updateMetadata: vi.fn(async () => {}),
+        updateStatus: vi.fn(async () => {}),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-runtime-test', db, { libraryRoot: null }) as any;
+
+    const restored = await manager.restoreAgentFromRateLimitFallbackIfReady('team-1', 'default', agent, now);
+
+    expect(restored).toBe(false);
+    expect(db.agents.updateStatus).not.toHaveBeenCalled();
+    expect(db.agents.updateMetadata).toHaveBeenCalledWith('agent-1', expect.objectContaining({
+      runtimeRateLimitRestore: expect.objectContaining({
+        skippedAtMs: now,
+        reason: 'agent already left local fallback runtime',
+        currentRuntime: 'codex',
+        currentModel: 'gpt-5.5',
+      }),
+    }));
+    const metadata = db.agents.updateMetadata.mock.calls[0][1];
+    expect(metadata.runtimeRateLimitFailover).toBeUndefined();
+    expect(metadata.previousRuntimeBeforeRateLimit).toBeUndefined();
+    expect(metadata.previousModelBeforeRateLimit).toBeUndefined();
+  });
+
   it('recovers the original failed rate-limited query when the failover retry succeeds', async () => {
     const failedOriginal = {
       team_id: 'team-1',

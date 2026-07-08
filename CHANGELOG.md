@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.1.105]
+
+- Prevent stale local-fallback metadata from restoring an agent to an older subscription runtime after the agent has already left Ollama. The restore sweep now only performs an automatic restore when the agent is actually still on the local fallback runtime, and cleans the stale failover marker otherwise.
+
 ## [0.1.104]
 
 - Restrict automatic local-model failover to subscription daily/weekly caps only. Generic API limits, overloads, session caps, and monthly usage caps no longer pivot agents such as the primary lead to Ollama; eligible local fallback still records the previous subscription runtime/model and the restore sweeper returns the agent when the original lane cooldown clears.
