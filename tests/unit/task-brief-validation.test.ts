@@ -358,6 +358,7 @@ describe('appendTaskBriefFieldsToDescription', () => {
       out_of_scope: 'Production code changes',
       backlog_policy: 'Track discovered edge cases separately',
       bittrees_relevance: 'high - task dispatch infrastructure',
+      target: 'https://agent.bittrees.org/docs/launch',
       parent_task: '#40077396',
       validation_purpose: 'Confirm unit coverage before merge',
     });
@@ -372,6 +373,7 @@ describe('appendTaskBriefFieldsToDescription', () => {
       'Out of scope: Production code changes',
       'Backlog policy: Track discovered edge cases separately',
       'Bittrees relevance: high - task dispatch infrastructure',
+      'Target: https://agent.bittrees.org/docs/launch',
       'Parent task: #40077396',
       'Validation purpose: Confirm unit coverage before merge',
     ].join('\n'));
@@ -388,6 +390,7 @@ describe('appendTaskBriefFieldsToDescription', () => {
       'Out of scope: already present',
       'Backlog policy: already present',
       'Bittrees relevance: high - already present',
+      'Target: https://agent.bittrees.org/docs/launch',
       'Parent task: #parent',
       'Validation purpose: already present',
     ].join('\n');
@@ -400,6 +403,7 @@ describe('appendTaskBriefFieldsToDescription', () => {
       out_of_scope: 'Production code changes',
       backlog_policy: 'Track discovered edge cases separately',
       bittrees_relevance: 'medium - task dispatch infrastructure',
+      target: 'https://agent.bittrees.org/docs/launch',
       parent_task: '#40077396',
       validation_purpose: 'Confirm unit coverage before merge',
     });
@@ -428,6 +432,20 @@ describe('appendTaskBriefFieldsToDescription', () => {
 
     const result = appendTaskBriefFieldsToDescription(existing, {
       recommendation_routing: 'Do not duplicate this value.',
+    });
+
+    expect(result).toBe(existing);
+  });
+
+  it('does not append target when the description already includes it', () => {
+    const existing = [
+      'Existing task description.',
+      '',
+      'Target: https://agent.bittrees.org/docs/launch',
+    ].join('\n');
+
+    const result = appendTaskBriefFieldsToDescription(existing, {
+      target: 'https://agent.bittrees.org/docs/launch',
     });
 
     expect(result).toBe(existing);

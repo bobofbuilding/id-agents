@@ -1052,7 +1052,7 @@ describe('/talk-to auto-attach', () => {
     expect(duplicateBody.existing_task).toBe('validate-parent-alpha-coder');
   });
 
-  it('rejects duplicate goal tasks only when the objective title overlaps', async () => {
+  it('rejects duplicate goal tasks by title overlap when no target is provided', async () => {
     const releaseBrief = {
       ...validBriefFields(),
       goal_id: 'goal_release_id_agents_v0_1_100',
@@ -1107,11 +1107,17 @@ describe('/talk-to auto-attach', () => {
       existing_task?: string;
       existing_task_ref?: string;
       existing_status?: string;
+      duplicate_scope?: string;
+      duplicate_state?: string;
+      suggested_action?: string;
     };
-    expect(duplicateBody.error).toBe('duplicate_task_goal');
+    expect(duplicateBody.error).toBe('existing_task_found');
     expect(duplicateBody.existing_task).toBe('publish-id-agents-v0-1-100');
     expect(duplicateBody.existing_task_ref).toMatch(/^#[a-f0-9]{8}$/);
     expect(duplicateBody.existing_status).toBe('todo');
+    expect(duplicateBody.duplicate_scope).toBe('goal+title');
+    expect(duplicateBody.duplicate_state).toBe('open');
+    expect(duplicateBody.suggested_action).toBe('status-check');
 
     const remoteDuplicate = await fetch(`${baseUrl}/remote`, {
       method: 'POST',
@@ -1125,12 +1131,79 @@ describe('/talk-to auto-attach', () => {
     const remoteDuplicateBody = await remoteDuplicate.json() as {
       ok: boolean;
       error?: string;
-      result?: { existing_task?: string; existing_status?: string };
+      result?: {
+        existing_task?: string;
+        existing_status?: string;
+        duplicate_scope?: string;
+        duplicate_state?: string;
+        suggested_action?: string;
+      };
     };
     expect(remoteDuplicateBody.ok).toBe(false);
-    expect(remoteDuplicateBody.error).toBe('duplicate_task_goal');
+    expect(remoteDuplicateBody.error).toBe('existing_task_found');
     expect(remoteDuplicateBody.result?.existing_task).toBe('publish-id-agents-v0-1-100');
     expect(remoteDuplicateBody.result?.existing_status).toBe('todo');
+    expect(remoteDuplicateBody.result?.duplicate_scope).toBe('goal+title');
+    expect(remoteDuplicateBody.result?.duplicate_state).toBe('open');
+    expect(remoteDuplicateBody.result?.suggested_action).toBe('status-check');
+  });
+
+  it('rejects duplicate goal tasks by target signature even when titles differ', async () => {
+    const targetBrief = {
+      ...validBriefFields(),
+      goal_id: 'goal_ground_agent_bittrees_page',
+      target: 'https://agent.bittrees.org/docs/launch?ref=ops',
+      expected_output: 'Grounded launch copy and CTA shipped to agent.bittrees.org/docs/launch',
+      acceptance_criteria: [
+        'Launch page copy is updated in the target document',
+        'Review links point at the same target page',
+      ],
+      backlog_policy: 'Block duplicate edits to the same target page until the owner reports status.',
+      bittrees_relevance: 'high: protects a live Bittrees page workflow from duplicate churn.',
+    };
+
+    const first = await fetch(`${baseUrl}/tasks`, {
+      method: 'POST',
+      headers: adminHeaders(TEAM),
+      body: JSON.stringify({
+        title: 'Refresh launch copy for agent.bittrees.org docs',
+        name: 'refresh-agent-bittrees-launch-copy',
+        from: 'manager',
+        ...targetBrief,
+      }),
+    });
+    expect(first.status).toBe(201);
+
+    const duplicate = await fetch(`${baseUrl}/tasks`, {
+      method: 'POST',
+      headers: adminHeaders(TEAM),
+      body: JSON.stringify({
+        title: 'QA launch CTA links before publish',
+        name: 'qa-agent-bittrees-launch-cta-links',
+        from: 'manager',
+        ...targetBrief,
+        target_url: 'agent.bittrees.org/docs/launch?ref=ops',
+        expected_output: 'CTA link audit for the same launch page',
+        acceptance_criteria: ['CTA links are verified on the target page'],
+      }),
+    });
+    expect(duplicate.status).toBe(409);
+    const duplicateBody = await duplicate.json() as {
+      error: string;
+      existing_task?: string;
+      existing_status?: string;
+      existing_target?: string;
+      duplicate_scope?: string;
+      duplicate_state?: string;
+      suggested_action?: string;
+    };
+    expect(duplicateBody.error).toBe('existing_task_found');
+    expect(duplicateBody.existing_task).toBe('refresh-agent-bittrees-launch-copy');
+    expect(duplicateBody.existing_status).toBe('todo');
+    expect(duplicateBody.existing_target).toBe('url:https://agent.bittrees.org/docs/launch?ref=ops');
+    expect(duplicateBody.duplicate_scope).toBe('goal+target');
+    expect(duplicateBody.duplicate_state).toBe('open');
+    expect(duplicateBody.suggested_action).toBe('status-check');
   });
 
   it('rejects validator children created after the parent task is terminal', async () => {

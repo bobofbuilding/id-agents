@@ -1015,6 +1015,18 @@ export class AgentManagerDb {
       input.title,
       input.description,
       (input as any).message,
+      (input as any).target,
+      (input as any).targetUrl,
+      (input as any).target_url,
+      (input as any).targetPage,
+      (input as any).target_page,
+      (input as any).page,
+      (input as any).pageUrl,
+      (input as any).page_url,
+      (input as any).site,
+      (input as any).siteUrl,
+      (input as any).site_url,
+      (input as any).url,
       (input as any).bittrees_relevance,
       (input as any).bittreesRelevance,
       (input as any).bittrees_contributor_relevance,
@@ -1052,6 +1064,11 @@ export class AgentManagerDb {
     return value.toLowerCase().replace(/[^a-z0-9#]+/g, '-').replace(/^-+|-+$/g, '');
   }
 
+  private normalizeGoalTaskId(value: unknown): string | null {
+    const match = String(value ?? '').match(/\bgoal_[a-z0-9_]+\b/i);
+    return match ? match[0].toLowerCase() : null;
+  }
+
   private taskGoalIdFromInput(input: TaskBriefValidationInput | Record<string, unknown>): string | null {
     const explicit = this.firstBriefString(input, ['goal_id', 'goalId']);
     const text = this.taskBriefGuardText(input);
@@ -1059,8 +1076,84 @@ export class AgentManagerDb {
       || this.briefLabel(text, 'Goal ID')
       || text.match(/\bgoal_[a-z0-9_]+\b/i)?.[0]
       || null;
-    const match = candidate?.match(/\bgoal_[a-z0-9_]+\b/i)?.[0];
-    return match ? match.toLowerCase() : null;
+    return this.normalizeGoalTaskId(candidate);
+  }
+
+  private goalTaskMarker(goalId: string): string {
+    return `[goal:${this.normalizeGoalTaskId(goalId) || goalId}]`;
+  }
+
+  private taskTargetSignatureFromInput(input: TaskBriefValidationInput | Record<string, unknown>): string | null {
+    const explicit = this.firstBriefString(input, [
+      'target',
+      'targetUrl',
+      'target_url',
+      'targetPage',
+      'target_page',
+      'page',
+      'pageUrl',
+      'page_url',
+      'site',
+      'siteUrl',
+      'site_url',
+      'url',
+    ]);
+    const text = this.taskBriefGuardText(input);
+    const candidate = explicit
+      || this.briefLabel(text, 'Target URL')
+      || this.briefLabel(text, 'Target')
+      || this.briefLabel(text, 'Page URL')
+      || this.briefLabel(text, 'Page')
+      || this.briefLabel(text, 'Site URL')
+      || this.briefLabel(text, 'Site')
+      || text.match(/\bhttps?:\/\/[^\s<>"'`]+/i)?.[0]
+      || text.match(/\b(?:[a-z0-9-]+\.)+[a-z]{2,}(?:\/[^\s<>"'`]+)?/i)?.[0]
+      || null;
+    return this.normalizeTaskTarget(candidate);
+  }
+
+  private taskTargetSignatureFromTask(task: TaskRow): string | null {
+    return this.taskTargetSignatureFromInput({
+      title: task.title,
+      description: [task.name, task.description || ''].filter(Boolean).join('\n'),
+    });
+  }
+
+  private taskDuplicateRecentDoneWindowMs(): number {
+    const raw = Number(process.env.ID_TASK_DUPLICATE_RECENT_DONE_MS);
+    if (Number.isFinite(raw) && raw >= 0) return raw;
+    return 7 * 24 * 60 * 60 * 1000;
+  }
+
+  private normalizeTaskTarget(value: string | null | undefined): string | null {
+    const raw = String(value || '').trim().replace(/^[<([{`"']+|[>)}\]`"',.;:!?]+$/g, '');
+    if (!raw) return null;
+
+    const hostMatch = raw.match(/^(?:https?:\/\/)?((?:[a-z0-9-]+\.)+[a-z]{2,})(?::(\d+))?(\/.*)?$/i);
+    if (!hostMatch) return null;
+
+    const urlText = raw.includes('://') ? raw : `https://${raw}`;
+    try {
+      const url = new URL(urlText);
+      url.hash = '';
+      url.hostname = url.hostname.toLowerCase();
+      url.protocol = url.protocol.toLowerCase();
+      if (!url.pathname) url.pathname = '/';
+      if (url.pathname !== '/' && url.pathname.endsWith('/')) {
+        url.pathname = url.pathname.replace(/\/+$/, '');
+      }
+      const hostPort = url.port ? `:${url.port}` : '';
+      const pathAndQuery = `${url.pathname || '/'}${url.search || ''}`;
+      if (pathAndQuery === '/') {
+        return `host:${url.hostname}${hostPort}`;
+      }
+      return `url:${url.protocol}//${url.hostname}${hostPort}${pathAndQuery}`;
+    } catch {
+      const host = hostMatch[1].toLowerCase();
+      const port = hostMatch[2] ? `:${hostMatch[2]}` : '';
+      const path = hostMatch[3] && hostMatch[3] !== '/' ? hostMatch[3].replace(/\/+$/, '') : '';
+      return path ? `url:https://${host}${port}${path}` : `host:${host}${port}`;
+    }
   }
 
   private duplicateTitleTokens(value: string): Set<string> {
@@ -1099,20 +1192,82 @@ export class AgentManagerDb {
   ): Promise<TaskRow | null> {
     const goalId = this.taskGoalIdFromInput(input);
     const title = this.firstBriefString(input, ['title']);
-    if (!goalId || !title) return null;
+    const targetSignature = this.taskTargetSignatureFromInput(input);
+    if (!goalId) return null;
+    const recentDoneWindowMs = this.taskDuplicateRecentDoneWindowMs();
+    const nowMs = Date.now();
     const allTasks = await this.db.tasks.list({ teamId }).catch(() => [] as TaskRow[]);
-    const matches = allTasks.filter((candidate) => {
+    const matches: Array<{ task: TaskRow; matchRank: number; statusRank: number; updatedAt: number }> = [];
+    for (const candidate of allTasks) {
       const candidateGoal = this.taskGoalIdFromInput(this.taskBriefInputFromTask(candidate));
-      return candidateGoal === goalId && this.taskTitlesLookDuplicate(candidate.title, title);
-    });
+      if (candidateGoal !== goalId) continue;
+
+      const candidateTarget = this.taskTargetSignatureFromTask(candidate);
+      const hasTargetMatch = Boolean(
+        targetSignature
+        && candidateTarget
+        && candidateTarget === targetSignature
+      );
+      const hasLegacyTitleMatch = Boolean(
+        (!targetSignature || !candidateTarget)
+        && title
+        && this.taskTitlesLookDuplicate(candidate.title, title)
+      );
+      if (!hasTargetMatch && !hasLegacyTitleMatch) continue;
+
+      if (candidate.status !== 'todo' && candidate.status !== 'doing' && candidate.status !== 'done') continue;
+      if (candidate.status === 'done') {
+        if (recentDoneWindowMs <= 0) continue;
+        if (nowMs - this.taskLastActivityMs(candidate) > recentDoneWindowMs) continue;
+      }
+      matches.push({
+        task: candidate,
+        matchRank: hasTargetMatch ? 0 : 1,
+        statusRank: candidate.status === 'doing' ? 0 : candidate.status === 'todo' ? 1 : 2,
+        updatedAt: candidate.updated_at,
+      });
+    }
     if (!matches.length) return null;
-    const statusPriority: Record<TaskRow['status'], number> = { doing: 0, todo: 1, done: 2 };
     matches.sort((a, b) => {
-      const statusDelta = statusPriority[a.status] - statusPriority[b.status];
+      const matchDelta = a.matchRank - b.matchRank;
+      if (matchDelta !== 0) return matchDelta;
+      const statusDelta = a.statusRank - b.statusRank;
       if (statusDelta !== 0) return statusDelta;
-      return b.updated_at - a.updated_at;
+      return b.updatedAt - a.updatedAt;
     });
-    return matches[0] || null;
+    return matches[0]?.task || null;
+  }
+
+  private async existingTaskFoundResponse(existing: TaskRow, input: TaskBriefValidationInput | Record<string, unknown>): Promise<Record<string, unknown>> {
+    const goalId = this.taskGoalIdFromInput(input);
+    const requestedTarget = this.taskTargetSignatureFromInput(input);
+    const existingTarget = this.taskTargetSignatureFromTask(existing);
+    const owner = existing.owner ? await this.db.agents.getById(existing.owner).catch(() => null) : null;
+    const ownerName = owner ? ((owner.metadata as any)?.alias || owner.name) : null;
+    const ageMs = this.taskLastActivityMs(existing) > 0 ? Math.max(0, Date.now() - this.taskLastActivityMs(existing)) : 0;
+    const recentDoneWindowMs = this.taskDuplicateRecentDoneWindowMs();
+    const duplicateState = existing.status === 'done' && ageMs <= recentDoneWindowMs ? 'recent_done' : 'open';
+    const duplicateScope = requestedTarget && existingTarget && requestedTarget === existingTarget
+      ? 'goal+target'
+      : 'goal+title';
+    const duplicateScopeLabel = duplicateScope === 'goal+target' ? 'goal+target' : 'goal+title';
+
+    return {
+      message: duplicateState === 'recent_done'
+        ? `Task duplicates existing recently completed task ${this.taskShortRef(existing)} ("${existing.title}") for the same ${duplicateScopeLabel}. Status-check the existing owner instead of creating a new task.`
+        : `Task duplicates existing ${existing.status} task ${this.taskShortRef(existing)} ("${existing.title}") for the same ${duplicateScopeLabel}. Status-check the existing owner instead of creating a new task.`,
+      existing_task: existing.name,
+      existing_task_ref: this.taskShortRef(existing),
+      existing_status: existing.status,
+      existing_title: existing.title,
+      existing_owner: ownerName,
+      existing_owner_id: owner?.id || existing.owner || null,
+      existing_goal_id: goalId,
+      existing_target: existingTarget,
+      duplicate_scope: duplicateScope,
+      duplicate_state: duplicateState,
+      suggested_action: 'status-check',
+    };
   }
 
   private duplicateTaskResponse(existing: TaskRow): Record<string, unknown> {
@@ -7100,7 +7255,12 @@ Return this JSON shape:
       description,
     });
     if (duplicateTask) {
-      throw makeAutoAttachError(409, 'duplicate_task_goal', this.duplicateTaskResponse(duplicateTask));
+      throw makeAutoAttachError(409, 'existing_task_found', await this.existingTaskFoundResponse(duplicateTask, {
+        ...body,
+        ...taskSpec,
+        title: taskSpec.title,
+        description,
+      }));
     }
 
     const leadBacklog = await this.leadDelegationBacklogGuard({
@@ -11101,8 +11261,12 @@ Return this JSON shape:
         });
         if (duplicateTask) {
           return res.status(409).json({
-            error: 'duplicate_task_goal',
-            ...this.duplicateTaskResponse(duplicateTask),
+            error: 'existing_task_found',
+            ...(await this.existingTaskFoundResponse(duplicateTask, {
+              ...body,
+              title,
+              description: taskDescription,
+            })),
           });
         }
 
@@ -14958,6 +15122,7 @@ Return this JSON shape:
           let outOfScope: string | undefined;
           let backlogPolicy: string | undefined;
           let bittreesRelevance: string | undefined;
+          let target: string | undefined;
           let parentTask: string | undefined;
           let validationPurpose: string | undefined;
           let leadCoordination = false;
@@ -14981,6 +15146,18 @@ Return this JSON shape:
               || token === '--recommendation-routing-instructions'
             ) { backlogPolicy = rawArgs[++i]; continue; }
             if (token === '--bittrees-relevance' || token === '--relevance') { bittreesRelevance = rawArgs[++i]; continue; }
+            if (
+              token === '--target'
+              || token === '--target-url'
+              || token === '--target_url'
+              || token === '--page'
+              || token === '--page-url'
+              || token === '--page_url'
+              || token === '--site'
+              || token === '--site-url'
+              || token === '--site_url'
+              || token === '--url'
+            ) { target = rawArgs[++i]; continue; }
             if (token === '--parent-task' || token === '--parent-ref') { parentTask = rawArgs[++i]; continue; }
             if (token === '--validation-purpose') { validationPurpose = rawArgs[++i]; continue; }
             if (token === '--lead-coordination' || token === '--coordination-parent') { leadCoordination = true; continue; }
@@ -14988,7 +15165,7 @@ Return this JSON shape:
           }
 
           if (!title) {
-            return { ok: false, error: 'Usage: /task create "<title>" [--name <slug>] [--description "..."] [--team <team>] [--owner <agent>] [--event <schedule-id>]...' };
+            return { ok: false, error: 'Usage: /task create "<title>" [--name <slug>] [--description "..."] [--team <team>] [--owner <agent>] [--target <url>] [--event <schedule-id>]...' };
           }
 
           // Resolve optional team first (needed for name uniqueness check)
@@ -15011,6 +15188,7 @@ Return this JSON shape:
             out_of_scope: outOfScope,
             backlog_policy: backlogPolicy,
             bittrees_relevance: bittreesRelevance,
+            target,
             parent_task: parentTask,
             validation_purpose: validationPurpose,
           });
@@ -15041,6 +15219,7 @@ Return this JSON shape:
             out_of_scope: outOfScope,
             backlog_policy: backlogPolicy,
             bittrees_relevance: bittreesRelevance,
+            target,
             parent_task: parentTask,
             validation_purpose: validationPurpose,
           }, { immediateExecution: Boolean(ownerRef) });
@@ -15122,6 +15301,7 @@ Return this JSON shape:
             input: {
               title,
               description: taskDescription,
+              target,
               parent_task: parentTask,
               validation_purpose: validationPurpose,
             },
@@ -15143,12 +15323,18 @@ Return this JSON shape:
             title,
             description: taskDescription,
             goal_id: goalId,
+            target,
           });
           if (duplicateTask) {
             return {
               ok: false,
-              error: 'duplicate_task_goal',
-              result: this.duplicateTaskResponse(duplicateTask),
+              error: 'existing_task_found',
+              result: await this.existingTaskFoundResponse(duplicateTask, {
+                title,
+                description: taskDescription,
+                goal_id: goalId,
+                target,
+              }),
             };
           }
 
@@ -16188,8 +16374,13 @@ Return this JSON shape:
   }
 
   private taskMentionsGoal(task: TaskRow, goalId: string): boolean {
+    const expected = this.normalizeGoalTaskId(goalId);
+    if (expected) {
+      const taskGoal = this.taskGoalIdFromInput(this.taskBriefInputFromTask(task));
+      if (taskGoal === expected) return true;
+    }
     const haystack = `${task.title}\n${task.description || ''}`.toLowerCase();
-    return haystack.includes(goalId.toLowerCase());
+    return haystack.includes(goalId.toLowerCase()) || Boolean(expected && haystack.includes(expected));
   }
 
   private isAutopilotGoalTask(task: TaskRow): boolean {
@@ -16210,6 +16401,7 @@ Return this JSON shape:
     const taskDescription = appendTaskBriefFieldsToDescription(
       [
         `Goal autopilot sync.`,
+        this.goalTaskMarker(goal.id),
         `Autopilot source goal: ${goal.id}`,
         `Priority: ${goal.priority}`,
         `Objective: ${objective}`,
@@ -16217,7 +16409,7 @@ Return this JSON shape:
       ].join('\n'),
       {
         title: `Advance autopilot goal: ${objective}`,
-        goal_id: goal.id,
+        goal_id: this.normalizeGoalTaskId(goal.id) || goal.id,
         expected_output: 'A small set of delegated child tasks or a precise blocker that prevents progress toward the active goal.',
         acceptance_criteria: [
           'At least one member-owned child task is created when actionable work exists.',

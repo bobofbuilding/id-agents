@@ -34,6 +34,18 @@ export interface TaskBriefValidationInput {
   bittrees_contributor_relevance?: unknown;
   bittreesContributorRelevance?: unknown;
   relevance?: unknown;
+  target?: unknown;
+  targetUrl?: unknown;
+  target_url?: unknown;
+  targetPage?: unknown;
+  target_page?: unknown;
+  page?: unknown;
+  pageUrl?: unknown;
+  page_url?: unknown;
+  site?: unknown;
+  siteUrl?: unknown;
+  site_url?: unknown;
+  url?: unknown;
   parent_task?: unknown;
   parentTask?: unknown;
   parent_task_name?: unknown;
@@ -212,6 +224,25 @@ export function appendTaskBriefFieldsToDescription(
       ?? input.bittrees_contributor_relevance
       ?? input.bittreesContributorRelevance
       ?? input.relevance,
+    ),
+  );
+  appendIfMissing(
+    additions,
+    existing,
+    'Target',
+    firstString(
+      input.target,
+      input.targetUrl,
+      input.target_url,
+      input.targetPage,
+      input.target_page,
+      input.page,
+      input.pageUrl,
+      input.page_url,
+      input.site,
+      input.siteUrl,
+      input.site_url,
+      input.url,
     ),
   );
   appendIfMissing(
