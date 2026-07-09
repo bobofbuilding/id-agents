@@ -4614,6 +4614,54 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('routes live owner send failures to the team lead on forced stalled triage', async () => {
+    const owner = agent();
+    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true, leadMaxActiveQueries: 2 } });
+    const db = fakeDb({
+      agents: {
+        getById: vi.fn(async (id: string) => id === owner.id ? owner : id === lead.id ? lead : null),
+        getByName: vi.fn(async (_teamId: string, name: string) => name === 'lead' ? lead : null),
+        list: vi.fn(async () => [owner, lead]),
+        resolve: vi.fn(async () => [owner, lead]),
+        updateStatus: vi.fn(async () => {}),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-live-owner-send-fallback-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async (teamName: string, agentName: string) => teamName === 'default' && agentName === 'lead');
+
+    const guard = await manager.stalledOwnerBacklogGuard({
+      teamId: TEAM_ID,
+      teamName: 'default',
+      owner,
+      forceTriage: true,
+    });
+
+    expect(guard?.triage).toMatchObject({
+      status: 'sent_lead',
+      taskRef: '#12345678',
+      actor: 'lead',
+    });
+    expect(manager.sendSupervisionAsk).toHaveBeenNthCalledWith(
+      1,
+      'default',
+      'worker',
+      expect.stringContaining('New task assignment to you is held'),
+    );
+    expect(manager.sendSupervisionAsk).toHaveBeenNthCalledWith(
+      2,
+      'default',
+      'lead',
+      expect.stringContaining('could not be reached through owner worker'),
+    );
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:triaged',
+      actor_agent_id: lead.id,
+      data: expect.objectContaining({
+        reason: 'owner_unavailable',
+      }),
+    }));
+  });
+
   it('routes stalled wake prompt failures to task-master fallback', async () => {
     const stoppedOwner = agent({
       status: 'stopped',

@@ -2259,6 +2259,51 @@ export class AgentManagerDb {
         return { status: 'sent_owner', taskRef: ref, actor: ownerName, attempt };
       }
       this.restoreStalledProbe(key, prevProbe);
+      if (sent !== 'recent') {
+        const fallback = await this.routeStalledTaskToTaskManagerFallback({
+          teamId: params.teamId,
+          teamName: params.teamName,
+          task,
+          ref,
+          stalledMinutes,
+          ownerName,
+          nowMs: params.nowMs,
+          renudgeMs,
+          maxProbes,
+          force: params.force,
+          reason: 'owner_unresponsive',
+          eventReason: this.isConfiguredTeamLead(params.teamName, params.owner) ? 'lead_delegation_required' : 'owner_busy',
+        });
+        if (fallback) return fallback;
+
+        const candidateLead = await this.findSupervisionLead(params.teamId).catch(() => null);
+        const lead = this.isConfiguredTeamLead(params.teamName, candidateLead) ? candidateLead : null;
+        if (lead && lead.id !== params.owner.id) {
+          const leadKey = `task:${task.id}:owner-send-failed-lead`;
+          if (this.canRunStalledProbeForTriage(leadKey, params.nowMs, renudgeMs, maxProbes, params.force)) {
+            const leadPending = await this.loadPendingQueriesForRecipient(lead).catch(() => [] as QueryRow[]);
+            const leadState = this.supervisionQueryStateFromRows(params.teamId, leadPending, ref, lead, params.teamName);
+            if (!leadState.hasActiveSupervisionAsk && leadState.hasActiveQueryCapacity) {
+              const prevLeadProbe = this.stalledNudges.get(leadKey);
+              const leadAttempt = this.markStalledProbe(leadKey, params.nowMs);
+              const leadMsg = `Backlog guard: task ${ref} ("${task.title}") could not be reached through owner ${ownerName}. New task assignment to that owner is held until this is triaged. Please claim it, reassign it, or route it to the right teammate.`;
+              const leadSent = await this.sendRecentThrottledSupervisionAsk({
+                teamId: params.teamId,
+                teamName: params.teamName,
+                recipient: lead,
+                message: leadMsg,
+                nowMs: params.nowMs,
+                force: params.force,
+              });
+              if (leadSent === 'sent') {
+                await this.recordTaskSupervision(task, params.teamId, lead.id, 'owner_unavailable', stalledMinutes, params.nowMs);
+                return { status: 'sent_lead', taskRef: ref, actor: lead.name, attempt: leadAttempt };
+              }
+              this.restoreStalledProbe(leadKey, prevLeadProbe);
+            }
+          }
+        }
+      }
       return { status: sent === 'recent' ? 'throttled' : 'send_failed', taskRef: ref, actor: ownerName };
     }
 
