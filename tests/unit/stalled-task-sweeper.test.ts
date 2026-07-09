@@ -176,6 +176,8 @@ describe('stalled task sweeper', () => {
     delete process.env.ID_AGENT_LEAD_QUERY_CONCURRENCY;
     delete process.env.ID_LEAD_DELEGATION_KICKOFF_GRACE_MS;
     delete process.env.LEAD_DELEGATION_KICKOFF_GRACE_MS;
+    delete process.env.ID_LEAD_BACKLOG_AUTO_KEEP_ACTIVE;
+    delete process.env.ID_LEAD_BACKLOG_AUTO_DISABLED;
   });
 
   it('defaults automatic stalled-task sweeps to a responsive assignment cadence', () => {
@@ -3155,6 +3157,71 @@ describe('stalled task sweeper', () => {
       data: expect.objectContaining({
         reason: 'lead_delegation_required',
         stalled_minutes: 11,
+      }),
+    }));
+  });
+
+  it('auto-compacts extra lead-owned delegation parents before they stack as stalled work', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const lead = agent({
+      id: 'lead-1',
+      name: 'lead',
+      metadata: { primaryLead: true },
+    });
+    const oldParent = task({
+      id: 'lead-task-old',
+      name: 'old-parent',
+      uuid: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      title: 'Old parent',
+      owner: lead.id,
+      created_by: lead.id,
+      created_at: nowSec - 30 * 60,
+      updated_at: nowSec - 30 * 60,
+    });
+    const extraParent = task({
+      id: 'lead-task-extra',
+      name: 'extra-parent',
+      uuid: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      title: 'Extra parent',
+      owner: lead.id,
+      created_by: lead.id,
+      created_at: nowSec - 20 * 60,
+      updated_at: nowSec - 20 * 60,
+    });
+    const updateFields = vi.fn(async () => {});
+    const db = fakeDb({
+      teams: {
+        listTeams: vi.fn(async () => [team()]),
+      },
+      agents: {
+        list: vi.fn(async () => [lead]),
+        getById: vi.fn(async (id: string) => id === lead.id ? lead : null),
+      },
+      tasks: {
+        list: vi.fn(async ({ status, teamId, owner }: { status?: string; teamId?: string; owner?: string } = {}) => {
+          if (status === 'doing' && owner === lead.id) return [oldParent, extraParent];
+          if (teamId === TEAM_ID) return [oldParent, extraParent];
+          return [];
+        }),
+        updateFields,
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-lead-backlog-auto-guard-test', db, { libraryRoot: null }) as any;
+
+    const requeued = await manager.autoCompactLeadDelegationBacklog();
+
+    expect(requeued).toBe(1);
+    expect(updateFields).toHaveBeenCalledWith(extraParent.id, expect.objectContaining({
+      owner: null,
+      status: 'todo',
+      completed_at: null,
+    }));
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:triaged',
+      subject_id: extraParent.uuid,
+      actor_agent_id: lead.id,
+      data: expect.objectContaining({
+        reason: 'lead_delegation_backlog_requeued',
       }),
     }));
   });

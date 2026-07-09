@@ -2771,6 +2771,30 @@ export class AgentManagerDb {
     };
   }
 
+  private autoLeadDelegationBacklogKeepActive(): number {
+    const parsed = Number(process.env.ID_LEAD_BACKLOG_AUTO_KEEP_ACTIVE);
+    return Number.isFinite(parsed) && parsed >= 0 ? Math.min(20, Math.floor(parsed)) : 1;
+  }
+
+  private async autoCompactLeadDelegationBacklog(): Promise<number> {
+    if (process.env.ID_LEAD_BACKLOG_AUTO_DISABLED === 'true') return 0;
+    const keepActive = this.autoLeadDelegationBacklogKeepActive();
+    const teams = (await this.db.teams.listTeams().catch(() => [] as TeamRow[]))
+      .map((teamRow) => ({ id: teamRow.id, name: teamRow.name }));
+    if (!teams.length) return 0;
+    const report = await this.leadDelegationBacklogReport({
+      teams,
+      apply: true,
+      keepActive,
+    });
+    const totals = (report as { totals?: { requeued?: unknown } }).totals;
+    const requeued = Number(totals?.requeued ?? 0) || 0;
+    if (requeued > 0) {
+      this.managerLog(`Lead delegation backlog guard requeued ${requeued} extra lead-owned parent task(s); keepActive=${keepActive}`);
+    }
+    return requeued;
+  }
+
   private generatedBacklogReason(task: TaskRow, match: 'generated' | 'all'): string | null {
     if (match === 'all') return 'unassigned_todo';
     const description = task.description || '';
@@ -17841,6 +17865,10 @@ Return this JSON shape:
     let nudged = 0;
     let unownedAssigned = 0;
     const assignedTodoTaskIds = new Set<string>();
+
+    await this.autoCompactLeadDelegationBacklog().catch((err) => {
+      console.warn('[Manager] Lead delegation backlog auto-guard failed:', err?.message || err);
+    });
 
     if (UNOWNED_ASSIGN_MAX_PER_SWEEP > 0) {
       const assignableTodo = await this.db.tasks
