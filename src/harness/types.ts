@@ -7,6 +7,13 @@
  */
 
 export type HarnessType = 'claude-agent-sdk' | 'claude-code-cli' | 'claude-code-local' | 'codex' | 'cursor-cli' | 'public-agent-remote';
+export type CodexReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh';
+
+export const CODEX_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh'] as const;
+
+export function isCodexReasoningEffort(value: unknown): value is CodexReasoningEffort {
+  return typeof value === 'string' && (CODEX_REASONING_EFFORTS as readonly string[]).includes(value);
+}
 
 export interface PluginConfig {
   name: string;
@@ -15,6 +22,7 @@ export interface PluginConfig {
 
 export interface HarnessOptions {
   model?: string;
+  effort?: CodexReasoningEffort;
   workingDirectory?: string;
   plugins?: PluginConfig[];
   allowedTools?: string[];

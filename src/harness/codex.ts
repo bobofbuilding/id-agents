@@ -20,6 +20,33 @@ import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
 
+export function buildCodexExecArgs(
+  options: Pick<HarnessOptions, 'model' | 'effort'> & { workingDirectory: string },
+  skipPermissions: boolean,
+): string[] {
+  const args: string[] = ['exec'];
+
+  args.push('--cd', options.workingDirectory);
+  args.push('--json');
+
+  if (options.model) {
+    args.push('--model', options.model);
+  }
+
+  if (options.effort) {
+    args.push('-c', `model_reasoning_effort=${options.effort}`);
+  }
+
+  if (skipPermissions) {
+    args.push('--dangerously-bypass-approvals-and-sandbox');
+  } else {
+    args.push('--full-auto');
+  }
+
+  args.push('--skip-git-repo-check');
+  return args;
+}
+
 export class CodexHarness implements AgentHarness {
   readonly type: HarnessType = 'codex' as HarnessType;
 
@@ -33,35 +60,14 @@ export class CodexHarness implements AgentHarness {
     console.log(`[Codex] Working directory: ${workingDir}`);
     if (options.model) console.log(`[Codex] Model: ${options.model}`);
 
-    // Build arguments for codex exec. For this Codex CLI version, flags must
-    // come before the `resume` subcommand.
-    const args: string[] = ['exec'];
-
-    // Working directory
-    args.push('--cd', workingDir);
-
-    // JSON output for parsing
-    args.push('--json');
-
-    // Model override
-    if (options.model) {
-      args.push('--model', options.model);
-    }
-
     // Default to --dangerously-bypass-approvals-and-sandbox so background
     // agents can act without an interactive shell. The agent's
     // `dangerouslySkipPermissions: false` config opts back into --full-auto
     // (which keeps the workspace-write sandbox and on-request approval policy).
     const skipPermissions = process.env.ID_AGENT_SKIP_PERMISSIONS !== 'false';
-    if (skipPermissions) {
-      args.push('--dangerously-bypass-approvals-and-sandbox');
-    } else {
-      args.push('--full-auto');
-    }
+    const args = buildCodexExecArgs({ model: options.model, effort: options.effort, workingDirectory: workingDir }, skipPermissions);
+    if (options.effort) console.log(`[Codex] Reasoning effort: ${options.effort}`);
     console.log(`[Codex] Permission mode: ${skipPermissions ? '--dangerously-bypass-approvals-and-sandbox (default)' : '--full-auto (config opt-out)'}`);
-
-    // Skip git repo check in case working dir isn't a git repo
-    args.push('--skip-git-repo-check');
 
     // Write prompt to temp file to avoid shell escaping issues
     const promptFile = path.join(os.tmpdir(), `codex-prompt-${Date.now()}.txt`);

@@ -24,6 +24,11 @@ export const MODEL_ABBREVIATIONS: Record<string, string> = {
   // OpenAI Codex
   'gpt-5.4': 'gpt-5.4',
   'gpt-5.5': 'gpt-5.5',
+  // 5.6 named variants — compress to a 'g5.6-' prefix + 3-letter suffix so the
+  // version stays visible and the cell fits the MODEL column (9 chars shown).
+  'gpt-5.6-luna': 'g5.6-lun',
+  'gpt-5.6-terra': 'g5.6-ter',
+  'gpt-5.6-sol': 'g5.6-sol',
 
   // Cursor / Composer
   'composer-2': 'comp-2',

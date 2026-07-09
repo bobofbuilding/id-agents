@@ -1,6 +1,7 @@
 export interface AgentMetadata {
   runtime?: string;
   description?: string;
+  effort?: string;
   heartbeat?: boolean;
   pid?: number;
   [key: string]: unknown;

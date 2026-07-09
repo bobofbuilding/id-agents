@@ -8,7 +8,7 @@
 
 import express from 'express';
 import fetch from 'node-fetch';
-import { createHarness, HarnessType, AgentHarness } from './harness/index.js';
+import { createHarness, HarnessType, AgentHarness, type CodexReasoningEffort } from './harness/index.js';
 import { withInterAgentSkill } from './inter-agent-skill.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -154,6 +154,7 @@ export class AgentRestServer {
   private lastSessionId?: string;  // Persisted session ID for conversation continuity
   private pendingReplyWaiters: Map<string, ReplyWaiter> = new Map(); // queryId -> waiter
   private model: string;
+  private effort: CodexReasoningEffort | undefined;
 
   // Agent catalog - dynamic fields agents can update themselves
   // These are exposed in /.well-known/restap.json
@@ -204,6 +205,7 @@ export class AgentRestServer {
 
   constructor(options: {
     model?: string;
+    effort?: CodexReasoningEffort;
     workingDirectory?: string;
     sharedDirectory?: string;
     allowedTools?: string[];
@@ -214,6 +216,7 @@ export class AgentRestServer {
   } = {}) {
     const resolvedRuntime = resolveRuntime(process.env.ID_HARNESS || 'claude-agent-sdk');
     this.model = options.model || process.env.CLAUDE_MODEL || getDefaultModelForRuntime(resolvedRuntime);
+    this.effort = options.effort;
     this.workingDirectory = options.workingDirectory || process.cwd();
     // Shared dir is team-scoped by the manager (e.g. /workspace/teams/<team>).
     // All agents in the same team share this directory.
@@ -1727,6 +1730,7 @@ ${prompt}`
 
       for await (const message of this.harness.run(enhancedPrompt, {
         model: this.model,
+        effort: this.effort,
         allowedTools: this.allowedTools,
         workingDirectory: this.workingDirectory,
         resume: allowSessionResume ? sessionId : undefined,

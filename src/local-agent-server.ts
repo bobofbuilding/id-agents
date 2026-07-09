@@ -27,6 +27,7 @@ import {
   resolveRuntime,
   usesCliLogin,
 } from './runtime/registry.js';
+import { isCodexReasoningEffort, type CodexReasoningEffort } from './harness/types.js';
 
 interface LocalAgentConfig {
   name: string;
@@ -34,6 +35,7 @@ interface LocalAgentConfig {
   port?: number;
   workingDirectory?: string;
   model?: string;
+  effort?: CodexReasoningEffort;
   managerUrl?: string;
   agentId?: string;  // Pre-registered agent ID from manager
   verbose?: boolean; // Enable detailed logging of agent activity
@@ -141,6 +143,7 @@ export async function startLocalAgent(config: LocalAgentConfig): Promise<{
     port: requestedPort,
     workingDirectory: configWorkDir,
     model = process.env.CLAUDE_MODEL || getDefaultModelForRuntime(runtime),
+    effort = isCodexReasoningEffort(process.env.ID_AGENT_EFFORT) ? process.env.ID_AGENT_EFFORT : undefined,
     managerUrl = process.env.MANAGER_URL || 'http://127.0.0.1:4100',
     agentId: preRegisteredId
   } = config;
@@ -208,7 +211,7 @@ export async function startLocalAgent(config: LocalAgentConfig): Promise<{
         working_directory: workingDirectory,
         status: 'running',
         created_at: Date.now(),
-        metadata: { name, service_type: 'REST-AP', service: `http://localhost:${port}`, runtime, local: true, pid: process.pid },
+        metadata: { name, service_type: 'REST-AP', service: `http://localhost:${port}`, runtime, local: true, pid: process.pid, ...(effort && { effort }) },
       });
       console.log(`📦 Registered in database (team: ${team})`);
     }
@@ -254,6 +257,7 @@ export async function startLocalAgent(config: LocalAgentConfig): Promise<{
   // Create the server
   const server = new AgentRestServer({
     model,
+    effort,
     workingDirectory,
     sharedDirectory,
     agentName: name,

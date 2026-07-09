@@ -78,7 +78,7 @@ import { closeLinkedCheckinsForTerminalTask } from './checkins/checkin-autoclose
 import type { CheckinRow } from './db/types.js';
 import { parseAgentRef, normalizeAlias, buildAmbiguityWarning, type AgentMatch } from './core/agent-identifier.js';
 import { resolveNewsTrigger } from './core/messaging-service.js';
-import type { HarnessType } from './harness/types.js';
+import { isCodexReasoningEffort, type CodexReasoningEffort, type HarnessType } from './harness/types.js';
 import { SchedulerService, synthesizeForceHeartbeat } from './scheduling/scheduler-service.js';
 import type { DispatchTarget } from './scheduling/schedule-types.js';
 import { heartbeatToSchedule, calendarToSchedule, validateIntervalSeconds, HEARTBEAT_GENERIC_MESSAGE } from './scheduling/schedule-config.js';
@@ -587,6 +587,9 @@ export class AgentManagerDb {
     // Add talkTimeout setting from metadata (default timeout for /talk-to requests)
     if (agent.metadata?.talkTimeout) {
       env.ID_TALK_TIMEOUT = String(agent.metadata.talkTimeout);
+    }
+    if (typeof agent.metadata?.effort === 'string') {
+      env.ID_AGENT_EFFORT = agent.metadata.effort;
     }
 
     return env;
@@ -3076,7 +3079,7 @@ export class AgentManagerDb {
         teamId = team.id;
         teamName = team.name;
 
-        const { name, type: agentType, model, runtime, allowedTools, pluginPath, plugins, skills, metadata: reqMetadata, local, agent, roleBody, heartbeat, openMode, workingDirectory: configWorkDir, verbose, dangerouslySkipPermissions, domain, tokenId, address } = req.body || {};
+        const { name, type: agentType, model, runtime, allowedTools, pluginPath, plugins, skills, metadata: reqMetadata, local, agent, roleBody, heartbeat, openMode, workingDirectory: configWorkDir, verbose, dangerouslySkipPermissions, effort, domain, tokenId, address } = req.body || {};
         const agentOverlay = agent;
         if (!name) return res.status(400).json({ error: 'Missing name' });
         const agentNameCheck = validateName(name, 'agent');
@@ -3106,6 +3109,20 @@ export class AgentManagerDb {
         }
 
         const effectiveRuntime = resolveRuntime(runtime);
+        let reasoningEffort: CodexReasoningEffort | undefined;
+        if (effort !== undefined) {
+          if (!isCodexReasoningEffort(effort)) {
+            return res.status(400).json({
+              error: `effort must be one of: low, medium, high, xhigh`
+            });
+          }
+          if (effectiveRuntime !== 'codex') {
+            return res.status(400).json({
+              error: 'effort is only supported for runtime: codex'
+            });
+          }
+          reasoningEffort = effort;
+        }
 
         id = `agent_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
         // Use config-specified working directory if provided, otherwise use workspace
@@ -3192,6 +3209,7 @@ export class AgentManagerDb {
           // Flag that heartbeat is enabled (actual config read from HEARTBEAT.yaml)
           ...(heartbeat && { heartbeat: true }),
           ...(openMode !== undefined && { openMode: openMode === true || openMode === 'true' }),
+          ...(reasoningEffort && { effort: reasoningEffort }),
           ...(dangerouslySkipPermissions !== undefined && { dangerouslySkipPermissions: dangerouslySkipPermissions === true || dangerouslySkipPermissions === 'true' })
         };
 
@@ -6405,6 +6423,7 @@ export class AgentManagerDb {
             skills: normalizedSkills,
             allowed_tools: spec.allowedTools,
             description: spec.description,
+            ...(spec.effort && { effort: spec.effort }),
             ...(isAutomator && { isAutomator: true }),
             ...(spec.heartbeat && { heartbeat: true }),
             ...(spec.dangerouslySkipPermissions !== undefined && { dangerouslySkipPermissions: spec.dangerouslySkipPermissions }),
@@ -6442,6 +6461,7 @@ export class AgentManagerDb {
           }
 
           const updatedMeta: AgentMetadata = walletMeta.metadata;
+          if (spec.effort === undefined) delete updatedMeta.effort;
 
           await this.db.agents.updateStatus(row.id, 'starting', {
             model: effectiveModel,
@@ -6516,6 +6536,7 @@ export class AgentManagerDb {
               skills: normalizedSkills,
               allowed_tools: spec.allowedTools,
               description: spec.description,
+              ...(spec.effort && { effort: spec.effort }),
               ...(isAutomator && { isAutomator: true }),
               ...(spec.heartbeat && { heartbeat: true }),
               ...(spec.openMode !== undefined && { openMode: spec.openMode }),
@@ -6837,6 +6858,7 @@ export class AgentManagerDb {
               ...(normalizedSkills && { skills: normalizedSkills }),
               allowed_tools: agentConfig.allowedTools,
               description: agentConfig.description,
+              ...(agentConfig.effort && { effort: agentConfig.effort }),
               ...(isAutomator && { isAutomator: true }),
               // Flag that heartbeat is enabled
               ...(heartbeatConfig && { heartbeat: true }),
@@ -8778,6 +8800,7 @@ export class AgentManagerDb {
     const skipPermsRaw = (agentRow?.metadata as any)?.dangerouslySkipPermissions;
     const skipPermissions = skipPermsRaw === false ? false : true;
     const catalogSeed = (agentRow?.metadata as any)?.catalog;
+    const effort = (agentRow?.metadata as any)?.effort;
     const catalogEnv = catalogSeed && typeof catalogSeed === 'object'
       ? Buffer.from(JSON.stringify(catalogSeed), 'utf8').toString('base64')
       : undefined;
@@ -8799,6 +8822,7 @@ export class AgentManagerDb {
       MANAGER_URL: `http://127.0.0.1:4100`,
       ID_AGENT_SKIP_PERMISSIONS: skipPermissions ? 'true' : 'false',
       ...(model && { CLAUDE_MODEL: resolveModelAlias(model) }),
+      ...(typeof effort === 'string' && { ID_AGENT_EFFORT: effort }),
       ...(tokenId && { ID_AGENT_TOKEN_ID: tokenId }),
       ...(owsWallet && { OWS_WALLET: owsWallet }),
       ...(catalogEnv && { ID_AGENT_CATALOG: catalogEnv }),

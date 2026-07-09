@@ -11,6 +11,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { HarnessType, isValidHarnessType, getAvailableHarnesses } from './harness/index.js';
+import { CODEX_REASONING_EFFORTS, type CodexReasoningEffort, isCodexReasoningEffort } from './harness/types.js';
 import {
   getDefaultRuntime,
   resolveRuntime,
@@ -72,6 +73,7 @@ export interface AgentSpec {
   openMode?: boolean;                 // Allow XMTP messages from any sender when no allowlist is configured
   description?: string;
   model?: string;
+  effort?: CodexReasoningEffort;       // Codex runtime only: model_reasoning_effort
   systemPrompt?: string;              // Custom system prompt for the agent
   roleBody?: string;                  // Agent role content from .claude/agents/<name>.md (set by processConfig)
   plugins?: PluginConfig[];           // Skill plugins
@@ -161,6 +163,7 @@ export interface DeployConfig {
   defaults?: {
     runtime?: HarnessType;              // Default harness for all agents
     model?: string;
+    effort?: CodexReasoningEffort;      // Default Codex reasoning effort
     plugins?: PluginConfig[];           // Skill plugins
     skills?: string[];                  // Default skills for all agents
     allowedTools?: string[];
@@ -528,6 +531,19 @@ export function validateConfig(config: DeployConfig): ValidationResult {
 
     const effectiveRuntime = resolveRuntime(agent.runtime || defaultRuntime);
     const effectiveModel = agent.model || config.defaults?.model;
+    if (agent.effort !== undefined) {
+      if (!isCodexReasoningEffort(agent.effort)) {
+        errors.push({
+          path: `${agentPath}.effort`,
+          message: `effort must be one of: ${CODEX_REASONING_EFFORTS.join(', ')}`
+        });
+      } else if (effectiveRuntime !== 'codex') {
+        errors.push({
+          path: `${agentPath}.effort`,
+          message: 'effort is only supported for runtime: codex'
+        });
+      }
+    }
     for (const issue of validateRuntimeModelCompatibility(effectiveRuntime, effectiveModel)) {
       errors.push({
         path: agent.model ? `${agentPath}.model` : `${agentPath}.runtime`,
@@ -580,6 +596,20 @@ export function validateConfig(config: DeployConfig): ValidationResult {
         path: config.defaults.model ? 'defaults.model' : 'defaults.runtime',
         message: issue.message
       });
+    }
+
+    if (config.defaults.effort !== undefined) {
+      if (!isCodexReasoningEffort(config.defaults.effort)) {
+        errors.push({
+          path: 'defaults.effort',
+          message: `effort must be one of: ${CODEX_REASONING_EFFORTS.join(', ')}`
+        });
+      } else if (defaultRuntime !== 'codex') {
+        errors.push({
+          path: 'defaults.effort',
+          message: 'effort is only supported for runtime: codex'
+        });
+      }
     }
 
     if (config.defaults.plugins) {
@@ -1144,6 +1174,11 @@ export function mergeDefaults(agent: AgentSpec, defaults: DeployConfig['defaults
   // Model: agent overrides defaults
   if (!merged.model && defaults.model) {
     merged.model = defaults.model;
+  }
+
+  // Codex reasoning effort: agent overrides defaults
+  if (!merged.effort && defaults.effort) {
+    merged.effort = defaults.effort;
   }
 
   // Plugins: merge (agent plugins take precedence for same name)

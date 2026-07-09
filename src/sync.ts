@@ -29,6 +29,7 @@ export interface SyncResult {
 
 const DIFF_FIELDS = [
   'model',
+  'effort',
   'runtime',
   'plugins',
   'agent',
@@ -116,6 +117,7 @@ function configFields(spec: AgentSpec, defaultModel?: string): Record<string, st
   const runtime = normalizeRuntime(spec.runtime);
   return {
     model: normalizeModel(spec.model, spec.runtime, defaultModel),
+    effort: spec.effort || '',
     runtime,
     plugins: normalizePlugins(spec.plugins),
     agent: spec.agent || '',
@@ -137,6 +139,7 @@ function runningFields(row: AgentRow): Record<string, string> {
   const meta = (row.metadata || {}) as Record<string, any>;
   return {
     model: row.model || '',
+    effort: typeof meta.effort === 'string' ? meta.effort : '',
     runtime: normalizeRuntime(row.runtime),
     plugins: normalizePlugins(meta.plugins),
     agent: meta.agent || '',

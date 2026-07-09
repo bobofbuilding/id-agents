@@ -5,6 +5,8 @@ import { padRight, truncate, humanizeLastSeen } from '../util/format.js';
 import { statusColor, healthColor, healthDot } from '../util/colors.js';
 import { formatMemory, memoryColor } from '../util/memory.js';
 import { abbrevModel } from '../util/models.js';
+import { abbrevEffort } from '../util/effort.js';
+import { abbrevStatus, abbrevHealth } from '../util/status.js';
 
 interface AgentRowProps {
   agent: Agent;
@@ -18,12 +20,13 @@ interface AgentRowProps {
 // Column widths for local agents
 const COLS = {
   marker: 2,
-  name: 17,
+  name: 16,
   port: 6,
-  runtime: 12,
-  model: 10, // abbreviated via util/models.ts (e.g. 'opus-4-7', 'sonn-4-6', 'comp-2')
-  status: 9,
-  health: 11,
+  runtime: 10,
+  model: 9, // abbreviated via util/models.ts (e.g. 'opus-4-7', 'sonn-4-6', 'comp-2')
+  effort: 4,
+  status: 4,
+  health: 6,
   news: 2,
   hb: 3,
   mem: 8,
@@ -34,17 +37,18 @@ const COLS = {
 // two extra columns: DOMAIN and DMZ appended at the end.
 const REMOTE_COLS = {
   marker: 2,
-  name: 17,
+  name: 16,
   port: 6,    // renders '—' but keeps same width
-  runtime: 12,
-  model: 10,
-  status: 9,
-  health: 11,
+  runtime: 10,
+  model: 9,
+  effort: 4,
+  status: 4,
+  health: 6,
   news: 2,
   hb: 3,
   mem: 8,     // renders '—' but keeps same width
   uptime: 14, // wider to show "Xm ago"
-  domain: 18, // customer_domain truncated to 17 chars + overflow '…'
+  domain: 16, // customer_domain truncated to 15 chars + overflow '…'
   dmz: 3,     // DMZ badge (3 chars) or empty
 } as const;
 
@@ -60,7 +64,14 @@ function abbrevRuntime(rt?: string): string {
 }
 
 function renderHealth(health: string): string {
-  return `${healthDot(health)} ${health}`;
+  // Online → green dot only (drop the literal "online" label). Other states
+  // keep the dot plus a short label.
+  if (health === 'online') return healthDot(health);
+  return `${healthDot(health)} ${abbrevHealth(health)}`;
+}
+
+function renderEffort(agent: Agent): string {
+  return abbrevEffort(typeof agent.metadata?.effort === 'string' ? agent.metadata.effort : undefined);
 }
 
 function isRemoteAgent(agent: Agent): boolean {
@@ -73,6 +84,7 @@ function AgentRowInner({ agent, selected, uptime, newsColor, memBytes, nowMs }: 
   const name = padRight(agent.alias ?? agent.name, COLS.name);
   const runtime = padRight(abbrevRuntime(agent.metadata?.runtime), COLS.runtime);
   const model = padRight(truncate(abbrevModel(agent.model), COLS.model - 1), COLS.model);
+  const effort = padRight(renderEffort(agent), COLS.effort);
   const health = padRight(renderHealth(agent.health), COLS.health);
   const hb = padRight(agent.metadata?.heartbeat ? '♥' : '-', COLS.hb);
   const newsGlyph = NEWS_GLYPH;
@@ -84,13 +96,14 @@ function AgentRowInner({ agent, selected, uptime, newsColor, memBytes, nowMs }: 
     const lastSeenStr = humanizeLastSeen(agent.last_seen, nowMs);
     const uptimeCell = padRight(lastSeenStr, REMOTE_COLS.uptime);
     const domainVal = agent.customer_domain ?? '';
-    const domainCell = padRight(truncate(domainVal, 17), REMOTE_COLS.domain);
+    const domainCell = padRight(truncate(domainVal, REMOTE_COLS.domain - 1), REMOTE_COLS.domain);
     const dmzVal = (agent.metadata as Record<string, unknown> | undefined)?.dmz === true ? 'DMZ' : '';
     const dmzCell = padRight(dmzVal, REMOTE_COLS.dmz);
 
     // STATUS column: for remote agents derive from health
     const remoteStatusLabel = agent.health === 'unknown' ? 'registered' : agent.health;
-    const remoteStatus = padRight(remoteStatusLabel, COLS.status);
+    const remoteStatus = padRight(abbrevStatus(remoteStatusLabel), REMOTE_COLS.status);
+    const remoteHealth = padRight(renderHealth(agent.health), REMOTE_COLS.health);
 
     return (
       <Text inverse={selected} wrap="truncate-end">
@@ -99,8 +112,9 @@ function AgentRowInner({ agent, selected, uptime, newsColor, memBytes, nowMs }: 
         <Text dimColor>{portCell}</Text>
         <Text dimColor>{runtime}</Text>
         <Text dimColor>{model}</Text>
+        <Text dimColor>{effort}</Text>
         <Text color={healthColor(agent.health)}>{remoteStatus}</Text>
-        <Text color={healthColor(agent.health)}>{health}</Text>
+        <Text color={healthColor(agent.health)}>{remoteHealth}</Text>
         <Text color={newsColor}>{newsGlyph}</Text>
         {' '}
         {hb}
@@ -114,7 +128,7 @@ function AgentRowInner({ agent, selected, uptime, newsColor, memBytes, nowMs }: 
 
   // Local agent row
   const port = padRight(agent.port ? String(agent.port) : '—', COLS.port);
-  const status = padRight(agent.status, COLS.status);
+  const status = padRight(abbrevStatus(agent.status), COLS.status);
   const memCell = padRight(formatMemory(memBytes), COLS.mem);
   const uptimeCell = padRight(uptime, COLS.uptime);
 
@@ -125,6 +139,7 @@ function AgentRowInner({ agent, selected, uptime, newsColor, memBytes, nowMs }: 
       {port}
       <Text dimColor>{runtime}</Text>
       <Text dimColor>{model}</Text>
+      <Text dimColor>{effort}</Text>
       <Text color={statusColor(agent.status)}>{status}</Text>
       <Text color={healthColor(agent.health)}>{health}</Text>
       <Text color={newsColor}>{newsGlyph}</Text>
@@ -152,6 +167,7 @@ export const AgentRow = React.memo(AgentRowInner, (prev, next) => {
     a.health === b.health &&
     a.model === b.model &&
     a.metadata?.runtime === b.metadata?.runtime &&
+    a.metadata?.effort === b.metadata?.effort &&
     a.metadata?.heartbeat === b.metadata?.heartbeat &&
     (a.metadata as Record<string, unknown> | undefined)?.dmz ===
       (b.metadata as Record<string, unknown> | undefined)?.dmz &&
@@ -169,8 +185,9 @@ export function AgentRowHeader(props: { hasRemote?: boolean }): React.ReactEleme
         {padRight('PORT', REMOTE_COLS.port)}
         {padRight('RUNTIME', REMOTE_COLS.runtime)}
         {padRight('MODEL', REMOTE_COLS.model)}
-        {padRight('STATUS', COLS.status)}
-        {padRight('HEALTH', COLS.health)}
+        {padRight('EFF', REMOTE_COLS.effort)}
+        {padRight('ST', REMOTE_COLS.status)}
+        {padRight('HP', REMOTE_COLS.health)}
         {padRight('N', COLS.news)}
         {padRight('HB', COLS.hb)}
         {padRight('MEM', REMOTE_COLS.mem)}
@@ -187,8 +204,9 @@ export function AgentRowHeader(props: { hasRemote?: boolean }): React.ReactEleme
       {padRight('PORT', COLS.port)}
       {padRight('RUNTIME', COLS.runtime)}
       {padRight('MODEL', COLS.model)}
-      {padRight('STATUS', COLS.status)}
-      {padRight('HEALTH', COLS.health)}
+      {padRight('EFF', COLS.effort)}
+      {padRight('ST', COLS.status)}
+      {padRight('HP', COLS.health)}
       {padRight('N', COLS.news)}
       {padRight('HB', COLS.hb)}
       {padRight('MEM', COLS.mem)}
