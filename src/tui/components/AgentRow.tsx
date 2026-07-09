@@ -6,6 +6,7 @@ import { statusColor, healthColor, healthDot } from '../util/colors.js';
 import { formatMemory, memoryColor } from '../util/memory.js';
 import { abbrevModel } from '../util/models.js';
 import { abbrevEffort } from '../util/effort.js';
+import { abbrevRuntime } from '../util/runtime.js';
 import { abbrevStatus, abbrevHealth } from '../util/status.js';
 
 interface AgentRowProps {
@@ -20,10 +21,10 @@ interface AgentRowProps {
 // Column widths for local agents
 const COLS = {
   marker: 2,
-  name: 16,
+  name: 17,
   port: 6,
-  runtime: 10,
-  model: 9, // abbreviated via util/models.ts (e.g. 'opus-4-7', 'sonn-4-6', 'comp-2')
+  runtime: 8,
+  model: 10, // abbreviated via util/models.ts (e.g. 'opus-4-7', 'sonn-4-6', 'comp-2')
   effort: 4,
   status: 4,
   health: 6,
@@ -37,10 +38,10 @@ const COLS = {
 // two extra columns: DOMAIN and DMZ appended at the end.
 const REMOTE_COLS = {
   marker: 2,
-  name: 16,
+  name: 17,
   port: 6,    // renders '—' but keeps same width
-  runtime: 10,
-  model: 9,
+  runtime: 8,
+  model: 10,
   effort: 4,
   status: 4,
   health: 6,
@@ -53,15 +54,6 @@ const REMOTE_COLS = {
 } as const;
 
 const NEWS_GLYPH = '●';
-
-function abbrevRuntime(rt?: string): string {
-  if (!rt) return '—';
-  if (rt === 'claude-code-cli') return 'claude-cli';
-  if (rt === 'claude-agent-sdk') return 'claude-sdk';
-  if (rt === 'cursor-cli') return 'cursor-cli';
-  if (rt === 'public-agent-remote') return 'juno';
-  return rt;
-}
 
 function renderHealth(health: string): string {
   // Online → green dot only (drop the literal "online" label). Other states

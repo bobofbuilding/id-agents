@@ -4,7 +4,9 @@ import { describe, expect, it } from 'vitest';
 
 import { MODEL_ALIASES, resolveModelAlias } from '../../src/agent-manager-db.js';
 import { modelDisplayName } from '../../src/claude-agent.js';
+import { abbrevEffort } from '../../src/tui/util/effort.js';
 import { abbrevModel } from '../../src/tui/util/models.js';
+import { abbrevRuntime } from '../../src/tui/util/runtime.js';
 
 describe('model alias resolution', () => {
   it('resolves the new fable/mythos aliases to canonical model ids', () => {
@@ -24,7 +26,7 @@ describe('model alias resolution', () => {
 
   it('preserves existing aliases (regression)', () => {
     expect(resolveModelAlias('haiku')).toBe('claude-haiku-4-5-20251001');
-    expect(resolveModelAlias('sonnet')).toBe('claude-sonnet-4-5-20250514');
+    expect(resolveModelAlias('sonnet')).toBe('claude-sonnet-5');
     expect(resolveModelAlias('opus')).toBe('claude-opus-4-5-20250514');
     expect(resolveModelAlias('opus-4-8')).toBe('claude-opus-4-8');
     expect(resolveModelAlias('opus-4.8')).toBe('claude-opus-4-8');
@@ -68,5 +70,26 @@ describe('TUI model abbreviations', () => {
   it('abbreviates fable and mythos model ids', () => {
     expect(abbrevModel('claude-fable-5')).toBe('fable-5');
     expect(abbrevModel('claude-mythos-5')).toBe('myth-5');
+  });
+});
+
+describe('TUI effort abbreviations', () => {
+  it('abbreviates known effort levels and passes unknowns through', () => {
+    expect(abbrevEffort('high')).toBe('hi');
+    expect(abbrevEffort('medium')).toBe('med');
+    expect(abbrevEffort('low')).toBe('lo');
+    expect(abbrevEffort('xhigh')).toBe('xhi');
+    expect(abbrevEffort(undefined)).toBe('—');
+    expect(abbrevEffort('experimental')).toBe('experimental');
+  });
+});
+
+describe('TUI runtime abbreviations', () => {
+  it('abbreviates known runtimes and passes unknowns through', () => {
+    expect(abbrevRuntime('claude-code-cli')).toBe('claude');
+    expect(abbrevRuntime('cursor-cli')).toBe('cursor');
+    expect(abbrevRuntime('codex')).toBe('codex');
+    expect(abbrevRuntime(undefined)).toBe('—');
+    expect(abbrevRuntime('experimental-runtime')).toBe('experimental-runtime');
   });
 });
