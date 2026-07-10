@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.1.107]
+
+- Keep manager parent-reconciliation prompts on delegation policy after sender-envelope wrapping. Query priority, MCP/tool access, and execution timeout are now derived from the canonical unwrapped prompt, while wrapped supervision prompts are also recognized directly for parity. This prevents completed-child parent reconciliation from being restricted to read-only tools and terminated after two 90-second attempts instead of receiving the intended 12-minute delegation window.
+
 ## [0.1.106]
 
 - Recover interrupted rate-limited work automatically: prefer another healthy subscription lane, fall back to an installed role-matched Ollama model before metered overflow, replay the original query, use bounded probe cooldowns for unclassified limits, and restore the exact preferred subscription runtime/model after cooldown. Successful retries now repair the original failed query on SQLite.
