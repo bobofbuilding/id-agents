@@ -44,6 +44,38 @@ describe('Claude CLI rate-limit detector', () => {
     });
   });
 
+  it('detects error-status stream events as HTTP 429s', () => {
+    const found = detectClaudeCliRateLimit({
+      stdout: JSON.stringify({
+        type: 'error',
+        error: 'rate_limit',
+        error_status: 429,
+        message: 'Weekly limit reached. Resets tomorrow.',
+      }),
+    });
+
+    expect(found).toMatchObject({
+      source: 'cli-stream-event',
+      status: 429,
+      reason: 'subscription_weekly_cap',
+    });
+  });
+
+  it('keeps a confirmed daily cap classification when the error result includes HTTP 429', () => {
+    expect(detectClaudeCliRateLimit({
+      stdout: JSON.stringify({
+        type: 'result',
+        is_error: true,
+        api_error_status: 429,
+        result: 'You have reached your daily limit. Resets tomorrow.',
+      }),
+    })).toMatchObject({
+      source: 'cli-json-result',
+      status: 429,
+      reason: 'subscription_daily_cap',
+    });
+  });
+
   it('detects nested Anthropic API rate_limit_error bodies', () => {
     const found = detectClaudeCliRateLimit({
       exitCode: 1,
@@ -135,11 +167,55 @@ describe('Claude CLI rate-limit detector', () => {
     });
   });
 
+  it('detects Codex model-capacity responses as transient model capacity', () => {
+    expect(detectClaudeCliRateLimit({
+      stdout: '',
+      stderr: 'Selected model is at capacity. Please try a different model.',
+    })).toMatchObject({
+      source: 'text-fallback',
+      reason: 'model_capacity',
+    });
+  });
+
   it('does not match bare rate_limit text outside structured events', () => {
     expect(detectClaudeCliRateLimit({
       stdout: '',
       stderr: 'rate_limit: something failed',
     })).toBeNull();
+  });
+
+  it('does not classify bare structured rate_limit telemetry without cap, status, or reset evidence', () => {
+    expect(detectClaudeCliRateLimit({
+      stdout: JSON.stringify({ type: 'error', error: 'rate_limit' }),
+    })).toBeNull();
+  });
+
+  it('does not classify status fields on non-error stream events', () => {
+    expect(detectClaudeCliRateLimit({
+      stdout: JSON.stringify({ type: 'status', error_status: 429, message: 'ready' }),
+    })).toBeNull();
+  });
+
+  it('accepts an explicit daily cap phrase without requiring an HTTP status', () => {
+    expect(detectClaudeCliRateLimit({
+      stdout: JSON.stringify({ type: 'error', error: 'rate_limit', message: 'Daily cap reached.' }),
+    })).toMatchObject({
+      reason: 'subscription_daily_cap',
+    });
+  });
+
+  it('accepts structured reset evidence for a rate-limit error event', () => {
+    expect(detectClaudeCliRateLimit({
+      stdout: JSON.stringify({
+        type: 'error',
+        error: 'rate_limit',
+        rate_limit_reset: '2026-07-11T00:00:00Z',
+      }),
+    })).toMatchObject({
+      source: 'cli-stream-event',
+      reason: 'unknown_rate_limit',
+      resetAt: '2026-07-11T00:00:00Z',
+    });
   });
 
   it('does not classify generic process failures as rate limits', () => {

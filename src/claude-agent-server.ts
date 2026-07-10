@@ -3181,7 +3181,9 @@ ${prompt}`
         agent_id: process.env.ID_AGENT_ID || this.dbAgentId,
         agent_name: process.env.ID_AGENT_NAME || this.agentName || this.getDisplayId(),
         runtime: this.harnessType,
-        lane_id: process.env.ID_RUNTIME_LANE_ID,
+        lane_id: rateLimit.reason === 'model_capacity'
+          ? `${this.harnessType}:model:${this.model}`
+          : process.env.ID_RUNTIME_LANE_ID,
         query_id: queryId,
         rateLimit,
       }),

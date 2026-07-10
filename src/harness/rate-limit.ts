@@ -7,6 +7,7 @@ export type RuntimeRateLimitReason =
   | 'subscription_monthly_cap'
   | 'api_rate_limit'
   | 'api_overloaded'
+  | 'model_capacity'
   | 'unknown_rate_limit';
 
 export interface RuntimeRateLimitSignal {
@@ -47,8 +48,14 @@ function retryAfterSecondsOf(value: unknown): number | undefined {
   return Number.isFinite(n) && n >= 0 ? n : undefined;
 }
 
+function resetAtOf(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
 function classify(text: string): RuntimeRateLimitReason {
-  return /\bmonthly\b/i.test(text)
+  return /selected model is at capacity|model is (?:currently )?at capacity/i.test(text)
+    ? 'model_capacity'
+    : /\bmonthly\b/i.test(text)
     ? 'subscription_monthly_cap'
     : /\bweekly\b/i.test(text)
     ? 'subscription_weekly_cap'
@@ -62,9 +69,14 @@ function classify(text: string): RuntimeRateLimitReason {
 }
 
 function reasonFor(status: number | undefined, errorType: string, message: string): RuntimeRateLimitReason {
+  const classified = classify(message);
   if (status === 529 || errorType === 'overloaded_error') return 'api_overloaded';
-  if (status === 429 && !/session limit|weekly/i.test(message)) return 'api_rate_limit';
-  return classify(message);
+  // A confirmed subscription cap remains a cap even when the CLI also reports
+  // its HTTP 429 status. The manager further narrows local fallback to daily
+  // and weekly reasons only.
+  if (classified !== 'unknown_rate_limit') return classified;
+  if (status === 429) return 'api_rate_limit';
+  return classified;
 }
 
 function resetTextFrom(text: string): string | undefined {
@@ -104,7 +116,9 @@ function signal(
 function inspectJsonObject(obj: any, source: RuntimeRateLimitSignal['source']): RuntimeRateLimitSignal | null {
   if (!obj || typeof obj !== 'object') return null;
 
-  const status = statusOf(obj.api_error_status ?? obj.apiErrorStatus ?? obj.status ?? obj.statusCode);
+  const status = statusOf(
+    obj.api_error_status ?? obj.apiErrorStatus ?? obj.error_status ?? obj.errorStatus ?? obj.status ?? obj.statusCode,
+  );
   const nestedError = objectOf(obj.error);
   const error = textOf(obj.error);
   const errorType = textOf(nestedError?.type) || error;
@@ -114,14 +128,23 @@ function inspectJsonObject(obj: any, source: RuntimeRateLimitSignal['source']): 
   const retryAfterSeconds = retryAfterSecondsOf(
     obj.retry_after ?? obj.retryAfter ?? obj.retry_after_seconds ?? obj.retryAfterSeconds,
   );
+  const resetAt = resetAtOf(
+    obj.reset_at ?? obj.resetAt ?? obj.rate_limit_reset ?? obj.rateLimitReset,
+  );
   const combined = [errorMessage, result, message, error && error !== errorType ? error : ''].filter(Boolean).join('\n');
+  const hasTrustedLimitEvidence = status === 429
+    || status === 529
+    || retryAfterSeconds !== undefined
+    || resetAt !== undefined
+    || Boolean(resetAtFromText(combined))
+    || classify(combined) !== 'unknown_rate_limit';
 
   if (status === 429 || status === 529) {
-    return signal(source, status, combined || `Claude CLI returned HTTP ${status}`, { errorType, retryAfterSeconds });
+    return signal(source, status, combined || `Claude CLI returned HTTP ${status}`, { errorType, retryAfterSeconds, resetAt });
   }
 
-  if (errorType === 'rate_limit' || errorType === 'rate_limit_error' || errorType === 'overloaded_error') {
-    return signal(source, status, combined || `Claude CLI stream event reported ${errorType}`, { errorType, retryAfterSeconds });
+  if (hasTrustedLimitEvidence && (errorType === 'rate_limit' || errorType === 'rate_limit_error' || errorType === 'overloaded_error')) {
+    return signal(source, status, combined || `Claude CLI stream event reported ${errorType}`, { errorType, retryAfterSeconds, resetAt });
   }
 
   return null;
@@ -133,7 +156,14 @@ function inspectJsonLines(stdout: string): RuntimeRateLimitSignal | null {
     if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) continue;
     try {
       const parsed = JSON.parse(trimmed);
-      const found = inspectJsonObject(parsed, parsed.type && parsed.type !== 'result' ? 'cli-stream-event' : 'cli-json-result');
+      const type = textOf(parsed.type);
+      const source = type === 'error'
+        ? 'cli-stream-event' as const
+        : (!type || type === 'result') && (parsed.is_error === true || parsed.isError === true)
+        ? 'cli-json-result' as const
+        : null;
+      if (!source) continue;
+      const found = inspectJsonObject(parsed, source);
       if (found) return found;
     } catch {
       // Ignore non-JSON noise; the CLI can mix progress text into output.
@@ -150,6 +180,9 @@ export function detectClaudeCliRateLimit(result: ClaudeCliExecutionResult): Runt
   if (jsonSignal) return jsonSignal;
 
   const text = `${stdout}\n${stderr}`;
+  if (/selected model is at capacity|model is (?:currently )?at capacity/i.test(text)) {
+    return signal('text-fallback', undefined, text.trim().slice(0, 1000));
+  }
   if (/You've hit your (session|usage) limit/i.test(text) || /chatgpt\.com\/codex\/settings\/usage/i.test(text)) {
     return signal('text-fallback', undefined, text.trim().slice(0, 1000));
   }
