@@ -3329,6 +3329,8 @@ describe('stalled task sweeper', () => {
   });
 
   it('auto-compacts extra lead-owned delegation parents before they stack as stalled work', async () => {
+    const previousLeadMaxParallel = process.env.LEAD_MAX_PARALLEL_OBJECTIVES;
+    process.env.LEAD_MAX_PARALLEL_OBJECTIVES = '1';
     const nowSec = Math.floor(NOW_MS / 1000);
     const lead = agent({
       id: 'lead-1',
@@ -3375,22 +3377,27 @@ describe('stalled task sweeper', () => {
     });
     const manager = new AgentManagerDb('/tmp/id-agents-lead-backlog-auto-guard-test', db, { libraryRoot: null }) as any;
 
-    const requeued = await manager.autoCompactLeadDelegationBacklog();
+    try {
+      const requeued = await manager.autoCompactLeadDelegationBacklog();
 
-    expect(requeued).toBe(1);
-    expect(updateFields).toHaveBeenCalledWith(extraParent.id, expect.objectContaining({
-      owner: null,
-      status: 'todo',
-      completed_at: null,
-    }));
-    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
-      topic: 'task:triaged',
-      subject_id: extraParent.uuid,
-      actor_agent_id: lead.id,
-      data: expect.objectContaining({
-        reason: 'lead_delegation_backlog_requeued',
-      }),
-    }));
+      expect(requeued).toBe(1);
+      expect(updateFields).toHaveBeenCalledWith(extraParent.id, expect.objectContaining({
+        owner: null,
+        status: 'todo',
+        completed_at: null,
+      }));
+      expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+        topic: 'task:triaged',
+        subject_id: extraParent.uuid,
+        actor_agent_id: lead.id,
+        data: expect.objectContaining({
+          reason: 'lead_delegation_backlog_requeued',
+        }),
+      }));
+    } finally {
+      if (previousLeadMaxParallel === undefined) delete process.env.LEAD_MAX_PARALLEL_OBJECTIVES;
+      else process.env.LEAD_MAX_PARALLEL_OBJECTIVES = previousLeadMaxParallel;
+    }
   });
 
   it('routes lead-owned delegation stalls to task-manager when available', async () => {

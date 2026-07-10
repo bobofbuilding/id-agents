@@ -1961,7 +1961,7 @@ export class AgentManagerDb {
    * A lead may hold up to LEAD_MAX_PARALLEL_OBJECTIVES concurrent parent
    * objectives (delegated or not) without being blocked. Only two things
    * force a block regardless of that count: (1) a task genuinely stalled
-   * past its delegation grace window with no member-owned children
+   * past the owner-stall threshold with no member-owned children
    * ('needs-delegation'), or (2) claiming another objective would push the
    * lead's held count past the configured limit — in which case every
    * held objective still missing delegation is reported so the caller sees
@@ -1984,7 +1984,11 @@ export class AgentManagerDb {
       audited.push({ task: candidate, status: audit?.status });
     }
 
-    const stalledBlockers = audited.filter((item) => item.status === 'needs-delegation').map((item) => item.task);
+    const nowMs = Date.now();
+    const stallMs = this.getStallSweepMs();
+    const stalledBlockers = audited
+      .filter((item) => item.status === 'needs-delegation' && nowMs - this.taskLastActivityMs(item.task) >= stallMs)
+      .map((item) => item.task);
 
     const limit = this.getLeadMaxParallelObjectives();
     const overCapacity = doing.length + 1 > limit;
@@ -7854,27 +7858,16 @@ Return this JSON shape:
       }));
     }
 
-    const leadBacklog = await this.leadDelegationBacklogGuard({
+    const capacityBlock = await this.leadCapacityGuard({
       teamId,
       teamName,
       owner: targetAgent,
     });
-    if (leadBacklog) {
-      throw makeAutoAttachError(409, 'lead_delegation_backlog', {
-        message: leadBacklog.message,
-        blocking_tasks: leadBacklog.blockers,
-      });
-    }
-    const stalledBacklog = await this.stalledOwnerBacklogGuard({
-      teamId,
-      teamName,
-      owner: targetAgent,
-    });
-    if (stalledBacklog) {
-      throw makeAutoAttachError(409, 'stalled_task_backlog', {
-        message: stalledBacklog.message,
-        blocking_tasks: stalledBacklog.blockers,
-        triage: stalledBacklog.triage,
+    if (capacityBlock) {
+      throw makeAutoAttachError(409, capacityBlock.error, {
+        message: capacityBlock.message,
+        blocking_tasks: capacityBlock.blocking_tasks,
+        ...(capacityBlock.triage !== undefined ? { triage: capacityBlock.triage } : {}),
       });
     }
 
@@ -15889,44 +15882,43 @@ Return this JSON shape:
           // Resolve optional owner
           let ownerId: string | null = null;
           let ownerAgentForGuard: AgentRow | null = null;
-          let leadDelegationWarning: string | undefined;
-          let stalledOwnerWarning: string | undefined;
           let defaultOwnerWarning: string | undefined;
-          let stalledOwnerTriage: Record<string, unknown> | null = null;
           if (ownerRef) {
             const resolveTeam = taskTeamId || teamId;
             const { agent, error } = await this.resolveSingleAgentForCommand(resolveTeam, ownerRef);
             if (!agent) return { ok: false, error: error || `Agent "${ownerRef}" not found` };
             ownerAgentForGuard = agent;
             const taskTeamRow = await this.db.teams.getTeam(taskTeamId).catch(() => null);
-            const stalledBacklog = await this.stalledOwnerBacklogGuard({
+            const effectiveTeamName = taskTeamRow?.name || teamName;
+            const capacityBlock = await this.leadCapacityGuard({
               teamId: taskTeamId,
-              teamName: taskTeamRow?.name || teamName,
+              teamName: effectiveTeamName,
               owner: agent,
             });
-            if (stalledBacklog) {
+            // Lead-coordination parents intentionally bypass a lead-only
+            // delegation backlog, but never a merged response that also
+            // reports genuinely stalled work.
+            const leadCoordinationOverride = Boolean(
+              capacityBlock
+              && capacityBlock.error === 'lead_delegation_backlog'
+              && leadCoordination
+              && this.isConfiguredTeamLead(effectiveTeamName, agent)
+              && !capacityBlock.message.includes('stalled_task_backlog:'),
+            );
+            if (capacityBlock && !leadCoordinationOverride) {
               return {
                 ok: false,
-                error: 'stalled_task_backlog',
+                error: capacityBlock.error,
                 result: {
-                  message: stalledBacklog.message,
-                  blocking_tasks: stalledBacklog.blockers,
-                  triage: stalledBacklog.triage,
+                  message: capacityBlock.message,
+                  blocking_tasks: capacityBlock.blocking_tasks,
+                  ...(capacityBlock.triage !== undefined ? { triage: capacityBlock.triage } : {}),
                   brief_validation: brief.validation,
                 },
               };
-            } else if (await this.hasDoingTaskRoom(taskTeamId)) {
-              const effectiveTeamName = taskTeamRow?.name || teamName;
-              const leadBacklog = await this.leadDelegationBacklogGuard({
-                teamId: taskTeamId,
-                teamName: effectiveTeamName,
-                owner: agent,
-              });
-              if (leadBacklog && !(leadCoordination && this.isConfiguredTeamLead(effectiveTeamName, agent))) {
-                leadDelegationWarning = leadBacklog.message;
-              } else {
-                ownerId = agent.id;
-              }
+            }
+            if (await this.hasDoingTaskRoom(taskTeamId)) {
+              ownerId = agent.id;
             }
           } else {
             const taskTeamRow = await this.db.teams.getTeam(taskTeamId).catch(() => null);
@@ -15999,8 +15991,6 @@ Return this JSON shape:
           const now = Math.floor(Date.now() / 1000);
           const status = ownerId ? 'doing' : 'todo';
           const queuedByDoingLimit = Boolean(ownerRef && !ownerId);
-          const queuedByLeadDelegation = Boolean(leadDelegationWarning);
-          const queuedByStalledOwner = Boolean(stalledOwnerWarning);
           // Resolve created_by from callerFrom if present
           let createdBy: string | null = null;
           if (callerFrom) {
@@ -16053,9 +16043,7 @@ Return this JSON shape:
             });
           }
           const warnings = [
-            queuedByDoingLimit && !queuedByLeadDelegation && !queuedByStalledOwner ? await this.doingTaskLimitMessage(taskTeamId) : undefined,
-            leadDelegationWarning,
-            stalledOwnerWarning,
+            queuedByDoingLimit ? await this.doingTaskLimitMessage(taskTeamId) : undefined,
             defaultOwnerWarning,
           ].filter((item): item is string => Boolean(item));
 
@@ -16069,7 +16057,6 @@ Return this JSON shape:
 	              owner_wake: ownerWake,
 	              specialist_routing: specialistRouting || undefined,
 	              warning: warnings.length ? warnings.join(' ') : undefined,
-	              stalled_task_triage: stalledOwnerTriage || undefined,
 	              brief_validation: brief.validation,
             },
           };

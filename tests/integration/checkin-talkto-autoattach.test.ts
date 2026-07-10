@@ -249,6 +249,66 @@ function validBriefFields() {
   };
 }
 
+async function seedCombinedLeadCapacityBlockers(
+  db: Awaited<ReturnType<typeof createInMemoryDb>>,
+  teamId: string,
+  leadId: string,
+  memberId: string,
+  prefix: string,
+  uuids: { undelegated: string; stalled: string; child: string },
+): Promise<{ undelegatedRef: string; stalledRef: string }> {
+  const now = Math.floor(Date.now() / 1000);
+  const stalledName = `${prefix}-stalled-parent`;
+
+  await db.tasks.create({
+    id: `task_${prefix}_undelegated`,
+    name: `${prefix}-undelegated-parent`,
+    uuid: uuids.undelegated,
+    team_id: teamId,
+    title: 'Undelegated alpha objective',
+    description: 'Lead-owned objective without member-owned child tasks',
+    status: 'doing',
+    created_by: leadId,
+    owner: leadId,
+    created_at: now - 4_000,
+    updated_at: now - 3_000,
+    completed_at: null,
+  });
+  await db.tasks.create({
+    id: `task_${prefix}_stalled`,
+    name: stalledName,
+    uuid: uuids.stalled,
+    team_id: teamId,
+    title: 'Stalled beta migration',
+    description: 'Lead-owned objective with delegated child work, but no recent activity',
+    status: 'doing',
+    created_by: leadId,
+    owner: leadId,
+    created_at: now - 4_000,
+    updated_at: now - 3_000,
+    completed_at: null,
+  });
+  await db.tasks.create({
+    id: `task_${prefix}_stalled_child`,
+    name: `worker-followup-${uuids.child.replace(/-/g, '').slice(0, 8)}`,
+    uuid: uuids.child,
+    team_id: teamId,
+    title: 'Worker follow-up for stalled migration',
+    description: `Member-owned child of ${stalledName}`,
+    status: 'doing',
+    created_by: leadId,
+    owner: memberId,
+    created_at: now - 3_900,
+    updated_at: now - 3_900,
+    completed_at: null,
+  });
+
+  return {
+    undelegatedRef: `#${uuids.undelegated.replace(/-/g, '').slice(0, 8)}`,
+    stalledRef: `#${uuids.stalled.replace(/-/g, '').slice(0, 8)}`,
+  };
+}
+
 function buildCheckinRow(overrides: Partial<CheckinRow> & Pick<CheckinRow, 'id' | 'team_id' | 'owner_agent_id' | 'linked_task_id'>): CheckinRow {
   const now = Date.now();
   return {
@@ -962,12 +1022,13 @@ describe('/talk-to auto-attach', () => {
     expect(cliBlocked.status).toBe(200);
     const cliBlockedBody = await cliBlocked.json() as {
       ok: boolean;
-      result?: { warning?: string; task?: { status?: string; ownerName?: string | null } };
+      error?: string;
+      result?: { message?: string; blocking_tasks?: string[] };
     };
-    expect(cliBlockedBody).toMatchObject({ ok: true });
-    expect(cliBlockedBody.result?.warning).toContain('lead_delegation_backlog');
-    expect(cliBlockedBody.result?.task?.status).toBe('todo');
-    expect(cliBlockedBody.result?.task?.ownerName).toBeNull();
+    expect(cliBlockedBody).toMatchObject({ ok: false, error: 'lead_delegation_backlog' });
+    expect(cliBlockedBody.result?.message).toContain('lead_delegation_backlog');
+    expect(cliBlockedBody.result?.blocking_tasks).toBeDefined();
+    expect(await db.tasks.getByNameForTeam('cli-blocked-lead-parent', engTeamId)).toBeNull();
     } finally {
       if (previousLeadMaxParallel === undefined) delete process.env.LEAD_MAX_PARALLEL_OBJECTIVES;
       else process.env.LEAD_MAX_PARALLEL_OBJECTIVES = previousLeadMaxParallel;
@@ -1039,14 +1100,59 @@ describe('/talk-to auto-attach', () => {
     expect(fourthBody.default_owner_routing?.warning).toContain('lead_delegation_backlog');
   });
 
+  it('does not block an under-limit lead merely because one objective is past delegation grace', async () => {
+    const previousLeadMaxParallel = process.env.LEAD_MAX_PARALLEL_OBJECTIVES;
+    process.env.LEAD_MAX_PARALLEL_OBJECTIVES = '3';
+    try {
+      const engTeamId = await db.teams.getOrCreateTeamId('engineering-team');
+      const leadId = await getOrInsertAgent(db, engTeamId, 'engineering-lead', null);
+      const now = Math.floor(Date.now() / 1000);
+
+      await db.tasks.create({
+        id: 'task_under_limit_grace_parent',
+        name: 'under-limit-grace-parent',
+        uuid: '22222220-2222-4222-8222-222222222222',
+        team_id: engTeamId,
+        title: 'Under-limit grace parent',
+        description: 'Past delegation grace but not idle long enough for stalled_task_backlog',
+        status: 'doing',
+        created_by: leadId,
+        owner: leadId,
+        created_at: now - 900,
+        updated_at: now - 900,
+        completed_at: null,
+      });
+
+      const created = await fetch(`${baseUrl}/tasks`, {
+        method: 'POST',
+        headers: adminHeaders('engineering-team'),
+        body: JSON.stringify({
+          title: 'Second under-limit objective',
+          name: 'second-under-limit-objective',
+          from: 'engineering-lead',
+          ...validBriefFields(),
+        }),
+      });
+
+      expect(created.status).toBe(201);
+      const body = await created.json() as { task?: { ownerName?: string | null; status?: string } };
+      expect(body.task?.ownerName).toBe('engineering-lead');
+      expect(body.task?.status).toBe('doing');
+    } finally {
+      if (previousLeadMaxParallel === undefined) delete process.env.LEAD_MAX_PARALLEL_OBJECTIVES;
+      else process.env.LEAD_MAX_PARALLEL_OBJECTIVES = previousLeadMaxParallel;
+    }
+  });
+
   it('returns blockers from both capacity gates in a single claim response instead of one at a time', async () => {
     const engTeamId = await db.teams.getOrCreateTeamId('engineering-team');
     const leadId = await getOrInsertAgent(db, engTeamId, 'engineering-lead', null);
     const memberId = await getOrInsertAgent(db, engTeamId, 'implementation-engineer', null);
     const now = Math.floor(Date.now() / 1000);
 
-    // Blocker #1: an undelegated lead objective past the 10-minute
-    // delegation grace window (genuinely needs delegation).
+    // Blocker #1: an undelegated lead objective idle past the stalled-task
+    // threshold (genuinely needs delegation now, not just over the fresh
+    // delegation grace).
     await db.tasks.create({
       id: 'task_transparency_undelegated',
       name: 'transparency-undelegated-parent',
@@ -1057,8 +1163,8 @@ describe('/talk-to auto-attach', () => {
       status: 'doing',
       created_by: leadId,
       owner: leadId,
-      created_at: now - 900,
-      updated_at: now - 900,
+      created_at: now - 4000,
+      updated_at: now - 3000,
       completed_at: null,
     });
 
@@ -1121,6 +1227,87 @@ describe('/talk-to auto-attach', () => {
     expect(claimBody.blocking_tasks).toContain('#33333332');
     expect(claimBody.message).toContain('lead_delegation_backlog');
     expect(claimBody.message).toContain('stalled_task_backlog');
+  });
+
+  it('returns both capacity blocker types from /talk-to auto-attach in one 409 response', async () => {
+    const engTeamId = await db.teams.getOrCreateTeamId('engineering-team');
+    const leadId = await getOrInsertAgent(db, engTeamId, 'engineering-lead', null);
+    const memberId = await getOrInsertAgent(db, engTeamId, 'implementation-engineer', null);
+    await getOrInsertAgent(db, engTeamId, 'manager', null);
+    const refs = await seedCombinedLeadCapacityBlockers(db, engTeamId, leadId, memberId, 'talkto-capacity', {
+      undelegated: '71000001-0000-4000-8000-000000000001',
+      stalled: '71000002-0000-4000-8000-000000000002',
+      child: '71000003-0000-4000-8000-000000000003',
+    });
+
+    const response = await fetch(`${baseUrl}/talk-to`, {
+      method: 'POST',
+      headers: adminHeaders('engineering-team'),
+      body: JSON.stringify({
+        to: 'engineering-lead',
+        from: 'manager',
+        message: 'Create another lead objective',
+        wait: false,
+        task: {
+          title: 'Talk-to combined-capacity objective',
+          name: 'talkto-combined-capacity-objective',
+          ...validBriefFields(),
+        },
+      }),
+    });
+
+    expect(response.status).toBe(409);
+    const body = await response.json() as {
+      error: string;
+      message?: string;
+      blocking_tasks?: string[];
+      triage?: Record<string, unknown> | null;
+    };
+    expect(body.error).toBe('lead_delegation_backlog');
+    expect(body.message).toContain('lead_delegation_backlog');
+    expect(body.message).toContain('stalled_task_backlog');
+    expect(body.blocking_tasks).toEqual(expect.arrayContaining([refs.undelegatedRef, refs.stalledRef]));
+    expect(await db.tasks.getByNameForTeam('talkto-combined-capacity-objective', engTeamId)).toBeNull();
+    expect(await db.checkins.list({ teamId: engTeamId })).toHaveLength(0);
+  });
+
+  it('returns both capacity blocker types from remote owner-targeted task creation in one response', async () => {
+    const engTeamId = await db.teams.getOrCreateTeamId('engineering-team');
+    const leadId = await getOrInsertAgent(db, engTeamId, 'engineering-lead', null);
+    const memberId = await getOrInsertAgent(db, engTeamId, 'implementation-engineer', null);
+    await getOrInsertAgent(db, engTeamId, 'manager', null);
+    const refs = await seedCombinedLeadCapacityBlockers(db, engTeamId, leadId, memberId, 'remote-capacity', {
+      undelegated: '72000001-0000-4000-8000-000000000001',
+      stalled: '72000002-0000-4000-8000-000000000002',
+      child: '72000003-0000-4000-8000-000000000003',
+    });
+
+    const response = await fetch(`${baseUrl}/remote`, {
+      method: 'POST',
+      headers: adminHeaders('engineering-team'),
+      body: JSON.stringify({
+        from: 'manager',
+        command: '/task create "Remote combined-capacity objective" --name remote-combined-capacity-objective --owner engineering-lead --goal goal_mr4khc5x_lf68y --expected-output "implementation patch and tests" --acceptance "returns both blocker types" --validation-path "coder and researcher" --out-of-scope "unrelated guard refactors" --backlog-policy "Non-required follow-ups become backlog candidates." --bittrees-relevance "medium: improves manager delegation reliability for Bittrees contributor work."',
+      }),
+    });
+
+    // /remote keeps its established HTTP-200 command-envelope contract;
+    // the task-create operation itself returns the capacity conflict.
+    expect(response.status).toBe(200);
+    const body = await response.json() as {
+      ok: boolean;
+      error?: string;
+      result?: {
+        message?: string;
+        blocking_tasks?: string[];
+        triage?: Record<string, unknown> | null;
+      };
+    };
+    expect(body).toMatchObject({ ok: false, error: 'lead_delegation_backlog' });
+    expect(body.result?.message).toContain('lead_delegation_backlog');
+    expect(body.result?.message).toContain('stalled_task_backlog');
+    expect(body.result?.blocking_tasks).toEqual(expect.arrayContaining([refs.undelegatedRef, refs.stalledRef]));
+    expect(await db.tasks.getByNameForTeam('remote-combined-capacity-objective', engTeamId)).toBeNull();
   });
 
   it('lets the pre-assigned owner claim a dead-state todo task (owner set, status still todo)', async () => {
