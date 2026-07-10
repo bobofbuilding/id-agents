@@ -168,6 +168,10 @@ Please inspect the repository, edit the integration, and run the test suite.`)).
   it('restricts control-plane prompts to read-only local tools', () => {
     const configured = ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'WebSearch', 'WebFetch'];
     const taskManagerTriage = 'TASK DELEGATION from manager: You are assigned task-manager triage for engineering-team task #fdcc9380 ("Inventory engineering skills"). Use the manager task flow to reassign or park it.';
+    const wrappedParentReconciliation = `[Message from the manager (your owner/operator) | Query ID: query_test]
+[Respond directly and helpfully — this is the person who manages you.]
+
+Supervision: Manager DB confirms parent task #f7d643d3 ("Codify validation decisions") exists and all detected delegated child tasks are done.`;
 
     expect(allowedToolsForPrompt('Supervision: task #12345678 has been in progress 48m.', configured))
       .toEqual(['Read', 'Glob', 'Grep']);
@@ -184,6 +188,8 @@ Please inspect the repository, edit the integration, and run the test suite.`)).
     expect(allowedToolsForPrompt('Team objective: Decompose this objective into member-owned work.', configured))
       .toEqual(['Read', 'Bash', 'Glob', 'Grep']);
     expect(allowedToolsForPrompt('You are the team lead. Break the objective below into sub-tasks.', configured))
+      .toEqual(['Read', 'Bash', 'Glob', 'Grep']);
+    expect(allowedToolsForPrompt(wrappedParentReconciliation, configured))
       .toEqual(['Read', 'Bash', 'Glob', 'Grep']);
     expect(allowedToolsForPrompt('IDACC Learn routed this material to the default team lead for digestion.', configured))
       .toEqual(configured);
@@ -202,6 +208,10 @@ Please inspect the repository, edit the integration, and run the test suite.`)).
     delete process.env.ID_AGENT_DELEGATION_QUERY_TIMEOUT_MS;
 
     try {
+      const wrappedParentReconciliation = `[Message from the manager (your owner/operator) | Query ID: query_test]
+[Respond directly and helpfully — this is the person who manages you.]
+
+Supervision: Manager DB confirms parent task #f7d643d3 ("Codify validation decisions") exists and all detected delegated child tasks are done.`;
       expect(queryExecutionTimeoutMsForPrompt('Backlog guard: task #12345678 has been active 60m with no progress update.'))
         .toBe(90_000);
       expect(queryExecutionTimeoutMsForPrompt('Control ping after manager restart: reply OK only.'))
@@ -213,6 +223,8 @@ Please inspect the repository, edit the integration, and run the test suite.`)).
       expect(queryExecutionTimeoutMsForPrompt('Lead delegation kickoff: task #12345678 is assigned to you as the team coordinator.'))
         .toBe(720_000);
       expect(queryExecutionTimeoutMsForPrompt('Supervision: Manager DB confirms parent task #f7d643d3 ("Codify validation decisions") exists and all detected delegated child tasks are done.'))
+        .toBe(720_000);
+      expect(queryExecutionTimeoutMsForPrompt(wrappedParentReconciliation))
         .toBe(720_000);
       expect(queryExecutionTimeoutMsForPrompt('Team objective: Decompose this objective into member-owned work.'))
         .toBe(720_000);
@@ -239,6 +251,14 @@ Please inspect the repository, edit the integration, and run the test suite.`)).
   it('queues task-manager triage as delegation work instead of background control-plane work', () => {
     expect(classifyQueryQueuePriority({
       prompt: 'TASK DELEGATION from manager: You are assigned task-manager triage for engineering-team task #fdcc9380 ("Inventory engineering skills"). Use the manager task flow to reassign or park it.',
+      from: 'manager',
+    })).toBe('delegation');
+
+    expect(classifyQueryQueuePriority({
+      prompt: `[Message from the manager (your owner/operator) | Query ID: query_test]
+[Respond directly and helpfully — this is the person who manages you.]
+
+Supervision: Manager DB confirms parent task #f7d643d3 ("Codify validation decisions") exists and all detected delegated child tasks are done.`,
       from: 'manager',
     })).toBe('delegation');
 

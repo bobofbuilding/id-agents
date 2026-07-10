@@ -382,6 +382,7 @@ const DELEGATION_PROMPT_PATTERNS = [
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nTeam objective:/,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nIDACC Learn (?:has ingested|routed this material)\b/i,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nLead delegation kickoff:/,
+  /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nSupervision:\s+Manager DB confirms parent task\b[\s\S]*\ball detected delegated child tasks are done\b/i,
   /^\[Message from the manager[^\n]*\]\s*\n[\s\S]*\nTask delegation/i,
   /^\[Message from agent "[^"]+"\s*\|[^\n]*\]\s*\n[\s\S]*\n\[Incoming Reply from "(?!checkin-service")[^"]+"\]/,
   /^\[Message from agent "[^"]+"\s*\|[^\n]*\]\s*\n[\s\S]*\n\[Incoming Message from "(?!checkin-service")[^"]+"\]/,
@@ -2740,12 +2741,16 @@ ${prompt}`
 
       // Read MCP servers from env (set by manager via buildLocalAgentEnv).
       // ID_MCP_SERVERS is a JSON array of McpServerSpec; parsing is tolerant.
-      const suppressMcp = operatorDirectResponse || shouldSuppressMcpForPrompt(promptForHarness);
-      const isDelegationControl = suppressMcp && isDelegationPrompt(promptForHarness);
+      // Policy is a property of the caller's canonical prompt. The sender
+      // envelope is presentation context and must not change queue class,
+      // tools, MCP access, or timeout selection.
+      const policyPrompt = prompt;
+      const suppressMcp = operatorDirectResponse || shouldSuppressMcpForPrompt(policyPrompt);
+      const isDelegationControl = suppressMcp && isDelegationPrompt(policyPrompt);
       const executionPolicy = operatorDirectResponse || (suppressMcp && !isDelegationControl) ? 'control-plane-readonly' : 'default';
       const allowedTools = operatorDirectResponse
         ? this.allowedTools.filter((tool) => CONTROL_PLANE_READONLY_TOOLS.has(tool))
-        : allowedToolsForPrompt(promptForHarness, this.allowedTools);
+        : allowedToolsForPrompt(policyPrompt, this.allowedTools);
       const mcpServers = suppressMcp ? undefined : parseMcpServersEnv(process.env.ID_MCP_SERVERS);
       if (suppressMcp && process.env.ID_MCP_SERVERS) {
         console.log(`${logTime()} [Agent] MCP suppressed for control-plane prompt ${queryId}`);
@@ -2759,7 +2764,7 @@ ${prompt}`
       }
       const executionTimeoutMs = operatorDirectResponse
         ? readOperatorDirectResponseTimeoutEnv()
-        : queryExecutionTimeoutMsForPrompt(promptForHarness);
+        : queryExecutionTimeoutMsForPrompt(policyPrompt);
       if (executionTimeoutMs) {
         const timeoutKind = operatorDirectResponse ? 'Operator fast-lane' : isDelegationControl ? 'Delegation' : suppressMcp ? 'Control-plane' : 'Delegation';
         console.log(`${logTime()} [Agent] ${timeoutKind} timeout for ${queryId}: ${executionTimeoutMs}ms`);
