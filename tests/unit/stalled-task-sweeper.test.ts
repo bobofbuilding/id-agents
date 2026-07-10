@@ -5836,6 +5836,57 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('flags stale owner-set todo work so the assigned lead can claim it', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
+    const ownedTodo = task({
+      id: 'todo-owned-1',
+      name: 'owned-todo-dead-state',
+      uuid: '98989898-8888-4777-9666-555555555555',
+      title: 'Owned todo dead state',
+      status: 'todo',
+      owner: lead.id,
+      updated_at: nowSec - 3600,
+    });
+    const db = fakeDb({
+      agents: {
+        getById: vi.fn(async (id: string) => id === lead.id ? lead : null),
+        getByName: vi.fn(async () => lead),
+        list: vi.fn(async () => [lead]),
+      },
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => {
+          if (status === 'todo') return [ownedTodo];
+          return [];
+        }),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-owned-todo-dead-state-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.sweepStalledTasks();
+
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'lead',
+      expect.stringContaining('pre-assigned to you but still status=todo'),
+    );
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'lead',
+      expect.stringContaining('POST /tasks/owned-todo-dead-state/claim'),
+    );
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      team_id: TEAM_ID,
+      topic: 'task:triaged',
+      actor_agent_id: lead.id,
+      subject_id: ownedTodo.uuid,
+      data: expect.objectContaining({
+        reason: 'owned_todo_dead_state',
+      }),
+    }));
+  });
+
   it('repairs ownerless doing work back to todo and assigns it', async () => {
     const nowSec = Math.floor(NOW_MS / 1000);
     const ownerlessDoing = task({
