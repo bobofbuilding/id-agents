@@ -271,6 +271,38 @@ describe('stalled task sweeper', () => {
     }), NOW_MS)).toBe(false);
   });
 
+  it('detects goal-less duplicate open tasks by title before creating another copy', async () => {
+    const existing = task({
+      name: 'specify-agent-workflow',
+      uuid: '6837df10-d9c5-4848-b093-f7ead813ca82',
+      title: 'Specify agent workflow',
+      status: 'doing',
+      description: 'Define the end-to-end workflow for AI agents visiting the page.',
+    });
+    const db = fakeDb({
+      tasks: {
+        list: vi.fn(async () => [existing]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-goalless-task-duplicate-test', db, { libraryRoot: null }) as any;
+
+    const duplicate = await manager.findDuplicateTaskByGoalSignature(TEAM_ID, {
+      title: 'Specify agent workflow',
+      description: 'Define workflow fields and routing rules.',
+    });
+    const response = await manager.existingTaskFoundResponse(existing, {
+      title: 'Specify agent workflow',
+    });
+
+    expect(duplicate).toBe(existing);
+    expect(response).toMatchObject({
+      existing_task: 'specify-agent-workflow',
+      existing_task_ref: '#6837df10',
+      duplicate_scope: 'title',
+      suggested_action: 'status-check',
+    });
+  });
+
   it('builds stable duplicate keys for repeated Learn routing prompts', () => {
     const manager = new AgentManagerDb('/tmp/id-agents-learn-route-dedup-key-test', fakeDb(), { libraryRoot: null }) as any;
 
@@ -294,13 +326,59 @@ describe('stalled task sweeper', () => {
       'IDACC Learn has ingested new material. You are the PRIMARY lead.nnTitle: github: graphitinSource: https://github.com/getzep/graphitinTopics: research',
       'research-lead-id',
     );
+    const goalFitLens = manager.learnRoutingDedupKey(
+      [
+        'Recursive Learn follow-up for `github: graphiti` (https://github.com/getzep/graphiti).',
+        'Learning lens: active-goal-fit',
+        'Learning depth: initial',
+        'Question set: goal-fit-v1',
+        'Active goals: current default goals',
+      ].join('\n'),
+      'research-lead-id',
+    );
+    const sameGoalFitLens = manager.learnRoutingDedupKey(
+      [
+        'Operator re-fired IDACC Learn routing for github: graphiti at https://github.com/getzep/graphiti.',
+        'Learning lens: active-goal-fit',
+        'Learning depth: initial',
+        'Question set: goal-fit-v1',
+        'Active goals: current default goals',
+      ].join('\n'),
+      'research-lead-id',
+    );
+    const riskLens = manager.learnRoutingDedupKey(
+      [
+        'Recursive Learn follow-up for `github: graphiti` (https://github.com/getzep/graphiti).',
+        'Learning lens: risk/security',
+        'Learning depth: second-pass',
+        'Question set: security-risk-v1',
+        'Active goals: current default goals',
+      ].join('\n'),
+      'research-lead-id',
+    );
 
     expect(first).toBeTruthy();
     expect(first).toBe(second);
     expect(first).toBe(primaryLeadIngest);
     expect(first).toBe(flattenedRemotePrompt);
     expect(first).not.toBe(otherRecipient);
+    expect(goalFitLens).toBe(sameGoalFitLens);
+    expect(goalFitLens).not.toBe(riskLens);
     expect(manager.learnRoutingDedupKey('normal task delegation with no Learn routing', 'research-lead-id')).toBeNull();
+  });
+
+  it('adds a recursive learning guard without duplicating the guard block', () => {
+    const manager = new AgentManagerDb('/tmp/id-agents-learn-route-guard-test', fakeDb(), { libraryRoot: null }) as any;
+    const prompt = 'Recursive Learn follow-up for `github: graphiti` (https://github.com/getzep/graphiti). Reuse existing work.';
+
+    const guarded = manager.withRecursiveLearningGuard(prompt);
+
+    expect(guarded).toContain('Recursive learning guard:');
+    expect(guarded).toContain('Learning lens');
+    expect(guarded).toContain('Question set');
+    expect(guarded).toContain('NO-ACTION duplicate lens');
+    expect(manager.withRecursiveLearningGuard(guarded)).toBe(guarded);
+    expect(manager.withRecursiveLearningGuard('normal task delegation')).toBe('normal task delegation');
   });
 
   it('finds recent duplicate Learn routing queries before redispatch', async () => {
@@ -1654,6 +1732,53 @@ describe('stalled task sweeper', () => {
     expect(db.news.add).toHaveBeenCalledWith(TEAM_ID, null, expect.objectContaining({
       type: 'query.received',
       query_id: 'manager_blocked_query-source-1',
+      kind: 'talk',
+      reply_expected: true,
+      owner_kind: 'manager',
+      owner_id: TEAM_ID,
+    }));
+  });
+
+  it('promotes bare ASK-USER replies into the manager inbox', async () => {
+    const db = fakeDb({
+      agents: {
+        getById: vi.fn(async () => agent({ name: 'task-master' })),
+      },
+      queries: {
+        getByQueryIdForTeam: vi.fn(async () => null),
+        create: vi.fn(async () => {}),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-ask-user-inbox-test', db, { libraryRoot: null }) as any;
+
+    await manager.promoteHumanDecisionBlockerToManagerInbox(
+      activeQuery('agent-1', {
+        query_id: 'query-task-manager-ask-user',
+        prompt: 'TASK DELEGATION from manager: resolve missing child owner decision.',
+        status: 'completed',
+      }),
+      { result: 'ASK-USER: the missing decision is which live child owner should take the first decomposition of `default` parent objective.' },
+      NOW_MS,
+    );
+
+    expect(db.queries.create).toHaveBeenCalledWith(
+      TEAM_ID,
+      'manager_blocked_query-task-manager-ask-user',
+      null,
+      expect.stringContaining('[From: task-master] ASK-USER: the missing decision is which live child owner'),
+      NOW_MS,
+      undefined,
+      { owner_kind: 'manager', owner_id: TEAM_ID },
+      expect.objectContaining({
+        source: 'human_decision_blocker',
+        source_query_id: 'query-task-manager-ask-user',
+        source_agent_id: 'agent-1',
+        source_agent_name: 'task-master',
+      }),
+    );
+    expect(db.news.add).toHaveBeenCalledWith(TEAM_ID, null, expect.objectContaining({
+      type: 'query.received',
+      query_id: 'manager_blocked_query-task-manager-ask-user',
       kind: 'talk',
       reply_expected: true,
       owner_kind: 'manager',
@@ -3326,7 +3451,7 @@ describe('stalled task sweeper', () => {
     );
     expect(db.tasks.updateFields).toHaveBeenCalledWith('lead-task-1', {
       status: 'todo',
-      owner: null,
+      owner: 'research-lead-1',
       updated_at: nowSec,
     });
     expect(manager.sendSupervisionAsk).not.toHaveBeenCalledWith(
@@ -5640,6 +5765,75 @@ describe('stalled task sweeper', () => {
       data: expect.objectContaining({
         owner: 'worker-2',
         status: 'doing',
+      }),
+    }));
+  });
+
+  it('repairs ownerless doing work back to todo and assigns it', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const ownerlessDoing = task({
+      id: 'ownerless-doing-1',
+      name: 'ownerless-doing-work',
+      uuid: '91919191-8888-4777-9666-555555555555',
+      title: 'Ownerless doing work',
+      status: 'doing',
+      owner: null,
+      updated_at: nowSec - 3600,
+    });
+    const repairedTodo = {
+      ...ownerlessDoing,
+      status: 'todo' as const,
+      owner: null,
+      completed_at: null,
+      updated_at: nowSec,
+    };
+    const worker = agent({ id: 'worker-2', name: 'worker-b' });
+    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
+    const assigned = { ...repairedTodo, owner: worker.id, status: 'doing' as const };
+    let taskLookupCount = 0;
+    const db = fakeDb({
+      agents: {
+        getById: vi.fn(async () => worker),
+        getByName: vi.fn(async () => lead),
+        list: vi.fn(async () => [lead, worker]),
+      },
+      tasks: {
+        list: vi.fn(async ({ status, owner }: { status?: string; owner?: string } = {}) => {
+          if (status === 'doing' && owner) return [];
+          if (status === 'doing') return [ownerlessDoing];
+          if (status === 'todo') return [];
+          return [];
+        }),
+        getByNameForTeam: vi.fn(async () => (++taskLookupCount === 1 ? repairedTodo : assigned)),
+        claim: vi.fn(async () => true),
+        updateFields: vi.fn(async () => {}),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-ownerless-doing-repair-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.sweepStalledTasks();
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith('ownerless-doing-1', expect.objectContaining({
+      owner: null,
+      status: 'todo',
+      completed_at: null,
+      updated_at: nowSec,
+    }));
+    expect(db.tasks.claim).toHaveBeenCalledWith('ownerless-doing-1', 'worker-2', nowSec, {
+      maxDoingForTeam: expect.any(Number),
+    });
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'worker-b',
+      expect.stringContaining('TASK DELEGATION from manager'),
+    );
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      team_id: TEAM_ID,
+      topic: 'task:triaged',
+      subject_id: ownerlessDoing.uuid,
+      data: expect.objectContaining({
+        reason: 'ownerless_doing_repaired',
       }),
     }));
   });

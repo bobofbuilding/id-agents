@@ -494,6 +494,26 @@ type AgentMetadata = Record<string, any> & {
   primaryLead?: boolean;
 };
 
+function objectRecord(value: unknown): Record<string, any> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, any>
+    : null;
+}
+
+export function mergeCatalogSeed(
+  yamlCatalog: unknown,
+  existingCatalog: unknown,
+): Record<string, any> | undefined {
+  const seed = objectRecord(yamlCatalog);
+  const live = objectRecord(existingCatalog);
+
+  if (!seed && !live) return undefined;
+  if (!seed) return { ...live };
+  if (!live) return { ...seed };
+
+  return { ...seed, ...live };
+}
+
 function envFlagEnabled(value: string | undefined): boolean {
   return /^(1|true|yes|on)$/i.test(String(value || '').trim());
 }
@@ -1208,14 +1228,14 @@ export class AgentManagerDb {
     const goalId = this.taskGoalIdFromInput(input);
     const title = this.firstBriefString(input, ['title']);
     const targetSignature = this.taskTargetSignatureFromInput(input);
-    if (!goalId) return null;
+    if (!goalId && !title) return null;
     const recentDoneWindowMs = this.taskDuplicateRecentDoneWindowMs();
     const nowMs = Date.now();
     const allTasks = await this.db.tasks.list({ teamId }).catch(() => [] as TaskRow[]);
     const matches: Array<{ task: TaskRow; matchRank: number; statusRank: number; updatedAt: number }> = [];
     for (const candidate of allTasks) {
       const candidateGoal = this.taskGoalIdFromInput(this.taskBriefInputFromTask(candidate));
-      if (candidateGoal !== goalId) continue;
+      if (goalId && candidateGoal !== goalId) continue;
 
       const candidateTarget = this.taskTargetSignatureFromTask(candidate);
       const hasTargetMatch = Boolean(
@@ -1228,7 +1248,13 @@ export class AgentManagerDb {
         && title
         && this.taskTitlesLookDuplicate(candidate.title, title)
       );
-      if (!hasTargetMatch && !hasLegacyTitleMatch) continue;
+      const hasGoallessTitleMatch = Boolean(
+        !goalId
+        && title
+        && this.taskTitlesLookDuplicate(candidate.title, title)
+        && (!targetSignature || !candidateTarget || hasTargetMatch)
+      );
+      if (!hasTargetMatch && !hasLegacyTitleMatch && !hasGoallessTitleMatch) continue;
 
       if (candidate.status !== 'todo' && candidate.status !== 'doing' && candidate.status !== 'done') continue;
       if (candidate.status === 'done') {
@@ -1237,7 +1263,7 @@ export class AgentManagerDb {
       }
       matches.push({
         task: candidate,
-        matchRank: hasTargetMatch ? 0 : 1,
+        matchRank: hasTargetMatch ? 0 : hasGoallessTitleMatch ? 1 : 2,
         statusRank: candidate.status === 'doing' ? 0 : candidate.status === 'todo' ? 1 : 2,
         updatedAt: candidate.updated_at,
       });
@@ -1262,15 +1288,14 @@ export class AgentManagerDb {
     const ageMs = this.taskLastActivityMs(existing) > 0 ? Math.max(0, Date.now() - this.taskLastActivityMs(existing)) : 0;
     const recentDoneWindowMs = this.taskDuplicateRecentDoneWindowMs();
     const duplicateState = existing.status === 'done' && ageMs <= recentDoneWindowMs ? 'recent_done' : 'open';
-    const duplicateScope = requestedTarget && existingTarget && requestedTarget === existingTarget
-      ? 'goal+target'
-      : 'goal+title';
-    const duplicateScopeLabel = duplicateScope === 'goal+target' ? 'goal+target' : 'goal+title';
+    const duplicateScope = goalId
+      ? (requestedTarget && existingTarget && requestedTarget === existingTarget ? 'goal+target' : 'goal+title')
+      : (requestedTarget && existingTarget && requestedTarget === existingTarget ? 'target+title' : 'title');
 
     return {
       message: duplicateState === 'recent_done'
-        ? `Task duplicates existing recently completed task ${this.taskShortRef(existing)} ("${existing.title}") for the same ${duplicateScopeLabel}. Status-check the existing owner instead of creating a new task.`
-        : `Task duplicates existing ${existing.status} task ${this.taskShortRef(existing)} ("${existing.title}") for the same ${duplicateScopeLabel}. Status-check the existing owner instead of creating a new task.`,
+        ? `Task duplicates existing recently completed task ${this.taskShortRef(existing)} ("${existing.title}") for the same ${duplicateScope}. Status-check the existing owner instead of creating a new task.`
+        : `Task duplicates existing ${existing.status} task ${this.taskShortRef(existing)} ("${existing.title}") for the same ${duplicateScope}. Status-check the existing owner instead of creating a new task.`,
       existing_task: existing.name,
       existing_task_ref: this.taskShortRef(existing),
       existing_status: existing.status,
@@ -1517,6 +1542,7 @@ export class AgentManagerDb {
     'onchain-execution': ['onchain-lead'],
     'ops-team': ['ops-lead'],
     research: ['research-lead'],
+    skillmesh: ['skillmesh-ops-lead'],
     'technology-security': ['security-router'],
   };
 
@@ -1565,6 +1591,37 @@ export class AgentManagerDb {
     if (/\b(lead|coordinator|router)\b/.test(roleNameText)) return true;
     return /\bhr[-_\s]?manager\b/.test(roleText)
       && /\b(coordinate|coordinator|routing|route|staffing|onboarding|team operations)\b/.test(roleText);
+  }
+
+  private async findConfiguredTaskCreationLead(teamId: string, teamName: string): Promise<AgentRow | null> {
+    const agents = await this.db.agents.list(teamId).catch(() => [] as AgentRow[]);
+    const configuredLeads = agents.filter((agent) => this.isConfiguredTeamLead(teamName, agent));
+    if (!configuredLeads.length) return null;
+    return configuredLeads.find((agent) => this.isLiveForSupervision(agent)) || configuredLeads[0];
+  }
+
+  private async defaultLeadOwnerForTaskCreation(params: {
+    teamId: string;
+    teamName: string;
+  }): Promise<{ owner: AgentRow | null; warning?: string }> {
+    const owner = await this.findConfiguredTaskCreationLead(params.teamId, params.teamName);
+    if (!owner) return { owner: null };
+    if (!(await this.hasDoingTaskRoom(params.teamId))) {
+      return { owner: null, warning: await this.doingTaskLimitMessage(params.teamId) };
+    }
+    const leadBacklog = await this.leadDelegationBacklogGuard({
+      teamId: params.teamId,
+      teamName: params.teamName,
+      owner,
+    });
+    if (leadBacklog) return { owner: null, warning: leadBacklog.message };
+    const stalledBacklog = await this.stalledOwnerBacklogGuard({
+      teamId: params.teamId,
+      teamName: params.teamName,
+      owner,
+    });
+    if (stalledBacklog) return { owner: null, warning: stalledBacklog.message };
+    return { owner };
   }
 
   private taskRefsFromCompletionPayload(payload: Record<string, unknown> | undefined): string[] {
@@ -2545,6 +2602,37 @@ export class AgentManagerDb {
     }
 
     const taskRef = this.taskShortRef(task);
+    if (task.status === 'doing' && !task.owner) {
+      const nowMs = Date.now();
+      const repaired = await this.repairOwnerlessDoingTask(task, params.team, nowMs);
+      const stalledMinutes = Math.max(0, Math.round((nowMs - this.taskLastActivityMs(task)) / 60000));
+      const fallback = await this.routeStalledTaskToTaskManagerFallback({
+        teamId: params.team.id,
+        teamName: params.team.name,
+        task: repaired,
+        ref: taskRef,
+        stalledMinutes,
+        ownerName: 'unclaimed (repaired ownerless doing)',
+        nowMs,
+        renudgeMs: this.getStallRenudgeMs(),
+        maxProbes: this.getMaxStalledTaskProbes(),
+        force: params.force,
+        reason: 'unclaimed',
+        eventReason: 'unclaimed',
+        blockerNote: 'Task was marked doing without an owner, so the manager repaired it to todo and routed it for assignment.',
+      });
+      report.scannedOwners = 1;
+      report.items.push({
+        team: params.team.name,
+        owner: 'unclaimed',
+        ownerStatus: null,
+        message: `ownerless_doing_repaired: ${taskRef} was parked to todo and needs task-manager triage`,
+        blockers: [taskRef],
+        triage: fallback ?? { status: 'no_task_manager_available', taskRef },
+      });
+      report.triagedOwners = fallback ? 1 : 0;
+      return report;
+    }
     if (task.status === 'todo' && !task.owner) {
       const nowMs = Date.now();
       const stalledMinutes = Math.max(0, Math.round((nowMs - this.taskLastActivityMs(task)) / 60000));
@@ -3784,6 +3872,21 @@ Return this JSON shape:
         usedSourceIds,
         learningLoop: queryLearningLoop,
       });
+      await this.postBrainCompletionMemory({
+        kind: 'query',
+        key: `query:${queryId}`,
+        teamId,
+        project: queryTeamName,
+        agentId: completedRow.owner_kind === 'manager' ? null : completedRow.agent_id,
+        queryId,
+        taskId,
+        title: this.compactBrainContextText(completedRow.prompt || messagePreview || `Query ${queryId}`, 420),
+        inputText: completedRow.prompt || messagePreview || '',
+        payload: completionPayload,
+        usedSourceIds,
+        volunteeredSourceIds: brainContext?.cited?.canonical_source_ids || [],
+        occurredAt,
+      });
       await emitQueryDelivered(this.db.events, {
         teamId,
         queryId,
@@ -3848,10 +3951,7 @@ Return this JSON shape:
       : JSON.stringify(metadataPatch);
     const metadataSet = dialect === 'postgres'
       ? `metadata = COALESCE(metadata, '{}'::jsonb) || ${p(3)}::jsonb`
-      : `metadata = CASE
-                WHEN metadata IS NULL THEN ${p(3)}
-                ELSE json_patch(metadata, ${p(3)})
-              END`;
+      : `metadata = json_patch(COALESCE(metadata, '{}'), ${p(3)})`;
     const { rowCount } = await this.db.adapter.query(
       `UPDATE queries
           SET status = 'completed',
@@ -3905,10 +4005,12 @@ Return this JSON shape:
   private humanDecisionBlockerMessage(message: string): boolean {
     const text = String(message || '').trim();
     if (!text) return false;
+    const explicitAskUser = /\bASK[-\s]?USER\b\s*:?\s*\S/i.test(text);
+    if (explicitAskUser) return true;
     const blockerSignal = /(^|\n)\s*(?:BLOCKED|BLOCKER)\s*:/i.test(text)
       || /\b(?:blocked|blocker)\b.{0,160}\b(?:human|user|operator|manager|lead|decision|approval|input|intervention)\b/i.test(text);
     if (!blockerSignal) return false;
-    const explicitAsk = /\b(?:ASK[-\s]?USER|USER[-\s]?DECISION|DECISION NEEDED|APPROVAL NEEDED|CONFIRMATION NEEDED)\b\s*:?\s*\S/i.test(text)
+    const explicitAsk = /\b(?:USER[-\s]?DECISION|DECISION NEEDED|APPROVAL NEEDED|CONFIRMATION NEEDED)\b\s*:?\s*\S/i.test(text)
       || /\b(?:approve|approval|confirm|confirmation|authorize|authorization|choose|select|decide|decision|should we|may we|can we|which option|what should)\b[^?\n]{0,220}\?/i.test(text)
       || /\b(?:needs?|requires?|awaiting)\s+(?:your |a |the )?(?:approval|confirmation|authorization|decision|routing instruction)\b.{0,220}\b(?:for|to|whether|which|before)\b/i.test(text)
       || /\bmissing\s+(?:decision|approval|confirmation|authorization|routing instruction|user input)\b.{0,220}\b(?:for|to|whether|which|before)\b/i.test(text);
@@ -5303,8 +5405,26 @@ Return this JSON shape:
   }
 
   private canUseLocalFallbackForRuntimeRateLimit(cooldown: RuntimeLaneCooldown): boolean {
-    return cooldown.kind === 'subscription'
-      && (cooldown.reason === 'subscription_daily_cap' || cooldown.reason === 'subscription_weekly_cap');
+    // Every signal reaching this path has already been classified as a runtime
+    // rate limit by the harness. Restricting local failover to daily/weekly
+    // subscription caps leaves API, session, monthly, and unclassified CLI
+    // limits retrying the same unavailable provider lane.
+    return Boolean(cooldown.reason);
+  }
+
+  private preferredRuntimeLaneForRestore(
+    runtime: HarnessType | string | undefined,
+    teamId: string,
+    candidateLaneId?: string,
+  ): string {
+    const lanes = this.runtimeCredentialLanes(runtime, teamId);
+    const candidate = candidateLaneId
+      ? lanes.find((lane) => lane.id === candidateLaneId)
+      : undefined;
+    if (candidate?.kind === 'subscription') return candidate.id;
+    return lanes.find((lane) => lane.kind === 'subscription')?.id
+      || candidateLaneId
+      || `${resolveRuntime(runtime)}:default`;
   }
 
   private resolveRateLimitLocalFallback(agent: AgentRow): { runtime: HarnessType; model: string; laneId: string } | null {
@@ -5417,10 +5537,21 @@ Return this JSON shape:
     if (!fallback) return { attempted: false };
 
     const metadata = (agent.metadata as Record<string, unknown>) || {};
+    const priorFailover = metadata.runtimeRateLimitFailover && typeof metadata.runtimeRateLimitFailover === 'object'
+      ? metadata.runtimeRateLimitFailover as Record<string, unknown>
+      : null;
+    const previousLaneId = typeof priorFailover?.fromLaneId === 'string'
+      ? priorFailover.fromLaneId
+      : cooldown.laneId;
+    const preferredLaneId = this.preferredRuntimeLaneForRestore(fromRuntime, teamId, previousLaneId);
     const nextMetadata: Record<string, unknown> = {
       ...metadata,
       runtimeRateLimitFailover: {
-        fromLaneId: cooldown.laneId,
+        // Preserve the original preferred lane across subscription -> metered
+        // -> local transitions so restore returns to the user's configured
+        // runtime lane, not the last failed overflow lane.
+        fromLaneId: preferredLaneId,
+        failedLaneId: cooldown.laneId,
         toLaneId: fallback.laneId,
         fromRuntime,
         toRuntime: fallback.runtime,
@@ -5488,6 +5619,24 @@ Return this JSON shape:
       );
     }
 
+    await this.db.news.add(teamId, agent.id, {
+      timestamp: Date.now(),
+      type: 'runtime.failover',
+      message: `Rate limit detected; switched ${agent.name} from ${fromRuntime} / ${agent.model} to ${fallback.runtime} / ${fallback.model}${retryQueryId ? ' and replayed the interrupted query' : ''}`,
+      data: {
+        fromRuntime,
+        fromModel: agent.model,
+        fromLaneId: preferredLaneId,
+        failedLaneId: cooldown.laneId,
+        toRuntime: fallback.runtime,
+        toModel: fallback.model,
+        toLaneId: fallback.laneId,
+        retryQueryId: retryQueryId ? String(retryQueryId) : undefined,
+        retryOf: cooldown.queryId,
+      },
+      query_id: retryQueryId ? String(retryQueryId) : cooldown.queryId,
+    }).catch(() => {});
+
     return { attempted: true, success: true, pid: spawnResult.pid, retryQueryId: retryQueryId ? String(retryQueryId) : undefined, laneId: fallback.laneId };
   }
 
@@ -5527,6 +5676,84 @@ Return this JSON shape:
     }
   }
 
+  private async restoreAgentCredentialLaneIfReady(
+    teamId: string,
+    teamName: string,
+    agent: AgentRow,
+    metadata: Record<string, unknown>,
+    failover: Record<string, unknown>,
+    now: number,
+  ): Promise<boolean> {
+    const recordedFromLaneId = typeof failover.fromLaneId === 'string' ? failover.fromLaneId : undefined;
+    const fromLaneId = this.preferredRuntimeLaneForRestore(agent.runtime, teamId, recordedFromLaneId);
+    if (this.isRuntimeLaneCooling(fromLaneId, now)) return false;
+
+    const currentLaneId = typeof metadata.runtimeCredentialLane === 'string'
+      ? metadata.runtimeCredentialLane
+      : typeof failover.toLaneId === 'string'
+      ? failover.toLaneId
+      : undefined;
+    if (!currentLaneId || currentLaneId === fromLaneId) {
+      const cleanMetadata = { ...metadata };
+      delete cleanMetadata.runtimeRateLimitFailover;
+      delete cleanMetadata.runtimeRateLimit;
+      delete cleanMetadata.previousRuntimeBeforeRateLimit;
+      delete cleanMetadata.previousModelBeforeRateLimit;
+      cleanMetadata.runtimeCredentialLane = fromLaneId;
+      await this.db.agents.updateMetadata(agent.id, cleanMetadata).catch(() => {});
+      return false;
+    }
+
+    const nextMetadata: Record<string, unknown> = {
+      ...metadata,
+      runtimeCredentialLane: fromLaneId,
+      runtimeRateLimitRestore: {
+        fromRuntime: agent.runtime,
+        fromModel: agent.model,
+        fromLaneId: currentLaneId,
+        toRuntime: agent.runtime,
+        toModel: agent.model,
+        laneId: fromLaneId,
+        observedAtMs: now,
+      },
+    };
+    delete nextMetadata.runtimeRateLimitFailover;
+    delete nextMetadata.runtimeRateLimit;
+    delete nextMetadata.previousRuntimeBeforeRateLimit;
+    delete nextMetadata.previousModelBeforeRateLimit;
+
+    const shouldRestart = agent.status !== 'stopped';
+    await this.db.agents.updateStatus(agent.id, shouldRestart ? 'pending' : 'stopped', {
+      runtime: agent.runtime,
+      model: agent.model,
+      metadata: nextMetadata,
+    });
+    if (!shouldRestart) return true;
+
+    const spawnResult = await this.rebuildLocalClaudeAgent(teamId, teamName, {
+      ...agent,
+      metadata: nextMetadata,
+    });
+    if (!spawnResult.success) {
+      await this.db.agents.updateStatus(agent.id, 'offline').catch(() => {});
+      this.managerLog(`Runtime credential-lane restore rebuild failed for ${teamName}/${agent.name}: ${spawnResult.error || 'unknown error'}`);
+      return false;
+    }
+
+    await this.db.news.add(teamId, agent.id, {
+      timestamp: now,
+      type: 'runtime.restore',
+      message: `Runtime rate-limit cooldown ended; restored ${agent.name} from lane ${currentLaneId} to preferred lane ${fromLaneId}`,
+      data: {
+        runtime: agent.runtime,
+        model: agent.model,
+        fromLaneId: currentLaneId,
+        toLaneId: fromLaneId,
+      },
+    }).catch(() => {});
+    return true;
+  }
+
   private async restoreAgentFromRateLimitFallbackIfReady(
     teamId: string,
     teamName: string,
@@ -5538,7 +5765,9 @@ Return this JSON shape:
       ? metadata.runtimeRateLimitFailover as Record<string, unknown>
       : null;
     if (!failover) return false;
-    if (failover.toRuntime !== 'ollama') return false;
+    if (failover.toRuntime !== 'ollama') {
+      return this.restoreAgentCredentialLaneIfReady(teamId, teamName, agent, metadata, failover, now);
+    }
     if (agent.runtime !== 'ollama') {
       const nextMetadata: Record<string, unknown> = {
         ...metadata,
@@ -5567,7 +5796,11 @@ Return this JSON shape:
       : typeof metadata.previousModelBeforeRateLimit === 'string'
       ? metadata.previousModelBeforeRateLimit
       : undefined;
-    const fromLaneId = typeof failover.fromLaneId === 'string' ? failover.fromLaneId : undefined;
+    const fromLaneId = this.preferredRuntimeLaneForRestore(
+      fromRuntime,
+      teamId,
+      typeof failover.fromLaneId === 'string' ? failover.fromLaneId : undefined,
+    );
     if (!fromRuntime || !fromModel) return false;
     if (this.isRuntimeLaneCooling(fromLaneId, now)) return false;
 
@@ -5586,7 +5819,8 @@ Return this JSON shape:
     delete nextMetadata.runtimeRateLimit;
     delete nextMetadata.previousRuntimeBeforeRateLimit;
     delete nextMetadata.previousModelBeforeRateLimit;
-    delete nextMetadata.runtimeCredentialLane;
+    if (fromLaneId) nextMetadata.runtimeCredentialLane = fromLaneId;
+    else delete nextMetadata.runtimeCredentialLane;
 
     const shouldRestart = agent.status !== 'stopped';
     await this.db.agents.updateStatus(agent.id, shouldRestart ? 'pending' : 'stopped', {
@@ -6322,6 +6556,16 @@ Return this JSON shape:
     return { id: `${resolved}:metered-overflow`, runtime: resolved, kind: 'metered-api' };
   }
 
+  private defaultRuntimeRateLimitCooldownMs(reason: string): number {
+    if (reason === 'api_overloaded') {
+      return Math.max(30_000, Number(process.env.ID_RATE_LIMIT_OVERLOAD_COOLDOWN_MS || 60_000) || 60_000);
+    }
+    if (reason === 'api_rate_limit' || reason === 'unknown_rate_limit') {
+      return Math.max(60_000, Number(process.env.ID_RATE_LIMIT_UNKNOWN_COOLDOWN_MS || 5 * 60_000) || 5 * 60_000);
+    }
+    return Math.max(5 * 60_000, Number(process.env.ID_RATE_LIMIT_CAP_COOLDOWN_MS || 5 * 60 * 60_000) || 5 * 60 * 60_000);
+  }
+
   private parseCooldownUntilMs(rateLimit: any): number {
     if (typeof rateLimit?.retryAfterSeconds === 'number' && Number.isFinite(rateLimit.retryAfterSeconds)) {
       return Date.now() + Math.max(0, rateLimit.retryAfterSeconds) * 1000;
@@ -6330,7 +6574,8 @@ Return this JSON shape:
       const parsed = Date.parse(rateLimit.resetAt);
       if (Number.isFinite(parsed)) return parsed;
     }
-    return Date.now() + 5 * 60 * 60 * 1000;
+    const reason = String(rateLimit?.reason || 'unknown_rate_limit');
+    return Date.now() + this.defaultRuntimeRateLimitCooldownMs(reason);
   }
 
   private async recordRuntimeRateLimit(teamId: string, input: {
@@ -6347,7 +6592,7 @@ Return this JSON shape:
     const cooldown: RuntimeLaneCooldown = {
       laneId,
       runtime,
-      kind: lane?.kind || 'subscription',
+      kind: lane?.kind || (laneId.endsWith(':metered-overflow') ? 'metered-api' : 'subscription'),
       coolingUntilMs: this.parseCooldownUntilMs(input.rateLimit),
       observedAtMs: Date.now(),
       reason: String(input.rateLimit?.reason || 'unknown_rate_limit'),
@@ -6411,13 +6656,25 @@ Return this JSON shape:
     this.runtimeLaneCooldowns.clear();
     const activeCooldowns = await cooldownRepo.listActive(now);
     for (const row of activeCooldowns) {
+      const reason = row.reason || 'unknown_rate_limit';
+      const observedAtMs = Number(row.observed_at_ms);
+      const persistedUntilMs = Number(row.cooling_until_ms);
+      const usesProbeCooldown = !row.reset_text
+        && (reason === 'unknown_rate_limit' || reason === 'api_rate_limit' || reason === 'api_overloaded');
+      const coolingUntilMs = usesProbeCooldown
+        ? Math.min(persistedUntilMs, observedAtMs + this.defaultRuntimeRateLimitCooldownMs(reason))
+        : persistedUntilMs;
+      if (coolingUntilMs !== persistedUntilMs) {
+        await cooldownRepo.upsert({ ...row, cooling_until_ms: coolingUntilMs });
+      }
+      if (coolingUntilMs <= now) continue;
       this.runtimeLaneCooldowns.set(row.lane_id, {
         laneId: row.lane_id,
         runtime: resolveRuntime(row.runtime) as HarnessType,
         kind: row.kind === 'metered-api' ? 'metered-api' : 'subscription',
-        coolingUntilMs: Number(row.cooling_until_ms),
-        observedAtMs: Number(row.observed_at_ms),
-        reason: row.reason || 'unknown_rate_limit',
+        coolingUntilMs,
+        observedAtMs,
+        reason,
         teamId: row.team_id || undefined,
         agentId: row.agent_id || undefined,
         agentName: row.agent_name || undefined,
@@ -6574,6 +6831,110 @@ Return this JSON shape:
         signal: AbortSignal.timeout(Number(process.env.BRAIN_CONTEXT_TIMEOUT_MS || 1200)),
       });
     } catch {}
+  }
+
+  private compactJsonForBrain(value: unknown, maxChars: number): string {
+    let text = '';
+    try {
+      text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+    } catch {
+      text = String(value ?? '');
+    }
+    return this.compactBrainContextText(this.redactBrainMemoryText(text), maxChars);
+  }
+
+  private redactBrainMemoryText(value: string): string {
+    return String(value || '')
+      .replace(/\b(?:sk|pk|ak|rk)-[A-Za-z0-9_-]{16,}\b/g, '[redacted-key]')
+      .replace(/\b0x[a-fA-F0-9]{64}\b/g, '[redacted-hex-secret]')
+      .replace(/\b((?:api[_-]?key|access[_-]?token|auth(?:orization)?|bearer|private[_-]?key|secret|password)\s*[:=]\s*)(["']?)[^\s"',}]+/gi, '$1$2[redacted]');
+  }
+
+  private completionPayloadSummary(payload: Record<string, unknown> | null | undefined): string {
+    if (!payload || typeof payload !== 'object') return '';
+    const candidates = [
+      payload.summary,
+      payload.acceptance,
+      payload.result,
+      payload.message,
+      payload.output,
+      payload.answer,
+      payload.failure_note,
+      payload.failureNote,
+      payload.blocked,
+      payload.reason,
+    ];
+    for (const candidate of candidates) {
+      if (typeof candidate === 'string' && candidate.trim()) {
+        return this.compactBrainContextText(this.redactBrainMemoryText(candidate), 2400);
+      }
+      if (candidate && typeof candidate === 'object') {
+        const text = this.compactJsonForBrain(candidate, 2400);
+        if (text) return text;
+      }
+    }
+    return this.compactJsonForBrain(payload, 2400);
+  }
+
+  private async agentNameForBrain(teamId: string, agentId?: string | null): Promise<string | null> {
+    if (!agentId) return null;
+    const agent = await this.dbQueryAgentById(teamId, agentId).catch(() => null);
+    return agent?.name || agentId;
+  }
+
+  private async postBrainCompletionMemory(input: {
+    kind: 'task' | 'query';
+    key: string;
+    teamId: string;
+    project: string;
+    agentId?: string | null;
+    queryId?: string | null;
+    taskId?: string | null;
+    taskName?: string | null;
+    title: string;
+    inputText?: string | null;
+    payload?: Record<string, unknown> | null;
+    usedSourceIds?: string[];
+    volunteeredSourceIds?: string[];
+    occurredAt: number;
+  }): Promise<void> {
+    const agentName = await this.agentNameForBrain(input.teamId, input.agentId);
+    const learnedArtifact = this.learnedArtifactFromPayload(input.payload || {});
+    const learningLoop = (input.payload as any)?.learning_loop || (input.payload as any)?.learningLoop || null;
+    const used = (input.usedSourceIds || []).slice(0, 40);
+    const volunteered = (input.volunteeredSourceIds || []).slice(0, 40);
+    const summary = this.completionPayloadSummary(input.payload || {});
+    const content = [
+      `# Completed ${input.kind}: ${this.redactBrainMemoryText(input.title || input.key)}`,
+      `Kind: ${input.kind}`,
+      `Team: ${input.project}`,
+      agentName ? `Agent: ${agentName}` : '',
+      input.taskName ? `Task name: ${input.taskName}` : '',
+      input.taskId ? `Task ref: ${input.taskId}` : '',
+      input.queryId ? `Query ref: ${input.queryId}` : '',
+      `Completed at: ${new Date(input.occurredAt).toISOString()}`,
+      used.length ? `Used Brain sources: ${used.join(', ')}` : '',
+      volunteered.length ? `Volunteered Brain sources: ${volunteered.join(', ')}` : '',
+      '',
+      input.inputText ? `## Original request\n${this.compactBrainContextText(this.redactBrainMemoryText(input.inputText), 1200)}` : '',
+      summary ? `## Result summary\n${summary}` : '',
+      learnedArtifact ? `## Learned artifact\n${this.compactJsonForBrain(learnedArtifact, 1600)}` : '',
+      learningLoop ? `## Learning loop capture\n${this.compactJsonForBrain(learningLoop, 1600)}` : '',
+    ].filter(Boolean).join('\n');
+    await this.postBrain('/memory/manager', {
+      key: `completion:${input.key}`,
+      content,
+      tags: [
+        'completion',
+        input.kind,
+        'persistent-memory',
+        'agent-output',
+        'manager-captured',
+        ...(agentName ? [`agent:${agentName}`] : []),
+      ],
+      shared: true,
+      project: input.project || 'default',
+    });
   }
 
   private async validateBrainLearningContract(body: Record<string, unknown>): Promise<void> {
@@ -6927,12 +7288,64 @@ Return this JSON shape:
       || text.startsWith('respond ok');
   }
 
+  private isLearnRoutingPrompt(message: string): boolean {
+    const text = String(message || '');
+    return /\blearn\b/i.test(text)
+      && /(IDACC Learn routed|IDACC Learn has ingested|Recursive Learn follow-up|Learn coordination prompt|Retry\/route repair for Recursive Learn|Operator re-fired IDACC Learn routing)/i.test(text);
+  }
+
+  private firstLearnRoutingLabel(text: string, labels: string[]): string | null {
+    for (const label of labels) {
+      const value = this.briefLabel(text, label);
+      if (value) return value;
+    }
+    return null;
+  }
+
+  private learnRoutingLensSignature(message: string): string {
+    const text = String(message || '');
+    const lens = this.firstLearnRoutingLabel(text, [
+      'Learning lens',
+      'Lens',
+      'Learning angle',
+      'Review lens',
+    ]) || 'active-goal-fit';
+    const depth = this.firstLearnRoutingLabel(text, [
+      'Learning depth',
+      'Depth',
+      'Level',
+      'Review depth',
+    ]) || 'initial';
+    const questions = this.firstLearnRoutingLabel(text, [
+      'Question set',
+      'Questions',
+      'Learning questions',
+      'Review questions',
+    ]) || 'default';
+    const goalContext = this.firstLearnRoutingLabel(text, [
+      'Active goals',
+      'Active goal',
+      'Goal context',
+      'Compared goals',
+    ]) || 'current-active-goals';
+    const signature = [
+      `lens:${lens}`,
+      `depth:${depth}`,
+      `questions:${questions}`,
+      `goals:${goalContext}`,
+    ].map((part) => this.normalizeGuardKey(part)).filter(Boolean).join('|');
+    return signature || 'lens-active-goal-fit|depth-initial|questions-default|goals-current-active-goals';
+  }
+
+  private withRecursiveLearningGuard(message: string): string {
+    const text = String(message || '');
+    if (!this.isLearnRoutingPrompt(text) || /Recursive learning guard:/i.test(text)) return text;
+    return `${text}\n\nRecursive learning guard:\n- Before asking questions or creating work, declare Learning lens, Learning depth, Question set, and Active goals used.\n- Do not repeat a prior question set for the same source and recipient. If this revisits the same material, choose a different lens such as implementation-gap, risk/security, routing/delegation, memory/schema, validation/evidence, user-experience, or second-order goal impact.\n- Compare the source against active primary and secondary goals. Create tasks only for new evidence, blockers, skills, memory links, or execution gaps found by this lens.\n- If no materially different lens is justified, reply NO-ACTION duplicate lens and include the prior source/task/query reference instead of asking the same question again.`;
+  }
+
   private learnRoutingDedupKey(message: string, targetAgentId: string | null | undefined): string | null {
     const text = String(message || '');
-    if (!/\blearn\b/i.test(text)) return null;
-    if (!/(IDACC Learn routed|IDACC Learn has ingested|Recursive Learn follow-up|Learn coordination prompt|Retry\/route repair for Recursive Learn|Operator re-fired IDACC Learn routing)/i.test(text)) {
-      return null;
-    }
+    if (!this.isLearnRoutingPrompt(text)) return null;
     const url = [...text.matchAll(/https?:\/\/[^\s)`"'<>]+/gi)]
       .map((match) => match[0]
         .replace(/n(?:title|source|topics|priority|active-goal|summary|untrusted|reply|brain)(?::|$)[\s\S]*$/i, '')
@@ -6945,7 +7358,8 @@ Return this JSON shape:
     const material = url || (titleMatch ? titleMatch[1].toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 160) : '');
     if (!material) return null;
     const target = String(targetAgentId || '').trim() || 'unknown-target';
-    return crypto.createHash('sha256').update(`learn-routing:v1:${target}:${material}`).digest('hex').slice(0, 24);
+    const lens = this.learnRoutingLensSignature(text);
+    return crypto.createHash('sha256').update(`learn-routing:v2:${target}:${material}:${lens}`).digest('hex').slice(0, 24);
   }
 
   private async findRecentDuplicateLearnRoutingQuery(params: {
@@ -7124,25 +7538,26 @@ Return this JSON shape:
             duplicate_of: duplicate.query_id,
             duplicate_status: duplicate.status,
             reason: 'learn_routing_duplicate',
-            message: 'Learn routing for this material was already sent to this recipient recently; duplicate dispatch suppressed.',
+            message: 'Learn routing for this material and learning lens was already sent to this recipient recently; duplicate dispatch suppressed.',
           });
         }
       }
 
+      const messageForDispatch = learnRoutingDedupKey ? this.withRecursiveLearningGuard(String(message)) : String(message);
       this.managerLog(`${shouldWait ? 'Forwarding' : 'Sending async'} message to ${targetDisplayId} at ${targetUrl}`);
       const autoAttach = (req as any)._autoAttach as { task?: TaskRow } | undefined;
       const taskIdForBrain = autoAttach?.task?.uuid ? `task:${autoAttach.task.uuid}` : null;
-      const brainRequiredIntent = this.brainContextRequiredIntent(String(message));
-      const brainContext = this.shouldAttachBrainContext(String(message))
+      const brainRequiredIntent = this.brainContextRequiredIntent(messageForDispatch);
+      const brainContext = this.shouldAttachBrainContext(messageForDispatch)
         ? await this.volunteerBrainContext({
             taskId: taskIdForBrain,
             agentId: targetAgent.id,
-            text: String(message),
+            text: messageForDispatch,
             project: teamName,
             sessionId: session_id || null,
           })
         : null;
-      const outgoingMessage = this.withBrainContextAppendix(String(message), brainContext, brainRequiredIntent);
+      const outgoingMessage = this.withBrainContextAppendix(messageForDispatch, brainContext, brainRequiredIntent);
 
       if (shouldWait && from && String(from).toLowerCase() !== 'manager') {
         this.releaseLocalGateForAgent(String(from));
@@ -7859,11 +8274,14 @@ Return this JSON shape:
           ?? await this.dbQueryAgentByNameMostRecent(teamId, agentRef);
         if (!agent) return res.status(404).json({ error: 'Agent not found', name: agentRef });
 
-        // Remove the deployed skill dir from both runtime layouts (whichever exists).
+        // Remove the deployed skill dir from every known runtime layout
+        // (whichever exists). Install is runtime-aware via getRuntimePaths();
+        // uninstall must be broader so switching runtimes cannot leave stale
+        // SKILL.md copies active in a previous harness directory.
         const workingDirectory = agent.working_directory
           || (agent.metadata as any)?.workingDirectory
           || path.join(this.baseWorkDir, 'agents', agent.name);
-        for (const rel of ['.claude/skills', '.agents/skills']) {
+        for (const rel of ['.claude/skills', '.agents/skills', '.cursor/skills']) {
           const p = path.join(workingDirectory, rel, skill);
           if (existsSync(p)) {
             try { rmSync(p, { recursive: true, force: true }); } catch { /* best-effort */ }
@@ -11354,6 +11772,11 @@ Return this JSON shape:
           });
         }
 
+        const defaultOwner = await this.defaultLeadOwnerForTaskCreation({
+          teamId: taskTeamId,
+          teamName: taskTeamName,
+        });
+
         // Generate or validate name slug, scoped to (team_id, name) uniqueness
         let name = rawName ? normalizeAlias(rawName) : normalizeAlias(title);
         if (rawName) {
@@ -11377,18 +11800,50 @@ Return this JSON shape:
           team_id: taskTeamId,
           title,
           description: taskDescription,
-          status: 'todo',
+          status: defaultOwner.owner ? 'doing' : 'todo',
           created_by: createdBy,
-          owner: null,
+          owner: defaultOwner.owner?.id ?? null,
           created_at: now,
           updated_at: now,
           completed_at: null,
         };
 
         await this.db.tasks.create(taskRow);
+        let ownerWake: Awaited<ReturnType<typeof this.wakeAssignedTaskOwner>> | undefined;
+        let brainContext: BrainVolunteerContext | null = null;
+        if (defaultOwner.owner) {
+          brainContext = await this.emitTaskClaimedWithBrainContext({
+            teamId: taskTeamId,
+            teamName: taskTeamName,
+            task: taskRow,
+            owner: defaultOwner.owner,
+            occurredAt: Date.now(),
+          });
+          ownerWake = await this.wakeAssignedTaskOwner(
+            taskTeamId,
+            taskTeamName,
+            taskRow,
+            defaultOwner.owner,
+            'task-create',
+          );
+          void this.promptLeadForDelegationKickoff(taskTeamId, taskTeamName, taskRow, defaultOwner.owner).catch((err) => {
+            console.warn(`[Supervision] Lead delegation kickoff failed for ${taskRow.name}: ${err?.message || err}`);
+          });
+        }
+        const taskResult = await this.buildTaskResult(taskRow, taskTeamId);
+        if (brainContext) (taskResult as any).brain_context = this.brainContextResponse(brainContext);
         res.status(201).json({
           ok: true,
-          task: await this.buildTaskResult(taskRow, teamId),
+          task: taskResult,
+          owner_wake: ownerWake,
+          default_owner_routing: defaultOwner.owner
+            ? {
+                owner: defaultOwner.owner.name,
+                reason: 'configured_team_lead',
+              }
+            : defaultOwner.warning
+              ? { warning: defaultOwner.warning }
+              : undefined,
           specialist_routing: specialistRouting || undefined,
           brief_validation: brief.validation,
         });
@@ -11734,6 +12189,21 @@ Return this JSON shape:
           injectedInstructionIds: this.stringArray(req.body?.injected_instruction_ids || req.body?.injectedInstructionIds),
           latencyMs: updated!.completed_at && updated!.created_at ? Math.max(0, (updated!.completed_at - updated!.created_at) * 1000) : null,
           learningLoop,
+        });
+        await this.postBrainCompletionMemory({
+          kind: 'task',
+          key: `task:${updated!.uuid}`,
+          teamId,
+          project: teamName,
+          agentId: callerAgent?.id ?? updated!.owner ?? null,
+          taskId: `task:${updated!.uuid}`,
+          title: updated!.title,
+          inputText: [updated!.title, updated!.description].filter(Boolean).join('\n\n'),
+          payload: req.body || {},
+          usedSourceIds,
+          volunteeredSourceIds,
+          occurredAt: completedAt,
+          taskName: updated!.name,
         });
         await emitTaskCompleted(this.db.events, {
           teamId,
@@ -13490,11 +13960,13 @@ Return this JSON shape:
                 agent: agentName,
                 deduped: true,
                 reason: 'learn_routing_duplicate',
+                dedupe_scope: 'material+learning_lens',
               },
             };
           }
         }
-        const duplicateTaskAsk = await this.findActiveDuplicateTaskAsk(teamId, a, message);
+        const messageForDispatch = learnRoutingDedupKey ? this.withRecursiveLearningGuard(message) : message;
+        const duplicateTaskAsk = await this.findActiveDuplicateTaskAsk(teamId, a, messageForDispatch);
         if (duplicateTaskAsk) {
           return {
             ok: true,
@@ -13522,16 +13994,16 @@ Return this JSON shape:
         // Discover REST-AP endpoints from the agent's catalog
         const endpoints = await discoverRestAPEndpoints(baseEndpoint);
         const talkUrl = `${baseEndpoint.replace(/\/+$/, '')}${endpoints.talk}`;
-        const brainRequiredIntent = this.brainContextRequiredIntent(message);
-        const brainContext = this.shouldAttachBrainContext(message)
+        const brainRequiredIntent = this.brainContextRequiredIntent(messageForDispatch);
+        const brainContext = this.shouldAttachBrainContext(messageForDispatch)
           ? await this.volunteerBrainContext({
               agentId: a.id,
-              text: message,
+              text: messageForDispatch,
               project: teamName,
               sessionId: callerSessionId || null,
             })
           : null;
-        const outgoingMessage = this.withBrainContextAppendix(message, brainContext, brainRequiredIntent);
+        const outgoingMessage = this.withBrainContextAppendix(messageForDispatch, brainContext, brainRequiredIntent);
 
         // Send message to agent's /talk endpoint
         const talkHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -13900,6 +14372,8 @@ Return this JSON shape:
 
           const configDomain = spec.domain;
           const normalizedSkills = normalizeConfigSkills(agentSkills);
+          const existingMetadata = (row.metadata as AgentMetadata | null) || {};
+          const mergedCatalog = mergeCatalogSeed(spec.catalog, existingMetadata.catalog);
 
           // 1. Deploy library-backed agent overlay into the runtime overlay target, if configured
           if (spec.agent) {
@@ -13924,9 +14398,8 @@ Return this JSON shape:
             ...(isAutomator && { isAutomator: true }),
             ...(spec.heartbeat && { heartbeat: true }),
             ...(spec.dangerouslySkipPermissions !== undefined && { dangerouslySkipPermissions: spec.dangerouslySkipPermissions }),
-            // Catalog seed from YAML — overwrites any runtime PATCH on redeploy.
-            // This is intentional: YAML is the redeploy floor.
-            ...(spec.catalog && { catalog: spec.catalog }),
+            // YAML catalog is a seed floor; live PATCHed catalog keys win.
+            ...(mergedCatalog && { catalog: mergedCatalog }),
           }, spec.wallet);
 
           this.deploySkillsToAgent(workingDirectory, agentSkills, {
@@ -14016,6 +14489,7 @@ Return this JSON shape:
 
             const agentSkills: string[] = spec.skills || [];
             const normalizedSkills = normalizeConfigSkills(agentSkills);
+            const mergedCatalog = mergeCatalogSeed(spec.catalog, undefined);
             let orgContext = '';
             if (syncOrg?.groups) {
               try {
@@ -14039,8 +14513,8 @@ Return this JSON shape:
               ...(spec.heartbeat && { heartbeat: true }),
               ...(spec.openMode !== undefined && { openMode: spec.openMode }),
               ...(spec.dangerouslySkipPermissions !== undefined && { dangerouslySkipPermissions: spec.dangerouslySkipPermissions }),
-              // Catalog seed from YAML — see notes on the sync-update site above.
-              ...(spec.catalog && { catalog: spec.catalog }),
+              // YAML catalog is a seed floor; no live row exists yet, so the seed stands.
+              ...(mergedCatalog && { catalog: mergedCatalog }),
             }, spec.wallet);
 
             // 1. Deploy library-backed agent overlay into the runtime overlay target, if configured
@@ -14347,6 +14821,12 @@ Return this JSON shape:
             const isAutomator = agentConfig.type === 'automator';
             const agentType = agentConfig.type || 'claude';
             const normalizedSkills = normalizeConfigSkills(agentConfig.skills);
+            const configDomain = agentConfig.domain;
+            const configTokenId = agentConfig.tokenId;
+            const agentName = configDomain || agentConfig.name;
+            const existing = await this.db.agents.getByName(effectiveTeamId, agentName);
+            const existingMetadata = (existing?.metadata as AgentMetadata | null) || {};
+            const mergedCatalog = mergeCatalogSeed(agentConfig.catalog, existingMetadata.catalog);
 
             // Get heartbeat config
             const heartbeatConfig = agentConfig.heartbeat;
@@ -14368,16 +14848,11 @@ Return this JSON shape:
               ...(heartbeatConfig && { heartbeat: true }),
               ...(agentConfig.openMode !== undefined && { openMode: agentConfig.openMode }),
               ...(agentConfig.dangerouslySkipPermissions !== undefined && { dangerouslySkipPermissions: agentConfig.dangerouslySkipPermissions }),
-              // Catalog seed from YAML — lands in metadata.catalog and surfaces
-              // via the agent's /catalog endpoint. Runtime PATCH /catalog still
-              // works; the next /deploy or /sync re-applies this YAML floor.
-              ...(agentConfig.catalog && { catalog: agentConfig.catalog })
+              // YAML catalog is a seed floor; live PATCHed catalog keys win.
+              ...(mergedCatalog && { catalog: mergedCatalog })
             };
 
             // Use ENS domain from config if available (preserves registration across redeploys)
-            const configDomain = agentConfig.domain;
-            const configTokenId = agentConfig.tokenId;
-            const agentName = configDomain || agentConfig.name;
             if (configDomain) {
               metadata.idchain_domain = configDomain;
               metadata.alias = agentConfig.name;
@@ -14441,7 +14916,6 @@ Return this JSON shape:
             }
 
             // Remove any existing agent with this name to avoid duplicates on redeploy
-            const existing = await this.db.agents.getByName(effectiveTeamId, agentName);
             if (existing) {
               // Kill the old process before deleting the DB row to prevent orphans
               if (existing.port) {
@@ -15337,6 +15811,7 @@ Return this JSON shape:
           let ownerAgentForGuard: AgentRow | null = null;
           let leadDelegationWarning: string | undefined;
           let stalledOwnerWarning: string | undefined;
+          let defaultOwnerWarning: string | undefined;
           let stalledOwnerTriage: Record<string, unknown> | null = null;
           if (ownerRef) {
             const resolveTeam = taskTeamId || teamId;
@@ -15372,6 +15847,18 @@ Return this JSON shape:
               } else {
                 ownerId = agent.id;
               }
+            }
+          } else {
+            const taskTeamRow = await this.db.teams.getTeam(taskTeamId).catch(() => null);
+            const defaultOwner = await this.defaultLeadOwnerForTaskCreation({
+              teamId: taskTeamId,
+              teamName: taskTeamRow?.name || taskTeamName,
+            });
+            if (defaultOwner.owner) {
+              ownerAgentForGuard = defaultOwner.owner;
+              ownerId = defaultOwner.owner.id;
+            } else if (defaultOwner.warning) {
+              defaultOwnerWarning = defaultOwner.warning;
             }
           }
 
@@ -15489,6 +15976,7 @@ Return this JSON shape:
             queuedByDoingLimit && !queuedByLeadDelegation && !queuedByStalledOwner ? await this.doingTaskLimitMessage(taskTeamId) : undefined,
             leadDelegationWarning,
             stalledOwnerWarning,
+            defaultOwnerWarning,
           ].filter((item): item is string => Boolean(item));
 
           return {
@@ -16093,9 +16581,11 @@ Return this JSON shape:
             return { ok: false, error: `Task "${taskRef}" not found` };
           }
 
+          let callerAgentForDone: AgentRow | null = null;
           // If called by an agent (callerFrom set), enforce ownership
           if (callerFrom) {
             const { agent: callerAgent } = await this.resolveSingleAgentForCommand(teamId, callerFrom);
+            callerAgentForDone = callerAgent ?? null;
             if (callerAgent && task.owner !== callerAgent.id) {
               return { ok: false, error: `Agent "${callerFrom}" is not the owner of task "${task.name}"` };
             }
@@ -16147,9 +16637,25 @@ Return this JSON shape:
 
           const updated = await this.db.tasks.getByNameForTeam(task.name, teamId);
           if (updated) {
+            const completedTeamName = teamRow?.name || 'default';
+            await this.postBrainCompletionMemory({
+              kind: 'task',
+              key: `task:${updated.uuid}`,
+              teamId,
+              project: completedTeamName,
+              agentId: callerAgentForDone?.id ?? updated.owner ?? null,
+              taskId: `task:${updated.uuid}`,
+              taskName: updated.name,
+              title: updated.title,
+              inputText: [updated.title, updated.description].filter(Boolean).join('\n\n'),
+              payload: completionPayload,
+              usedSourceIds: [],
+              volunteeredSourceIds: [],
+              occurredAt: now * 1000,
+            });
             void this.wakeDelegatedParentLeadIfReady({
               teamId,
-              teamName: teamRow?.name || 'default',
+              teamName: completedTeamName,
               child: updated,
               occurredAt: now * 1000,
             }).catch((err) => {
@@ -16198,6 +16704,24 @@ Return this JSON shape:
           });
 
           const updated = await this.db.tasks.getByNameForTeam(task.name, teamId);
+          if (updated && newStatus === 'done') {
+            const teamRow = await this.db.teams.getTeam(teamId).catch(() => null);
+            await this.postBrainCompletionMemory({
+              kind: 'task',
+              key: `task:${updated.uuid}`,
+              teamId,
+              project: teamRow?.name || teamName,
+              agentId: updated.owner ?? null,
+              taskId: `task:${updated.uuid}`,
+              taskName: updated.name,
+              title: updated.title,
+              inputText: [updated.title, updated.description].filter(Boolean).join('\n\n'),
+              payload: { status: 'done', completion_route: 'remote.task.status' },
+              usedSourceIds: [],
+              volunteeredSourceIds: [],
+              occurredAt: now * 1000,
+            });
+          }
           return { ok: true, result: { task: await this.buildTaskResult(updated!, teamId) } };
         }
 
@@ -16470,6 +16994,15 @@ Return this JSON shape:
   private isAutopilotGoalTask(task: TaskRow): boolean {
     const haystack = `${task.title}\n${task.description || ''}`.toLowerCase();
     return haystack.includes('autopilot source goal:') || haystack.includes('goal autopilot sync');
+  }
+
+  private isLeadCoordinationParentTask(task: TaskRow): boolean {
+    const haystack = `${task.title}\n${task.description || ''}`.toLowerCase();
+    return this.isAutopilotGoalTask(task)
+      || haystack.includes('team lead must decompose')
+      || haystack.includes('lead delegation kickoff')
+      || haystack.includes('member-owned child task')
+      || haystack.includes('member-owned child tasks');
   }
 
   private async createAutopilotGoalTask(goal: BrainAutopilotGoal, team: TeamRow, lead: AgentRow): Promise<{ task: TaskRow; brainContext: BrainVolunteerContext | null }> {
@@ -17331,7 +17864,7 @@ Return this JSON shape:
     task: TaskRow,
     teamId: string,
     actorAgentId: string | null,
-    reason: 'owner_refresh' | 'owner_unavailable' | 'owner_busy' | 'unclaimed' | 'checkin_heartbeat_probe' | 'probe_limit_reached' | 'validator_stalled_terminal' | 'lead_delegation_required' | 'lead_owner_unavailable' | 'delegated_children_complete' | 'control_reply_done' | 'control_reply_in_progress' | 'control_reply_delegated' | 'control_reply_claimed' | 'control_reply_blocked' | 'control_reply_reassign' | 'control_reply_route_assigned' | 'control_reply_repeated_attempt',
+    reason: 'owner_refresh' | 'owner_unavailable' | 'owner_busy' | 'unclaimed' | 'ownerless_doing_repaired' | 'checkin_heartbeat_probe' | 'probe_limit_reached' | 'validator_stalled_terminal' | 'lead_delegation_required' | 'lead_owner_unavailable' | 'delegated_children_complete' | 'control_reply_done' | 'control_reply_in_progress' | 'control_reply_delegated' | 'control_reply_claimed' | 'control_reply_blocked' | 'control_reply_reassign' | 'control_reply_route_assigned' | 'control_reply_repeated_attempt',
     stalledMinutes: number,
     nowMs: number,
   ): Promise<void> {
@@ -17371,6 +17904,41 @@ Return this JSON shape:
     }
   }
 
+  private async repairOwnerlessDoingTask(
+    task: TaskRow,
+    teamRow: { id: string; name: string },
+    nowMs: number,
+  ): Promise<TaskRow> {
+    if (task.status !== 'doing' || task.owner) return task;
+    const nowSec = Math.floor(nowMs / 1000);
+    const note = 'Task was in doing with no owner; manager parked it back to todo so assignment and triage can continue.';
+    const parkedTask: TaskRow = {
+      ...task,
+      owner: null,
+      status: 'todo',
+      completed_at: null,
+      updated_at: nowSec,
+      description: this.appendTaskTriageNote(task.description, 'ownerless_doing_repaired', note, nowMs),
+    };
+    await this.db.tasks.updateFields(task.id, {
+      owner: parkedTask.owner,
+      status: parkedTask.status,
+      completed_at: parkedTask.completed_at,
+      description: parkedTask.description,
+      updated_at: parkedTask.updated_at,
+    });
+    await this.recordTaskSupervision(
+      parkedTask,
+      teamRow.id,
+      null,
+      'ownerless_doing_repaired',
+      Math.max(0, Math.round((nowMs - this.taskLastActivityMs(task)) / 60000)),
+      nowMs,
+    );
+    this.managerLog(`Repaired ownerless doing task ${task.name}: parked to todo for reassignment`);
+    return parkedTask;
+  }
+
   private async parkLeadDelegationTask(params: {
     task: TaskRow;
     teamId: string;
@@ -17384,10 +17952,13 @@ Return this JSON shape:
     message: string;
   }): Promise<void> {
     const nowSec = Math.floor(params.nowMs / 1000);
+    const retainedOwner = params.reason === 'lead_delegation_required'
+      ? (params.ownerAgent?.id ?? params.task.owner ?? null)
+      : null;
     if (params.parkTask !== false) {
       await this.db.tasks.updateFields(params.task.id, {
         status: 'todo',
-        owner: null,
+        owner: retainedOwner,
         updated_at: nowSec,
       });
     }
@@ -17401,7 +17972,8 @@ Return this JSON shape:
         params.nowMs,
       );
     }
-    this.managerLog(`${params.parkTask === false ? 'Held' : 'Parked'} lead-owned task ${params.task.name}: ${params.message}`);
+    const ownerNote = retainedOwner ? ` retained owner ${params.ownerName}` : ' cleared owner';
+    this.managerLog(`${params.parkTask === false ? 'Held' : 'Parked'} lead-owned task ${params.task.name}:${ownerNote}: ${params.message}`);
   }
 
   private async closeStalledValidatorTaskTerminal(params: {
@@ -17506,8 +18078,9 @@ Return this JSON shape:
     opts: { dispatch?: boolean } = {},
   ): Promise<{ assigned: boolean; reason: string; owner?: AgentRow; dispatched?: boolean }> {
     if (task.owner || task.status !== 'todo') return { assigned: false, reason: 'not_unowned_todo' };
+    const leadCoordinationTask = this.isLeadCoordinationParentTask(task);
     const assignmentHoldReason = await this.recentAssignmentHoldTriageReason(teamRow.id, task, nowMs);
-    if (assignmentHoldReason) {
+    if (assignmentHoldReason && !leadCoordinationTask) {
       return { assigned: false, reason: this.assignmentHoldSkipReason(assignmentHoldReason) };
     }
     if (!(await this.hasDoingTaskRoom(teamRow.id))) return { assigned: false, reason: 'doing_limit_full' };
@@ -17543,7 +18116,7 @@ Return this JSON shape:
 
     const tryAssign = async (
       owner: AgentRow,
-      assignOpts: { wakeBeforeClaim?: boolean } = {},
+      assignOpts: { wakeBeforeClaim?: boolean; allowLeadCoordinationBacklog?: boolean } = {},
     ): Promise<{ assigned: boolean; reason: string; owner?: AgentRow; dispatched?: boolean }> => {
       const stalledBacklog = await this.stalledOwnerBacklogGuard({
         teamId: teamRow.id,
@@ -17552,7 +18125,23 @@ Return this JSON shape:
       });
       if (stalledBacklog) return { assigned: false, reason: 'owner_has_stalled_backlog' };
       if ((activeByOwner.get(owner.id) ?? 0) > 0) return { assigned: false, reason: 'owner_has_active_task' };
-      if ((await this.countOpenOwnedTasks(owner.id)) > 0) return { assigned: false, reason: 'owner_has_open_task' };
+      const openOwnedCount = await this.countOpenOwnedTasks(owner.id);
+      if (openOwnedCount > 0) {
+        if (!assignOpts.allowLeadCoordinationBacklog) return { assigned: false, reason: 'owner_has_open_task' };
+        const openTasks = await this.listOpenTasksForTeam(teamRow.id);
+        const openLeadCoordination = openTasks.filter((openTask) =>
+          openTask.id !== task.id
+          && openTask.owner === owner.id
+          && this.isLeadCoordinationParentTask(openTask),
+        );
+        if (openLeadCoordination.length >= this.goalAutopilotSyncMaxOpenPerLead()) {
+          return { assigned: false, reason: 'lead_coordination_open_limit' };
+        }
+        const leadDelegationBlockers = await this.findLeadDelegationBlockers(teamRow.id, teamRow.name, owner, task.id);
+        if (leadDelegationBlockers.length >= this.goalAutopilotLeadBlockerLimit()) {
+          return { assigned: false, reason: 'lead_delegation_backlog' };
+        }
+      }
       if ((await this.countActiveCheckins(owner.id)) > 0) return { assigned: false, reason: 'owner_has_active_checkin' };
       if (await this.hasAnyActiveQuery(owner)) return { assigned: false, reason: 'owner_has_active_query' };
       const current = await this.db.tasks.getByNameForTeam(task.name, teamRow.id).catch(() => null);
@@ -17596,6 +18185,24 @@ Return this JSON shape:
       return { assigned: true, reason: 'assigned', owner, dispatched };
     };
 
+    let leadRecoveryReason: string | null = null;
+    if (leadCoordinationTask) {
+      const lead = await this.findConfiguredTaskCreationLead(teamRow.id, teamRow.name);
+      if (!lead) {
+        leadRecoveryReason = 'no_configured_lead';
+      } else if (!this.isLiveForSupervision(lead) && !this.canWakeAssignedTaskOwner(lead)) {
+        leadRecoveryReason = 'lead_unavailable';
+      } else {
+        const assignment = await tryAssign(lead, {
+          wakeBeforeClaim: !this.isLiveForSupervision(lead) && this.canWakeAssignedTaskOwner(lead),
+          allowLeadCoordinationBacklog: true,
+        });
+        if (assignment.assigned) return assignment;
+        leadRecoveryReason = assignment.reason;
+      }
+      return { assigned: false, reason: `lead_recovery_${leadRecoveryReason || 'unavailable'}` };
+    }
+
     for (const owner of candidates) {
       const assignment = await tryAssign(owner);
       if (assignment.assigned) return assignment;
@@ -17606,11 +18213,11 @@ Return this JSON shape:
       if (assignment.assigned) return assignment;
     }
 
-    return { assigned: false, reason: 'no_idle_live_member' };
+    return { assigned: false, reason: leadRecoveryReason ? `lead_recovery_${leadRecoveryReason}` : 'no_idle_live_member' };
   }
 
   private shouldRouteUnownedAssignmentMiss(reason: string): boolean {
-    return [
+    return reason.startsWith('lead_recovery_') || [
       'no_idle_live_member',
       'owner_has_active_task',
       'owner_has_open_task',
@@ -17796,7 +18403,7 @@ Return this JSON shape:
           continue;
         }
         const assignmentHoldReason = await this.recentAssignmentHoldTriageReason(teamRow.id, task, now);
-        if (assignmentHoldReason) {
+        if (assignmentHoldReason && !this.isLeadCoordinationParentTask(task)) {
           skippedCount++;
           items.push({
             team: teamRow.name,
@@ -17905,7 +18512,7 @@ Return this JSON shape:
           ? active
           : [];
         if (active.length && !transferableCheckins.length) continue;
-        if (await this.recentAssignmentHoldTriageReason(teamRow.id, t, now)) continue;
+        if (await this.recentAssignmentHoldTriageReason(teamRow.id, t, now) && !this.isLeadCoordinationParentTask(t)) continue;
 
         const assignment = await this.assignUnownedTodoTask(t, teamRow, now);
         if (assignment.assigned) {
@@ -17995,7 +18602,30 @@ Return this JSON shape:
     };
     for (const t of doing) {
       if (nudged >= MAX_PER_SWEEP) break;
-      if (!t.owner) continue;
+      if (!t.owner) {
+        const teamRow = await getTeamRow(t.team_id);
+        if (!teamRow) continue;
+        const repaired = await this.repairOwnerlessDoingTask(t, teamRow, now);
+        const assignment = await this.assignUnownedTodoTask(repaired, teamRow, now);
+        if (assignment.assigned) {
+          assignedTodoTaskIds.add(t.id);
+          nudged++;
+          unownedAssigned++;
+          continue;
+        }
+        const routed = await this.routeUnownedAssignmentMissToTaskManager({
+          teamRow,
+          task: repaired,
+          reason: assignment.reason,
+          ageMinutes: Math.max(0, Math.round((now - this.taskLastActivityMs(t)) / 60000)),
+          nowMs: now,
+        });
+        if (routed) {
+          assignedTodoTaskIds.add(t.id);
+          nudged++;
+        }
+        continue;
+      }
       const updated = this.taskLastActivityMs(t);
       const ageMs = now - updated;
       const [ownerAgent, teamRow] = await Promise.all([
@@ -18333,7 +18963,7 @@ Return this JSON shape:
       const mins = Math.round((now - updated) / 60000);
       const hasRecentSupervision = await this.hasRecentTaskSupervisionEvent(teamRow.id, t, now - RENUDGE_MS);
       if (hasRecentSupervision) continue;
-      if (await this.recentAssignmentHoldTriageReason(teamRow.id, t, now)) continue;
+      if (await this.recentAssignmentHoldTriageReason(teamRow.id, t, now) && !this.isLeadCoordinationParentTask(t)) continue;
 
       if (!lead) {
         const fallback = await this.routeStalledTaskToTaskManagerFallback({

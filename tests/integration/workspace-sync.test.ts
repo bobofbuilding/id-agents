@@ -102,7 +102,7 @@ describe('workspace sync integration', () => {
     });
 
     expect(first.counts).toEqual({
-      wroteMissing: 6,
+      wroteMissing: 7,
       matchedSource: 0,
       overwroteManaged: 0,
       drifted: 0,
@@ -112,6 +112,7 @@ describe('workspace sync integration', () => {
     expect(walkFiles(workspacePath)).toEqual([
       '.claude/CLAUDE.md',
       '.claude/skills/foundry-scripting-and-deploy/SKILL.md',
+      '.claude/skills/fuzz-suite-generation/SKILL.md',
       '.claude/skills/gas-optimization-foundry/SKILL.md',
       '.claude/skills/solidity-style-modern/SKILL.md',
       '.claude/skills/using-foundry/SKILL.md',
@@ -129,6 +130,7 @@ describe('workspace sync integration', () => {
     expect(Object.keys(receipt.files).sort()).toEqual([
       '.claude/CLAUDE.md',
       '.claude/skills/foundry-scripting-and-deploy/SKILL.md',
+      '.claude/skills/fuzz-suite-generation/SKILL.md',
       '.claude/skills/gas-optimization-foundry/SKILL.md',
       '.claude/skills/solidity-style-modern/SKILL.md',
       '.claude/skills/using-foundry/SKILL.md',
@@ -153,7 +155,7 @@ describe('workspace sync integration', () => {
 
     expect(second.counts).toEqual({
       wroteMissing: 0,
-      matchedSource: 6,
+      matchedSource: 7,
       overwroteManaged: 0,
       drifted: 0,
     });
@@ -171,7 +173,7 @@ describe('workspace sync integration', () => {
 
     expect(third.counts).toEqual({
       wroteMissing: 0,
-      matchedSource: 5,
+      matchedSource: 6,
       overwroteManaged: 0,
       drifted: 1,
     });
@@ -199,7 +201,7 @@ describe('workspace sync integration', () => {
     });
 
     expect(first.counts).toEqual({
-      wroteMissing: 6,
+      wroteMissing: 7,
       matchedSource: 0,
       overwroteManaged: 0,
       drifted: 0,
@@ -219,6 +221,7 @@ describe('workspace sync integration', () => {
       '.claude/CLAUDE.md',
       '.claude/rules/agent-foundry-dev.md',
       '.claude/skills/foundry-scripting-and-deploy/SKILL.md',
+      '.claude/skills/fuzz-suite-generation/SKILL.md',
       '.claude/skills/gas-optimization-foundry/SKILL.md',
       '.claude/skills/solidity-style-modern/SKILL.md',
       '.claude/skills/using-foundry/SKILL.md',
@@ -234,6 +237,7 @@ describe('workspace sync integration', () => {
     expect(Object.keys(receipt.files).sort()).toEqual([
       '.claude/rules/agent-foundry-dev.md',
       '.claude/skills/foundry-scripting-and-deploy/SKILL.md',
+      '.claude/skills/fuzz-suite-generation/SKILL.md',
       '.claude/skills/gas-optimization-foundry/SKILL.md',
       '.claude/skills/solidity-style-modern/SKILL.md',
       '.claude/skills/using-foundry/SKILL.md',
@@ -265,7 +269,7 @@ describe('workspace sync integration', () => {
 
     expect(second.counts).toEqual({
       wroteMissing: 0,
-      matchedSource: 6,
+      matchedSource: 7,
       overwroteManaged: 0,
       drifted: 0,
     });
@@ -291,7 +295,7 @@ describe('workspace sync integration', () => {
 
     // Root file is Case 2 matched-source (no write); skills are Case 1 writes.
     expect(first.counts).toEqual({
-      wroteMissing: 5,
+      wroteMissing: 6,
       matchedSource: 1,
       overwroteManaged: 0,
       drifted: 0,
@@ -338,7 +342,7 @@ describe('workspace sync integration', () => {
     // is created, matching slice-3 semantics.
     expect(second.counts).toEqual({
       wroteMissing: 0,
-      matchedSource: 5,
+      matchedSource: 6,
       overwroteManaged: 0,
       drifted: 1,
     });
@@ -400,7 +404,7 @@ describe('workspace sync integration', () => {
     });
 
     expect(first.counts).toEqual({
-      wroteMissing: 6,
+      wroteMissing: 7,
       matchedSource: 0,
       overwroteManaged: 0,
       drifted: 0,
@@ -408,6 +412,7 @@ describe('workspace sync integration', () => {
     expect(first.warnings).toEqual([]);
     expect(walkFiles(workspacePath)).toEqual([
       '.agents/skills/foundry-scripting-and-deploy/SKILL.md',
+      '.agents/skills/fuzz-suite-generation/SKILL.md',
       '.agents/skills/gas-optimization-foundry/SKILL.md',
       '.agents/skills/solidity-style-modern/SKILL.md',
       '.agents/skills/using-foundry/SKILL.md',
@@ -524,7 +529,7 @@ describe('workspace sync integration', () => {
       libraryRoot: FIXTURE_LIBRARY_ROOT,
       workspacePath,
     });
-    expect(first.counts.wroteMissing).toBe(6);
+    expect(first.counts.wroteMissing).toBe(7);
 
     // User replaces .claude/CLAUDE.md wholesale with unrelated content.
     // Neither the append-drift test nor the user-authored-first-deploy test
@@ -541,7 +546,7 @@ describe('workspace sync integration', () => {
 
     expect(second.counts).toEqual({
       wroteMissing: 0,
-      matchedSource: 5,
+      matchedSource: 6,
       overwroteManaged: 0,
       drifted: 1,
     });
@@ -602,7 +607,7 @@ describe('workspace sync integration', () => {
       });
 
       expect(result.counts).toEqual({
-        wroteMissing: 6,
+        wroteMissing: 7,
         matchedSource: 0,
         overwroteManaged: 0,
         drifted: 0,
@@ -611,6 +616,7 @@ describe('workspace sync integration', () => {
 
       expect(walkFiles(workspacePath)).toEqual([
         '.agents/skills/foundry-scripting-and-deploy/SKILL.md',
+        '.agents/skills/fuzz-suite-generation/SKILL.md',
         '.agents/skills/gas-optimization-foundry/SKILL.md',
         '.agents/skills/solidity-style-modern/SKILL.md',
         '.agents/skills/using-foundry/SKILL.md',
@@ -628,6 +634,7 @@ describe('workspace sync integration', () => {
       ) as { files: Record<string, { sha256: string; source: string }> };
       expect(Object.keys(receipt.files).sort()).toEqual([
         '.agents/skills/foundry-scripting-and-deploy/SKILL.md',
+        '.agents/skills/fuzz-suite-generation/SKILL.md',
         '.agents/skills/gas-optimization-foundry/SKILL.md',
         '.agents/skills/solidity-style-modern/SKILL.md',
         '.agents/skills/using-foundry/SKILL.md',
@@ -850,7 +857,7 @@ describe('workspace sync integration', () => {
       workspacePath,
     });
 
-    expect(result.counts).toEqual({ deleted: 6, preserved: 0, missing: 0 });
+    expect(result.counts).toEqual({ deleted: 7, preserved: 0, missing: 0 });
     expect(result.warnings).toEqual([]);
     // Workspace is empty — every managed file and directory is gone.
     expect(walkFiles(workspacePath)).toEqual([]);
@@ -878,7 +885,7 @@ describe('workspace sync integration', () => {
       workspacePath,
     });
 
-    expect(result.counts).toEqual({ deleted: 5, preserved: 1, missing: 0 });
+    expect(result.counts).toEqual({ deleted: 6, preserved: 1, missing: 0 });
     expect(result.warnings).toEqual([
       'Preserved user-edited file (ownership released): .claude/skills/using-foundry/SKILL.md',
     ]);
@@ -948,7 +955,7 @@ describe('workspace sync integration', () => {
         workspacePath,
       });
 
-      expect(result.counts).toEqual({ deleted: 6, preserved: 0, missing: 0 });
+      expect(result.counts).toEqual({ deleted: 7, preserved: 0, missing: 0 });
       expect(result.warnings).toEqual([]);
 
       // Our managed artifacts are gone.

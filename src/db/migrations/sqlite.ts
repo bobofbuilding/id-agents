@@ -132,8 +132,6 @@ async function migrateNewsItemsNullableAgentSqlite(adapter: SqliteAdapter): Prom
  * Hard-fails if orphan refs would violate integrity (runs after PK/nullable migrations).
  */
 export async function migrateDeleteManagerShadowAgentsSqlite(adapter: SqliteAdapter): Promise<void> {
-  if (await hasSqliteMigrationMarker(adapter, MANAGER_SHADOW_CLEANUP_MARKER)) return;
-
   const probe = async (sql: string): Promise<number> => {
     try {
       const r = await adapter.query<{ c: number }>(sql);

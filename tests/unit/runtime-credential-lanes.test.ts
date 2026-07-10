@@ -42,6 +42,9 @@ describe('runtime credential lanes', () => {
     delete process.env.ID_RATE_LIMIT_LOCAL_FALLBACK;
     delete process.env.ID_RATE_LIMIT_LOCAL_MODEL;
     delete process.env.ID_LOCAL_FALLBACK_MODEL;
+    delete process.env.ID_RATE_LIMIT_OVERLOAD_COOLDOWN_MS;
+    delete process.env.ID_RATE_LIMIT_UNKNOWN_COOLDOWN_MS;
+    delete process.env.ID_RATE_LIMIT_CAP_COOLDOWN_MS;
   });
 
   it('excludes the failed mid-run lane and replays the query on the next lane', async () => {
@@ -378,7 +381,7 @@ describe('runtime credential lanes', () => {
     }));
   });
 
-  it('does not pivot to a local model for generic API rate limits', async () => {
+  it('pivots to a role-matched local model and replays generic API rate limits', async () => {
     process.env.ID_RATE_LIMIT_LOCAL_MODEL = 'qwen3:4b';
     const db = fakeDb({
       agents: {
@@ -411,6 +414,24 @@ describe('runtime credential lanes', () => {
         })),
         updateStatus: vi.fn(async () => {}),
       },
+      queries: {
+        getByQueryIdForTeam: vi.fn(async () => ({
+          team_id: 'team-1',
+          agent_id: 'agent-1',
+          query_id: 'query-original',
+          status: 'failed',
+          prompt: 'do the work',
+          created: 1,
+          completed: 2,
+          result: null,
+          error: 'rate limited',
+          session_id: 'session-1',
+          owner_kind: 'agent',
+          owner_id: 'agent-1',
+          metadata: null,
+        })),
+        create: vi.fn(async () => {}),
+      },
     });
     const manager = new AgentManagerDb('/tmp/id-agents-runtime-test', db, { libraryRoot: null }) as any;
     manager.rebuildLocalClaudeAgent = vi.fn(async () => ({ success: true, pid: 1234 }));
@@ -428,13 +449,20 @@ describe('runtime credential lanes', () => {
       queryId: 'query-original',
     });
 
-    expect(failover).toEqual({ attempted: false });
-    expect(db.agents.updateStatus).not.toHaveBeenCalled();
-    expect(manager.rebuildLocalClaudeAgent).not.toHaveBeenCalled();
-    expect(manager.forwardToAgent).not.toHaveBeenCalled();
+    expect(failover).toMatchObject({ attempted: true, success: true, laneId: 'ollama:rate-limit-local', retryQueryId: 'query-retry' });
+    expect(db.agents.updateStatus).toHaveBeenCalledWith('agent-1', 'pending', expect.objectContaining({
+      runtime: 'ollama',
+      model: 'qwen3:4b',
+    }));
+    expect(manager.forwardToAgent).toHaveBeenCalledWith(
+      'http://localhost:4311',
+      'do the work',
+      'manager',
+      'session-1',
+    );
   });
 
-  it('does not use local fallback for session or monthly caps when subscription lanes are unavailable', async () => {
+  it('uses local fallback before a metered lane when subscription lanes are unavailable', async () => {
     process.env.ID_RATE_LIMIT_LOCAL_MODEL = 'qwen3:4b';
     const db = fakeDb({
       agents: {
@@ -519,16 +547,34 @@ describe('runtime credential lanes', () => {
       queryId: 'query-original',
     });
 
-    expect(failover).toMatchObject({ attempted: true, success: true, laneId: 'metered', retryQueryId: 'query-retry' });
-    expect(db.agents.updateStatus).not.toHaveBeenCalledWith('agent-1', 'pending', expect.objectContaining({ runtime: 'ollama' }));
-    expect(db.agents.updateMetadata).toHaveBeenCalledWith('agent-1', expect.objectContaining({
-      runtimeCredentialLane: 'metered',
+    expect(failover).toMatchObject({ attempted: true, success: true, laneId: 'ollama:rate-limit-local', retryQueryId: 'query-retry' });
+    expect(db.agents.updateStatus).toHaveBeenCalledWith('agent-1', 'pending', expect.objectContaining({
+      runtime: 'ollama',
+      model: 'qwen3:4b',
+      metadata: expect.objectContaining({
+        runtimeRateLimitFailover: expect.objectContaining({
+          fromLaneId: 'sub-a',
+          failedLaneId: 'sub-a',
+          toLaneId: 'ollama:rate-limit-local',
+        }),
+      }),
     }));
     expect(manager.rebuildLocalClaudeAgent).toHaveBeenCalledWith(
       'team-1',
       'default',
-      expect.objectContaining({ runtime: 'claude-code-cli', model: 'sonnet' }),
+      expect.objectContaining({ runtime: 'ollama', model: 'qwen3:4b' }),
     );
+  });
+
+  it('uses short probe cooldowns for unclassified limits and keeps explicit reset times', async () => {
+    const manager = new AgentManagerDb('/tmp/id-agents-runtime-test', fakeDb(), { libraryRoot: null }) as any;
+    const before = Date.now();
+    const unknownUntil = manager.parseCooldownUntilMs({ reason: 'unknown_rate_limit' });
+    expect(unknownUntil).toBeGreaterThanOrEqual(before + 5 * 60_000);
+    expect(unknownUntil).toBeLessThanOrEqual(Date.now() + 5 * 60_000 + 100);
+
+    const resetAt = new Date(Date.now() + 47 * 60_000).toISOString();
+    expect(manager.parseCooldownUntilMs({ reason: 'unknown_rate_limit', resetAt })).toBe(Date.parse(resetAt));
   });
 
   it('selects local fallback models from agent responsibilities when no override is set', async () => {
@@ -702,6 +748,7 @@ describe('runtime credential lanes', () => {
     const metadata = db.agents.updateStatus.mock.calls[0][2].metadata;
     expect(metadata.runtimeRateLimitFailover).toBeUndefined();
     expect(metadata.runtimeRateLimit).toBeUndefined();
+    expect(metadata.runtimeCredentialLane).toBe('claude-code-cli:default');
     expect(manager.rebuildLocalClaudeAgent).toHaveBeenCalledWith(
       'team-1',
       'engineering-team',
@@ -767,6 +814,76 @@ describe('runtime credential lanes', () => {
     await manager.restoreAgentFromRateLimitFallbackIfReady('team-1', 'engineering-team', fallbackAgent, now);
 
     expect(db.agents.updateStatus).not.toHaveBeenCalled();
+  });
+
+  it('restores same-runtime credential failovers to the preferred subscription lane', async () => {
+    const now = Date.now();
+    const agent = {
+      team_id: 'team-1',
+      id: 'agent-1',
+      name: 'lead',
+      type: 'claude',
+      model: 'claude-sonnet-5',
+      port: 4311,
+      endpoint: 'http://localhost:4311',
+      working_directory: '/tmp/agent-1',
+      status: 'running',
+      created_at: 1,
+      registry: null,
+      metadata: {
+        runtimeCredentialLane: 'claude-code-cli:metered-overflow',
+        runtimeRateLimitFailover: {
+          fromLaneId: 'claude-code-cli:metered-overflow',
+          toLaneId: 'claude-code-cli:metered-overflow',
+          queryId: 'query-original',
+        },
+      },
+      deleted_at: null,
+      runtime: 'claude-code-cli',
+      token_id: null,
+      domain: null,
+      api_key: null,
+      customer_domain: null,
+      public_endpoint_url: null,
+      internal_endpoint_url: null,
+      ssh_target: null,
+      last_seen: null,
+      last_probed_at: null,
+      last_error: null,
+      consecutive_failures: 0,
+    };
+    const db = fakeDb({
+      agents: {
+        updateStatus: vi.fn(async () => {}),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-runtime-test', db, { libraryRoot: null }) as any;
+    manager.runtimeLaneCooldowns.clear();
+    manager.rebuildLocalClaudeAgent = vi.fn(async () => ({ success: true, pid: 1234 }));
+
+    const restored = await manager.restoreAgentFromRateLimitFallbackIfReady('team-1', 'default', agent, now);
+
+    expect(restored).toBe(true);
+    expect(db.agents.updateStatus).toHaveBeenCalledWith('agent-1', 'pending', expect.objectContaining({
+      runtime: 'claude-code-cli',
+      model: 'claude-sonnet-5',
+      metadata: expect.objectContaining({
+        runtimeCredentialLane: 'claude-code-cli:default',
+        runtimeRateLimitRestore: expect.objectContaining({
+          fromLaneId: 'claude-code-cli:metered-overflow',
+          laneId: 'claude-code-cli:default',
+        }),
+      }),
+    }));
+    expect(manager.rebuildLocalClaudeAgent).toHaveBeenCalledWith(
+      'team-1',
+      'default',
+      expect.objectContaining({
+        runtime: 'claude-code-cli',
+        model: 'claude-sonnet-5',
+        metadata: expect.objectContaining({ runtimeCredentialLane: 'claude-code-cli:default' }),
+      }),
+    );
   });
 
   it('cleans stale local-fallback restore metadata when an agent already left Ollama', async () => {
@@ -876,7 +993,10 @@ describe('runtime credential lanes', () => {
       },
       adapter: {
         dialect: 'sqlite',
-        query: vi.fn(async () => ({ rows: [], rowCount: 1 })),
+        query: vi.fn(async (sql: string, params: unknown[]) => {
+          expect((sql.match(/\?/g) || []).length).toBe(params.length);
+          return { rows: [], rowCount: 1 };
+        }),
       },
     });
     const manager = new AgentManagerDb('/tmp/id-agents-runtime-test', db, { libraryRoot: null }) as any;

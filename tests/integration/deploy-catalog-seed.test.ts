@@ -5,9 +5,9 @@
  * Proves that:
  *   1. A `catalog:` block in a deploy YAML lands in `agents.metadata.catalog`
  *      on first deploy.
- *   2. A redeploy (sync) re-applies the YAML floor: a runtime PATCH to
- *      `metadata.catalog` is overwritten back to the YAML values, while
- *      runtime-only fields outside the catalog object stay intact.
+ *   2. A redeploy (sync) preserves runtime PATCHed catalog fields while
+ *      filling only absent YAML seed keys, including nullish YAML fields
+ *      that must not clear existing live values.
  *
  * Pattern follows tests/integration/wallet-opt-in.test.ts: in-memory SQLite,
  * a real AgentManagerDb, but `spawnLocalAgentProcess` is stubbed so the test
@@ -120,6 +120,7 @@ agents:
       description: "Updated junior dev blurb."
       expertise: [typescript, simple-refactors, doc-edits]
       costTier: low
+      profileStatus: null
       notSuitableFor: [security-key-handling, multi-file-schema-migrations]
       status: available
 
@@ -313,15 +314,14 @@ agents:
     expect(apiCat?.costTier).toBe('low');
   });
 
-  it('redeploy re-applies the YAML floor over a runtime PATCH', async () => {
+  it('redeploy preserves live PATCHed catalog keys while filling absent YAML seed keys', async () => {
     // First deploy seeds the original catalog.
     await deploy(firstYamlPath);
     const beforeRow = await readAgentRowByName(AGENT_JR);
     expect((beforeRow.metadata as any).catalog.description).toBe('Junior dev for low-stakes work.');
 
-    // Simulate a runtime PATCH /catalog drift — the agent server writes back
-    // the merged metadata with a different description and an extra runtime
-    // field that's NOT in the YAML.
+    // Simulate a runtime PATCH /catalog update — the agent server writes back
+    // live catalog fields that are not present in the YAML floor.
     const teamId = await db.teams.getOrCreateTeamId(TEST_TEAM);
     const driftedMeta = {
       ...(beforeRow.metadata as any),
@@ -331,6 +331,9 @@ agents:
         expertise: ['nothing'],
         costTier: 'high',
         status: 'busy',
+        profileStatus: 'hands-on',
+        contributorTitle: 'Runtime principal',
+        bittreesLanes: ['engineering', 'architecture'],
         currentTask: 'doing my own thing',
       },
     };
@@ -338,22 +341,22 @@ agents:
     const drifted = await db.agents.getByName(teamId, AGENT_JR);
     expect((drifted!.metadata as any).catalog.role).toBe('rogue-role');
 
-    // Redeploy with the updated YAML — should overwrite back to the YAML floor.
+    // Redeploy with the updated YAML. The YAML floor should only fill absent
+    // keys and leave existing live values intact, including nullish seed data.
     await deploy(redeployYamlPath);
 
     const after = await readAgentRowByName(AGENT_JR);
     const afterCat = (after.metadata as any).catalog;
-    // YAML floor wins: role is back, description is the redeploy YAML's,
-    // expertise reflects the new YAML list (not the runtime drift).
-    expect(afterCat.role).toBe('junior-developer');
-    expect(afterCat.description).toBe('Updated junior dev blurb.');
-    expect(afterCat.expertise).toEqual(['typescript', 'simple-refactors', 'doc-edits']);
+    expect(afterCat.role).toBe('rogue-role');
+    expect(afterCat.description).toBe('agent rewrote me at runtime');
+    expect(afterCat.expertise).toEqual(['nothing']);
+    expect(afterCat.costTier).toBe('high');
+    expect(afterCat.status).toBe('busy');
+    expect(afterCat.profileStatus).toBe('hands-on');
+    expect(afterCat.contributorTitle).toBe('Runtime principal');
+    expect(afterCat.bittreesLanes).toEqual(['engineering', 'architecture']);
+    expect(afterCat.currentTask).toBe('doing my own thing');
     expect(afterCat.notSuitableFor).toEqual(['security-key-handling', 'multi-file-schema-migrations']);
-    // Runtime-only `currentTask` from the drift is gone — the YAML block is
-    // a full replacement at the catalog object level on redeploy.
-    expect(afterCat.currentTask).toBeUndefined();
-    // status comes from the YAML.
-    expect(afterCat.status).toBe('available');
   });
 
   it('spawn env handoff carries the catalog seed as base64-encoded ID_AGENT_CATALOG', async () => {

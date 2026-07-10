@@ -14,7 +14,7 @@
  *   combining `resume` with the non-interactive flags used here
  */
 
-import { spawn, ChildProcess } from 'child_process';
+import { spawn, spawnSync, ChildProcess } from 'child_process';
 import { AgentHarness, HarnessOptions, HarnessMessage, HarnessType, McpServerSpec } from './types.js';
 import { reportTurnUsage } from './usage-report.js';
 import { terminateChildProcessTree } from './claude-code-cli.js';
@@ -145,6 +145,64 @@ export function resolveCodexExecutable(env: NodeJS.ProcessEnv = process.env): Re
   }
 
   return { command: 'codex', display: 'codex', native: false };
+}
+
+const MIN_CODEX_VERSION_FOR_GPT56 = '0.144.0';
+
+function parseVersion(raw: string | undefined): [number, number, number] | null {
+  const m = String(raw || '').match(/(\d+)\.(\d+)\.(\d+)/);
+  if (!m) return null;
+  return [Number(m[1]), Number(m[2]), Number(m[3])];
+}
+
+function compareVersions(a: string | undefined, b: string): number {
+  const av = parseVersion(a);
+  const bv = parseVersion(b);
+  if (!av || !bv) return -1;
+  for (let i = 0; i < 3; i++) {
+    if (av[i] !== bv[i]) return av[i] > bv[i] ? 1 : -1;
+  }
+  return 0;
+}
+
+function codexVersion(command: string): string | undefined {
+  try {
+    const out = spawnSync(command, ['--version'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 3000,
+      env: process.env,
+    });
+    return `${out.stdout || ''} ${out.stderr || ''}`.trim();
+  } catch {
+    return undefined;
+  }
+}
+
+function cachedCodexModels(): string[] {
+  try {
+    const raw = fs.readFileSync(path.join(os.homedir(), '.codex', 'models_cache.json'), 'utf8');
+    const models = (JSON.parse(raw).models ?? []) as { slug?: string; visibility?: string; priority?: number }[];
+    return models
+      .filter((m) => m.slug && m.visibility === 'list')
+      .sort((a, b) => (a.priority ?? 999) - (b.priority ?? 999))
+      .map((m) => m.slug as string);
+  } catch {
+    return [];
+  }
+}
+
+function resolveCodexModelForCli(model: string | undefined, command: string): { model?: string; fallbackReason?: string } {
+  if (!model || !/^gpt-5\.6(?:-|$)/i.test(model)) return { model };
+  const cache = cachedCodexModels();
+  if (cache.includes(model)) return { model };
+  const version = codexVersion(command);
+  if (compareVersions(version, MIN_CODEX_VERSION_FOR_GPT56) >= 0) return { model };
+  const fallback = cache.find((m) => !/^gpt-5\.6(?:-|$)/i.test(m)) || 'gpt-5.5';
+  return {
+    model: fallback,
+    fallbackReason: `${model} requires a newer Codex CLI than ${version || 'the installed version'}; using ${fallback} until Codex is updated or its model cache lists ${model}.`,
+  };
 }
 
 /** TOML-encode a string scalar. */
@@ -294,7 +352,14 @@ export class CodexHarness implements AgentHarness {
 
     console.log(`[Codex] Starting harness`);
     console.log(`[Codex] Working directory: ${workingDir}`);
+    const codexExecutable = resolveCodexExecutable();
+    const modelResolution = resolveCodexModelForCli(options.model, codexExecutable.command);
+    const effectiveModel = modelResolution.model;
     if (options.model) console.log(`[Codex] Model: ${options.model}`);
+    if (modelResolution.fallbackReason) {
+      console.warn(`[Codex] ${modelResolution.fallbackReason}`);
+      yield { type: 'progress', content: modelResolution.fallbackReason };
+    }
 
     const skipPermissions = process.env.ID_AGENT_SKIP_PERMISSIONS !== 'false';
     // A prior thread id (from a previous turn of THIS conversation) → resume it so
@@ -317,8 +382,8 @@ export class CodexHarness implements AgentHarness {
     args.push('--json');
 
     // Model override — REQUIRED on resume (see above); harmless on fresh exec.
-    if (options.model) {
-      args.push('--model', options.model);
+    if (effectiveModel) {
+      args.push('--model', effectiveModel);
     }
 
     // Default to --dangerously-bypass-approvals-and-sandbox so background
@@ -377,7 +442,6 @@ export class CodexHarness implements AgentHarness {
 
     // Fail-closed: never spawn with a credential on the command line.
     assertNoSecretsInArgv(args);
-    const codexExecutable = resolveCodexExecutable();
     console.log(`[Codex] Full command: ${redactForLog(codexExecutable.display)} ${redactForLog(args.join(' '))}`);
     if (codexExecutable.native) {
       console.log(`[Codex] Using native binary directly; bypassing the Node CLI shim`);
@@ -699,9 +763,16 @@ export class CodexHarness implements AgentHarness {
                 // real spend, not the cached context re-counted every turn.
                 const input = Math.max(0, (Number(u.input_tokens) || 0) - (Number(u.cached_input_tokens) || 0));
                 const output = Number(u.output_tokens) || 0;
+                const reasoningOutput = Number(u.reasoning_output_tokens) || 0;
+                if ([516, 1034, 1552].includes(reasoningOutput)) {
+                  console.warn(
+                    `[Codex] Reasoning-token cluster candidate observed: ${reasoningOutput} tokens ` +
+                    `(model=${effectiveModel || options.model || process.env.CODEX_MODEL || 'codex'}, query=${this.currentQueryId || 'unknown'})`,
+                  );
+                }
                 reportTurnUsage({
                   runtime: 'codex',
-                  model: options.model || process.env.CODEX_MODEL || 'codex',
+                  model: effectiveModel || options.model || process.env.CODEX_MODEL || 'codex',
                   input: input || null,
                   output: output || null,
                   genMs: Date.now() - turnStartMs,

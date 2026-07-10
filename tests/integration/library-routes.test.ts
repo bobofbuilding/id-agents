@@ -147,6 +147,7 @@ describe('library inventory routes — mounted foundry-dev fixture', () => {
     // Bundled skills enumerated from the entry's skills/ subdir.
     expect([...body.bundledSkills].sort()).toEqual([
       'foundry-scripting-and-deploy',
+      'fuzz-suite-generation',
       'gas-optimization-foundry',
       'solidity-style-modern',
       'using-foundry',

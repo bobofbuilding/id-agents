@@ -597,6 +597,57 @@ describe('/talk-to auto-attach', () => {
     });
   });
 
+  it('routes ownerless REST and CLI task creation to the configured team lead when available', async () => {
+    await withBriefValidationMode('enforce', async () => {
+      const restRoutingTeam = `owner-routing-rest-${Date.now()}`;
+      const restRoutingTeamId = await db.teams.getOrCreateTeamId(restRoutingTeam);
+      await insertAgent(db, restRoutingTeamId, 'engineering-lead', null);
+
+      const restCreate = await fetch(`${baseUrl}/tasks`, {
+        method: 'POST',
+        headers: adminHeaders(restRoutingTeam),
+        body: JSON.stringify({
+          title: 'REST default lead owner task',
+          name: `rest-default-lead-owner-${Date.now()}`,
+          from: 'manager',
+          ...validBriefFields(),
+        }),
+      });
+      expect(restCreate.status).toBe(201);
+      const restBody = await restCreate.json() as {
+        task?: { ownerName?: string | null; status?: string };
+        default_owner_routing?: { owner?: string; reason?: string };
+      };
+      expect(restBody.task?.ownerName).toBe('engineering-lead');
+      expect(restBody.task?.status).toBe('doing');
+      expect(restBody.default_owner_routing).toMatchObject({
+        owner: 'engineering-lead',
+        reason: 'configured_team_lead',
+      });
+
+      const cliRoutingTeam = `owner-routing-cli-${Date.now()}`;
+      const cliRoutingTeamId = await db.teams.getOrCreateTeamId(cliRoutingTeam);
+      await insertAgent(db, cliRoutingTeamId, 'engineering-lead', null);
+
+      const cliCreate = await fetch(`${baseUrl}/remote`, {
+        method: 'POST',
+        headers: adminHeaders(cliRoutingTeam),
+        body: JSON.stringify({
+          from: 'manager',
+          command: '/task create "CLI default lead owner task" --name cli-default-lead-owner --goal goal_mqxibu5r_2k2my --expected-output "implementation patch and tests" --acceptance "covers CLI default lead owner" --validation-path "coder and researcher" --out-of-scope "optional recommendations" --recommendation-routing "Non-required recommendations become backlog candidates." --bittrees-relevance "medium: improves manager delegation reliability for Bittrees contributor work."',
+        }),
+      });
+      expect(cliCreate.status).toBe(200);
+      const cliBody = await cliCreate.json() as {
+        ok: boolean;
+        result?: { task?: { ownerName?: string | null; status?: string } };
+      };
+      expect(cliBody.ok).toBe(true);
+      expect(cliBody.result?.task?.ownerName).toBe('engineering-lead');
+      expect(cliBody.result?.task?.status).toBe('doing');
+    });
+  });
+
   it('requires acceptance coverage or an explicit failure note before successful done in enforce mode', async () => {
     await withBriefValidationMode('enforce', async () => {
       const created = await fetch(`${baseUrl}/tasks`, {
@@ -690,13 +741,9 @@ describe('/talk-to auto-attach', () => {
       }),
     });
     expect(created.status).toBe(201);
-
-    const claimed = await fetch(`${baseUrl}/tasks/advisory-manager-query/claim`, {
-      method: 'POST',
-      headers: adminHeaders('engineering-team'),
-      body: JSON.stringify({ agent_id: 'engineering-lead' }),
-    });
-    expect(claimed.status).toBe(200);
+    const createdBody = await created.json() as { task?: { ownerName?: string | null; status?: string } };
+    expect(createdBody.task?.ownerName).toBe('engineering-lead');
+    expect(createdBody.task?.status).toBe('doing');
 
     const rejected = await fetch(`${baseUrl}/tasks/advisory-manager-query/done`, {
       method: 'POST',
@@ -1204,6 +1251,138 @@ describe('/talk-to auto-attach', () => {
     expect(duplicateBody.duplicate_scope).toBe('goal+target');
     expect(duplicateBody.duplicate_state).toBe('open');
     expect(duplicateBody.suggested_action).toBe('status-check');
+  });
+
+  it('rejects duplicate goal target tasks during /talk-to auto-attach before creating a second task or checkin', async () => {
+    const targetBrief = {
+      ...validBriefFields(),
+      goal_id: 'goal_agent_bittrees_legal_review',
+      target: 'https://agent.bittrees.org/legal/launch',
+      expected_output: 'Legal signoff for the agent.bittrees.org launch page',
+      acceptance_criteria: ['Legal review is complete for the target page'],
+      backlog_policy: 'Send status checks to the current owner instead of opening duplicate legal reviews.',
+      bittrees_relevance: 'medium: reduces duplicate legal-team dispatches for Bittrees launch work.',
+    };
+
+    const first = await fetch(`${baseUrl}/talk-to`, {
+      method: 'POST',
+      headers: adminHeaders(TEAM),
+      body: JSON.stringify({
+        to: 'coder',
+        from: 'manager',
+        message: 'Review the launch page legal copy.',
+        wait: false,
+        task: {
+          title: 'Review agent.bittrees.org launch legal copy',
+          name: 'review-agent-bittrees-legal-copy',
+          ...targetBrief,
+        },
+      }),
+    });
+    expect(first.status).toBe(200);
+
+    const duplicate = await fetch(`${baseUrl}/talk-to`, {
+      method: 'POST',
+      headers: adminHeaders(TEAM),
+      body: JSON.stringify({
+        to: 'coder',
+        from: 'manager',
+        message: 'Open another legal review for the same launch page.',
+        wait: false,
+        task: {
+          title: 'Check agent.bittrees.org launch disclaimers',
+          name: 'check-agent-bittrees-launch-disclaimers',
+          ...targetBrief,
+          target_url: 'agent.bittrees.org/legal/launch',
+          expected_output: 'Second legal pass for the same target page',
+        },
+      }),
+    });
+    expect(duplicate.status).toBe(409);
+    const duplicateBody = await duplicate.json() as {
+      error: string;
+      existing_task?: string;
+      existing_status?: string;
+      existing_owner?: string;
+      existing_owner_id?: string;
+      duplicate_scope?: string;
+      duplicate_state?: string;
+      suggested_action?: string;
+    };
+    expect(duplicateBody.error).toBe('existing_task_found');
+    expect(duplicateBody.existing_task).toBe('review-agent-bittrees-legal-copy');
+    expect(duplicateBody.existing_status).toBe('doing');
+    expect(duplicateBody.existing_owner).toBe('coder');
+    expect(duplicateBody.existing_owner_id).toBe(targetId);
+    expect(duplicateBody.duplicate_scope).toBe('goal+target');
+    expect(duplicateBody.duplicate_state).toBe('open');
+    expect(duplicateBody.suggested_action).toBe('status-check');
+    expect(await db.tasks.list({ teamId })).toHaveLength(1);
+    expect(await db.checkins.list({ teamId })).toHaveLength(1);
+  });
+
+  it('rejects duplicate goal target tasks when the existing task is recently done', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    await db.tasks.create({
+      id: 'task_recent_done_agent_bittrees_guard',
+      name: 'completed-agent-bittrees-launch-review',
+      uuid: '12345678-1234-4234-9234-123456789abc',
+      team_id: teamId,
+      title: 'Completed agent.bittrees.org launch review',
+      description: [
+        'Goal ID: goal_agent_bittrees_recent_review',
+        'Target: https://agent.bittrees.org/legal/launch',
+        'Expected output: completed launch review',
+        'Acceptance criteria: review complete',
+        'Validation path: coder and researcher',
+        'Out of scope: duplicate review creation',
+        'Backlog policy: status-check recent owner before reopening',
+        'Bittrees relevance: medium: avoids duplicate review loops',
+      ].join('\n'),
+      status: 'done',
+      created_by: dispatcherId,
+      owner: targetId,
+      created_at: now - 180,
+      updated_at: now - 60,
+      completed_at: now - 60,
+    });
+
+    const duplicate = await fetch(`${baseUrl}/tasks`, {
+      method: 'POST',
+      headers: adminHeaders(TEAM),
+      body: JSON.stringify({
+        title: 'Reopen agent.bittrees.org legal launch review',
+        name: 'reopen-agent-bittrees-legal-launch-review',
+        from: 'manager',
+        ...validBriefFields(),
+        goal_id: 'goal_agent_bittrees_recent_review',
+        target: 'agent.bittrees.org/legal/launch',
+        expected_output: 'duplicate follow-up on the same recently reviewed target',
+        acceptance_criteria: ['duplicate would have created a new review task'],
+        backlog_policy: 'status-check the recent owner instead of reopening',
+        bittrees_relevance: 'medium: avoids duplicate legal-team dispatches.',
+      }),
+    });
+    expect(duplicate.status).toBe(409);
+    const duplicateBody = await duplicate.json() as {
+      error: string;
+      existing_task?: string;
+      existing_status?: string;
+      existing_owner?: string;
+      existing_owner_id?: string;
+      duplicate_scope?: string;
+      duplicate_state?: string;
+      suggested_action?: string;
+    };
+    expect(duplicateBody.error).toBe('existing_task_found');
+    expect(duplicateBody.existing_task).toBe('completed-agent-bittrees-launch-review');
+    expect(duplicateBody.existing_status).toBe('done');
+    expect(duplicateBody.existing_owner).toBe('coder');
+    expect(duplicateBody.existing_owner_id).toBe(targetId);
+    expect(duplicateBody.duplicate_scope).toBe('goal+target');
+    expect(duplicateBody.duplicate_state).toBe('recent_done');
+    expect(duplicateBody.suggested_action).toBe('status-check');
+    expect(await db.tasks.list({ teamId })).toHaveLength(1);
   });
 
   it('rejects validator children created after the parent task is terminal', async () => {
