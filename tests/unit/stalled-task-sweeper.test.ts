@@ -164,6 +164,8 @@ describe('stalled task sweeper', () => {
     delete process.env.ID_STALL_MANUAL_RENUDGE_MS;
     delete process.env.STALL_SWEEP_MAX_PER_SWEEP;
     delete process.env.STALL_MAX_PROBES;
+    delete process.env.STALL_PROBE_RESET_MS;
+    delete process.env.ID_STALL_PROBE_RESET_MS;
     delete process.env.ID_TASK_MANAGER_FALLBACK_COOLDOWN_MS;
     delete process.env.ID_UNOWNED_ASSIGN_MIN_MS;
     delete process.env.ID_UNOWNED_ASSIGN_MAX_PER_SWEEP;
@@ -195,6 +197,45 @@ describe('stalled task sweeper', () => {
 
     process.env.STALL_SWEEP_INTERVAL_MS = String(20 * 60 * 1000);
     expect(manager.getStallSweepIntervalMs()).toBe(20 * 60 * 1000);
+  });
+
+  it('refreshes an exhausted stalled-probe budget after the reset window', () => {
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', fakeDb(), { libraryRoot: null }) as any;
+    const renudgeMs = 90 * 60 * 1000;
+    const resetMs = 4 * 60 * 60 * 1000;
+    const key = 'todo-assign:task-1';
+
+    expect(manager.markStalledProbe(key, NOW_MS)).toBe(1);
+    expect(manager.markStalledProbe(key, NOW_MS)).toBe(2);
+    expect(manager.markStalledProbe(key, NOW_MS)).toBe(3);
+
+    // Budget exhausted: renudge spacing alone no longer re-opens probing.
+    expect(manager.canRunStalledProbe(key, NOW_MS + renudgeMs, renudgeMs, 3)).toBe(false);
+    expect(manager.canRunStalledProbe(key, NOW_MS + resetMs - 1, renudgeMs, 3)).toBe(false);
+
+    // After the cool-off window the budget resets so the task is re-probed
+    // instead of being stranded until a manager restart.
+    expect(manager.canRunStalledProbe(key, NOW_MS + resetMs, renudgeMs, 3)).toBe(true);
+    expect(manager.markStalledProbe(key, NOW_MS + resetMs)).toBe(1);
+  });
+
+  it('supports stalled-probe reset window override and opt-out', () => {
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', fakeDb(), { libraryRoot: null }) as any;
+    const renudgeMs = 90 * 60 * 1000;
+    const key = 'todo-assign:task-2';
+
+    manager.markStalledProbe(key, NOW_MS);
+    manager.markStalledProbe(key, NOW_MS);
+
+    process.env.STALL_PROBE_RESET_MS = String(30 * 60 * 1000);
+    expect(manager.getStallProbeResetMs()).toBe(30 * 60 * 1000);
+    expect(manager.canRunStalledProbe(key, NOW_MS + 30 * 60 * 1000, renudgeMs, 2)).toBe(true);
+
+    // 0 disables the reset entirely (legacy permanent burnout behavior).
+    manager.markStalledProbe(key, NOW_MS);
+    manager.markStalledProbe(key, NOW_MS);
+    process.env.STALL_PROBE_RESET_MS = '0';
+    expect(manager.canRunStalledProbe(key, NOW_MS + 365 * 24 * 60 * 60 * 1000, renudgeMs, 2)).toBe(false);
   });
 
   it('does not delay lead delegation kickoff for fresh tasks by default', () => {

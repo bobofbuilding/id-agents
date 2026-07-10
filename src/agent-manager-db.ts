@@ -812,6 +812,11 @@ export class AgentManagerDb {
     return Number(process.env.STALL_RENUDGE_MS) || 90 * 60 * 1000;
   }
 
+  private getStallProbeResetMs(): number {
+    const parsed = Number(process.env.STALL_PROBE_RESET_MS || process.env.ID_STALL_PROBE_RESET_MS);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 4 * 60 * 60 * 1000;
+  }
+
   private getTaskManagerFallbackCooldownMs(renudgeMs = this.getStallRenudgeMs(), force = false): number {
     const parsed = Number(process.env.ID_TASK_MANAGER_FALLBACK_COOLDOWN_MS);
     const base = Number.isFinite(parsed) && parsed >= 0 ? parsed : Math.min(renudgeMs, 15 * 60 * 1000);
@@ -898,7 +903,17 @@ export class AgentManagerDb {
   private canRunStalledProbe(key: string, nowMs: number, renudgeMs: number, maxProbes: number): boolean {
     const state = this.stalledNudges.get(key);
     if (!state) return true;
-    if (state.attempts >= maxProbes) return false;
+    if (state.attempts >= maxProbes) {
+      // An exhausted probe budget must not strand a task forever: refresh the
+      // budget after a cool-off window so stalled todo/doing rows keep getting
+      // re-probed until they are assigned, completed, or closed.
+      const resetMs = this.getStallProbeResetMs();
+      if (resetMs > 0 && nowMs - state.lastAt >= resetMs) {
+        this.stalledNudges.set(key, { ...state, attempts: 0 });
+        return true;
+      }
+      return false;
+    }
     return nowMs - state.lastAt >= renudgeMs;
   }
 
