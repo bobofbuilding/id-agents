@@ -4545,6 +4545,20 @@ Return this JSON shape:
     return [description?.trim(), line].filter(Boolean).join('\n\n');
   }
 
+  private taskRouteEvidence(params: {
+    processOnline: boolean | 'unresolved' | 'not_evaluated';
+    requestLaneBusy: boolean | 'unresolved' | 'not_evaluated';
+    objectiveCapacity: boolean | 'unresolved' | 'not_evaluated';
+    assignmentCapacity: boolean | 'unresolved' | 'not_evaluated';
+  }): string {
+    return [
+      `process_online=${params.processOnline}`,
+      `request_lane_busy=${params.requestLaneBusy}`,
+      `objective_capacity=${params.objectiveCapacity}`,
+      `assignment_capacity=${params.assignmentCapacity}`,
+    ].join('; ');
+  }
+
   private latestManagerTriageNote(task: TaskRow): { reason: string; note: string } | null {
     const description = String(task.description || '');
     const matches = [...description.matchAll(/Manager triage \(([^,]+), [^)]+\): ([^\n]+)/g)];
@@ -4959,86 +4973,128 @@ Return this JSON shape:
     const taskTeamId = task.team_id || queryRow.team_id;
     const taskTeamRow = await this.db.teams.getTeam(taskTeamId).catch(() => null);
     let fallbackNote = effectiveParsed.note;
+    let parkedDestinationTeam: TeamRow | null = null;
     if (effectiveParsed.action === 'reassign' && effectiveParsed.target) {
       const route = await this.resolveControlReplyRouteTarget(taskTeamId, effectiveParsed.target);
-      const routeBlock = (reason: string): void => {
-        fallbackNote = `${effectiveParsed.note} (route target "${effectiveParsed.target}" not assigned: ${reason})`;
+      const routeBlock = (reason: string, evidence: string): void => {
+        const target = route ? `${route.team.name}/${route.agent.name}` : effectiveParsed.target!;
+        const destinationFallback = parkedDestinationTeam
+          ? `NEEDS-REASSIGNMENT: destination delivery deferred to ${target}; ${reason}; ${evidence}`
+          : `route target "${target}" not assigned: ${reason}; ${evidence}`;
+        fallbackNote = `${effectiveParsed.note} (${destinationFallback})`;
       };
 
       if (!route) {
-        routeBlock('target_not_found');
-      } else if (route.team.id !== taskTeamId) {
-        routeBlock(`cross_team_route_to_${route.team.name}_not_applied`);
+        routeBlock('target_not_found', this.taskRouteEvidence({
+          processOnline: 'unresolved',
+          requestLaneBusy: 'unresolved',
+          objectiveCapacity: 'unresolved',
+          assignmentCapacity: 'unresolved',
+        }));
       } else if (!/running|online|ok/i.test(route.agent.status || '')) {
-        routeBlock(`target_${route.agent.name}_not_live`);
-      } else if (task.status !== 'doing' && !(await this.hasDoingTaskRoom(taskTeamId))) {
-        routeBlock('doing_limit_full');
+        if (route.team.id !== taskTeamId) parkedDestinationTeam = route.team;
+        routeBlock(`target_${route.agent.name}_not_live`, this.taskRouteEvidence({
+          processOnline: false,
+          requestLaneBusy: 'not_evaluated',
+          objectiveCapacity: 'not_evaluated',
+          assignmentCapacity: 'not_evaluated',
+        }));
       } else {
-        const leadBacklog = await this.leadDelegationBacklogGuard({
-          teamId: taskTeamId,
-          teamName: route.team.name,
-          owner: route.agent,
-          excludeTaskId: task.id,
-        });
-        const stalledBacklog = leadBacklog ? null : await this.stalledOwnerBacklogGuard({
-          teamId: taskTeamId,
-          teamName: route.team.name,
-          owner: route.agent,
-          excludeTaskId: task.id,
-        });
-        if (leadBacklog) {
-          routeBlock('lead_delegation_backlog');
-        } else if (stalledBacklog) {
-          routeBlock('stalled_task_backlog');
-        } else if (!(await this.hasActiveQueryCapacity(route.agent, route.team.name))) {
-          routeBlock('target_has_active_query');
+        if (route.team.id !== taskTeamId) parkedDestinationTeam = route.team;
+        const requiresDestinationSlot = route.team.id !== taskTeamId || task.status !== 'doing';
+        if (requiresDestinationSlot && !(await this.hasDoingTaskRoom(route.team.id))) {
+          routeBlock('doing_limit_full', this.taskRouteEvidence({
+            processOnline: true,
+            requestLaneBusy: 'not_evaluated',
+            objectiveCapacity: 'not_evaluated',
+            assignmentCapacity: false,
+          }));
         } else {
-          await this.db.tasks.updateFields(task.id, {
-            owner: route.agent.id,
-            status: 'doing',
-            completed_at: null,
-            updated_at: nowSec,
-          });
-          const routedTask = await this.db.tasks.getByNameForTeam(task.name, taskTeamId).catch(() => null) ?? {
-            ...task,
-            owner: route.agent.id,
-            status: 'doing' as const,
-            completed_at: null,
-            updated_at: nowSec,
-          };
-          await this.emitTaskClaimedWithBrainContext({
-            teamId: taskTeamId,
+          const leadBacklog = await this.leadDelegationBacklogGuard({
+            teamId: route.team.id,
+          teamName: route.team.name,
+          owner: route.agent,
+          excludeTaskId: task.id,
+        });
+          const stalledBacklog = leadBacklog ? null : await this.stalledOwnerBacklogGuard({
+            teamId: route.team.id,
             teamName: route.team.name,
-            task: routedTask,
             owner: route.agent,
-            occurredAt,
+            excludeTaskId: task.id,
           });
-          await this.recordTaskSupervision(
-            routedTask,
-            taskTeamId,
-            route.agent.id,
-            'control_reply_route_assigned',
-            stalledMinutes,
-            occurredAt,
-          );
-          const ref = this.taskShortRef(routedTask);
-          if (this.isConfiguredTeamLead(route.team.name, route.agent)) {
-            void this.promptLeadForDelegationKickoff(taskTeamId, route.team.name, routedTask, route.agent).catch((err) => {
-              console.warn(`[Supervision] Lead delegation kickoff failed for ${routedTask.name}: ${err?.message || err}`);
+          if (leadBacklog) {
+            routeBlock('lead_delegation_backlog', this.taskRouteEvidence({
+              processOnline: true,
+              requestLaneBusy: 'not_evaluated',
+              objectiveCapacity: false,
+              assignmentCapacity: true,
+            }));
+          } else if (stalledBacklog) {
+            routeBlock('stalled_task_backlog', this.taskRouteEvidence({
+              processOnline: true,
+              requestLaneBusy: 'not_evaluated',
+              objectiveCapacity: false,
+              assignmentCapacity: true,
+            }));
+          } else if (!(await this.hasActiveQueryCapacity(route.agent, route.team.name))) {
+            routeBlock('target_has_active_query', this.taskRouteEvidence({
+              processOnline: true,
+              requestLaneBusy: true,
+              objectiveCapacity: true,
+              assignmentCapacity: true,
+            }));
+          } else {
+            await this.db.tasks.updateFields(task.id, {
+              ...(route.team.id !== taskTeamId ? { team_id: route.team.id } : {}),
+              owner: route.agent.id,
+              status: 'doing',
+              completed_at: null,
+              updated_at: nowSec,
             });
-          } else if (!(await this.hasActiveSupervisionAskForMarker(taskTeamId, route.agent, ref))) {
-            const sent = await this.sendSupervisionAsk(route.team.name, route.agent.name, this.taskDelegationPrompt(routedTask, ref));
-            if (!sent) this.managerLog(`Routed task ${routedTask.name} to ${route.agent.name}, but the delegation prompt could not be delivered`);
+            const routedTask = await this.db.tasks.getByNameForTeam(task.name, route.team.id).catch(() => null) ?? {
+              ...task,
+              team_id: route.team.id,
+              owner: route.agent.id,
+              status: 'doing' as const,
+              completed_at: null,
+              updated_at: nowSec,
+            };
+            await this.emitTaskClaimedWithBrainContext({
+              teamId: route.team.id,
+              teamName: route.team.name,
+              task: routedTask,
+              owner: route.agent,
+              occurredAt,
+            });
+            await this.recordTaskSupervision(
+              routedTask,
+              route.team.id,
+              route.agent.id,
+              'control_reply_route_assigned',
+              stalledMinutes,
+              occurredAt,
+            );
+            const ref = this.taskShortRef(routedTask);
+            if (this.isConfiguredTeamLead(route.team.name, route.agent)) {
+              void this.promptLeadForDelegationKickoff(route.team.id, route.team.name, routedTask, route.agent).catch((err) => {
+                console.warn(`[Supervision] Lead delegation kickoff failed for ${routedTask.name}: ${err?.message || err}`);
+              });
+            } else if (!(await this.hasActiveSupervisionAskForMarker(route.team.id, route.agent, ref))) {
+              const sent = await this.sendSupervisionAsk(route.team.name, route.agent.name, this.taskDelegationPrompt(routedTask, ref));
+              if (!sent) this.managerLog(`Routed task ${routedTask.name} to ${route.agent.name}, but the delegation prompt could not be delivered`);
+            }
+            await this.markTaskControlReplyApplied({ teamId: queryRow.team_id, queryId: queryRow.query_id, agentId: actorAgentId, occurredAt, task: routedTask, action: 'route_assigned' });
+            this.managerLog(`Applied ROUTE control reply for task ${task.name} to ${route.team.name}/${route.agent.name} from query ${queryRow.query_id}`);
+            return { applied: true, action: 'route_assigned', task: task.name };
           }
-          await this.markTaskControlReplyApplied({ teamId: queryRow.team_id, queryId: queryRow.query_id, agentId: actorAgentId, occurredAt, task: routedTask, action: 'route_assigned' });
-          this.managerLog(`Applied ROUTE control reply for task ${task.name} to ${route.team.name}/${route.agent.name} from query ${queryRow.query_id}`);
-          return { applied: true, action: 'route_assigned', task: task.name };
         }
       }
     }
 
+    const parkedTeam = parkedDestinationTeam ?? taskTeamRow;
     const parkedTask: TaskRow = {
       ...task,
+      team_id: parkedTeam?.id ?? task.team_id,
       owner: null,
       status: 'todo',
       completed_at: null,
@@ -5046,6 +5102,7 @@ Return this JSON shape:
       description: this.appendTaskTriageNote(task.description, `control_reply_${effectiveParsed.action}`, fallbackNote, occurredAt),
     };
     await this.db.tasks.updateFields(task.id, {
+      team_id: parkedTask.team_id,
       owner: parkedTask.owner,
       status: parkedTask.status,
       completed_at: parkedTask.completed_at,
@@ -5054,17 +5111,17 @@ Return this JSON shape:
     });
     await this.recordTaskSupervision(
       parkedTask,
-      taskTeamRow?.id || queryRow.team_id,
+      parkedTeam?.id || queryRow.team_id,
       actorAgentId,
       effectiveParsed.action === 'blocked' ? 'control_reply_blocked' : 'control_reply_reassign',
       stalledMinutes,
       occurredAt,
     );
     await this.markTaskControlReplyApplied({ teamId: queryRow.team_id, queryId: queryRow.query_id, agentId: actorAgentId, occurredAt, task, action: effectiveParsed.action });
-    if (taskTeamRow) {
+    if (parkedTeam) {
       void this.routeParkedControlReplyTaskToTaskManager({
-        teamId: taskTeamRow.id,
-        teamName: taskTeamRow.name,
+        teamId: parkedTeam.id,
+        teamName: parkedTeam.name,
         task: parkedTask,
         ref: this.taskShortRef(parkedTask),
         stalledMinutes,
