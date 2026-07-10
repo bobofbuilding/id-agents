@@ -137,12 +137,16 @@ export class SqliteTasksRepo implements TasksRepository {
     updatedAt: number,
     options?: { maxDoingForTeam?: number },
   ): Promise<boolean> {
+    // A pre-assigned todo row (owner set by auto-routing, status still
+    // 'todo') must be claimable by that same owner — otherwise it's a dead
+    // state nobody can flip to 'doing'. Only a *different* owner is
+    // rejected by the `owner IS NULL OR owner = ?` condition below.
     const limit = options?.maxDoingForTeam;
     if (limit !== undefined) {
       const { rowCount } = await this.db.query(
         `UPDATE tasks
          SET owner = ?, status = 'doing', updated_at = ?
-         WHERE id = ? AND owner IS NULL AND status = 'todo'
+         WHERE id = ? AND (owner IS NULL OR owner = ?) AND status = 'todo'
            AND (
              SELECT COUNT(*)
              FROM tasks active
@@ -152,7 +156,7 @@ export class SqliteTasksRepo implements TasksRepository {
                  OR (active.team_id IS NULL AND tasks.team_id IS NULL)
                )
            ) < ?`,
-        [ownerId, updatedAt, taskId, limit],
+        [ownerId, updatedAt, taskId, ownerId, limit],
       );
       return rowCount > 0;
     }
@@ -160,8 +164,8 @@ export class SqliteTasksRepo implements TasksRepository {
     const { rowCount } = await this.db.query(
       `UPDATE tasks
        SET owner = ?, status = 'doing', updated_at = ?
-       WHERE id = ? AND owner IS NULL AND status = 'todo'`,
-      [ownerId, updatedAt, taskId],
+       WHERE id = ? AND (owner IS NULL OR owner = ?) AND status = 'todo'`,
+      [ownerId, updatedAt, taskId, ownerId],
     );
     return rowCount > 0;
   }

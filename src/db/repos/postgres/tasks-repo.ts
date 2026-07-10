@@ -143,12 +143,16 @@ export class PgTasksRepo implements TasksRepository {
     updatedAt: number,
     options?: { maxDoingForTeam?: number },
   ): Promise<boolean> {
+    // A pre-assigned todo row (owner set by auto-routing, status still
+    // 'todo') must be claimable by that same owner — otherwise it's a dead
+    // state nobody can flip to 'doing'. Only a *different* owner is
+    // rejected by the `owner IS NULL OR owner = $2` condition below.
     const limit = options?.maxDoingForTeam;
     if (limit !== undefined) {
       const r = await this.db.query(
         `UPDATE tasks AS target
          SET owner = $2, status = 'doing', updated_at = $3
-         WHERE target.id = $1 AND target.owner IS NULL AND target.status = 'todo'
+         WHERE target.id = $1 AND (target.owner IS NULL OR target.owner = $2) AND target.status = 'todo'
            AND (
              SELECT COUNT(*)
              FROM tasks active
@@ -166,7 +170,7 @@ export class PgTasksRepo implements TasksRepository {
     const r = await this.db.query(
       `UPDATE tasks
        SET owner = $2, status = 'doing', updated_at = $3
-       WHERE id = $1 AND owner IS NULL AND status = 'todo'`,
+       WHERE id = $1 AND (owner IS NULL OR owner = $2) AND status = 'todo'`,
       [taskId, ownerId, updatedAt],
     );
     return r.rowCount > 0;

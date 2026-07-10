@@ -873,6 +873,14 @@ describe('/talk-to auto-attach', () => {
   });
 
   it('blocks team leads from accepting another parent objective until current lead work is delegated', async () => {
+    // Pinned to a concurrency limit of 1 so this test keeps exercising the
+    // "any undelegated objective blocks the next one" edge case. The
+    // manager's default LEAD_MAX_PARALLEL_OBJECTIVES (3) intentionally lets
+    // a lead hold several concurrent objectives before this gate fires —
+    // see the dedicated concurrency-limit regression tests below.
+    const previousLeadMaxParallel = process.env.LEAD_MAX_PARALLEL_OBJECTIVES;
+    process.env.LEAD_MAX_PARALLEL_OBJECTIVES = '1';
+    try {
     const engTeamId = await db.teams.getOrCreateTeamId('engineering-team');
     const leadId = await getOrInsertAgent(db, engTeamId, 'engineering-lead', null);
     const memberId = await getOrInsertAgent(db, engTeamId, 'implementation-engineer', null);
@@ -960,6 +968,260 @@ describe('/talk-to auto-attach', () => {
     expect(cliBlockedBody.result?.warning).toContain('lead_delegation_backlog');
     expect(cliBlockedBody.result?.task?.status).toBe('todo');
     expect(cliBlockedBody.result?.task?.ownerName).toBeNull();
+    } finally {
+      if (previousLeadMaxParallel === undefined) delete process.env.LEAD_MAX_PARALLEL_OBJECTIVES;
+      else process.env.LEAD_MAX_PARALLEL_OBJECTIVES = previousLeadMaxParallel;
+    }
+  });
+
+  it('lets a lead hold concurrent parent objectives up to the configured limit, then blocks with the full blocker list', async () => {
+    const engTeamId = await db.teams.getOrCreateTeamId('engineering-team');
+    const leadId = await getOrInsertAgent(db, engTeamId, 'engineering-lead', null);
+    const now = Math.floor(Date.now() / 1000);
+
+    // Two recent lead-owned objectives, still inside the delegation grace
+    // window (not stalled) and without children yet — this used to block
+    // any further claim by itself (count=1). With the default
+    // LEAD_MAX_PARALLEL_OBJECTIVES=3, holding two of these is fine.
+    for (const suffix of ['a', 'b']) {
+      await db.tasks.create({
+        id: `task_concurrency_${suffix}`,
+        name: `concurrency-parent-${suffix}`,
+        uuid: `2222222${suffix}-2222-4222-8222-222222222222`,
+        team_id: engTeamId,
+        title: `Concurrency parent ${suffix}`,
+        description: 'Recent lead-owned objective, no children yet',
+        status: 'doing',
+        created_by: leadId,
+        owner: leadId,
+        created_at: now - 30,
+        updated_at: now - 30,
+        completed_at: null,
+      });
+    }
+
+    // A third concurrent objective is still within the limit (2 held + 1 == 3).
+    const thirdCreate = await fetch(`${baseUrl}/tasks`, {
+      method: 'POST',
+      headers: adminHeaders('engineering-team'),
+      body: JSON.stringify({
+        title: 'Third concurrent parent',
+        name: 'concurrency-parent-c',
+        from: 'engineering-lead',
+        ...validBriefFields(),
+      }),
+    });
+    expect(thirdCreate.status).toBe(201);
+    const thirdBody = await thirdCreate.json() as { task?: { ownerName?: string | null; status?: string } };
+    expect(thirdBody.task?.ownerName).toBe('engineering-lead');
+    expect(thirdBody.task?.status).toBe('doing');
+
+    // A fourth would exceed the limit (3 held + 1 == 4 > 3) — blocked, and
+    // the block reports the full set of held-but-undelegated objectives in
+    // one shot instead of one blocker at a time.
+    const fourthCreate = await fetch(`${baseUrl}/tasks`, {
+      method: 'POST',
+      headers: adminHeaders('engineering-team'),
+      body: JSON.stringify({
+        title: 'Fourth concurrent parent',
+        name: 'concurrency-parent-d',
+        from: 'engineering-lead',
+        ...validBriefFields(),
+      }),
+    });
+    expect(fourthCreate.status).toBe(201);
+    const fourthBody = await fourthCreate.json() as {
+      task?: { ownerName?: string | null; status?: string };
+      default_owner_routing?: { warning?: string };
+    };
+    expect(fourthBody.task?.ownerName).toBeNull();
+    expect(fourthBody.task?.status).toBe('todo');
+    expect(fourthBody.default_owner_routing?.warning).toContain('lead_delegation_backlog');
+  });
+
+  it('returns blockers from both capacity gates in a single claim response instead of one at a time', async () => {
+    const engTeamId = await db.teams.getOrCreateTeamId('engineering-team');
+    const leadId = await getOrInsertAgent(db, engTeamId, 'engineering-lead', null);
+    const memberId = await getOrInsertAgent(db, engTeamId, 'implementation-engineer', null);
+    const now = Math.floor(Date.now() / 1000);
+
+    // Blocker #1: an undelegated lead objective past the 10-minute
+    // delegation grace window (genuinely needs delegation).
+    await db.tasks.create({
+      id: 'task_transparency_undelegated',
+      name: 'transparency-undelegated-parent',
+      uuid: '33333331-3333-4333-8333-333333333333',
+      team_id: engTeamId,
+      title: 'Transparency undelegated parent',
+      description: 'Lead-owned parent objective without child tasks, past grace',
+      status: 'doing',
+      created_by: leadId,
+      owner: leadId,
+      created_at: now - 900,
+      updated_at: now - 900,
+      completed_at: null,
+    });
+
+    // Blocker #2: a *different*, fully-delegated lead objective (has a
+    // member-owned child, so it is not a lead_delegation_backlog blocker)
+    // that is nonetheless stalled — idle well past the 45-minute default
+    // stall threshold — so it trips stalled_task_backlog independently.
+    await db.tasks.create({
+      id: 'task_transparency_stalled',
+      name: 'transparency-stalled-parent',
+      uuid: '33333332-3333-4333-8333-333333333333',
+      team_id: engTeamId,
+      title: 'Transparency stalled parent',
+      description: 'Lead-owned parent objective with a delegated child, but stalled',
+      status: 'doing',
+      created_by: leadId,
+      owner: leadId,
+      created_at: now - 4000,
+      updated_at: now - 3000,
+      completed_at: null,
+    });
+    await db.tasks.create({
+      id: 'task_transparency_stalled_child',
+      name: 'transparency-stalled-child',
+      uuid: '33333333-3333-4333-8333-333333333333',
+      team_id: engTeamId,
+      title: 'Transparency stalled parent: delegated child work',
+      description: 'Member-owned child of transparency-stalled-parent',
+      status: 'doing',
+      created_by: leadId,
+      owner: memberId,
+      created_at: now - 3900,
+      updated_at: now - 3900,
+      completed_at: null,
+    });
+
+    const thirdCreate = await fetch(`${baseUrl}/tasks`, {
+      method: 'POST',
+      headers: adminHeaders('engineering-team'),
+      body: JSON.stringify({
+        title: 'Transparency third parent',
+        name: 'transparency-third-parent',
+        from: 'manager',
+        ...validBriefFields(),
+      }),
+    });
+    expect(thirdCreate.status).toBe(201);
+
+    const claim = await fetch(`${baseUrl}/tasks/transparency-third-parent/claim`, {
+      method: 'POST',
+      headers: adminHeaders('engineering-team'),
+      body: JSON.stringify({ agent_id: 'engineering-lead' }),
+    });
+    expect(claim.status).toBe(409);
+    const claimBody = await claim.json() as { error: string; message?: string; blocking_tasks?: string[] };
+    expect(claimBody.error).toBe('lead_delegation_backlog');
+    // Both blockers show up together — no need to retry after fixing one
+    // to discover the other.
+    expect(claimBody.blocking_tasks).toContain('#33333331');
+    expect(claimBody.blocking_tasks).toContain('#33333332');
+    expect(claimBody.message).toContain('lead_delegation_backlog');
+    expect(claimBody.message).toContain('stalled_task_backlog');
+  });
+
+  it('lets the pre-assigned owner claim a dead-state todo task (owner set, status still todo)', async () => {
+    const engTeamId = await db.teams.getOrCreateTeamId('engineering-team');
+    const ownerId = await getOrInsertAgent(db, engTeamId, 'implementation-engineer', null);
+    await getOrInsertAgent(db, engTeamId, 'qa-engineer', null);
+    const now = Math.floor(Date.now() / 1000);
+
+    await db.tasks.create({
+      id: 'task_dead_state',
+      name: 'dead-state-preassigned',
+      uuid: '44444440-4444-4444-8444-444444444444',
+      team_id: engTeamId,
+      title: 'Dead state preassigned task',
+      description: 'Owner set by auto-routing, but status never flipped to doing',
+      status: 'todo',
+      created_by: ownerId,
+      owner: ownerId,
+      created_at: now - 1200,
+      updated_at: now - 1200,
+      completed_at: null,
+    });
+
+    // A different agent must not be able to steal someone else's
+    // pre-assigned task.
+    const otherAttempt = await fetch(`${baseUrl}/tasks/dead-state-preassigned/claim`, {
+      method: 'POST',
+      headers: adminHeaders('engineering-team'),
+      body: JSON.stringify({ agent_id: 'qa-engineer' }),
+    });
+    expect(otherAttempt.status).toBe(409);
+
+    // The pre-assigned owner CAN claim it — this used to dead-end because
+    // claim() required owner IS NULL even when the caller *was* the owner.
+    const ownerAttempt = await fetch(`${baseUrl}/tasks/dead-state-preassigned/claim`, {
+      method: 'POST',
+      headers: adminHeaders('engineering-team'),
+      body: JSON.stringify({ agent_id: 'implementation-engineer' }),
+    });
+    expect(ownerAttempt.status).toBe(200);
+    const flipped = await db.tasks.getByNameForTeam('dead-state-preassigned', engTeamId);
+    expect(flipped?.status).toBe('doing');
+    expect(flipped?.owner).toBe(ownerId);
+  });
+
+  it('accepts a cross-team delegated_task_names ref as completion evidence instead of hard-failing', async () => {
+    const engTeamId = await db.teams.getOrCreateTeamId('engineering-team');
+    const otherTeamId = await db.teams.getOrCreateTeamId('cross-team-evidence-team');
+    const leadId = await getOrInsertAgent(db, engTeamId, 'engineering-lead', null);
+    const otherTeamWorkerId = await getOrInsertAgent(db, otherTeamId, 'other-team-worker', null);
+    const now = Math.floor(Date.now() / 1000);
+
+    const parentUuid = '55555550-5555-4555-8555-555555555555';
+    await db.tasks.create({
+      id: 'task_crossteam_parent',
+      name: 'crossteam-evidence-parent',
+      uuid: parentUuid,
+      team_id: engTeamId,
+      title: 'Cross-team evidence parent',
+      description: 'Lead-owned parent objective completed with a cross-team child as evidence',
+      status: 'doing',
+      created_by: leadId,
+      owner: leadId,
+      created_at: now - 120,
+      updated_at: now - 120,
+      completed_at: null,
+    });
+
+    const childUuid = '55555551-5555-4555-8555-555555555555';
+    await db.tasks.create({
+      id: 'task_crossteam_child',
+      name: 'crossteam-evidence-child',
+      uuid: childUuid,
+      team_id: otherTeamId,
+      title: 'Cross-team evidence child',
+      description: 'Done in a different team, used as completion evidence for the engineering-team parent',
+      status: 'done',
+      created_by: otherTeamWorkerId,
+      owner: otherTeamWorkerId,
+      created_at: now - 100,
+      updated_at: now - 60,
+      completed_at: now - 60,
+    });
+    const childShortId = `#${childUuid.replace(/-/g, '').slice(0, 8)}`;
+
+    const done = await fetch(`${baseUrl}/tasks/crossteam-evidence-parent/done`, {
+      method: 'POST',
+      headers: adminHeaders('engineering-team'),
+      body: JSON.stringify({
+        agent_id: 'engineering-lead',
+        acceptance_coverage: ['validated via cross-team delegated evidence'],
+        delegated_task_names: childShortId,
+      }),
+    });
+    expect(done.status).toBe(200);
+    const doneBody = await done.json() as { task?: { status?: string }; delegation_warnings?: string[] };
+    expect(doneBody.task?.status).toBe('done');
+    expect(doneBody.delegation_warnings?.some((w) => w.includes('cross-team'))).toBe(true);
+
+    const finished = await db.tasks.getByNameForTeam('crossteam-evidence-parent', engTeamId);
+    expect(finished?.status).toBe('done');
   });
 
   it('reports and requeues existing lead-owned delegation backlog with linked checkin cleanup', async () => {

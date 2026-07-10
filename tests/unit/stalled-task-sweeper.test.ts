@@ -1995,7 +1995,7 @@ describe('stalled task sweeper', () => {
     });
     const manager = new AgentManagerDb('/tmp/id-agents-comma-delegated-task-names-test', db, { libraryRoot: null }) as any;
 
-    const error = await manager.validateTeamLeadDelegationBeforeDone({
+    const result = await manager.validateTeamLeadDelegationBeforeDone({
       teamId: TEAM_ID,
       teamName: 'research',
       task: parent,
@@ -2004,7 +2004,8 @@ describe('stalled task sweeper', () => {
       },
     });
 
-    expect(error).toBeNull();
+    expect(result.error).toBeNull();
+    expect(result.warnings).toEqual([]);
   });
 
   it('marks a memory-writing delegation done when it returns a memory update package', async () => {

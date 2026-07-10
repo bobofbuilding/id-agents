@@ -141,6 +141,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DEFAULT_MAX_DOING_TASKS = 30;
 const DEFAULT_STALLED_TASK_MAX_PROBES = 3;
+const DEFAULT_LEAD_MAX_PARALLEL_OBJECTIVES = 3;
 const DEFAULT_MAX_ACTIVE_QUERIES_PER_AGENT = 1;
 const DEFAULT_MAX_ACTIVE_QUERIES_PER_LEAD = Number.POSITIVE_INFINITY;
 const DEFAULT_TASK_BOARD_OPEN_LIMIT = 250;
@@ -808,6 +809,12 @@ export class AgentManagerDb {
     const raw = process.env.STALL_MAX_PROBES;
     const parsed = raw ? Number(raw) : DEFAULT_STALLED_TASK_MAX_PROBES;
     return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : DEFAULT_STALLED_TASK_MAX_PROBES;
+  }
+
+  private getLeadMaxParallelObjectives(): number {
+    const raw = process.env.LEAD_MAX_PARALLEL_OBJECTIVES;
+    const parsed = raw ? Number(raw) : DEFAULT_LEAD_MAX_PARALLEL_OBJECTIVES;
+    return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : DEFAULT_LEAD_MAX_PARALLEL_OBJECTIVES;
   }
 
   private getStallSweepMs(): number {
@@ -1609,18 +1616,12 @@ export class AgentManagerDb {
     if (!(await this.hasDoingTaskRoom(params.teamId))) {
       return { owner: null, warning: await this.doingTaskLimitMessage(params.teamId) };
     }
-    const leadBacklog = await this.leadDelegationBacklogGuard({
+    const capacityBlock = await this.leadCapacityGuard({
       teamId: params.teamId,
       teamName: params.teamName,
       owner,
     });
-    if (leadBacklog) return { owner: null, warning: leadBacklog.message };
-    const stalledBacklog = await this.stalledOwnerBacklogGuard({
-      teamId: params.teamId,
-      teamName: params.teamName,
-      owner,
-    });
-    if (stalledBacklog) return { owner: null, warning: stalledBacklog.message };
+    if (capacityBlock) return { owner: null, warning: capacityBlock.message };
     return { owner };
   }
 
@@ -1647,42 +1648,62 @@ export class AgentManagerDb {
     teamName: string;
     task: TaskRow;
     payload?: Record<string, unknown>;
-  }): Promise<string | null> {
+  }): Promise<{ error: string | null; warnings: string[] }> {
+    const noBlock = { error: null, warnings: [] as string[] };
     const owner = params.task.owner
       ? await this.db.agents.getById(params.task.owner).catch(() => null)
       : null;
-    if (!this.isConfiguredTeamLead(params.teamName, owner)) return null;
+    if (!this.isConfiguredTeamLead(params.teamName, owner)) return noBlock;
     const exemption = this.taskCompletionDelegationExemption(params.payload);
-    if (exemption.exempt) return null;
+    if (exemption.exempt) return noBlock;
 
     const childRefs = this.taskRefsFromCompletionPayload(params.payload);
     if (childRefs.length === 0) {
-      return `Team lead objectives require delegated_task_names (or child_task_names) naming at least one completed member-owned child task before completion`;
+      return {
+        error: `Team lead objectives require delegated_task_names (or child_task_names) naming at least one completed member-owned child task before completion`,
+        warnings: [],
+      };
     }
 
+    const warnings: string[] = [];
     for (const childRef of childRefs) {
-      const { task: childTask, error } = await this.resolveTaskRef(childRef, params.teamId);
+      // Same-team name/shortId resolution first (unchanged behavior). Only
+      // when that fails AND the ref is a shortId do we retry globally —
+      // scoping every lookup to the parent's own team made a genuinely
+      // cross-team child (referenced by #shortId) unresolvable, not just
+      // unaccepted. Bare names stay same-team scoped since names aren't
+      // unique across teams.
+      let { task: childTask, error } = await this.resolveTaskRef(childRef, params.teamId);
+      if (!childTask && /^#?[0-9a-fA-F]{4,}$/.test(childRef.trim())) {
+        const global = await this.resolveTaskRef(childRef);
+        if (global.task) {
+          childTask = global.task;
+          error = undefined;
+        }
+      }
       if (!childTask) {
-        return `Delegated child task "${childRef}" not found in ${params.teamName} team${error ? `: ${error}` : ''}`;
+        return { error: `Delegated child task "${childRef}" not found${error ? `: ${error}` : ''}`, warnings };
       }
       if (childTask.id === params.task.id) {
-        return `Delegated child task "${childRef}" cannot be the parent team-lead objective`;
+        return { error: `Delegated child task "${childRef}" cannot be the parent team-lead objective`, warnings };
       }
-      if (childTask.team_id && childTask.team_id !== params.teamId) {
-        return `Delegated child task "${childRef}" is not in the ${params.teamName} team`;
+      const isCrossTeam = Boolean(childTask.team_id && childTask.team_id !== params.teamId);
+      if (isCrossTeam) {
+        const childTeamRow = await this.db.teams.getTeam(childTask.team_id!).catch(() => null);
+        warnings.push(`Delegated child task "${childRef}" belongs to team ${childTeamRow?.name || childTask.team_id} (not ${params.teamName}); accepted as cross-team completion evidence.`);
       }
       if (!childTask.owner) {
-        return `Delegated child task "${childRef}" must be claimed by a ${params.teamName} member`;
+        return { error: `Delegated child task "${childRef}" must be claimed before it can be used as completion evidence`, warnings };
       }
       if (owner && childTask.owner === owner.id) {
-        return `Delegated child task "${childRef}" must be owned by a ${params.teamName} member, not ${owner.name}`;
+        return { error: `Delegated child task "${childRef}" must be owned by someone other than ${owner.name}`, warnings };
       }
       if (childTask.status !== 'done') {
-        return `Delegated child task "${childRef}" must be done before the team-lead objective can be completed`;
+        return { error: `Delegated child task "${childRef}" must be done before the team-lead objective can be completed`, warnings };
       }
     }
 
-    return null;
+    return { error: null, warnings };
   }
 
   private taskMatchesParentRef(candidate: TaskRow, parent: TaskRow): boolean {
@@ -1936,6 +1957,17 @@ export class AgentManagerDb {
     };
   }
 
+  /**
+   * A lead may hold up to LEAD_MAX_PARALLEL_OBJECTIVES concurrent parent
+   * objectives (delegated or not) without being blocked. Only two things
+   * force a block regardless of that count: (1) a task genuinely stalled
+   * past its delegation grace window with no member-owned children
+   * ('needs-delegation'), or (2) claiming another objective would push the
+   * lead's held count past the configured limit — in which case every
+   * held objective still missing delegation is reported so the caller sees
+   * the full picture in one response instead of discovering blockers one
+   * gate at a time.
+   */
   private async findLeadDelegationBlockers(
     teamId: string,
     teamName: string,
@@ -1943,14 +1975,25 @@ export class AgentManagerDb {
     excludeTaskId?: string,
   ): Promise<TaskRow[]> {
     if (!owner || !this.isConfiguredTeamLead(teamName, owner)) return [];
-    const doing = await this.db.tasks.list({ teamId, status: 'doing', owner: owner.id }).catch(() => [] as TaskRow[]);
-    const blockers: TaskRow[] = [];
+    const doing = (await this.db.tasks.list({ teamId, status: 'doing', owner: owner.id }).catch(() => [] as TaskRow[]))
+      .filter((candidate) => !excludeTaskId || candidate.id !== excludeTaskId);
+
+    const audited: Array<{ task: TaskRow; status: unknown }> = [];
     for (const candidate of doing) {
-      if (excludeTaskId && candidate.id === excludeTaskId) continue;
       const audit = await this.buildDelegationAudit(candidate, teamId, teamName, owner);
-      if (audit && audit.status !== 'ok') blockers.push(candidate);
+      audited.push({ task: candidate, status: audit?.status });
     }
-    return blockers;
+
+    const stalledBlockers = audited.filter((item) => item.status === 'needs-delegation').map((item) => item.task);
+
+    const limit = this.getLeadMaxParallelObjectives();
+    const overCapacity = doing.length + 1 > limit;
+    if (!overCapacity) return stalledBlockers;
+
+    const undelegatedBlockers = audited.filter((item) => item.status && item.status !== 'ok').map((item) => item.task);
+    const merged = new Map<string, TaskRow>();
+    for (const task of [...stalledBlockers, ...undelegatedBlockers]) merged.set(task.id, task);
+    return Array.from(merged.values());
   }
 
   private leadDelegationBlockerRefs(blockers: TaskRow[]): string[] {
@@ -2503,6 +2546,55 @@ export class AgentManagerDb {
       blockers: blockers.map((item) => item.ref),
       triage,
     };
+  }
+
+  /**
+   * Runs the lead-delegation and stalled-owner capacity gates together and
+   * reports every blocking task ref in one 409, instead of a caller fixing
+   * one gate only to discover the other on the next retry. When the lead
+   * gate fires first we still surface any stalled-owner blockers as
+   * read-only metadata (via findStalledOwnerTaskBlockers, no triage side
+   * effects) so the response is complete without double-firing triage
+   * nudges. When the lead gate doesn't fire, the stalled-owner guard runs
+   * exactly as it did before this change (including its triage side effect).
+   */
+  private async leadCapacityGuard(params: {
+    teamId: string;
+    teamName: string;
+    owner: AgentRow | null;
+    excludeTaskId?: string;
+  }): Promise<{
+    error: 'lead_delegation_backlog' | 'stalled_task_backlog';
+    message: string;
+    blocking_tasks: string[];
+    triage?: Record<string, unknown> | null;
+  } | null> {
+    const leadBacklog = await this.leadDelegationBacklogGuard(params);
+    if (leadBacklog) {
+      const stalledBlockers = await this.findStalledOwnerTaskBlockers({
+        teamId: params.teamId,
+        owner: params.owner,
+        excludeTaskId: params.excludeTaskId,
+      }).catch(() => []);
+      const blockingSet = new Set<string>([...leadBacklog.blockers, ...stalledBlockers.map((item) => item.ref)]);
+      return {
+        error: 'lead_delegation_backlog',
+        message: stalledBlockers.length && params.owner
+          ? `${leadBacklog.message} Also blocked by: ${this.stalledOwnerBacklogMessage(params.teamName, params.owner, stalledBlockers)}`
+          : leadBacklog.message,
+        blocking_tasks: Array.from(blockingSet),
+      };
+    }
+    const stalledBacklog = await this.stalledOwnerBacklogGuard(params);
+    if (stalledBacklog) {
+      return {
+        error: 'stalled_task_backlog',
+        message: stalledBacklog.message,
+        blocking_tasks: stalledBacklog.blockers,
+        triage: stalledBacklog.triage,
+      };
+    }
+    return null;
   }
 
   private async triageStalledOwnerBacklogs(params: {
@@ -11971,31 +12063,18 @@ Return this JSON shape:
           });
         }
 
-        const leadBacklog = await this.leadDelegationBacklogGuard({
+        const capacityBlock = await this.leadCapacityGuard({
           teamId,
           teamName,
           owner: agent,
           excludeTaskId: task.id,
         });
-        if (leadBacklog) {
+        if (capacityBlock) {
           return res.status(409).json({
-            error: 'lead_delegation_backlog',
-            message: leadBacklog.message,
-            blocking_tasks: leadBacklog.blockers,
-          });
-        }
-        const stalledBacklog = await this.stalledOwnerBacklogGuard({
-          teamId,
-          teamName,
-          owner: agent,
-          excludeTaskId: task.id,
-        });
-        if (stalledBacklog) {
-          return res.status(409).json({
-            error: 'stalled_task_backlog',
-            message: stalledBacklog.message,
-            blocking_tasks: stalledBacklog.blockers,
-            triage: stalledBacklog.triage,
+            error: capacityBlock.error,
+            message: capacityBlock.message,
+            blocking_tasks: capacityBlock.blocking_tasks,
+            ...(capacityBlock.triage !== undefined ? { triage: capacityBlock.triage } : {}),
           });
         }
 
@@ -12106,14 +12185,14 @@ Return this JSON shape:
           });
         }
 
-        const delegationError = await this.validateTeamLeadDelegationBeforeDone({
+        const delegationCheck = await this.validateTeamLeadDelegationBeforeDone({
           teamId,
           teamName,
           task,
           payload: req.body || {},
         });
-        if (delegationError) {
-          return res.status(409).json({ error: delegationError });
+        if (delegationCheck.error) {
+          return res.status(409).json({ error: delegationCheck.error });
         }
 
         const now = Math.floor(Date.now() / 1000);
@@ -12246,6 +12325,7 @@ Return this JSON shape:
           ok: true,
           task: await this.buildTaskResult(updated!, teamId),
           completion_validation: completion.validation,
+          ...(delegationCheck.warnings.length ? { delegation_warnings: delegationCheck.warnings } : {}),
         });
       } catch (err: any) {
         console.error('[Manager] Error in POST /tasks/:ref/done:', err);
@@ -16372,36 +16452,20 @@ Return this JSON shape:
           if (!agent) return { ok: false, error: error || `Agent "${agentRef}" not found` };
           const taskTeamIdForGuard = task.team_id || teamId;
           const taskTeamRowForGuard = await this.db.teams.getTeam(taskTeamIdForGuard).catch(() => null);
-          const leadBacklog = await this.leadDelegationBacklogGuard({
+          const assignCapacityBlock = await this.leadCapacityGuard({
             teamId: taskTeamIdForGuard,
             teamName: taskTeamRowForGuard?.name || teamName,
             owner: agent,
             excludeTaskId: task.id,
           });
-          if (leadBacklog) {
+          if (assignCapacityBlock) {
             return {
               ok: false,
-              error: 'lead_delegation_backlog',
+              error: assignCapacityBlock.error,
               result: {
-                message: leadBacklog.message,
-                blocking_tasks: leadBacklog.blockers,
-              },
-            };
-          }
-          const stalledBacklog = await this.stalledOwnerBacklogGuard({
-            teamId: taskTeamIdForGuard,
-            teamName: taskTeamRowForGuard?.name || teamName,
-            owner: agent,
-            excludeTaskId: task.id,
-          });
-          if (stalledBacklog) {
-            return {
-              ok: false,
-              error: 'stalled_task_backlog',
-              result: {
-                message: stalledBacklog.message,
-                blocking_tasks: stalledBacklog.blockers,
-                triage: stalledBacklog.triage,
+                message: assignCapacityBlock.message,
+                blocking_tasks: assignCapacityBlock.blocking_tasks,
+                ...(assignCapacityBlock.triage !== undefined ? { triage: assignCapacityBlock.triage } : {}),
               },
             };
           }
@@ -16478,36 +16542,20 @@ Return this JSON shape:
               result: { brief_validation: claimBrief.validation },
             };
           }
-          const leadBacklog = await this.leadDelegationBacklogGuard({
+          const claimCapacityBlock = await this.leadCapacityGuard({
             teamId,
             teamName,
             owner: callerAgent,
             excludeTaskId: task.id,
           });
-          if (leadBacklog) {
+          if (claimCapacityBlock) {
             return {
               ok: false,
-              error: 'lead_delegation_backlog',
+              error: claimCapacityBlock.error,
               result: {
-                message: leadBacklog.message,
-                blocking_tasks: leadBacklog.blockers,
-              },
-            };
-          }
-          const stalledBacklog = await this.stalledOwnerBacklogGuard({
-            teamId,
-            teamName,
-            owner: callerAgent,
-            excludeTaskId: task.id,
-          });
-          if (stalledBacklog) {
-            return {
-              ok: false,
-              error: 'stalled_task_backlog',
-              result: {
-                message: stalledBacklog.message,
-                blocking_tasks: stalledBacklog.blockers,
-                triage: stalledBacklog.triage,
+                message: claimCapacityBlock.message,
+                blocking_tasks: claimCapacityBlock.blocking_tasks,
+                ...(claimCapacityBlock.triage !== undefined ? { triage: claimCapacityBlock.triage } : {}),
               },
             };
           }
@@ -16618,14 +16666,14 @@ Return this JSON shape:
           }
 
           const teamRow = await this.db.teams.getTeam(teamId).catch(() => null);
-          const delegationError = await this.validateTeamLeadDelegationBeforeDone({
+          const delegationCheck = await this.validateTeamLeadDelegationBeforeDone({
             teamId,
             teamName: teamRow?.name || 'default',
             task,
             payload: completionPayload,
           });
-          if (delegationError) {
-            return { ok: false, error: delegationError };
+          if (delegationCheck.error) {
+            return { ok: false, error: delegationCheck.error };
           }
 
           const now = Math.floor(Date.now() / 1000);
@@ -16662,7 +16710,14 @@ Return this JSON shape:
               console.warn(`[Supervision] Delegated parent wake failed for ${updated.name}: ${err?.message || err}`);
             });
           }
-          return { ok: true, result: { task: await this.buildTaskResult(updated!, teamId), completion_validation: completion.validation } };
+          return {
+            ok: true,
+            result: {
+              task: await this.buildTaskResult(updated!, teamId),
+              completion_validation: completion.validation,
+              ...(delegationCheck.warnings.length ? { delegation_warnings: delegationCheck.warnings } : {}),
+            },
+          };
         }
 
         if (subCmd === 'status') {
@@ -17864,7 +17919,7 @@ Return this JSON shape:
     task: TaskRow,
     teamId: string,
     actorAgentId: string | null,
-    reason: 'owner_refresh' | 'owner_unavailable' | 'owner_busy' | 'unclaimed' | 'ownerless_doing_repaired' | 'checkin_heartbeat_probe' | 'probe_limit_reached' | 'validator_stalled_terminal' | 'lead_delegation_required' | 'lead_owner_unavailable' | 'delegated_children_complete' | 'control_reply_done' | 'control_reply_in_progress' | 'control_reply_delegated' | 'control_reply_claimed' | 'control_reply_blocked' | 'control_reply_reassign' | 'control_reply_route_assigned' | 'control_reply_repeated_attempt',
+    reason: 'owner_refresh' | 'owner_unavailable' | 'owner_busy' | 'unclaimed' | 'owned_todo_dead_state' | 'ownerless_doing_repaired' | 'checkin_heartbeat_probe' | 'probe_limit_reached' | 'validator_stalled_terminal' | 'lead_delegation_required' | 'lead_owner_unavailable' | 'delegated_children_complete' | 'control_reply_done' | 'control_reply_in_progress' | 'control_reply_delegated' | 'control_reply_claimed' | 'control_reply_blocked' | 'control_reply_reassign' | 'control_reply_route_assigned' | 'control_reply_repeated_attempt',
     stalledMinutes: number,
     nowMs: number,
   ): Promise<void> {
@@ -18534,6 +18589,44 @@ Return this JSON shape:
             assignedTodoTaskIds.add(t.id);
             nudged++;
           }
+        }
+      }
+    }
+
+    // Dead-state pre-assigned todos: owner already set (e.g. auto-routed to
+    // a lead) but status never flipped to 'doing'. These used to be
+    // unclaimable by their own owner (claim() required owner IS NULL); now
+    // that the owner can self-claim, flag stale rows so the owner gets
+    // nudged to actually take the flip instead of the task sitting inert.
+    {
+      const ownedTodo = await this.db.tasks
+        .list({ status: 'todo', order: 'updated_asc', limit: SCAN_LIMIT })
+        .catch(() => [] as TaskRow[]);
+      for (const t of ownedTodo) {
+        if (nudged >= MAX_PER_SWEEP) break;
+        if (t.status !== 'todo' || !t.owner || !t.team_id || assignedTodoTaskIds.has(t.id)) continue;
+        const lastActivity = this.taskLastActivityMs(t);
+        if (now - lastActivity < UNOWNED_ASSIGN_MS) continue;
+        const nudgeKey = `todo-owned-dead-state:${t.id}`;
+        if (!this.canRunStalledProbe(nudgeKey, now, RENUDGE_MS, MAX_PROBES)) continue;
+        const teamRow = await this.db.teams.getTeam(t.team_id).catch(() => null);
+        if (!teamRow) continue;
+        const ownerAgent = await this.db.agents.getById(t.owner).catch(() => null);
+        if (!ownerAgent) continue;
+        const ref = this.taskShortRef(t);
+        const ageMinutes = Math.round((now - lastActivity) / 60000);
+        const message = `Supervision: task ${ref} ("${t.title}") is pre-assigned to you but still status=todo after ${ageMinutes}m — this is dead-state (no one can act on it until it's claimed). Claim it now via POST /tasks/${t.name}/claim with { agent_id: "${ownerAgent.name}" } to flip it to doing, or reply BLOCKED: <reason> if you cannot take it.`;
+        const sent = await this.sendRecentThrottledSupervisionAsk({
+          teamId: teamRow.id,
+          teamName: teamRow.name,
+          recipient: ownerAgent,
+          message,
+          nowMs: now,
+        });
+        if (sent === 'sent') {
+          this.markStalledProbe(nudgeKey, now);
+          await this.recordTaskSupervision(t, teamRow.id, ownerAgent.id, 'owned_todo_dead_state', ageMinutes, now).catch(() => {});
+          nudged++;
         }
       }
     }
