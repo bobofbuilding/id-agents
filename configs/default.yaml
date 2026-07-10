@@ -15,12 +15,9 @@ defaults:
   skills:
     - brain
     - catalog
-    - idagents-admin-control
     - identity
     - inter-agent
     - task-discipline
-    - wallet
-    - xmtp
 
 agents:
   - name: lead
@@ -36,6 +33,9 @@ agents:
     skills:
       - team-coordinator
       - idagents-team-builder
+      - idagents-admin-control
+      - wallet
+      - xmtp
     catalog:
       role: lead
       expertise:
@@ -52,8 +52,8 @@ agents:
       status: available
 
   - name: coder
-    runtime: ollama
-    model: qwen2.5-coder:7b
+    runtime: codex
+    model: gpt-5.6-luna
     description: >-
       Secondary implementation validation lead for the default team. Validates
       accomplishment packets from team leads against the original objective,
