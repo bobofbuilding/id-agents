@@ -79,6 +79,19 @@ describe('validateTaskBrief', () => {
     expect(result.dispatch_ready).toBe(false);
   });
 
+  it('reports a provided but keyword-less bittrees_relevance as invalid, not missing', () => {
+    const result = validateTaskBrief({
+      ...completeBrief,
+      bittrees_relevance: 'keeps the fleet manager sweeper reliable for all agent teams',
+    }, 'enforce');
+
+    expect(result.ok).toBe(false);
+    expect(result.invalid).toContain('bittrees_relevance');
+    expect(result.missing).not.toContain('bittrees_relevance');
+    expect(result.reason_codes).toContain('invalid_bittrees_relevance');
+    expect(result.dispatch_ready).toBe(false);
+  });
+
   it('accepts recommendation-routing aliases as the required backlog policy control', () => {
     const input = { ...completeBrief };
     delete input.backlog_policy;
