@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.106]
+
+- Recover interrupted rate-limited work automatically: prefer another healthy subscription lane, fall back to an installed role-matched Ollama model before metered overflow, replay the original query, use bounded probe cooldowns for unclassified limits, and restore the exact preferred subscription runtime/model after cooldown. Successful retries now repair the original failed query on SQLite.
+- Harden task throughput and delegation: deduplicate goal-target and goal-less title fanout, route ownerless task creation to configured team leads, repair ownerless `doing` tasks, compact excess lead-owned parents, reroute failed stalled-owner supervision, and reset exhausted probe budgets after a cool-off window.
+- Persist completed task and query outcomes into Brain memory, attach Brain context to knowledge/capability work, route explicit `ASK-USER` decisions into the manager inbox, and prevent recursive Learn passes from repeating the same source/question lens.
+- Preserve live catalog fields when YAML seeds are reapplied during deploy or sync, while still filling missing seed values.
+- Gate GPT-5.6 Codex execution against the installed Codex CLI/model cache and fall back compatibly when an older executor cannot run the requested model.
+- Add audited Alchemy, Allium, OpenSea, agentic gateway, and Foundry fuzzing skills; update workspace/library inventory coverage for the expanded Foundry bundle.
+- Make manager-shadow SQLite cleanup rerunnable so rollback helpers and older clients cannot leave legacy manager agent rows or foreign-key references behind.
+- Add delegation guidance and a reusable task-brief template.
+
 ## [0.1.105]
 
 - Prevent stale local-fallback metadata from restoring an agent to an older subscription runtime after the agent has already left Ollama. The restore sweep now only performs an automatic restore when the agent is actually still on the local fallback runtime, and cleans the stale failover marker otherwise.
