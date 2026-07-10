@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.1.108]
+
+- Harden Claude CLI rate-limit handling: require trusted structured/status/reset evidence, preserve confirmed daily/weekly subscription-cap fallback, keep session/monthly/API/unknown limits off Ollama, and cover Codex model-capacity fallback/replay/restore behavior.
+
 ## [0.1.107]
 
 - Keep manager parent-reconciliation prompts on delegation policy after sender-envelope wrapping. Query priority, MCP/tool access, and execution timeout are now derived from the canonical unwrapped prompt, while wrapped supervision prompts are also recognized directly for parity. This prevents completed-child parent reconciliation from being restricted to read-only tools and terminated after two 90-second attempts instead of receiving the intended 12-minute delegation window.
