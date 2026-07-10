@@ -4020,7 +4020,7 @@ Return this JSON shape:
 
   private isRecoverableRateLimitFailure(queryRow: QueryRow): boolean {
     const text = `${queryRow.error || ''}\n${queryRow.prompt || ''}`;
-    return /rate_limit|rate limit|usage limit|session limit|codex\/settings\/usage/i.test(text);
+    return /rate_limit|rate limit|usage limit|session limit|codex\/settings\/usage|selected model is at capacity/i.test(text);
   }
 
   private async completeFailedRateLimitRecoveredQuery(params: {
@@ -4064,6 +4064,7 @@ Return this JSON shape:
             OR LOWER(COALESCE(error, '')) LIKE '%usage limit%'
             OR LOWER(COALESCE(error, '')) LIKE '%session limit%'
             OR LOWER(COALESCE(error, '')) LIKE '%codex/settings/usage%'
+            OR LOWER(COALESCE(error, '')) LIKE '%selected model is at capacity%'
           )`,
       [params.occurredAt, resultValue, metadataValue, params.teamId, params.queryId],
     );
@@ -5425,6 +5426,10 @@ Return this JSON shape:
     const providerRuntime = this.providerRuntimeForAgent(agent, metadata);
     if (isLocalModelRuntime(runtime, providerRuntime?.baseUrl)) return { attempted: false };
 
+    if (runtime === 'codex' && cooldown.reason === 'model_capacity') {
+      return this.handleRuntimeModelCapacityFallback(teamId, teamName, agent, cooldown);
+    }
+
     if (runtime !== 'claude-code-cli' && runtime !== 'claude-code-local') {
       if (!this.canUseLocalFallbackForRuntimeRateLimit(cooldown)) return { attempted: false };
       const localFallback = await this.handleRuntimeRateLimitLocalFallback(teamId, teamName, agent, runtime, cooldown);
@@ -5500,12 +5505,119 @@ Return this JSON shape:
     return !/^(0|false|off|no)$/i.test(String(process.env.ID_RATE_LIMIT_LOCAL_FALLBACK ?? '1').trim());
   }
 
+  private codexCapacityFallbackModel(agent: AgentRow): string | null {
+    const metadata = (agent.metadata as Record<string, unknown>) || {};
+    const configured = Array.isArray(metadata.capacityFallbackModels)
+      ? metadata.capacityFallbackModels.map(String)
+      : String(process.env.ID_CODEX_CAPACITY_FALLBACK_MODELS || '')
+          .split(',')
+          .map((model) => model.trim())
+          .filter(Boolean);
+    return [...configured, 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini']
+      .find((model) => model && model !== agent.model) || null;
+  }
+
+  private async handleRuntimeModelCapacityFallback(
+    teamId: string,
+    teamName: string,
+    agent: AgentRow,
+    cooldown: RuntimeLaneCooldown,
+  ): Promise<{ attempted: boolean; success?: boolean; pid?: number; retryQueryId?: string; laneId?: string; error?: string }> {
+    const fallbackModel = this.codexCapacityFallbackModel(agent);
+    if (!fallbackModel) return { attempted: false };
+
+    const metadata = (agent.metadata as Record<string, unknown>) || {};
+    const fallbackLaneId = `codex:model:${fallbackModel}`;
+    const nextMetadata: Record<string, unknown> = {
+      ...metadata,
+      runtimeRateLimitFailover: {
+        fromLaneId: cooldown.laneId,
+        failedLaneId: cooldown.laneId,
+        toLaneId: fallbackLaneId,
+        fromRuntime: 'codex',
+        toRuntime: 'codex',
+        fromModel: agent.model,
+        toModel: fallbackModel,
+        reason: 'model_capacity',
+        queryId: cooldown.queryId,
+        observedAtMs: Date.now(),
+      },
+      previousRuntimeBeforeRateLimit: agent.runtime,
+      previousModelBeforeRateLimit: agent.model,
+    };
+
+    await this.db.agents.updateStatus(agent.id, 'pending', {
+      runtime: 'codex',
+      model: fallbackModel,
+      metadata: nextMetadata,
+    });
+    const spawnResult = await this.rebuildLocalClaudeAgent(teamId, teamName, {
+      ...agent,
+      runtime: 'codex',
+      model: fallbackModel,
+      metadata: nextMetadata,
+    });
+    if (!spawnResult.success) {
+      return { attempted: true, success: false, pid: spawnResult.pid, laneId: fallbackLaneId, error: spawnResult.error };
+    }
+    if (!cooldown.queryId) return { attempted: true, success: true, pid: spawnResult.pid, laneId: fallbackLaneId };
+
+    const query = await this.db.queries.getByQueryIdForTeam(teamId, cooldown.queryId).catch(() => null);
+    if (!query?.prompt) {
+      return { attempted: true, success: true, pid: spawnResult.pid, laneId: fallbackLaneId, error: 'original query not found for model-capacity replay' };
+    }
+    const result = await this.forwardToAgent(`http://localhost:${agent.port}`, query.prompt, 'manager', query.session_id ?? undefined);
+    if (!result.ok) {
+      return { attempted: true, success: false, pid: spawnResult.pid, laneId: fallbackLaneId, error: result.error };
+    }
+
+    const retryQueryId = result.data?.query_id ? String(result.data.query_id) : undefined;
+    if (retryQueryId) {
+      this.runtimeFailoverRetryOf.set(retryQueryId, cooldown.queryId);
+      await this.db.queries.create(
+        teamId,
+        retryQueryId,
+        agent.id,
+        query.prompt,
+        Date.now(),
+        query.session_id ?? undefined,
+        undefined,
+        {
+          ...(query.metadata || {}),
+          retry_of: cooldown.queryId,
+          runtime: 'codex',
+          model: fallbackModel,
+          runtimeCredentialLane: fallbackLaneId,
+          failedRuntimeCredentialLane: cooldown.laneId,
+        },
+      );
+    }
+
+    await this.db.news.add(teamId, agent.id, {
+      timestamp: Date.now(),
+      type: 'runtime.failover',
+      message: `Model capacity detected; switched ${agent.name} from ${agent.model} to ${fallbackModel}${retryQueryId ? ' and replayed the interrupted query' : ''}`,
+      data: {
+        fromRuntime: 'codex',
+        toRuntime: 'codex',
+        fromModel: agent.model,
+        toModel: fallbackModel,
+        retryQueryId,
+        retryOf: cooldown.queryId,
+      },
+      query_id: retryQueryId || cooldown.queryId,
+    }).catch(() => {});
+
+    return { attempted: true, success: true, pid: spawnResult.pid, retryQueryId, laneId: fallbackLaneId };
+  }
+
   private canUseLocalFallbackForRuntimeRateLimit(cooldown: RuntimeLaneCooldown): boolean {
-    // Every signal reaching this path has already been classified as a runtime
-    // rate limit by the harness. Restricting local failover to daily/weekly
-    // subscription caps leaves API, session, monthly, and unclassified CLI
-    // limits retrying the same unavailable provider lane.
-    return Boolean(cooldown.reason);
+    // Local fallback is reserved for confirmed subscription window caps. API
+    // throttling, overloads, unknown telemetry, session caps, and monthly caps
+    // must stay on their provider lane/failover path instead of pivoting an
+    // agent to Ollama.
+    return cooldown.kind === 'subscription'
+      && (cooldown.reason === 'subscription_daily_cap' || cooldown.reason === 'subscription_weekly_cap');
   }
 
   private preferredRuntimeLaneForRestore(
@@ -5861,6 +5973,54 @@ Return this JSON shape:
       ? metadata.runtimeRateLimitFailover as Record<string, unknown>
       : null;
     if (!failover) return false;
+    const activeQueries = await this.db.queries.getPending(agent.id).catch(() => [] as QueryRow[]);
+    if (activeQueries.length > 0) return false;
+    if (failover.reason === 'model_capacity') {
+      const fromModel = typeof failover.fromModel === 'string' ? failover.fromModel : undefined;
+      const toModel = typeof failover.toModel === 'string' ? failover.toModel : undefined;
+      const fromLaneId = typeof failover.fromLaneId === 'string' ? failover.fromLaneId : undefined;
+      if (!fromModel || !toModel || agent.runtime !== 'codex' || agent.model !== toModel) {
+        const cleanMetadata = { ...metadata };
+        delete cleanMetadata.runtimeRateLimitFailover;
+        delete cleanMetadata.runtimeRateLimit;
+        delete cleanMetadata.previousRuntimeBeforeRateLimit;
+        delete cleanMetadata.previousModelBeforeRateLimit;
+        await this.db.agents.updateMetadata(agent.id, cleanMetadata).catch(() => {});
+        return false;
+      }
+      if (this.isRuntimeLaneCooling(fromLaneId, now)) return false;
+
+      const nextMetadata: Record<string, unknown> = {
+        ...metadata,
+        runtimeRateLimitRestore: {
+          fromRuntime: 'codex',
+          toRuntime: 'codex',
+          fromModel: toModel,
+          toModel: fromModel,
+          laneId: fromLaneId,
+          observedAtMs: now,
+        },
+      };
+      delete nextMetadata.runtimeRateLimitFailover;
+      delete nextMetadata.runtimeRateLimit;
+      delete nextMetadata.previousRuntimeBeforeRateLimit;
+      delete nextMetadata.previousModelBeforeRateLimit;
+
+      const shouldRestart = agent.status !== 'stopped';
+      await this.db.agents.updateStatus(agent.id, shouldRestart ? 'pending' : 'stopped', {
+        runtime: 'codex',
+        model: fromModel,
+        metadata: nextMetadata,
+      });
+      if (!shouldRestart) return true;
+      const spawnResult = await this.rebuildLocalClaudeAgent(teamId, teamName, {
+        ...agent,
+        runtime: 'codex',
+        model: fromModel,
+        metadata: nextMetadata,
+      });
+      return spawnResult.success;
+    }
     if (failover.toRuntime !== 'ollama') {
       return this.restoreAgentCredentialLaneIfReady(teamId, teamName, agent, metadata, failover, now);
     }
@@ -6653,6 +6813,9 @@ Return this JSON shape:
   }
 
   private defaultRuntimeRateLimitCooldownMs(reason: string): number {
+    if (reason === 'model_capacity') {
+      return Math.max(30_000, Number(process.env.ID_MODEL_CAPACITY_COOLDOWN_MS || 5 * 60_000) || 5 * 60_000);
+    }
     if (reason === 'api_overloaded') {
       return Math.max(30_000, Number(process.env.ID_RATE_LIMIT_OVERLOAD_COOLDOWN_MS || 60_000) || 60_000);
     }
