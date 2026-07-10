@@ -945,12 +945,17 @@ export class AgentManagerDb {
   }
 
   private canRunStalledProbeForTriage(key: string, nowMs: number, renudgeMs: number, maxProbes: number, force = false): boolean {
-    return this.canRunStalledProbe(
-      key,
-      nowMs,
-      force ? Math.min(renudgeMs, this.getManualStallRenudgeMs()) : renudgeMs,
-      maxProbes,
-    );
+    const effectiveRenudgeMs = force ? Math.min(renudgeMs, this.getManualStallRenudgeMs()) : renudgeMs;
+    if (force) {
+      // Manual triage intent overrides an exhausted automatic probe budget:
+      // once the manual spacing floor has elapsed, refresh the budget so an
+      // operator kickstart is never silently refused by burned-out state.
+      const state = this.stalledNudges.get(key);
+      if (state && state.attempts >= maxProbes && nowMs - state.lastAt >= effectiveRenudgeMs) {
+        this.stalledNudges.set(key, { ...state, attempts: 0 });
+      }
+    }
+    return this.canRunStalledProbe(key, nowMs, effectiveRenudgeMs, maxProbes);
   }
 
   private canRunStalledCooldown(key: string, nowMs: number, cooldownMs: number): boolean {
@@ -973,6 +978,24 @@ export class AgentManagerDb {
   private restoreStalledProbe(key: string, prev: StalledProbeState | undefined): void {
     if (prev) this.stalledNudges.set(key, prev);
     else this.stalledNudges.delete(key);
+  }
+
+  private pruneStalledNudges(now: number, renudgeMs: number, maxProbes: number, maxEntries = 2000): void {
+    // Keep the throttle map from growing without bound.
+    if (this.stalledNudges.size <= maxEntries) return;
+    const resetMs = this.getStallProbeResetMs();
+    for (const [k, state] of this.stalledNudges) {
+      if (state.attempts < maxProbes) {
+        if (now - state.lastAt > 2 * renudgeMs) this.stalledNudges.delete(k);
+      } else if (resetMs > 0 && now - state.lastAt >= Math.max(2 * renudgeMs, resetMs)) {
+        // Exhausted entries whose task has since completed would otherwise pin
+        // the map until a restart. Past the reset window, deleting is
+        // equivalent to the budget refresh for still-open tasks, so it is
+        // safe. When the reset is opted out (STALL_PROBE_RESET_MS=0), keep the
+        // entry to preserve the permanent-burnout semantics.
+        this.stalledNudges.delete(k);
+      }
+    }
   }
 
   private canEscalateStalledProbe(key: string, maxProbes: number): boolean {
@@ -19303,14 +19326,7 @@ Return this JSON shape:
         }
       }
     }
-    // Keep the throttle map from growing without bound.
-    if (this.stalledNudges.size > 2000) {
-      for (const [k, state] of this.stalledNudges) {
-        if (state.attempts < MAX_PROBES && now - state.lastAt > 2 * RENUDGE_MS) {
-          this.stalledNudges.delete(k);
-        }
-      }
-    }
+    this.pruneStalledNudges(now, RENUDGE_MS, MAX_PROBES);
     if (nudged) console.log(`[Manager] Stalled-task sweep: probed ${nudged} stalled item(s)`);
   }
 

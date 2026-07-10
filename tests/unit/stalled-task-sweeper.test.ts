@@ -238,6 +238,65 @@ describe('stalled task sweeper', () => {
     expect(manager.canRunStalledProbe(key, NOW_MS + 365 * 24 * 60 * 60 * 1000, renudgeMs, 2)).toBe(false);
   });
 
+  it('lets forced manual triage override an exhausted stalled-probe budget', () => {
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', fakeDb(), { libraryRoot: null }) as any;
+    const renudgeMs = 90 * 60 * 1000;
+    const manualFloorMs = 60 * 1000;
+    const key = 'todo-assign:task-3';
+
+    manager.markStalledProbe(key, NOW_MS);
+    manager.markStalledProbe(key, NOW_MS);
+    manager.markStalledProbe(key, NOW_MS);
+
+    // Unforced triage stays refused before the automatic reset window.
+    expect(manager.canRunStalledProbeForTriage(key, NOW_MS + renudgeMs, renudgeMs, 3)).toBe(false);
+    // Forced triage under the manual spacing floor is still throttled...
+    expect(manager.canRunStalledProbeForTriage(key, NOW_MS + manualFloorMs - 1, renudgeMs, 3, true)).toBe(false);
+    // ...but past the floor it refreshes the exhausted budget instead of
+    // silently refusing the operator's kickstart.
+    expect(manager.canRunStalledProbeForTriage(key, NOW_MS + manualFloorMs, renudgeMs, 3, true)).toBe(true);
+    expect(manager.markStalledProbe(key, NOW_MS + manualFloorMs)).toBe(1);
+  });
+
+  it('prunes exhausted stalled-probe entries once past the reset window', () => {
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', fakeDb(), { libraryRoot: null }) as any;
+    const renudgeMs = 90 * 60 * 1000;
+    const resetMs = 4 * 60 * 60 * 1000;
+    const maxProbes = 3;
+
+    const freshAt = NOW_MS + resetMs - renudgeMs;
+    for (let i = 0; i < maxProbes; i++) manager.markStalledProbe('todo-assign:exhausted', NOW_MS);
+    manager.markStalledProbe('todo-assign:fresh', freshAt);
+
+    // Under the entry cap nothing is pruned.
+    manager.pruneStalledNudges(NOW_MS + resetMs, renudgeMs, maxProbes, 2000);
+    expect(manager.stalledNudges.has('todo-assign:exhausted')).toBe(true);
+
+    // Over the cap: exhausted entries inside the reset window survive...
+    manager.pruneStalledNudges(NOW_MS + resetMs - 1, renudgeMs, maxProbes, 1);
+    expect(manager.stalledNudges.has('todo-assign:exhausted')).toBe(true);
+    // ...but past the reset window they are pruned instead of pinning the map
+    // until a restart. Non-exhausted entries keep the 2x-renudge rule.
+    manager.pruneStalledNudges(NOW_MS + resetMs, renudgeMs, maxProbes, 1);
+    expect(manager.stalledNudges.has('todo-assign:exhausted')).toBe(false);
+    expect(manager.stalledNudges.has('todo-assign:fresh')).toBe(true);
+    manager.pruneStalledNudges(freshAt + 2 * renudgeMs + 1, renudgeMs, maxProbes, 0);
+    expect(manager.stalledNudges.has('todo-assign:fresh')).toBe(false);
+  });
+
+  it('never prunes exhausted stalled-probe entries when the reset is opted out', () => {
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', fakeDb(), { libraryRoot: null }) as any;
+    const renudgeMs = 90 * 60 * 1000;
+    const maxProbes = 2;
+
+    manager.markStalledProbe('todo-assign:opted-out', NOW_MS);
+    manager.markStalledProbe('todo-assign:opted-out', NOW_MS);
+
+    process.env.STALL_PROBE_RESET_MS = '0';
+    manager.pruneStalledNudges(NOW_MS + 365 * 24 * 60 * 60 * 1000, renudgeMs, maxProbes, 1);
+    expect(manager.stalledNudges.has('todo-assign:opted-out')).toBe(true);
+  });
+
   it('does not delay lead delegation kickoff for fresh tasks by default', () => {
     const nowSec = Math.floor(NOW_MS / 1000);
     expect(shouldDelayLeadDelegationKickoffForFreshTask(task({
