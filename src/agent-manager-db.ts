@@ -1164,16 +1164,17 @@ export class AgentManagerDb {
       'url',
     ]);
     const text = this.taskBriefGuardText(input);
-    const candidate = explicit
-      || this.briefLabel(text, 'Target URL')
+    const labeled = this.briefLabel(text, 'Target URL')
       || this.briefLabel(text, 'Target')
       || this.briefLabel(text, 'Page URL')
       || this.briefLabel(text, 'Page')
       || this.briefLabel(text, 'Site URL')
-      || this.briefLabel(text, 'Site')
-      || text.match(/\bhttps?:\/\/[^\s<>"'`]+/i)?.[0]
-      || text.match(/\b(?:[a-z0-9-]+\.)+[a-z]{2,}(?:\/[^\s<>"'`]+)?/i)?.[0]
-      || null;
+      || this.briefLabel(text, 'Site');
+    const url = text.match(/\bhttps?:\/\/[^\s<>"'`]+/i)?.[0] || null;
+    // A dotted token in free-form prose is too weak to be a strict target:
+    // source files such as agent-manager-db.ts previously became host
+    // signatures and collapsed unrelated work under the same goal.
+    const candidate = explicit || labeled || url;
     return this.normalizeTaskTarget(candidate);
   }
 
@@ -1193,6 +1194,17 @@ export class AgentManagerDb {
   private normalizeTaskTarget(value: string | null | undefined): string | null {
     const raw = String(value || '').trim().replace(/^[<([{`"']+|[>)}\]`"',.;:!?]+$/g, '');
     if (!raw) return null;
+
+    const withoutQueryOrFragment = raw.split(/[?#]/, 1)[0].replace(/\/+$/, '');
+    const finalSegment = withoutQueryOrFragment.split('/').pop()?.toLowerCase() || '';
+    const commonFileExtensions = new Set([
+      'c', 'cc', 'cfg', 'conf', 'cpp', 'cs', 'css', 'csv', 'env', 'go', 'h', 'hpp',
+      'html', 'ini', 'java', 'js', 'json', 'jsx', 'lock', 'md', 'mjs', 'php', 'properties',
+      'py', 'rb', 'rs', 'scss', 'sh', 'sql', 'svg', 'toml', 'ts', 'tsx', 'txt', 'xml',
+      'yaml', 'yml',
+    ]);
+    const extension = finalSegment.includes('.') ? finalSegment.split('.').pop() || '' : '';
+    if (!raw.includes('://') && commonFileExtensions.has(extension)) return null;
 
     const hostMatch = raw.match(/^(?:https?:\/\/)?((?:[a-z0-9-]+\.)+[a-z]{2,})(?::(\d+))?(\/.*)?$/i);
     if (!hostMatch) return null;
@@ -1650,7 +1662,9 @@ export class AgentManagerDb {
 
   private taskRefsFromCompletionPayload(payload: Record<string, unknown> | undefined): string[] {
     if (!payload) return [];
-    const raw = payload.delegated_task_names
+    const raw = payload.child_task_refs
+      ?? payload.childTaskRefs
+      ?? payload.delegated_task_names
       ?? payload.delegatedTaskNames
       ?? payload.child_task_names
       ?? payload.childTaskNames
@@ -1683,7 +1697,7 @@ export class AgentManagerDb {
     const childRefs = this.taskRefsFromCompletionPayload(params.payload);
     if (childRefs.length === 0) {
       return {
-        error: `Team lead objectives require delegated_task_names (or child_task_names) naming at least one completed member-owned child task before completion`,
+        error: `Team lead objectives require child_task_refs (or legacy delegated_task_names/child_task_names) naming at least one completed member-owned child task before completion`,
         warnings: [],
       };
     }
@@ -1696,7 +1710,19 @@ export class AgentManagerDb {
       // cross-team child (referenced by #shortId) unresolvable, not just
       // unaccepted. Bare names stay same-team scoped since names aren't
       // unique across teams.
-      let { task: childTask, error } = await this.resolveTaskRef(childRef, params.teamId);
+      let childTask: TaskRow | undefined;
+      let error: string | undefined;
+      const qualified = childRef.match(/^([^/]+)\/(.+)$/);
+      if (qualified) {
+        const childTeam = await this.db.teams.getTeamByName(qualified[1]).catch(() => null);
+        if (!childTeam) {
+          error = `team "${qualified[1]}" not found`;
+        } else {
+          ({ task: childTask, error } = await this.resolveTaskRef(qualified[2], childTeam.id));
+        }
+      } else {
+        ({ task: childTask, error } = await this.resolveTaskRef(childRef, params.teamId));
+      }
       if (!childTask && /^#?[0-9a-fA-F]{4,}$/.test(childRef.trim())) {
         const global = await this.resolveTaskRef(childRef);
         if (global.task) {
@@ -1705,7 +1731,10 @@ export class AgentManagerDb {
         }
       }
       if (!childTask) {
-        return { error: `Delegated child task "${childRef}" not found${error ? `: ${error}` : ''}`, warnings };
+        return {
+          error: `Delegated child task "${childRef}" not found${error ? `: ${error}` : ''}. For cross-team completion evidence, use a globally unique #shortId or qualified team/name reference.`,
+          warnings,
+        };
       }
       if (childTask.id === params.task.id) {
         return { error: `Delegated child task "${childRef}" cannot be the parent team-lead objective`, warnings };
@@ -1874,7 +1903,7 @@ export class AgentManagerDb {
       `Parent task name: ${parent.name}. Parent task uuid: ${parent.uuid || 'unknown'}.`,
       'Completed delegated children and available completion evidence:',
       childBlocks || '- none detected',
-      'Reconcile from the embedded child completion evidence above; do not require cross-agent workspace file access. Mark the parent done with child_task_names/delegated_task_names, or reply BLOCKED: <reason> if a concrete blocker remains.',
+      'Reconcile from the embedded child completion evidence above; do not require cross-agent workspace file access. Mark the parent done with child_task_refs (legacy child_task_names/delegated_task_names remain accepted), or reply BLOCKED: <reason> if a concrete blocker remains.',
       `Do not answer that ${parentRef} has no trace; this prompt is the authoritative task record. Do not create new tasks from this control prompt.`,
     ].join('\n');
   }
@@ -3188,7 +3217,7 @@ export class AgentManagerDb {
       return;
     }
     const memberHint = members.length ? ` Available teammates: ${members.join(', ')}.` : '';
-    const message = `Lead delegation kickoff: task ${ref} ("${task.title}") is assigned to you as the team coordinator. Do not do the whole task yourself. Immediately decompose it into member-owned child tasks with \`/task create ... --owner <teammate> --parent-task ${ref}\`, then close this parent only after child tasks are done using \`/task done ${ref} --delegated-task-names "child-a,child-b"\`. If this is truly advisory, close it with \`--no-delegation-reason\` and a failure/summary note.${memberHint}`;
+    const message = `Lead delegation kickoff: task ${ref} ("${task.title}") is assigned to you as the team coordinator. Do not do the whole task yourself. Immediately decompose it into member-owned child tasks with \`/task create ... --owner <teammate> --parent-task ${ref}\`, then close this parent only after child tasks are done using \`/task done ${ref} --child-task-refs "child-a,other-team/child-b,#1a2b3c4d"\`. Legacy \`--delegated-task-names\` and \`--child-task-names\` remain accepted. If this is truly advisory, close it with \`--no-delegation-reason\` and a failure/summary note.${memberHint}`;
     if (await this.sendSupervisionAsk(teamName, owner.name, message)) {
       this.markStalledProbe(key, Date.now());
       await this.recordTaskSupervision(task, teamId, owner.id, 'lead_delegation_required', 0, Date.now());
@@ -16822,14 +16851,14 @@ Return this JSON shape:
         }
 
         if (subCmd === 'done') {
-          // /task done <task-name|#shortid> [--acceptance "..."] [--failure-note "..."] [--delegated-task-names "child-a,child-b"]
+          // /task done <task-name|#shortid> [--acceptance "..."] [--failure-note "..."] [--child-task-refs "child-a,team/child-b,#shortid"]
           // Manager can mark any task done; agent can only mark its own task done
           const taskRef = args[1];
           if (!taskRef) {
-            return { ok: false, error: 'Usage: /task done <task-name|#shortid> [--acceptance "..."] [--failure-note "..."] [--delegated-task-names "child-a,child-b"]' };
+            return { ok: false, error: 'Usage: /task done <task-name|#shortid> [--acceptance "..."] [--failure-note "..."] [--child-task-refs "child-a,team/child-b,#shortid"]' };
           }
           const acceptanceCoverage: string[] = [];
-          const delegatedTaskNames: string[] = [];
+          const childTaskRefs: string[] = [];
           let failureNote: string | undefined;
           let noDelegationReason: string | undefined;
           let advisoryQuery = false;
@@ -16837,14 +16866,20 @@ Return this JSON shape:
             const token = args[i];
             if (token === '--acceptance' || token === '--acceptance-coverage') { acceptanceCoverage.push(args[++i]); continue; }
             if (token === '--failure-note' || token === '--failure') { failureNote = args[++i]; continue; }
-            if (token === '--delegated-task-names' || token === '--child-task-names' || token === '--delegated-tasks' || token === '--child-tasks') {
+            if (
+              token === '--child-task-refs'
+              || token === '--delegated-task-names'
+              || token === '--child-task-names'
+              || token === '--delegated-tasks'
+              || token === '--child-tasks'
+            ) {
               const value = args[++i] || '';
-              delegatedTaskNames.push(...value.split(',').map((item) => item.trim()).filter(Boolean));
+              childTaskRefs.push(...value.split(',').map((item) => item.trim()).filter(Boolean));
               continue;
             }
-            if (token === '--delegated-task' || token === '--child-task') {
+            if (token === '--child-task-ref' || token === '--delegated-task' || token === '--child-task') {
               const value = args[++i];
-              if (value) delegatedTaskNames.push(value);
+              if (value) childTaskRefs.push(value);
               continue;
             }
             if (token === '--no-delegation-reason') { noDelegationReason = args[++i]; continue; }
@@ -16881,7 +16916,7 @@ Return this JSON shape:
 
           const completionPayload = {
             acceptance_coverage: acceptanceCoverage,
-            delegated_task_names: delegatedTaskNames,
+            child_task_refs: childTaskRefs,
             failure_note: failureNote,
             no_delegation_reason: noDelegationReason,
             advisory_query: advisoryQuery,

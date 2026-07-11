@@ -2,7 +2,7 @@
 
 Repeatable process for decomposing remaining work, creating child tasks,
 collecting validation packets, and closing parent tasks with delegated
-child task names. Written for goal `goal_plan_1fgpnd5`, generalizes to any
+child task references. Written for goal `goal_plan_1fgpnd5`, generalizes to any
 team-lead-owned objective in this fleet. Grounded in live-verified manager
 API behavior — see `primary-lead-delegation-audit.md` for the underlying
 evidence and bottlenecks found while producing this runbook.
@@ -16,7 +16,8 @@ evidence and bottlenecks found while producing this runbook.
   `coder`/`researcher` — those are validators, not executors.
 - **Team lead** (e.g. `ops-lead`) — decomposes its objective into
   member-owned child tasks, delegates in parallel, coordinates, validates,
-  and closes with `child_task_names`/`delegated_task_names`.
+  and closes with canonical `child_task_refs` (legacy
+  `child_task_names`/`delegated_task_names` remain accepted).
 - **Team member** (e.g. `task-master`, `deployer`, `git-manager`,
   `content-moderator`, `content-ops`) — claims and executes one child
   task's concrete scope.
@@ -139,17 +140,18 @@ acceptable validation path per the task's own brief — but do not use that
 narrower path to avoid dispatching genuinely cross-team or high-risk work
 to the validators.
 
-## 6. Close the parent with delegated child task names
+## 6. Close the parent with delegated child task references
 
 `POST $MANAGER_URL/tasks/<parent>/done` (or the `#<shortId>`-prefixed
 resolver form, which is the reliable one for supervised/manager-originated
 tasks — bare hex/name has been seen to 404) requires, for a lead-owned
 objective:
 
-1. `child_task_names` (or `delegated_task_names`) listing at least one
-   **completed, member-owned, same-team** child. A cross-team validator
-   task does not count even if it is the genuine validation for this work
-   — spin off one small, real, same-team re-check if that's all you have.
+1. `child_task_refs` listing at least one **completed, member-owned** child.
+   Same-team names remain the simplest form. Cross-team children can use a
+   globally unique `#shortId` or qualified `team/name` reference and are
+   accepted with an explicit cross-team warning. Legacy
+   `child_task_names`/`delegated_task_names` payloads remain compatible.
 2. A completion packet: `acceptance_coverage` (what was delivered against
    the acceptance criteria) and/or `failure_note` (why some scope could
    not land). A field named `acceptance_coverage_or_failure_note` is not
@@ -160,7 +162,7 @@ curl -s -X POST "$MANAGER_URL/tasks/%23caee67c8/done" \
   -H "Content-Type: application/json" -H "X-Id-Team: ops-team" \
   -d '{
     "agent_id": "ops-lead",
-    "delegated_task_names": ["draft-delegation-runbook-content", "screen-delegation-rules-policy-fit-d0cfd5a4"],
+    "child_task_refs": ["draft-delegation-runbook-content", "research/screen-delegation-rules-policy-fit-d0cfd5a4"],
     "acceptance_coverage": "Runbook + audit published to ./output/; two same-team children (deployer draft, content-moderator policy screen) completed and folded in; stalled git-manager/maintainer children nudged and documented as an open follow-up, not silently dropped."
   }'
 ```
@@ -189,7 +191,7 @@ a false "done." Either:
 - [ ] Progress checked via the probe ladder, not assumed
 - [ ] Stalled/wedged children nudged once, documented, not silently dropped
 - [ ] Substantial/cross-team completions relayed to `default/coder` + `default/researcher`
-- [ ] Parent closed with real `delegated_task_names` + `acceptance_coverage`/`failure_note`
+- [ ] Parent closed with real `child_task_refs` + `acceptance_coverage`/`failure_note`
 - [ ] Result relayed upward only after validation, never raw
 
 ## Sources

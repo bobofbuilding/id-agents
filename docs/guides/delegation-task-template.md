@@ -88,11 +88,12 @@ curl -s -X POST "$MANAGER_URL/tasks/%23<parentShortId>/done" \
   -H "Content-Type: application/json" -H "X-Id-Team: <team>" \
   -d '{
     "agent_id": "<lead-agent-id>",
-    "delegated_task_names": ["<done-member-owned-child-1>", "..."],
+    "child_task_refs": ["<done-member-owned-child-1>", "<team>/<cross-team-child>", "#<globally-unique-short-id>"],
     "acceptance_coverage": "<what was delivered against the parent acceptance criteria, citing child evidence>"
   }'
 ```
 
-`delegated_task_names` / `child_task_names` entries must be `done` **and**
-owned by a real distinct team member — an entry owned by the lead itself is
-rejected even if it is same-team and genuinely completed work.
+`child_task_refs` entries must be `done` **and** owned by a real distinct
+team member — an entry owned by the lead itself is rejected even if it is
+same-team and genuinely completed work. Legacy `delegated_task_names` and
+`child_task_names` payload fields remain accepted for compatibility.

@@ -815,6 +815,7 @@ describe('/talk-to auto-attach', () => {
     });
     expect(rejected.status).toBe(409);
     const rejectedBody = await rejected.json() as { error: string };
+    expect(rejectedBody.error).toContain('child_task_refs');
     expect(rejectedBody.error).toContain('delegated_task_names');
 
     const done = await fetch(`${baseUrl}/tasks/advisory-manager-query/done`, {
@@ -1353,7 +1354,7 @@ describe('/talk-to auto-attach', () => {
     expect(flipped?.owner).toBe(ownerId);
   });
 
-  it('accepts a cross-team child_task_names ref as completion evidence instead of hard-failing', async () => {
+  it('accepts a globally unique cross-team #shortId in child_task_refs', async () => {
     const engTeamId = await db.teams.getOrCreateTeamId('engineering-team');
     const otherTeamId = await db.teams.getOrCreateTeamId('cross-team-evidence-team');
     const leadId = await getOrInsertAgent(db, engTeamId, 'engineering-lead', null);
@@ -1399,7 +1400,7 @@ describe('/talk-to auto-attach', () => {
       body: JSON.stringify({
         agent_id: 'engineering-lead',
         acceptance_coverage: ['validated via cross-team delegated evidence'],
-        child_task_names: childShortId,
+        child_task_refs: childShortId,
       }),
     });
     expect(done.status).toBe(200);
@@ -1409,6 +1410,84 @@ describe('/talk-to auto-attach', () => {
 
     const finished = await db.tasks.getByNameForTeam('crossteam-evidence-parent', engTeamId);
     expect(finished?.status).toBe('done');
+  });
+
+  it('accepts a qualified cross-team child_task_refs reference', async () => {
+    const engTeamId = await db.teams.getOrCreateTeamId('engineering-team');
+    const otherTeamName = 'qualified-evidence-team';
+    const otherTeamId = await db.teams.getOrCreateTeamId(otherTeamName);
+    const leadId = await getOrInsertAgent(db, engTeamId, 'engineering-lead', null);
+    const workerId = await getOrInsertAgent(db, otherTeamId, 'qualified-worker', null);
+    const now = Math.floor(Date.now() / 1000);
+    await db.tasks.create({
+      id: 'task_qualified_parent', name: 'qualified-evidence-parent', uuid: '66666660-6666-4666-8666-666666666666',
+      team_id: engTeamId, title: 'Qualified evidence parent', description: 'Cross-team qualified reference parent',
+      status: 'doing', created_by: leadId, owner: leadId, created_at: now - 120, updated_at: now - 120, completed_at: null,
+    });
+    await db.tasks.create({
+      id: 'task_qualified_child', name: 'qualified-evidence-child', uuid: '66666661-6666-4666-8666-666666666666',
+      team_id: otherTeamId, title: 'Qualified evidence child', description: 'Completed cross-team child',
+      status: 'done', created_by: workerId, owner: workerId, created_at: now - 100, updated_at: now - 60, completed_at: now - 60,
+    });
+    const done = await fetch(`${baseUrl}/tasks/qualified-evidence-parent/done`, {
+      method: 'POST', headers: adminHeaders('engineering-team'),
+      body: JSON.stringify({
+        agent_id: 'engineering-lead', acceptance_coverage: ['qualified cross-team evidence validated'],
+        child_task_refs: `${otherTeamName}/qualified-evidence-child`,
+      }),
+    });
+    expect(done.status).toBe(200);
+    const body = await done.json() as { delegation_warnings?: string[] };
+    expect(body.delegation_warnings?.some((warning) => warning.includes('cross-team'))).toBe(true);
+  });
+
+  it('accepts canonical --child-task-refs in the /task done command', async () => {
+    const engTeamId = await db.teams.getOrCreateTeamId('engineering-team');
+    const leadId = await getOrInsertAgent(db, engTeamId, 'engineering-lead', null);
+    const workerId = await getOrInsertAgent(db, engTeamId, 'implementation-engineer', null);
+    const now = Math.floor(Date.now() / 1000);
+    await db.tasks.create({
+      id: 'task_cli_canonical_parent', name: 'cli-canonical-parent', uuid: '67676760-6767-4767-8767-676767676767',
+      team_id: engTeamId, title: 'CLI canonical parent', description: 'Lead-owned CLI completion parent',
+      status: 'doing', created_by: leadId, owner: leadId, created_at: now - 120, updated_at: now - 120, completed_at: null,
+    });
+    await db.tasks.create({
+      id: 'task_cli_canonical_child', name: 'cli-canonical-child', uuid: '67676761-6767-4767-8767-676767676767',
+      team_id: engTeamId, title: 'CLI canonical child', description: 'Completed member-owned CLI child',
+      status: 'done', created_by: leadId, owner: workerId, created_at: now - 100, updated_at: now - 60, completed_at: now - 60,
+    });
+
+    const done = await fetch(`${baseUrl}/remote`, {
+      method: 'POST',
+      headers: adminHeaders('engineering-team'),
+      body: JSON.stringify({
+        from: 'engineering-lead',
+        command: '/task done cli-canonical-parent --acceptance "canonical child refs validated" --child-task-refs "cli-canonical-child"',
+      }),
+    });
+    expect(done.status).toBe(200);
+    const body = await done.json() as { ok?: boolean; result?: { task?: { status?: string } } };
+    expect(body.ok).toBe(true);
+    expect(body.result?.task?.status).toBe('done');
+  });
+
+  it('guides unresolved cross-team completion references toward supported forms', async () => {
+    const engTeamId = await db.teams.getOrCreateTeamId('engineering-team');
+    const leadId = await getOrInsertAgent(db, engTeamId, 'engineering-lead', null);
+    const now = Math.floor(Date.now() / 1000);
+    await db.tasks.create({
+      id: 'task_guidance_parent', name: 'guidance-evidence-parent', uuid: '77777770-7777-4777-8777-777777777777',
+      team_id: engTeamId, title: 'Guidance evidence parent', description: 'Missing cross-team child guidance parent',
+      status: 'doing', created_by: leadId, owner: leadId, created_at: now - 120, updated_at: now - 120, completed_at: null,
+    });
+    const done = await fetch(`${baseUrl}/tasks/guidance-evidence-parent/done`, {
+      method: 'POST', headers: adminHeaders('engineering-team'),
+      body: JSON.stringify({ agent_id: 'engineering-lead', acceptance_coverage: ['attempted child evidence'], child_task_refs: 'missing-cross-team-child' }),
+    });
+    expect(done.status).toBe(409);
+    const body = await done.json() as { error: string };
+    expect(body.error).toContain('#shortId');
+    expect(body.error).toContain('team/name');
   });
 
   it('reports and requeues existing lead-owned delegation backlog with linked checkin cleanup', async () => {
@@ -1700,6 +1779,83 @@ describe('/talk-to auto-attach', () => {
     expect(duplicateBody.duplicate_scope).toBe('goal+target');
     expect(duplicateBody.duplicate_state).toBe('open');
     expect(duplicateBody.suggested_action).toBe('status-check');
+  });
+
+  it.each([
+    'agent-manager-db.ts',
+    'package.json',
+    'tsconfig.json',
+    '.env',
+    'config.yaml',
+  ])('allows distinct objectives against common source/config target %s', async (sourceFile) => {
+    const suffix = sourceFile.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    const sourceBrief = {
+      ...validBriefFields(),
+      goal_id: `goal_manager_source_file_repairs_${suffix}`,
+      target: sourceFile,
+      expected_output: `A focused manager behavior change in ${sourceFile}`,
+      acceptance_criteria: ['The requested behavior has regression coverage'],
+      backlog_policy: 'Keep separate behavior fixes independently actionable.',
+      bittrees_relevance: 'high: improves manager task lifecycle reliability.',
+    };
+    const first = await fetch(`${baseUrl}/tasks`, {
+      method: 'POST', headers: adminHeaders(TEAM),
+      body: JSON.stringify({ title: 'Repair target signature extraction', name: `repair-target-signature-extraction-${suffix}`, from: 'manager', ...sourceBrief }),
+    });
+    expect(first.status).toBe(201);
+    const distinct = await fetch(`${baseUrl}/tasks`, {
+      method: 'POST', headers: adminHeaders(TEAM),
+      body: JSON.stringify({
+        title: 'Clarify cross-team completion references', name: `clarify-cross-team-completion-references-${suffix}`, from: 'manager',
+        ...sourceBrief, expected_output: `Qualified completion references implemented in ${sourceFile}`,
+      }),
+    });
+    expect(distinct.status).toBe(201);
+  });
+
+  it('does not treat an unlabeled bare hostname in prose as a strict target signature', async () => {
+    const proseBrief = {
+      ...validBriefFields(),
+      goal_id: 'goal_unlabeled_host_prose',
+      expected_output: 'A release artifact mentioning agent.bittrees.org without identifying a target page',
+      acceptance_criteria: ['The requested objective has focused evidence'],
+      backlog_policy: 'Keep distinct release objectives independently actionable.',
+      bittrees_relevance: 'high: prevents unrelated Bittrees work from being collapsed.',
+    };
+    const first = await fetch(`${baseUrl}/tasks`, {
+      method: 'POST', headers: adminHeaders(TEAM),
+      body: JSON.stringify({ title: 'Draft launch announcement', name: 'draft-unlabeled-host-announcement', from: 'manager', ...proseBrief }),
+    });
+    expect(first.status).toBe(201);
+    const distinct = await fetch(`${baseUrl}/tasks`, {
+      method: 'POST', headers: adminHeaders(TEAM),
+      body: JSON.stringify({ title: 'Audit contributor FAQ', name: 'audit-unlabeled-host-faq', from: 'manager', ...proseBrief }),
+    });
+    expect(distinct.status).toBe(201);
+  });
+
+  it('uses an HTTPS URL in prose as stronger goal+target dedup evidence', async () => {
+    const urlBrief = {
+      ...validBriefFields(),
+      goal_id: 'goal_strong_url_evidence',
+      expected_output: 'A verified update at https://agent.bittrees.org/docs/strong-evidence',
+      acceptance_criteria: ['The target page is verified'],
+      backlog_policy: 'Status-check an existing owner before duplicating the same page work.',
+      bittrees_relevance: 'high: prevents duplicate edits to a live Bittrees page.',
+    };
+    const first = await fetch(`${baseUrl}/tasks`, {
+      method: 'POST', headers: adminHeaders(TEAM),
+      body: JSON.stringify({ title: 'Refresh strong-evidence copy', name: 'refresh-strong-evidence-copy', from: 'manager', ...urlBrief }),
+    });
+    expect(first.status).toBe(201);
+    const duplicate = await fetch(`${baseUrl}/tasks`, {
+      method: 'POST', headers: adminHeaders(TEAM),
+      body: JSON.stringify({ title: 'Verify strong-evidence CTA', name: 'verify-strong-evidence-cta', from: 'manager', ...urlBrief }),
+    });
+    expect(duplicate.status).toBe(409);
+    const body = await duplicate.json() as { error?: string; duplicate_scope?: string };
+    expect(body.error).toBe('existing_task_found');
+    expect(body.duplicate_scope).toBe('goal+target');
   });
 
   it('rejects duplicate goal target tasks during /talk-to auto-attach before creating a second task or checkin', async () => {
