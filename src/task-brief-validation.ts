@@ -134,7 +134,12 @@ export function validateTaskBrief(
   if (!hasValidationPath(input, text)) missing.push('validation_path');
   if (!hasOutOfScope(input, text)) missing.push('out_of_scope');
   if (!hasBacklogPolicy(input, text)) missing.push('backlog_policy');
-  if (!hasBittreesContributorRelevance(input, text)) missing.push('bittrees_relevance');
+  if (!hasBittreesContributorRelevance(input, text)) {
+    // A provided-but-unparseable relevance (no high/medium/low/backlog/reject
+    // priority keyword) is a different failure than an absent field; report it
+    // as invalid so "missing" stops masking the real fix for the submitter.
+    (hasBittreesRelevanceField(input) ? invalid : missing).push('bittrees_relevance');
+  }
 
   const bypassReason = firstString(input.bypass_reason, input.bypassReason);
   if (bypassReason) {
@@ -304,6 +309,16 @@ function hasBacklogPolicy(input: TaskBriefValidationInput, text: string): boolea
 
 function hasBittreesContributorRelevance(input: TaskBriefValidationInput, text: string): boolean {
   return getBittreesContributorPriority(input, text) !== null;
+}
+
+function hasBittreesRelevanceField(input: TaskBriefValidationInput): boolean {
+  return hasNonEmpty(
+    input.bittrees_relevance
+    ?? input.bittreesRelevance
+    ?? input.bittrees_contributor_relevance
+    ?? input.bittreesContributorRelevance
+    ?? input.relevance,
+  );
 }
 
 export function getBittreesContributorPriority(

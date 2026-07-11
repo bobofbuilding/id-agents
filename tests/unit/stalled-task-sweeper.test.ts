@@ -238,6 +238,65 @@ describe('stalled task sweeper', () => {
     expect(manager.canRunStalledProbe(key, NOW_MS + 365 * 24 * 60 * 60 * 1000, renudgeMs, 2)).toBe(false);
   });
 
+  it('lets forced manual triage override an exhausted stalled-probe budget', () => {
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', fakeDb(), { libraryRoot: null }) as any;
+    const renudgeMs = 90 * 60 * 1000;
+    const manualFloorMs = 60 * 1000;
+    const key = 'todo-assign:task-3';
+
+    manager.markStalledProbe(key, NOW_MS);
+    manager.markStalledProbe(key, NOW_MS);
+    manager.markStalledProbe(key, NOW_MS);
+
+    // Unforced triage stays refused before the automatic reset window.
+    expect(manager.canRunStalledProbeForTriage(key, NOW_MS + renudgeMs, renudgeMs, 3)).toBe(false);
+    // Forced triage under the manual spacing floor is still throttled...
+    expect(manager.canRunStalledProbeForTriage(key, NOW_MS + manualFloorMs - 1, renudgeMs, 3, true)).toBe(false);
+    // ...but past the floor it refreshes the exhausted budget instead of
+    // silently refusing the operator's kickstart.
+    expect(manager.canRunStalledProbeForTriage(key, NOW_MS + manualFloorMs, renudgeMs, 3, true)).toBe(true);
+    expect(manager.markStalledProbe(key, NOW_MS + manualFloorMs)).toBe(1);
+  });
+
+  it('prunes exhausted stalled-probe entries once past the reset window', () => {
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', fakeDb(), { libraryRoot: null }) as any;
+    const renudgeMs = 90 * 60 * 1000;
+    const resetMs = 4 * 60 * 60 * 1000;
+    const maxProbes = 3;
+
+    const freshAt = NOW_MS + resetMs - renudgeMs;
+    for (let i = 0; i < maxProbes; i++) manager.markStalledProbe('todo-assign:exhausted', NOW_MS);
+    manager.markStalledProbe('todo-assign:fresh', freshAt);
+
+    // Under the entry cap nothing is pruned.
+    manager.pruneStalledNudges(NOW_MS + resetMs, renudgeMs, maxProbes, 2000);
+    expect(manager.stalledNudges.has('todo-assign:exhausted')).toBe(true);
+
+    // Over the cap: exhausted entries inside the reset window survive...
+    manager.pruneStalledNudges(NOW_MS + resetMs - 1, renudgeMs, maxProbes, 1);
+    expect(manager.stalledNudges.has('todo-assign:exhausted')).toBe(true);
+    // ...but past the reset window they are pruned instead of pinning the map
+    // until a restart. Non-exhausted entries keep the 2x-renudge rule.
+    manager.pruneStalledNudges(NOW_MS + resetMs, renudgeMs, maxProbes, 1);
+    expect(manager.stalledNudges.has('todo-assign:exhausted')).toBe(false);
+    expect(manager.stalledNudges.has('todo-assign:fresh')).toBe(true);
+    manager.pruneStalledNudges(freshAt + 2 * renudgeMs + 1, renudgeMs, maxProbes, 0);
+    expect(manager.stalledNudges.has('todo-assign:fresh')).toBe(false);
+  });
+
+  it('never prunes exhausted stalled-probe entries when the reset is opted out', () => {
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', fakeDb(), { libraryRoot: null }) as any;
+    const renudgeMs = 90 * 60 * 1000;
+    const maxProbes = 2;
+
+    manager.markStalledProbe('todo-assign:opted-out', NOW_MS);
+    manager.markStalledProbe('todo-assign:opted-out', NOW_MS);
+
+    process.env.STALL_PROBE_RESET_MS = '0';
+    manager.pruneStalledNudges(NOW_MS + 365 * 24 * 60 * 60 * 1000, renudgeMs, maxProbes, 1);
+    expect(manager.stalledNudges.has('todo-assign:opted-out')).toBe(true);
+  });
+
   it('does not delay lead delegation kickoff for fresh tasks by default', () => {
     const nowSec = Math.floor(NOW_MS / 1000);
     expect(shouldDelayLeadDelegationKickoffForFreshTask(task({
@@ -847,6 +906,158 @@ describe('stalled task sweeper', () => {
         reason: 'control_reply_route_assigned',
       }),
     }));
+  });
+
+  it('#bf9577bd transfers a valid cross-team route to the destination owner and lifecycle', async () => {
+    const routedTask = task({ status: 'todo', owner: null });
+    const destination = team({ id: 'research-team-id', name: 'research' });
+    const researcher = agent({ id: 'researcher-1', team_id: destination.id, name: 'researcher' });
+    const assignedTask = {
+      ...routedTask,
+      team_id: destination.id,
+      owner: researcher.id,
+      status: 'doing' as const,
+      updated_at: Math.floor(NOW_MS / 1000),
+    };
+    const db = fakeDb({
+      teams: {
+        getTeamByName: vi.fn(async (name: string) => name === 'research' ? destination : name === 'default' ? team() : null),
+      },
+      agents: {
+        resolve: vi.fn(async (teamId: string, ref: string) =>
+          teamId === destination.id && ref === 'researcher' ? [researcher] : [],
+        ),
+      },
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => status === 'doing' ? [] : [routedTask]),
+        getByNameForTeam: vi.fn(async (name: string, teamId: string) =>
+          name === routedTask.name && teamId === destination.id ? assignedTask : null,
+        ),
+        getByUuidPrefix: vi.fn(async () => [routedTask]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-cross-team-route-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery('lead-agent', {
+        query_id: 'guard-cross-team-route',
+        prompt: 'Supervision: unclaimed task #12345678 ("Stalled work") has been waiting 60m. Reply with one line: CLAIM, ROUTE: <team/agent>, or BLOCKED: <reason>.',
+        status: 'completed',
+      }),
+      { result: 'ROUTE: research/researcher' },
+      NOW_MS,
+    );
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(routedTask.id, {
+      team_id: destination.id,
+      owner: researcher.id,
+      status: 'doing',
+      completed_at: null,
+      updated_at: Math.floor(NOW_MS / 1000),
+    });
+    expect(db.tasks.getByNameForTeam).toHaveBeenCalledWith(routedTask.name, destination.id);
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'research',
+      'researcher',
+      expect.stringContaining('TASK DELEGATION from manager'),
+    );
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      team_id: destination.id,
+      topic: 'task:claimed',
+      subject_id: routedTask.uuid,
+      data: expect.objectContaining({ owner: researcher.id }),
+    }));
+  });
+
+  it('#cce9b462 queues a valid busy cross-team destination with actionable reassignment evidence', async () => {
+    const routedTask = task({ status: 'todo', owner: null });
+    const destination = team({ id: 'research-team-id', name: 'research' });
+    const researcher = agent({ id: 'researcher-1', team_id: destination.id, name: 'researcher' });
+    const db = fakeDb({
+      teams: {
+        getTeamByName: vi.fn(async (name: string) => name === 'research' ? destination : name === 'default' ? team() : null),
+      },
+      agents: {
+        resolve: vi.fn(async (teamId: string, ref: string) =>
+          teamId === destination.id && ref === 'researcher' ? [researcher] : [],
+        ),
+      },
+      queries: {
+        getPending: vi.fn(async (agentId: string) => agentId === researcher.id
+          ? [activeQuery(researcher.id, { status: 'processing' })]
+          : [],
+        ),
+      },
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => status === 'doing' ? [] : [routedTask]),
+        getByUuidPrefix: vi.fn(async () => [routedTask]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-cross-team-busy-route-test', db, { libraryRoot: null }) as any;
+
+    await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery('lead-agent', {
+        query_id: 'guard-cross-team-busy-route',
+        prompt: 'Supervision: unclaimed task #12345678 ("Stalled work") has been waiting 60m. Reply with one line: CLAIM, ROUTE: <team/agent>, or BLOCKED: <reason>.',
+        status: 'completed',
+      }),
+      { result: 'ROUTE: research/researcher' },
+      NOW_MS,
+    );
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(routedTask.id, expect.objectContaining({
+      team_id: destination.id,
+      owner: null,
+      status: 'todo',
+      completed_at: null,
+      description: expect.stringContaining('NEEDS-REASSIGNMENT: destination delivery deferred to research/researcher'),
+    }));
+    const update = db.tasks.updateFields.mock.calls[0][1];
+    expect(update.description).toContain('process_online=true');
+    expect(update.description).toContain('request_lane_busy=true');
+    expect(update.description).toContain('objective_capacity=true');
+    expect(update.description).toContain('assignment_capacity=true');
+    expect(update.description).toContain('target_has_active_query');
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      team_id: destination.id,
+      topic: 'task:triaged',
+      subject_id: routedTask.uuid,
+      data: expect.objectContaining({ reason: 'control_reply_reassign' }),
+    }));
+  });
+
+  it('keeps an invalid cross-team route fail-closed in the source team', async () => {
+    const routedTask = task({ status: 'todo', owner: null });
+    const db = fakeDb({
+      teams: {
+        getTeamByName: vi.fn(async (name: string) => name === 'default' ? team() : null),
+      },
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [routedTask]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-invalid-cross-team-route-test', db, { libraryRoot: null }) as any;
+
+    await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery('lead-agent', {
+        query_id: 'guard-invalid-cross-team-route',
+        prompt: 'Supervision: unclaimed task #12345678 ("Stalled work") has been waiting 60m. Reply with one line: CLAIM, ROUTE: <team/agent>, or BLOCKED: <reason>.',
+        status: 'completed',
+      }),
+      { result: 'ROUTE: missing-team/missing-agent' },
+      NOW_MS,
+    );
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(routedTask.id, expect.objectContaining({
+      team_id: TEAM_ID,
+      owner: null,
+      status: 'todo',
+      description: expect.stringContaining('target_not_found'),
+    }));
+    const update = db.tasks.updateFields.mock.calls[0][1];
+    expect(update.description).toContain('process_online=unresolved');
+    expect(update.description).toContain('request_lane_busy=unresolved');
   });
 
   it('extracts route targets from prose control replies without treating the task title as the target', async () => {
@@ -5773,6 +5984,57 @@ describe('stalled task sweeper', () => {
       data: expect.objectContaining({
         owner: 'worker-2',
         status: 'doing',
+      }),
+    }));
+  });
+
+  it('flags stale owner-set todo work so the assigned lead can claim it', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
+    const ownedTodo = task({
+      id: 'todo-owned-1',
+      name: 'owned-todo-dead-state',
+      uuid: '98989898-8888-4777-9666-555555555555',
+      title: 'Owned todo dead state',
+      status: 'todo',
+      owner: lead.id,
+      updated_at: nowSec - 3600,
+    });
+    const db = fakeDb({
+      agents: {
+        getById: vi.fn(async (id: string) => id === lead.id ? lead : null),
+        getByName: vi.fn(async () => lead),
+        list: vi.fn(async () => [lead]),
+      },
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => {
+          if (status === 'todo') return [ownedTodo];
+          return [];
+        }),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-owned-todo-dead-state-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.sweepStalledTasks();
+
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'lead',
+      expect.stringContaining('pre-assigned to you but still status=todo'),
+    );
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'lead',
+      expect.stringContaining('POST /tasks/owned-todo-dead-state/claim'),
+    );
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      team_id: TEAM_ID,
+      topic: 'task:triaged',
+      actor_agent_id: lead.id,
+      subject_id: ownedTodo.uuid,
+      data: expect.objectContaining({
+        reason: 'owned_todo_dead_state',
       }),
     }));
   });

@@ -1312,7 +1312,7 @@ describe('/talk-to auto-attach', () => {
 
   it('lets the pre-assigned owner claim a dead-state todo task (owner set, status still todo)', async () => {
     const engTeamId = await db.teams.getOrCreateTeamId('engineering-team');
-    const ownerId = await getOrInsertAgent(db, engTeamId, 'implementation-engineer', null);
+    const ownerId = await getOrInsertAgent(db, engTeamId, 'engineering-lead', null);
     await getOrInsertAgent(db, engTeamId, 'qa-engineer', null);
     const now = Math.floor(Date.now() / 1000);
 
@@ -1345,7 +1345,7 @@ describe('/talk-to auto-attach', () => {
     const ownerAttempt = await fetch(`${baseUrl}/tasks/dead-state-preassigned/claim`, {
       method: 'POST',
       headers: adminHeaders('engineering-team'),
-      body: JSON.stringify({ agent_id: 'implementation-engineer' }),
+      body: JSON.stringify({ agent_id: 'engineering-lead' }),
     });
     expect(ownerAttempt.status).toBe(200);
     const flipped = await db.tasks.getByNameForTeam('dead-state-preassigned', engTeamId);
@@ -1353,7 +1353,7 @@ describe('/talk-to auto-attach', () => {
     expect(flipped?.owner).toBe(ownerId);
   });
 
-  it('accepts a cross-team delegated_task_names ref as completion evidence instead of hard-failing', async () => {
+  it('accepts a cross-team child_task_names ref as completion evidence instead of hard-failing', async () => {
     const engTeamId = await db.teams.getOrCreateTeamId('engineering-team');
     const otherTeamId = await db.teams.getOrCreateTeamId('cross-team-evidence-team');
     const leadId = await getOrInsertAgent(db, engTeamId, 'engineering-lead', null);
@@ -1399,7 +1399,7 @@ describe('/talk-to auto-attach', () => {
       body: JSON.stringify({
         agent_id: 'engineering-lead',
         acceptance_coverage: ['validated via cross-team delegated evidence'],
-        delegated_task_names: childShortId,
+        child_task_names: childShortId,
       }),
     });
     expect(done.status).toBe(200);
