@@ -4760,6 +4760,10 @@ Return this JSON shape:
     if (!effectiveParsed.action) return { applied: false, reason: 'no_control_action' };
     if (this.isTerminalTaskStatus(task.status)) return { applied: false, action: effectiveParsed.action, task: task.name, reason: 'task_terminal' };
 
+    if (effectiveParsed.action === 'done' && await this.taskDependencyBlock(task, queryRow.team_id)) {
+      return { applied: false, action: effectiveParsed.action, task: task.name, reason: 'task_dependency_incomplete' };
+    }
+
     const nowSec = Math.floor(occurredAt / 1000);
     const stalledMinutes = Math.max(0, Math.round((occurredAt - this.taskLastActivityMs(task)) / 60000));
     const actorAgentId = queryRow.agent_id ?? task.owner ?? null;
@@ -8058,6 +8062,7 @@ Return this JSON shape:
       team_id: teamId,
       title: taskSpec.title,
       description,
+      depends_on: [],
       status: 'doing',
       created_by: fromAgent?.id ?? null,
       owner: targetAgent.id,
@@ -11913,9 +11918,13 @@ Return this JSON shape:
         const principal = (req as any).ctx?.principal || 'anon';
         const body = req.body || {};
         const { title, name: rawName, description, team: teamRef, from } = body;
+        const dependsOn = this.normalizeTaskDependencies(body.depends_on ?? body.dependsOn);
 
         if (!title || typeof title !== 'string') {
           return res.status(400).json({ error: 'Missing required field: title' });
+        }
+        if (!dependsOn) {
+          return res.status(400).json({ error: 'invalid_depends_on' });
         }
 
         // Resolve created_by from `from` field first so we can recover the
@@ -12048,7 +12057,8 @@ Return this JSON shape:
           team_id: taskTeamId,
           title,
           description: taskDescription,
-          status: defaultOwner.owner ? 'doing' : 'todo',
+          depends_on: dependsOn,
+          status: defaultOwner.owner && dependsOn.length === 0 ? 'doing' : 'todo',
           created_by: createdBy,
           owner: defaultOwner.owner?.id ?? null,
           created_at: now,
@@ -12059,7 +12069,7 @@ Return this JSON shape:
         await this.db.tasks.create(taskRow);
         let ownerWake: Awaited<ReturnType<typeof this.wakeAssignedTaskOwner>> | undefined;
         let brainContext: BrainVolunteerContext | null = null;
-        if (defaultOwner.owner) {
+        if (defaultOwner.owner && dependsOn.length === 0) {
           brainContext = await this.emitTaskClaimedWithBrainContext({
             teamId: taskTeamId,
             teamName: taskTeamName,
@@ -12211,6 +12221,11 @@ Return this JSON shape:
           return res.status(404).json({ error: `Task "${req.params.ref}" not found` });
         }
 
+        const dependencyBlock = await this.taskDependencyBlock(task, teamId);
+        if (dependencyBlock) {
+          return res.status(409).json(dependencyBlock);
+        }
+
         const claimBrief = this.validateIncomingTaskBrief(this.taskBriefInputFromTask(task));
         if (claimBrief.blocked && !this.canClaimMalformedBriefForRepair(teamName, agent, task)) {
           return res.status(409).json({
@@ -12331,6 +12346,11 @@ Return this JSON shape:
             task: await this.buildTaskResult(task, teamId),
             already_done: true,
           });
+        }
+
+        const dependencyBlock = await this.taskDependencyBlock(task, teamId);
+        if (dependencyBlock) {
+          return res.status(409).json(dependencyBlock);
         }
 
         const completion = this.validateCompletionPayload(req.body || {});
@@ -13262,6 +13282,7 @@ Return this JSON shape:
       shortId,
       title: task.title,
       description: task.description,
+      dependsOn: task.depends_on,
       status: task.status,
       ownerName,
       teamName,
@@ -15902,7 +15923,7 @@ Return this JSON shape:
         const subCmd = args[0]?.toLowerCase() || 'list';
 
         if (subCmd === 'create') {
-          // /task create "<title>" [--name <slug>] [--description "..."] [--team <team>] [--owner <agent>] [--event <schedule-id>]...
+          // /task create "<title>" [--name <slug>] [--description "..."] [--team <team>] [--owner <agent>] [--depends-on <task-name>]... [--event <schedule-id>]...
           const rawArgs = args.slice(1);
           let title: string | undefined;
           let name: string | undefined;
@@ -15921,6 +15942,7 @@ Return this JSON shape:
           let validationPurpose: string | undefined;
           let leadCoordination = false;
           const eventIds: string[] = [];
+          const dependsOn: string[] = [];
 
           for (let i = 0; i < rawArgs.length; i++) {
             const token = rawArgs[i];
@@ -15929,6 +15951,12 @@ Return this JSON shape:
             if (token === '--team') { teamRef = rawArgs[++i]; continue; }
             if (token === '--owner') { ownerRef = rawArgs[++i]; continue; }
             if (token === '--event') { eventIds.push(rawArgs[++i]); continue; }
+            if (token === '--depends-on') {
+              const dependency = rawArgs[++i];
+              if (!dependency) return { ok: false, error: '--depends-on requires a task name or id' };
+              dependsOn.push(dependency);
+              continue;
+            }
             if (token === '--goal' || token === '--goal-id') { goalId = rawArgs[++i]; continue; }
             if (token === '--expected-output') { expectedOutput = rawArgs[++i]; continue; }
             if (token === '--acceptance' || token === '--acceptance-criteria') { acceptanceCriteria.push(rawArgs[++i]); continue; }
@@ -16152,7 +16180,7 @@ Return this JSON shape:
           }
 
           const now = Math.floor(Date.now() / 1000);
-          const status = ownerId ? 'doing' : 'todo';
+          const status = ownerId && dependsOn.length === 0 ? 'doing' : 'todo';
           const queuedByDoingLimit = Boolean(ownerRef && !ownerId);
           // Resolve created_by from callerFrom if present
           let createdBy: string | null = null;
@@ -16169,6 +16197,7 @@ Return this JSON shape:
             team_id: taskTeamId,
             title,
             description: taskDescription,
+            depends_on: this.normalizeTaskDependencies(dependsOn) || [],
             status,
             created_by: createdBy,
             owner: ownerId,
@@ -16180,7 +16209,7 @@ Return this JSON shape:
           await this.db.tasks.create(taskRow, eventIds.length > 0 ? eventIds : undefined);
           let ownerWake: Awaited<ReturnType<typeof this.wakeAssignedTaskOwner>> | undefined;
           let brainContext: BrainVolunteerContext | null = null;
-          if (ownerId && ownerAgentForGuard) {
+          if (ownerId && ownerAgentForGuard && dependsOn.length === 0) {
             const taskTeamRow = await this.db.teams.getTeam(taskTeamId).catch(() => null);
             brainContext = await this.emitTaskClaimedWithBrainContext({
               teamId: taskTeamId,
@@ -16601,6 +16630,10 @@ Return this JSON shape:
           const { agent, error } = await this.resolveSingleAgentForCommand(resolveTeam, agentRef);
           if (!agent) return { ok: false, error: error || `Agent "${agentRef}" not found` };
           const taskTeamIdForGuard = task.team_id || teamId;
+          const dependencyBlock = await this.taskDependencyBlock(task, taskTeamIdForGuard);
+          if (dependencyBlock) {
+            return { ok: false, error: dependencyBlock.error, result: dependencyBlock };
+          }
           const taskTeamRowForGuard = await this.db.teams.getTeam(taskTeamIdForGuard).catch(() => null);
           const assignCapacityBlock = await this.leadCapacityGuard({
             teamId: taskTeamIdForGuard,
@@ -16683,6 +16716,11 @@ Return this JSON shape:
           // Resolve caller agent
           const { agent: callerAgent, error: callerError } = await this.resolveSingleAgentForCommand(teamId, callerFrom);
           if (!callerAgent) return { ok: false, error: callerError || `Caller agent "${callerFrom}" not found` };
+
+          const dependencyBlock = await this.taskDependencyBlock(task, teamId);
+          if (dependencyBlock) {
+            return { ok: false, error: dependencyBlock.error, result: dependencyBlock };
+          }
 
           const claimBrief = this.validateIncomingTaskBrief(this.taskBriefInputFromTask(task));
           if (claimBrief.blocked && !this.canClaimMalformedBriefForRepair(teamName, callerAgent, task)) {
@@ -16799,6 +16837,11 @@ Return this JSON shape:
             };
           }
 
+          const dependencyBlock = await this.taskDependencyBlock(task, teamId);
+          if (dependencyBlock) {
+            return { ok: false, error: dependencyBlock.error, result: dependencyBlock };
+          }
+
           const completionPayload = {
             acceptance_coverage: acceptanceCoverage,
             delegated_task_names: delegatedTaskNames,
@@ -16888,6 +16931,13 @@ Return this JSON shape:
 
           if (task.team_id && task.team_id !== teamId) {
             return { ok: false, error: `Task "${taskRef}" not found` };
+          }
+
+          if (newStatus === 'doing' || newStatus === 'done') {
+            const dependencyBlock = await this.taskDependencyBlock(task, teamId);
+            if (dependencyBlock) {
+              return { ok: false, error: dependencyBlock.error, result: dependencyBlock };
+            }
           }
 
           if (newStatus === 'done') {
@@ -17251,6 +17301,7 @@ Return this JSON shape:
       team_id: team.id,
       title: `Advance autopilot goal: ${objective}`,
       description: taskDescription,
+      depends_on: [],
       status: 'doing',
       created_by: null,
       owner: lead.id,
@@ -17974,6 +18025,58 @@ Return this JSON shape:
 
   private taskShortRef(task: TaskRow): string {
     return task.uuid ? `#${task.uuid.replace(/-/g, '').slice(0, 8)}` : task.name;
+  }
+
+  private normalizeTaskDependencies(value: unknown): string[] | null {
+    if (value === undefined || value === null) return [];
+    if (!Array.isArray(value)) return null;
+
+    const dependencies = new Set<string>();
+    for (const candidate of value) {
+      if (typeof candidate !== 'string' || !candidate.trim()) return null;
+      dependencies.add(candidate.trim());
+    }
+    return [...dependencies];
+  }
+
+  /**
+   * Resolve a task's prerequisites within its team. Missing or removed
+   * dependencies deliberately remain blockers: silently treating them as done
+   * would let a task bypass its declared ordering.
+   */
+  private async taskDependencyBlock(
+    task: TaskRow,
+    fallbackTeamId: string,
+  ): Promise<{ error: 'task_dependency_incomplete'; message: string; blocking_dependencies: string[] } | null> {
+    const dependencies = this.normalizeTaskDependencies(task.depends_on) || [];
+    if (dependencies.length === 0) return null;
+
+    const teamId = task.team_id || fallbackTeamId;
+    const blockers = new Set<string>();
+    for (const reference of dependencies) {
+      let dependency = (await this.resolveTaskRef(reference, teamId)).task;
+      if (!dependency) {
+        const getById = (this.db.tasks as any).getById;
+        const byId = typeof getById === 'function'
+          ? await getById.call(this.db.tasks, reference).catch(() => null)
+          : null;
+        if (byId?.team_id === teamId) dependency = byId;
+      }
+
+      if (!dependency) {
+        blockers.add(`${reference} (missing)`);
+      } else if (dependency.id === task.id || !this.isTerminalTaskStatus(dependency.status)) {
+        blockers.add(dependency.name);
+      }
+    }
+
+    if (blockers.size === 0) return null;
+    const blockingDependencies = [...blockers];
+    return {
+      error: 'task_dependency_incomplete',
+      message: `Task "${task.name}" is blocked by unfinished dependencies: ${blockingDependencies.join(', ')}`,
+      blocking_dependencies: blockingDependencies,
+    };
   }
 
   private taskTimestampMs(timestamp: number): number {

@@ -161,7 +161,7 @@ const HELP_ITEMS: Array<{ cmd: string; desc: string; indent?: boolean }> = [
   { cmd: '/calendar', desc: 'List calendar events' },
   { cmd: '/calendar add <agent> <time> <days|date> <message>', desc: 'Add calendar event' },
   { cmd: '/calendar pause|resume|remove <id>', desc: 'Manage calendar event' },
-  { cmd: '/task create "<title>" [--owner <agent>] [--team <team>] [--event <id>]', desc: 'Create a task' },
+  { cmd: '/task create "<title>" [--owner <agent>] [--team <team>] [--depends-on <task>]... [--event <id>]', desc: 'Create a task' },
   { cmd: '/task list [--status <status>] [--owner <agent>] [--team <team>]', desc: 'List tasks' },
   { cmd: '/task assign <task-name> <agent>', desc: 'Assign task to agent' },
   { cmd: '/task done <task-name>', desc: 'Mark task done' },
