@@ -1,0 +1,738 @@
+{
+  "schema_version": "2026-07-11.task-delegation-workflow.v1",
+  "title": "Primary-lead delegation task workflow schema",
+  "scope": {
+    "source_endpoints": [
+      "GET /tasks",
+      "GET /tasks/:ref"
+    ],
+    "workflow": "primary-lead to team-lead delegation, delegated execution, validator relay, retry, and parent closure",
+    "notes": [
+      "The manager persists task rows with task status todo|doing|done.",
+      "Lead-specific delegation health is exposed through delegationAudit on live task records.",
+      "Validator accept, needs-revision, and blocked outcomes are workflow states inferred from validator child-task packets and do not overwrite the persisted task status field."
+    ]
+  },
+  "record_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "required": [
+      "name",
+      "uuid",
+      "shortId",
+      "title",
+      "status",
+      "ownerName",
+      "teamName",
+      "linkedEvents",
+      "createdAt",
+      "updatedAt",
+      "completedAt"
+    ],
+    "properties": {
+      "name": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uuid": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+      },
+      "shortId": {
+        "type": "string",
+        "pattern": "^#[0-9a-f]{8}$"
+      },
+      "title": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "status": {
+        "type": "string",
+        "enum": [
+          "todo",
+          "doing",
+          "done"
+        ]
+      },
+      "ownerName": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "teamName": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "linkedEvents": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "createdAt": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "updatedAt": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "completedAt": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "minimum": 0
+      },
+      "dependsOn": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "dependencyError": {
+        "type": "string"
+      },
+      "completionEvidence": {
+        "type": "object",
+        "required": [
+          "decision",
+          "recorded_at"
+        ],
+        "properties": {
+          "decision": {
+            "type": "string",
+            "enum": [
+              "accept"
+            ]
+          },
+          "recorded_at": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "acceptance_coverage": {
+            "type": [
+              "string",
+              "array",
+              "object"
+            ]
+          },
+          "failure_note": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      },
+      "delegationAudit": {
+        "type": "object",
+        "required": [
+          "status",
+          "ownerRole",
+          "ageSeconds",
+          "graceSeconds",
+          "childTaskRefs",
+          "childTasks"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending-delegation",
+              "needs-delegation",
+              "ok"
+            ]
+          },
+          "ownerRole": {
+            "type": "string",
+            "enum": [
+              "team-lead"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          },
+          "ageSeconds": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "graceSeconds": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "childTaskRefs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "childTasks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/childTaskSummary"
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "conditional_rules": [
+      {
+        "name": "done_requires_completedAt",
+        "if": {
+          "status": "done"
+        },
+        "then": {
+          "completedAt": "integer"
+        }
+      },
+      {
+        "name": "open_tasks_keep_completedAt_null",
+        "if": {
+          "status": [
+            "todo",
+            "doing"
+          ]
+        },
+        "then": {
+          "completedAt": "null"
+        }
+      },
+      {
+        "name": "delegation_audit_only_on_active_lead_objectives",
+        "if": {
+          "delegationAudit": "present"
+        },
+        "then": {
+          "status": "doing"
+        }
+      },
+      {
+        "name": "delegation_refs_and_summaries_align",
+        "if": {
+          "delegationAudit": "present"
+        },
+        "then": {
+          "childTaskRefs_length_equals_childTasks_length": true
+        }
+      }
+    ]
+  },
+  "$defs": {
+    "childTaskSummary": {
+      "type": "object",
+      "required": [
+        "ref",
+        "name",
+        "title",
+        "status",
+        "ownerName",
+        "updatedAt",
+        "completedAt",
+        "completionEvidence"
+      ],
+      "properties": {
+        "ref": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "todo",
+            "doing",
+            "done"
+          ]
+        },
+        "ownerName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "updatedAt": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "completedAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "completionEvidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/queryEvidence"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "queryEvidence": {
+      "type": "object",
+      "required": [
+        "queryId",
+        "completedAt",
+        "excerpt"
+      ],
+      "properties": {
+        "queryId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "completedAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "excerpt": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "role_model": [
+    {
+      "role": "primary-lead",
+      "agent_examples": [
+        "default/lead"
+      ],
+      "responsibility": "delegates only to team leads and waits for validated return packets before parent closure"
+    },
+    {
+      "role": "team-lead",
+      "agent_examples": [
+        "ops-lead",
+        "engineering-lead",
+        "research-lead",
+        "security-router",
+        "general-counsel",
+        "skillmesh-ops-lead"
+      ],
+      "responsibility": "decomposes parent objectives, dispatches member-owned children, collects validator feedback, and closes parent tasks"
+    },
+    {
+      "role": "team-member",
+      "responsibility": "owns delegated execution tasks and returns completion packets"
+    },
+    {
+      "role": "default-validator",
+      "agent_examples": [
+        "default/coder",
+        "default/researcher"
+      ],
+      "responsibility": "relay accept, needs-revision, or blocked findings back through the owning team lead"
+    }
+  ],
+  "state_dimensions": {
+    "persisted_task_status": [
+      "todo",
+      "doing",
+      "done"
+    ],
+    "lead_delegation_status": [
+      "pending-delegation",
+      "needs-delegation",
+      "ok"
+    ],
+    "derived_workflow_phase": [
+      "member-ready",
+      "member-executing",
+      "lead-pending-delegation",
+      "lead-needs-delegation",
+      "delegated-execution-in-flight",
+      "validator-relay-pending",
+      "retry-required",
+      "parent-closure-ready",
+      "task-complete"
+    ]
+  },
+  "workflow_phases": [
+    {
+      "id": "member-ready",
+      "observable_from_single_record": true,
+      "when": {
+        "status": "todo",
+        "delegationAudit": "absent"
+      }
+    },
+    {
+      "id": "member-executing",
+      "observable_from_single_record": true,
+      "when": {
+        "status": "doing",
+        "delegationAudit": "absent"
+      }
+    },
+    {
+      "id": "lead-pending-delegation",
+      "observable_from_single_record": true,
+      "when": {
+        "status": "doing",
+        "delegationAudit.status": "pending-delegation"
+      }
+    },
+    {
+      "id": "lead-needs-delegation",
+      "observable_from_single_record": true,
+      "when": {
+        "status": "doing",
+        "delegationAudit.status": "needs-delegation"
+      }
+    },
+    {
+      "id": "delegated-execution-in-flight",
+      "observable_from_single_record": true,
+      "when": {
+        "status": "doing",
+        "delegationAudit.status": "ok",
+        "childTaskStatuses_any_of": [
+          "todo",
+          "doing"
+        ]
+      }
+    },
+    {
+      "id": "validator-relay-pending",
+      "observable_from_single_record": false,
+      "when": {
+        "status": "doing",
+        "delegationAudit.status": "ok",
+        "allChildTasksDone": true,
+        "validationPathMentions": [
+          "coder",
+          "researcher"
+        ]
+      },
+      "notes": [
+        "This phase uses the parent task description plus child-task completion state.",
+        "Validator verdicts are carried by validator task completions rather than a separate persisted parent status."
+      ]
+    },
+    {
+      "id": "retry-required",
+      "observable_from_single_record": false,
+      "when": {
+        "status": "doing",
+        "validatorVerdictAnyOf": [
+          "needs-revision",
+          "blocked"
+        ]
+      },
+      "notes": [
+        "Retry is modeled as a workflow phase because the parent task remains doing while the team lead re-delegates or refines child work."
+      ]
+    },
+    {
+      "id": "parent-closure-ready",
+      "observable_from_single_record": false,
+      "when": {
+        "status": "doing",
+        "allRequiredChildRefsDone": true,
+        "validatorVerdictAllOf": [
+          "accepted"
+        ]
+      }
+    },
+    {
+      "id": "task-complete",
+      "observable_from_single_record": true,
+      "when": {
+        "status": "done"
+      }
+    }
+  ],
+  "transitions": [
+    {
+      "id": "claim-or-assign",
+      "from": [
+        "member-ready"
+      ],
+      "to": "member-executing",
+      "trigger": "POST /tasks/:ref/claim or owner assignment",
+      "persisted_status_delta": [
+        "todo",
+        "doing"
+      ]
+    },
+    {
+      "id": "lead-starts-grace-window",
+      "from": [
+        "member-executing"
+      ],
+      "to": "lead-pending-delegation",
+      "trigger": "configured team lead owns a doing task with no detected member-owned children inside grace window",
+      "persisted_status_delta": [
+        "doing",
+        "doing"
+      ]
+    },
+    {
+      "id": "lead-misses-delegation-grace",
+      "from": [
+        "lead-pending-delegation"
+      ],
+      "to": "lead-needs-delegation",
+      "trigger": "delegationAudit.ageSeconds >= delegationAudit.graceSeconds and no child tasks detected",
+      "persisted_status_delta": [
+        "doing",
+        "doing"
+      ]
+    },
+    {
+      "id": "lead-detects-child-work",
+      "from": [
+        "lead-pending-delegation",
+        "lead-needs-delegation"
+      ],
+      "to": "delegated-execution-in-flight",
+      "trigger": "member-owned child tasks are detected for the parent objective",
+      "persisted_status_delta": [
+        "doing",
+        "doing"
+      ]
+    },
+    {
+      "id": "delegated-child-completes",
+      "from": [
+        "member-executing",
+        "delegated-execution-in-flight"
+      ],
+      "to": "delegated-execution-in-flight",
+      "trigger": "child task POST /tasks/:ref/done accepted while parent remains open",
+      "persisted_status_delta": [
+        "doing",
+        "done"
+      ]
+    },
+    {
+      "id": "all-child-work-complete-await-validators",
+      "from": [
+        "delegated-execution-in-flight"
+      ],
+      "to": "validator-relay-pending",
+      "trigger": "all delegated child tasks are done and parent validation path still requires default validators",
+      "persisted_status_delta": [
+        "doing",
+        "doing"
+      ]
+    },
+    {
+      "id": "validator-revision-loop",
+      "from": [
+        "validator-relay-pending"
+      ],
+      "to": "retry-required",
+      "trigger": "coder or researcher returns needs-revision or blocked findings",
+      "persisted_status_delta": [
+        "doing",
+        "doing"
+      ]
+    },
+    {
+      "id": "retry-redelegated",
+      "from": [
+        "retry-required"
+      ],
+      "to": "delegated-execution-in-flight",
+      "trigger": "team lead creates or updates member-owned child tasks to address validator findings",
+      "persisted_status_delta": [
+        "doing",
+        "doing"
+      ]
+    },
+    {
+      "id": "parent-closure",
+      "from": [
+        "validator-relay-pending",
+        "parent-closure-ready",
+        "member-executing"
+      ],
+      "to": "task-complete",
+      "trigger": "POST /tasks/:ref/done accepted with valid completion packet and required child_task_refs or no_delegation_reason exemption",
+      "persisted_status_delta": [
+        "doing",
+        "done"
+      ]
+    }
+  ],
+  "closure_enforcement_rules": [
+    {
+      "id": "lead-objective-requires-child-task-refs",
+      "applies_when": {
+        "ownerRole": "team-lead",
+        "exemptionAbsent": true
+      },
+      "requirement": "child_task_refs or legacy delegated_task_names/child_task_names must name at least one completed member-owned child task"
+    },
+    {
+      "id": "lead-exemption-for-advisory-work",
+      "applies_when": {
+        "payloadAnyOf": [
+          "no_delegation_reason",
+          "advisory_query"
+        ]
+      },
+      "requirement": "team lead may close without child_task_refs"
+    },
+    {
+      "id": "cross-team-child-ref-accepted-with-warning",
+      "applies_when": {
+        "childRefTeamDiffersFromParentTeam": true
+      },
+      "requirement": "accept child ref but emit delegation warning"
+    },
+    {
+      "id": "child-ref-cannot-point-to-parent",
+      "applies_when": {
+        "childRefResolvesToParentTask": true
+      },
+      "requirement": "reject completion"
+    },
+    {
+      "id": "child-ref-must-be-claimed-and-done",
+      "applies_when": {
+        "childRefProvided": true
+      },
+      "requirement": "resolved child task must have an owner and status done"
+    },
+    {
+      "id": "validator-child-after-terminal-parent-blocked",
+      "applies_when": {
+        "parentStatus": "done"
+      },
+      "requirement": "reject new validator child creation"
+    },
+    {
+      "id": "validator-recursion-blocked",
+      "applies_when": {
+        "validatorCreatesValidatorChild": true
+      },
+      "requirement": "reject recursive validator child creation"
+    }
+  ],
+  "throughput_metrics": [
+    {
+      "name": "task_age_seconds",
+      "formula": "validation_now_seconds - createdAt",
+      "applies_to": [
+        "todo",
+        "doing",
+        "done"
+      ]
+    },
+    {
+      "name": "update_lag_seconds",
+      "formula": "validation_now_seconds - updatedAt",
+      "applies_to": [
+        "todo",
+        "doing",
+        "done"
+      ]
+    },
+    {
+      "name": "completion_latency_seconds",
+      "formula": "completedAt - createdAt",
+      "applies_to": [
+        "done"
+      ]
+    },
+    {
+      "name": "delegation_grace_seconds",
+      "formula": "delegationAudit.graceSeconds",
+      "applies_to": [
+        "lead-pending-delegation",
+        "lead-needs-delegation",
+        "delegated-execution-in-flight",
+        "validator-relay-pending",
+        "retry-required",
+        "parent-closure-ready"
+      ]
+    },
+    {
+      "name": "delegation_overdue_seconds",
+      "formula": "max(0, delegationAudit.ageSeconds - delegationAudit.graceSeconds)",
+      "applies_to": [
+        "lead-needs-delegation"
+      ]
+    },
+    {
+      "name": "delegated_child_count",
+      "formula": "delegationAudit.childTasks.length",
+      "applies_to": [
+        "lead-pending-delegation",
+        "lead-needs-delegation",
+        "delegated-execution-in-flight",
+        "validator-relay-pending",
+        "retry-required",
+        "parent-closure-ready"
+      ]
+    },
+    {
+      "name": "delegated_child_done_count",
+      "formula": "count(delegationAudit.childTasks[*] where status == done)",
+      "applies_to": [
+        "delegated-execution-in-flight",
+        "validator-relay-pending",
+        "retry-required",
+        "parent-closure-ready"
+      ]
+    },
+    {
+      "name": "delegated_child_open_count",
+      "formula": "count(delegationAudit.childTasks[*] where status != done)",
+      "applies_to": [
+        "delegated-execution-in-flight",
+        "validator-relay-pending",
+        "retry-required",
+        "parent-closure-ready"
+      ]
+    },
+    {
+      "name": "delegated_child_done_ratio",
+      "formula": "delegated_child_done_count / delegated_child_count",
+      "applies_to": [
+        "delegated-execution-in-flight",
+        "validator-relay-pending",
+        "retry-required",
+        "parent-closure-ready"
+      ]
+    },
+    {
+      "name": "delegated_child_query_evidence_count",
+      "formula": "sum(length(child.completionEvidence) for child in delegationAudit.childTasks)",
+      "applies_to": [
+        "delegated-execution-in-flight",
+        "validator-relay-pending",
+        "retry-required",
+        "parent-closure-ready"
+      ]
+    }
+  ],
+  "backlog_notes": [
+    "If the manager later persists validator verdicts directly on parent task rows, add a first-class validatorVerdict field instead of inferring retry-required from validator child-task packets.",
+    "If parent closure readiness becomes queryable from the manager API, promote parent-closure-ready from a derived workflow phase to an observable record field.",
+    "If top-level completionEvidence becomes common on live tasks, tighten the root completionEvidence.acceptance_coverage type from broad string|array|object to the manager's canonical accepted packet shape."
+  ]
+}
