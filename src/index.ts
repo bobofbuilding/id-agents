@@ -56,3 +56,6 @@ export {
   type AgentSpec,
   type PluginConfig,
 } from './config-parser.js';
+
+// Render-only contributor proposals, Base-bound policy decisions, and audit records.
+export * from './contributor-signing/index.js';

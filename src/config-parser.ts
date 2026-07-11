@@ -22,6 +22,10 @@ import {
 import { validateName } from './name-validation.js';
 import { enumerateLibraryAgents } from './lib/agent-library.js';
 import { resolveDefaultLibraryRoot } from './lib/library-inventory.js';
+import {
+  validateContributorSigningConfig,
+  type ContributorSigningConfig,
+} from './contributor-signing/index.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -172,6 +176,7 @@ export interface DeployConfig {
   onchain?: OnchainConfig;              // Onchain registration settings
   org?: OrgConfig;                      // Organization chart
   runtimeCredentialPool?: RuntimeCredentialPoolConfig; // Runtime auth lanes for subscription/metered failover
+  contributorSigning?: ContributorSigningConfig; // Safe contributor proposal/signing policy boundary
   calendar?: CalendarSpec[];            // Team calendar schedules
   defaults?: {
     runtime?: HarnessType;              // Default harness for all agents
@@ -411,6 +416,10 @@ export function validateConfig(config: DeployConfig): ValidationResult {
   const validDays = new Set(['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']);
   const errors: ValidationError[] = [];
   const defaultRuntime = resolveRuntime(config.defaults?.runtime || getDefaultRuntime());
+
+  if (config.contributorSigning !== undefined) {
+    errors.push(...validateContributorSigningConfig(config.contributorSigning));
+  }
 
   // Check version
   if (!config.version) {

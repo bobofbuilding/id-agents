@@ -19,6 +19,46 @@ defaults:
     - inter-agent
     - task-discipline
 
+# Disabled until staging approval. RPC values are read only from these env vars;
+# contributor and forum policies are structurally pinned to Base (8453).
+contributorSigning:
+  enabled: false
+  registryVersion: 1
+  chains:
+    - chainId: 1
+      name: ethereum
+      rpcEnv: ETHEREUM_RPC_URL
+      scopes: [identity, registry]
+    - chainId: 8453
+      name: base
+      rpcEnv: BASE_RPC_URL
+      scopes: [identity, registry, contributor, forum]
+  policies:
+    - org: bittrees-inc
+      surface: contributor
+      action: apply
+      chainId: 8453
+      allowedTargets: [bittrees-inc-contributor-registry]
+      allowedRoles: [contributor]
+    - org: bittrees-research
+      surface: contributor
+      action: apply
+      chainId: 8453
+      allowedTargets: [bittrees-research-contributor-registry]
+      allowedRoles: [contributor]
+    - org: bittrees-inc
+      surface: forum
+      action: post
+      chainId: 8453
+      allowedTargets: [gov.bittrees.org]
+      allowedRoles: [contributor, moderator]
+    - org: bittrees-research
+      surface: forum
+      action: post
+      chainId: 8453
+      allowedTargets: [research.bittrees.org]
+      allowedRoles: [contributor, moderator]
+
 agents:
   - name: lead
     lead: true
