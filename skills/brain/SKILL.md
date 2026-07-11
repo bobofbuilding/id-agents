@@ -242,6 +242,29 @@ curl -s "http://127.0.0.1:4200/memory/market-parser/market:ETH-USD"
 - TTL controls freshness — gas data is stale at 60s, market prices at 5min, wallet balances at 1h.
 - Brain timeline records every shared write — you can audit which agent produced which signal.
 
+## Task completion provenance
+
+When you claim a task, the manager automatically attaches `brain_context`. Read it from your own task before starting work:
+
+```bash
+curl -s "$MANAGER_URL/tasks/<ref>"
+# → { task: { brain_context: { cited: { canonical_source_ids: [...] }, instructions: [...] } } }
+```
+
+When marking the task done, cite only the Brain context you actually relied on. Use source, fact, and memory IDs from `brain_context.cited.canonical_source_ids` in `used_source_ids`; use applied `memory:<id>` entries from `brain_context.instructions` in `used_instruction_ids`. Include `ignored_instruction_ids` or `harmful_instruction_ids` when applicable.
+
+```bash
+curl -s -X POST "$MANAGER_URL/tasks/<ref>/done" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "agent_id": "'"$ID_AGENT_NAME"'",
+    "used_source_ids": ["fact:123", "memory:456"],
+    "used_instruction_ids": ["memory:456"],
+    "ignored_instruction_ids": ["memory:789"],
+    "harmful_instruction_ids": []
+  }'
+```
+
 ## When to use brain
 
 - **Required for submissions and contribution intake** — before accepting, rejecting, routing, or summarizing a submission/proposal/contribution, recall related Brain context and store durable outcomes back to Brain.
