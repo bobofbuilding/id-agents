@@ -10,8 +10,8 @@ export class PgTasksRepo implements TasksRepository {
   async create(task: TaskRow, eventScheduleIds?: string[]): Promise<void> {
     await this.db.query(
       `INSERT INTO tasks
-         (id, name, uuid, team_id, title, description, status, created_by, owner, created_at, updated_at, completed_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+         (id, name, uuid, team_id, title, description, status, created_by, owner, created_at, updated_at, completed_at, depends_on, completion_evidence)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
       [
         task.id,
         task.name,
@@ -25,6 +25,8 @@ export class PgTasksRepo implements TasksRepository {
         task.created_at,
         task.updated_at,
         task.completed_at,
+        task.depends_on ?? null,
+        task.completion_evidence ?? null,
       ],
     );
 
@@ -113,6 +115,8 @@ export class PgTasksRepo implements TasksRepository {
       title?: string;
       description?: string | null;
       completed_at?: number | null;
+      depends_on?: string | null;
+      completion_evidence?: string | null;
       updated_at: number;
     },
   ): Promise<void> {
@@ -129,6 +133,8 @@ export class PgTasksRepo implements TasksRepository {
     if (fields.title !== undefined) { sets.push(`title = $${idx++}`); params.push(fields.title); }
     if (fields.description !== undefined) { sets.push(`description = $${idx++}`); params.push(fields.description); }
     if (fields.completed_at !== undefined) { sets.push(`completed_at = $${idx++}`); params.push(fields.completed_at); }
+    if (fields.depends_on !== undefined) { sets.push(`depends_on = $${idx++}`); params.push(fields.depends_on); }
+    if (fields.completion_evidence !== undefined) { sets.push(`completion_evidence = $${idx++}`); params.push(fields.completion_evidence); }
 
     params.push(taskId);
     await this.db.query(

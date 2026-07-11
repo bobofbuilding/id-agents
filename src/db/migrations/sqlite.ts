@@ -388,6 +388,8 @@ export async function migrateSqlite(adapter: SqliteAdapter): Promise<void> {
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       completed_at INTEGER,
+      depends_on TEXT,
+      completion_evidence TEXT,
       UNIQUE(team_id, name)
     );
 
@@ -499,6 +501,16 @@ export async function migrateSqlite(adapter: SqliteAdapter): Promise<void> {
   // Tasks: add uuid column for short-id lookups (#xxxxxxxx)
   try {
     adapter.exec(`ALTER TABLE tasks ADD COLUMN uuid TEXT`);
+  } catch {
+    // Column already exists in upgraded databases.
+  }
+  try {
+    adapter.exec(`ALTER TABLE tasks ADD COLUMN depends_on TEXT`);
+  } catch {
+    // Column already exists in upgraded databases.
+  }
+  try {
+    adapter.exec(`ALTER TABLE tasks ADD COLUMN completion_evidence TEXT`);
   } catch {
     // Column already exists in upgraded databases.
   }
@@ -672,6 +684,8 @@ async function migrateTasks_TeamNameUnique(adapter: SqliteAdapter): Promise<void
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       completed_at INTEGER,
+      depends_on TEXT,
+      completion_evidence TEXT,
       UNIQUE(team_id, name)
     );
 

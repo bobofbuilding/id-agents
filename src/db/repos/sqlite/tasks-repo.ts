@@ -10,8 +10,8 @@ export class SqliteTasksRepo implements TasksRepository {
   async create(task: TaskRow, eventScheduleIds?: string[]): Promise<void> {
     await this.db.query(
       `INSERT INTO tasks
-         (id, name, uuid, team_id, title, description, status, created_by, owner, created_at, updated_at, completed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, name, uuid, team_id, title, description, status, created_by, owner, created_at, updated_at, completed_at, depends_on, completion_evidence)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         task.id,
         task.name,
@@ -25,6 +25,8 @@ export class SqliteTasksRepo implements TasksRepository {
         task.created_at,
         task.updated_at,
         task.completed_at,
+        task.depends_on ?? null,
+        task.completion_evidence ?? null,
       ],
     );
 
@@ -111,6 +113,8 @@ export class SqliteTasksRepo implements TasksRepository {
       title?: string;
       description?: string | null;
       completed_at?: number | null;
+      depends_on?: string | null;
+      completion_evidence?: string | null;
       updated_at: number;
     },
   ): Promise<void> {
@@ -123,6 +127,8 @@ export class SqliteTasksRepo implements TasksRepository {
     if (fields.title !== undefined) { sets.push('title = ?'); params.push(fields.title); }
     if (fields.description !== undefined) { sets.push('description = ?'); params.push(fields.description); }
     if (fields.completed_at !== undefined) { sets.push('completed_at = ?'); params.push(fields.completed_at); }
+    if (fields.depends_on !== undefined) { sets.push('depends_on = ?'); params.push(fields.depends_on); }
+    if (fields.completion_evidence !== undefined) { sets.push('completion_evidence = ?'); params.push(fields.completion_evidence); }
 
     params.push(taskId);
     await this.db.query(

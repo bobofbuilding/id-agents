@@ -164,6 +164,10 @@ export interface TaskRow {
   created_at: number;
   updated_at: number;
   completed_at: number | null;
+  /** JSON-encoded task refs that must be done before this task can run. */
+  depends_on?: string | null;
+  /** Normalized JSON evidence captured when a REST completion packet is accepted. */
+  completion_evidence?: string | null;
 }
 
 /** task_event_links table row */

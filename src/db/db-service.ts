@@ -579,6 +579,8 @@ export interface TasksRepository {
       title?: string;
       description?: string | null;
       completed_at?: number | null;
+      depends_on?: string | null;
+      completion_evidence?: string | null;
       updated_at: number;
     },
   ): Promise<void>;

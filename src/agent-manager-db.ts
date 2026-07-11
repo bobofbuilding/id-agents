@@ -1068,6 +1068,116 @@ export class AgentManagerDb {
     };
   }
 
+  private acceptedCompletionEvidence(
+    payload: Record<string, unknown>,
+    validation: TaskCompletionValidationResult,
+    recordedAt: number,
+  ): string | null {
+    if (validation.decision !== 'accept') return null;
+
+    const acceptanceCoverage = payload.acceptance_coverage ?? payload.acceptanceCoverage;
+    const failureNote = payload.failure_note
+      ?? payload.failureNote
+      ?? payload.failure
+      ?? payload.failure_reason
+      ?? payload.failureReason;
+    const evidence: Record<string, unknown> = {
+      decision: validation.decision,
+      recorded_at: recordedAt,
+    };
+    if (acceptanceCoverage !== undefined && acceptanceCoverage !== null) {
+      evidence.acceptance_coverage = this.redactCompletionEvidenceValue(acceptanceCoverage);
+    }
+    if (failureNote !== undefined && failureNote !== null) {
+      evidence.failure_note = this.redactCompletionEvidenceValue(failureNote);
+    }
+    return JSON.stringify(evidence);
+  }
+
+  private redactCompletionEvidenceValue(value: unknown): unknown {
+    if (typeof value === 'string') return this.redactBrainMemoryText(value);
+    if (Array.isArray(value)) return value.map((item) => this.redactCompletionEvidenceValue(item));
+    if (value && typeof value === 'object') {
+      const redacted: Record<string, unknown> = {};
+      for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+        redacted[this.redactBrainMemoryText(key)] = this.redactCompletionEvidenceValue(item);
+      }
+      return redacted;
+    }
+    return value;
+  }
+
+  private parseCompletionEvidence(value: string | null | undefined): Record<string, unknown> | null {
+    if (!value || typeof value !== 'string') return null;
+    try {
+      const parsed = JSON.parse(value);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? this.redactCompletionEvidenceValue(parsed) as Record<string, unknown>
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private normalizeTaskDependencyRefs(value: unknown): { refs: string[]; error?: string } {
+    if (value === undefined || value === null || value === '') return { refs: [] };
+    const values = Array.isArray(value) ? value : [value];
+    const refs: string[] = [];
+    for (const item of values) {
+      if (typeof item !== 'string') {
+        return { refs: [], error: 'depends_on must be a task ref string or an array of task ref strings' };
+      }
+      refs.push(...item.split(',').map((ref) => ref.trim()).filter(Boolean));
+    }
+    return { refs: [...new Set(refs)] };
+  }
+
+  private taskDependencyRefs(task: TaskRow): { refs: string[]; error?: string } {
+    if (!task.depends_on) return { refs: [] };
+    try {
+      return this.normalizeTaskDependencyRefs(JSON.parse(task.depends_on));
+    } catch {
+      return { refs: [], error: `Task "${task.name}" has invalid stored depends_on data` };
+    }
+  }
+
+  private async taskDependencyBlock(
+    task: TaskRow,
+    teamId: string,
+  ): Promise<{
+    error: 'task_dependency_incomplete';
+    message: string;
+    depends_on: string[];
+    unresolved_dependencies: Array<{ ref: string; status: string; error?: string }>;
+  } | null> {
+    const parsed = this.taskDependencyRefs(task);
+    if (parsed.error) {
+      return {
+        error: 'task_dependency_incomplete',
+        message: parsed.error,
+        depends_on: [],
+        unresolved_dependencies: [{ ref: '<invalid>', status: 'invalid', error: parsed.error }],
+      };
+    }
+    if (parsed.refs.length === 0) return null;
+
+    const unresolved = await Promise.all(parsed.refs.map(async (ref) => {
+      const { task: dependency, error } = await this.resolveTaskRef(ref, teamId);
+      if (!dependency) return { ref, status: 'missing', ...(error ? { error } : {}) };
+      if (dependency.id === task.id) return { ref, status: task.status, error: 'task cannot depend on itself' };
+      if (dependency.status !== 'done') return { ref, status: dependency.status };
+      return null;
+    }));
+    const incomplete = unresolved.filter((item): item is NonNullable<typeof item> => item !== null);
+    if (incomplete.length === 0) return null;
+    return {
+      error: 'task_dependency_incomplete',
+      message: `Task "${task.name}" is blocked until all dependencies are done`,
+      depends_on: parsed.refs,
+      unresolved_dependencies: incomplete,
+    };
+  }
+
   private taskBriefInputFromTask(task: TaskRow): TaskBriefValidationInput {
     return {
       title: task.title,
@@ -1374,7 +1484,7 @@ export class AgentManagerDb {
   private validationChildKey(
     input: TaskBriefValidationInput | Record<string, unknown>,
     validatorName?: string | null,
-  ): { parentRef: string; purpose: string } | null {
+  ): { parentRef: string; parentRaw: string; purpose: string } | null {
     const text = this.taskBriefGuardText(input);
     if (!/\b(validat(e|ion|or)|review|approval|approve)\b/i.test(text)) return null;
     const parent = this.firstBriefString(input, [
@@ -1396,6 +1506,7 @@ export class AgentManagerDb {
       || (validatorName ? `${validatorName}-validation` : 'validation');
     return {
       parentRef: this.normalizeGuardKey(parent),
+      parentRaw: parent,
       purpose: this.normalizeGuardKey(purpose),
     };
   }
@@ -1414,6 +1525,33 @@ export class AgentManagerDb {
         status: 409,
         code: 'validator_task_recursion_blocked',
         message: 'Validator tasks must not create validator tasks.',
+      };
+    }
+
+    const parentResolution = await this.resolveTaskRef(key.parentRaw, params.teamId);
+    if (!parentResolution.task) {
+      return {
+        status: 409,
+        code: 'validator_parent_task_not_found',
+        message: `Cannot create a validator child task: parent task "${key.parentRaw}" was not found.`,
+      };
+    }
+    if (this.isTerminalTaskStatus(parentResolution.task.status)) {
+      return {
+        status: 409,
+        code: 'validator_child_post_terminal_blocked',
+        message: `Cannot create a validator child task: parent task "${parentResolution.task.name}" is already done. Create validator tasks before closing the parent.`,
+      };
+    }
+    if (
+      params.targetAgent
+      && this.defaultValidatorName(params.targetAgent)
+      && parentResolution.task.owner === params.targetAgent.id
+    ) {
+      return {
+        status: 409,
+        code: 'validator_self_assignment_blocked',
+        message: `Cannot create a validator child task: validator "${params.targetAgent.name}" owns parent task "${parentResolution.task.name}".`,
       };
     }
 
@@ -11920,6 +12058,7 @@ Return this JSON shape:
           teamName,
           typeof from === 'string' ? from : undefined,
           typeof req.body?.session_id === 'string' ? req.body.session_id : undefined,
+          ((req as any).ctx?.principal || 'anon') as 'admin' | 'agent' | 'anon',
         );
         res.json(result);
       } catch (error: any) {
@@ -12025,6 +12164,11 @@ Return this JSON shape:
 
         if (!title || typeof title !== 'string') {
           return res.status(400).json({ error: 'Missing required field: title' });
+        }
+        const dependencyInput = body.depends_on ?? body.dependsOn;
+        const dependencies = this.normalizeTaskDependencyRefs(dependencyInput);
+        if (dependencies.error) {
+          return res.status(400).json({ error: 'invalid_task_dependencies', message: dependencies.error });
         }
 
         // Resolve created_by from `from` field first so we can recover the
@@ -12148,6 +12292,12 @@ Return this JSON shape:
           }
           name = candidate;
         }
+        if (dependencies.refs.includes(name)) {
+          return res.status(400).json({
+            error: 'invalid_task_dependencies',
+            message: `Task "${name}" cannot depend on itself`,
+          });
+        }
 
         const now = Math.floor(Date.now() / 1000);
         const taskRow: TaskRow = {
@@ -12163,12 +12313,16 @@ Return this JSON shape:
           created_at: now,
           updated_at: now,
           completed_at: null,
+          depends_on: dependencies.refs.length ? JSON.stringify(dependencies.refs) : null,
         };
+
+        const creationDependencyBlock = await this.taskDependencyBlock(taskRow, taskTeamId);
+        if (creationDependencyBlock) taskRow.status = 'todo';
 
         await this.db.tasks.create(taskRow);
         let ownerWake: Awaited<ReturnType<typeof this.wakeAssignedTaskOwner>> | undefined;
         let brainContext: BrainVolunteerContext | null = null;
-        if (defaultOwner.owner) {
+        if (defaultOwner.owner && !creationDependencyBlock) {
           brainContext = await this.emitTaskClaimedWithBrainContext({
             teamId: taskTeamId,
             teamName: taskTeamName,
@@ -12202,6 +12356,7 @@ Return this JSON shape:
               ? { warning: defaultOwner.warning }
               : undefined,
           specialist_routing: specialistRouting || undefined,
+          dependency_block: creationDependencyBlock || undefined,
           brief_validation: brief.validation,
         });
       } catch (err: any) {
@@ -12319,6 +12474,9 @@ Return this JSON shape:
         if (task.team_id && task.team_id !== teamId) {
           return res.status(404).json({ error: `Task "${req.params.ref}" not found` });
         }
+
+        const dependencyBlock = await this.taskDependencyBlock(task, teamId);
+        if (dependencyBlock) return res.status(409).json(dependencyBlock);
 
         const claimBrief = this.validateIncomingTaskBrief(this.taskBriefInputFromTask(task));
         if (claimBrief.blocked && !this.canClaimMalformedBriefForRepair(teamName, agent, task)) {
@@ -12442,6 +12600,9 @@ Return this JSON shape:
           });
         }
 
+        const dependencyBlock = await this.taskDependencyBlock(task, teamId);
+        if (dependencyBlock) return res.status(409).json(dependencyBlock);
+
         const completion = this.validateCompletionPayload(req.body || {});
         if (completion.blocked) {
           return res.status(422).json({
@@ -12461,9 +12622,11 @@ Return this JSON shape:
         }
 
         const now = Math.floor(Date.now() / 1000);
+        const completionEvidence = this.acceptedCompletionEvidence(req.body || {}, completion.validation, now);
         await this.db.tasks.updateFields(task.id, {
           status: 'done',
           completed_at: now,
+          ...(completionEvidence ? { completion_evidence: completionEvidence } : {}),
           updated_at: now,
         });
 
@@ -13364,6 +13527,8 @@ Return this JSON shape:
     const links = await this.db.tasks.listEventLinksForTask(task.id);
     const shortId = task.uuid ? `#${task.uuid.replace(/-/g, '').slice(0, 8)}` : null;
     const delegationAudit = await this.buildDelegationAudit(task, teamId, teamName, ownerAgent, lookups?.agentsById);
+    const completionEvidence = this.parseCompletionEvidence(task.completion_evidence);
+    const dependencies = this.taskDependencyRefs(task);
 
     return {
       name: task.name,
@@ -13378,6 +13543,9 @@ Return this JSON shape:
       createdAt: task.created_at,
       updatedAt: task.updated_at,
       completedAt: task.completed_at,
+      dependsOn: dependencies.refs,
+      ...(dependencies.error ? { dependencyError: dependencies.error } : {}),
+      ...(completionEvidence ? { completion_evidence: completionEvidence } : {}),
       ...(delegationAudit ? { delegationAudit } : {}),
     };
   }
@@ -13520,12 +13688,59 @@ Return this JSON shape:
   /**
    * Execute a CLI-style command and return the result
    */
+  private async authorizeTaskAssignCommand(params: {
+    teamId: string;
+    teamName: string;
+    task: TaskRow;
+    targetAgent: AgentRow;
+    callerFrom?: string;
+    callerPrincipal: 'admin' | 'agent' | 'anon';
+  }): Promise<{ ok: true } | { ok: false; error: string; message: string }> {
+    const taskTeamId = params.task.team_id || params.teamId;
+    if (params.targetAgent.team_id !== taskTeamId) {
+      return {
+        ok: false,
+        error: 'task_assign_cross_team_forbidden',
+        message: `Cannot assign task "${params.task.name}" to an agent outside its team.`,
+      };
+    }
+
+    if (params.callerPrincipal === 'admin') return { ok: true };
+
+    if (!params.callerFrom) {
+      return {
+        ok: false,
+        error: 'task_assign_forbidden',
+        message: 'Task assignment requires an admin principal or a named team lead/current owner caller.',
+      };
+    }
+
+    const { agent: callerAgent, error } = await this.resolveSingleAgentForCommand(taskTeamId, params.callerFrom);
+    if (!callerAgent) {
+      return {
+        ok: false,
+        error: 'task_assign_forbidden',
+        message: error || `Caller agent "${params.callerFrom}" not found in task team.`,
+      };
+    }
+
+    if (params.task.owner && params.task.owner === callerAgent.id) return { ok: true };
+    if (this.isConfiguredTeamLead(params.teamName, callerAgent)) return { ok: true };
+
+    return {
+      ok: false,
+      error: 'task_assign_forbidden',
+      message: `Agent "${params.callerFrom}" is not authorized to reassign task "${params.task.name}".`,
+    };
+  }
+
   private async executeRemoteCommand(
     command: string,
     teamId: string,
     teamName: string,
     callerFrom?: string,
     callerSessionId?: string,
+    callerPrincipal: 'admin' | 'agent' | 'anon' = 'anon',
   ): Promise<{ ok: boolean; result?: any; error?: string }> {
     // Remove leading slash if present
     const cmd = command.startsWith('/') ? command.slice(1) : command;
@@ -13544,6 +13759,7 @@ Return this JSON shape:
           teamName,
           callerFrom,
           callerSessionId,
+          callerPrincipal,
         );
       }
 
@@ -16011,7 +16227,7 @@ Return this JSON shape:
         const subCmd = args[0]?.toLowerCase() || 'list';
 
         if (subCmd === 'create') {
-          // /task create "<title>" [--name <slug>] [--description "..."] [--team <team>] [--owner <agent>] [--event <schedule-id>]...
+          // /task create "<title>" [--name <slug>] [--description "..."] [--team <team>] [--owner <agent>] [--depends-on <task-ref>]... [--event <schedule-id>]...
           const rawArgs = args.slice(1);
           let title: string | undefined;
           let name: string | undefined;
@@ -16029,6 +16245,7 @@ Return this JSON shape:
           let parentTask: string | undefined;
           let validationPurpose: string | undefined;
           let leadCoordination = false;
+          const dependencyInputs: string[] = [];
           const eventIds: string[] = [];
 
           for (let i = 0; i < rawArgs.length; i++) {
@@ -16037,6 +16254,12 @@ Return this JSON shape:
             if (token === '--description') { description = rawArgs[++i]; continue; }
             if (token === '--team') { teamRef = rawArgs[++i]; continue; }
             if (token === '--owner') { ownerRef = rawArgs[++i]; continue; }
+            if (token === '--depends-on' || token === '--depends_on') {
+              const value = rawArgs[++i];
+              if (!value) return { ok: false, error: '--depends-on requires a task reference' };
+              dependencyInputs.push(value);
+              continue;
+            }
             if (token === '--event') { eventIds.push(rawArgs[++i]); continue; }
             if (token === '--goal' || token === '--goal-id') { goalId = rawArgs[++i]; continue; }
             if (token === '--expected-output') { expectedOutput = rawArgs[++i]; continue; }
@@ -16068,7 +16291,7 @@ Return this JSON shape:
           }
 
           if (!title) {
-            return { ok: false, error: 'Usage: /task create "<title>" [--name <slug>] [--description "..."] [--team <team>] [--owner <agent>] [--target <url>] [--event <schedule-id>]...' };
+            return { ok: false, error: 'Usage: /task create "<title>" [--name <slug>] [--description "..."] [--team <team>] [--owner <agent>] [--depends-on <task-ref>]... [--target <url>] [--event <schedule-id>]...' };
           }
 
           // Resolve optional team first (needed for name uniqueness check)
@@ -16149,6 +16372,11 @@ Return this JSON shape:
             if (await this.db.tasks.getByNameForTeam(name, taskTeamId)) {
               return { ok: false, error: `Task name "${name}" already exists in this team` };
             }
+          }
+          const dependencies = this.normalizeTaskDependencyRefs(dependencyInputs);
+          if (dependencies.error) return { ok: false, error: dependencies.error };
+          if (dependencies.refs.includes(name)) {
+            return { ok: false, error: `Task "${name}" cannot depend on itself` };
           }
 
           // Resolve optional owner
@@ -16284,12 +16512,16 @@ Return this JSON shape:
             created_at: now,
             updated_at: now,
             completed_at: null,
+            depends_on: dependencies.refs.length ? JSON.stringify(dependencies.refs) : null,
           };
+
+          const creationDependencyBlock = await this.taskDependencyBlock(taskRow, taskTeamId);
+          if (creationDependencyBlock) taskRow.status = 'todo';
 
           await this.db.tasks.create(taskRow, eventIds.length > 0 ? eventIds : undefined);
           let ownerWake: Awaited<ReturnType<typeof this.wakeAssignedTaskOwner>> | undefined;
           let brainContext: BrainVolunteerContext | null = null;
-          if (ownerId && ownerAgentForGuard) {
+          if (ownerId && ownerAgentForGuard && !creationDependencyBlock) {
             const taskTeamRow = await this.db.teams.getTeam(taskTeamId).catch(() => null);
             brainContext = await this.emitTaskClaimedWithBrainContext({
               teamId: taskTeamId,
@@ -16316,6 +16548,7 @@ Return this JSON shape:
           }
           const warnings = [
             queuedByDoingLimit ? await this.doingTaskLimitMessage(taskTeamId) : undefined,
+            creationDependencyBlock?.message,
             defaultOwnerWarning,
           ].filter((item): item is string => Boolean(item));
 
@@ -16696,6 +16929,19 @@ Return this JSON shape:
           const { task, error: taskErr } = await this.resolveTaskRef(taskName, teamId);
           if (!task) return { ok: false, error: taskErr || `Task "${taskName}" not found` };
 
+          const dependencyBlock = await this.taskDependencyBlock(task, task.team_id || teamId);
+          if (dependencyBlock) {
+            return {
+              ok: false,
+              error: dependencyBlock.error,
+              result: {
+                message: dependencyBlock.message,
+                depends_on: dependencyBlock.depends_on,
+                unresolved_dependencies: dependencyBlock.unresolved_dependencies,
+              },
+            };
+          }
+
           // Check for --team flag
           let resolveTeam = teamId;
           for (let i = 3; i < args.length; i++) {
@@ -16711,6 +16957,21 @@ Return this JSON shape:
           if (!agent) return { ok: false, error: error || `Agent "${agentRef}" not found` };
           const taskTeamIdForGuard = task.team_id || teamId;
           const taskTeamRowForGuard = await this.db.teams.getTeam(taskTeamIdForGuard).catch(() => null);
+          const assignmentAuth = await this.authorizeTaskAssignCommand({
+            teamId,
+            teamName: taskTeamRowForGuard?.name || teamName,
+            task,
+            targetAgent: agent,
+            callerFrom,
+            callerPrincipal,
+          });
+          if (!assignmentAuth.ok) {
+            return {
+              ok: false,
+              error: assignmentAuth.error,
+              result: { message: assignmentAuth.message },
+            };
+          }
           const assignCapacityBlock = await this.leadCapacityGuard({
             teamId: taskTeamIdForGuard,
             teamName: taskTeamRowForGuard?.name || teamName,
@@ -16787,6 +17048,19 @@ Return this JSON shape:
           // Cross-team claim guard
           if (task.team_id && task.team_id !== teamId) {
             return { ok: false, error: `Task "${taskRef}" not found` };
+          }
+
+          const dependencyBlock = await this.taskDependencyBlock(task, teamId);
+          if (dependencyBlock) {
+            return {
+              ok: false,
+              error: dependencyBlock.error,
+              result: {
+                message: dependencyBlock.message,
+                depends_on: dependencyBlock.depends_on,
+                unresolved_dependencies: dependencyBlock.unresolved_dependencies,
+              },
+            };
           }
 
           // Resolve caller agent
@@ -16914,6 +17188,19 @@ Return this JSON shape:
             };
           }
 
+          const dependencyBlock = await this.taskDependencyBlock(task, teamId);
+          if (dependencyBlock) {
+            return {
+              ok: false,
+              error: dependencyBlock.error,
+              result: {
+                message: dependencyBlock.message,
+                depends_on: dependencyBlock.depends_on,
+                unresolved_dependencies: dependencyBlock.unresolved_dependencies,
+              },
+            };
+          }
+
           const completionPayload = {
             acceptance_coverage: acceptanceCoverage,
             child_task_refs: childTaskRefs,
@@ -16942,9 +17229,11 @@ Return this JSON shape:
           }
 
           const now = Math.floor(Date.now() / 1000);
+          const completionEvidence = this.acceptedCompletionEvidence(completionPayload, completion.validation, now);
           await this.db.tasks.updateFields(task.id, {
             status: 'done',
             completed_at: now,
+            ...(completionEvidence ? { completion_evidence: completionEvidence } : {}),
             updated_at: now,
           });
 

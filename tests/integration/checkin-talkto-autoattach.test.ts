@@ -237,6 +237,10 @@ function adminHeaders(team: string): Record<string, string> {
   return { 'Content-Type': 'application/json', 'X-Id-Team': team, 'X-Id-Admin': '1' };
 }
 
+function userHeaders(team: string): Record<string, string> {
+  return { 'Content-Type': 'application/json', 'X-Id-Team': team };
+}
+
 function validBriefFields() {
   return {
     goal_id: 'goal_mqxibu5r_2k2my',
@@ -782,6 +786,389 @@ describe('/talk-to auto-attach', () => {
       expect(coverageDone.status).toBe(200);
       const coverageFinished = await db.tasks.getByNameForTeam('coverage-completion-packet-task', teamId);
       expect(coverageFinished?.status).toBe('done');
+    });
+  });
+
+  it('persists accepted completion evidence and returns it from later task reads', async () => {
+    await withBriefValidationMode('enforce', async () => {
+      const taskName = 'persisted-completion-evidence-task';
+      const created = await fetch(`${baseUrl}/tasks`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({
+          title: 'Persisted completion evidence task',
+          name: taskName,
+          from: 'manager',
+          ...validBriefFields(),
+        }),
+      });
+      expect(created.status).toBe(201);
+
+      const claimed = await fetch(`${baseUrl}/tasks/${taskName}/claim`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({ agent_id: 'coder' }),
+      });
+      expect(claimed.status).toBe(200);
+
+      const coverage = ['GET task reads retain accepted completion evidence'];
+      const done = await fetch(`${baseUrl}/tasks/${taskName}/done`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({ agent_id: 'coder', acceptance_coverage: coverage }),
+      });
+      expect(done.status).toBe(200);
+
+      const fetched = await fetch(`${baseUrl}/tasks/${taskName}`, {
+        headers: adminHeaders(TEAM),
+      });
+      expect(fetched.status).toBe(200);
+      const body = await fetched.json() as {
+        task?: {
+          completion_evidence?: {
+            acceptance_coverage?: string[];
+            decision?: string;
+            recorded_at?: number;
+          };
+        };
+      };
+      expect(body.task?.completion_evidence).toMatchObject({
+        acceptance_coverage: coverage,
+        decision: 'accept',
+      });
+      expect(body.task?.completion_evidence?.recorded_at).toEqual(expect.any(Number));
+    });
+  });
+
+  it('redacts secret-shaped strings before storing accepted completion evidence', async () => {
+    await withBriefValidationMode('enforce', async () => {
+      const taskName = 'redacted-completion-evidence-task';
+      const created = await fetch(`${baseUrl}/tasks`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({
+          title: 'Redacted completion evidence task',
+          name: taskName,
+          from: 'manager',
+          ...validBriefFields(),
+        }),
+      });
+      expect(created.status).toBe(201);
+
+      const claimed = await fetch(`${baseUrl}/tasks/${taskName}/claim`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({ agent_id: 'coder' }),
+      });
+      expect(claimed.status).toBe(200);
+
+      const done = await fetch(`${baseUrl}/tasks/${taskName}/done`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({
+          agent_id: 'coder',
+          acceptance_coverage: ['credential check: api_key=fixture-secret-value'],
+        }),
+      });
+      expect(done.status).toBe(200);
+
+      const stored = await db.tasks.getByNameForTeam(taskName, teamId);
+      expect(stored?.completion_evidence).not.toContain('fixture-secret-value');
+
+      const fetched = await fetch(`${baseUrl}/tasks/${taskName}`, {
+        headers: adminHeaders(TEAM),
+      });
+      expect(fetched.status).toBe(200);
+      const body = await fetched.json() as {
+        task?: { completion_evidence?: { acceptance_coverage?: string[] } };
+      };
+      expect(body.task?.completion_evidence?.acceptance_coverage).toEqual([
+        'credential check: api_key=[redacted]',
+      ]);
+    });
+  });
+
+  it('persists accepted completion evidence from the /task done command', async () => {
+    await withBriefValidationMode('enforce', async () => {
+      const taskName = 'cli-persisted-completion-evidence-task';
+      const created = await fetch(`${baseUrl}/tasks`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({
+          title: 'CLI persisted completion evidence task',
+          name: taskName,
+          from: 'manager',
+          ...validBriefFields(),
+        }),
+      });
+      expect(created.status).toBe(201);
+
+      const claimed = await fetch(`${baseUrl}/tasks/${taskName}/claim`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({ agent_id: 'coder' }),
+      });
+      expect(claimed.status).toBe(200);
+
+      const done = await fetch(`${baseUrl}/remote`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({
+          from: 'coder',
+          command: `/task done ${taskName} --acceptance "CLI task reads retain accepted completion evidence"`,
+        }),
+      });
+      expect(done.status).toBe(200);
+      const doneBody = await done.json() as { ok?: boolean };
+      expect(doneBody.ok).toBe(true);
+
+      const fetched = await fetch(`${baseUrl}/tasks/${taskName}`, {
+        headers: adminHeaders(TEAM),
+      });
+      expect(fetched.status).toBe(200);
+      const body = await fetched.json() as {
+        task?: {
+          completion_evidence?: {
+            acceptance_coverage?: string[];
+            decision?: string;
+            recorded_at?: number;
+          };
+        };
+      };
+      expect(body.task?.completion_evidence).toMatchObject({
+        acceptance_coverage: ['CLI task reads retain accepted completion evidence'],
+        decision: 'accept',
+      });
+      expect(body.task?.completion_evidence?.recorded_at).toEqual(expect.any(Number));
+    });
+  });
+
+  it('persists REST dependencies, blocks partial execution, and unlocks after dependency completion', async () => {
+    await withBriefValidationMode('enforce', async () => {
+      const rootName = 'dependency-root-task';
+      const childName = 'dependency-child-task';
+      const root = await fetch(`${baseUrl}/tasks`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({ title: 'Dependency root task', name: rootName, from: 'manager', ...validBriefFields() }),
+      });
+      expect(root.status).toBe(201);
+
+      const child = await fetch(`${baseUrl}/tasks`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({
+          title: 'Dependency child task',
+          name: childName,
+          from: 'manager',
+          depends_on: [rootName],
+          ...validBriefFields(),
+        }),
+      });
+      expect(child.status).toBe(201);
+      const childBody = await child.json() as { task?: { dependsOn?: string[]; status?: string } };
+      expect(childBody.task).toMatchObject({ dependsOn: [rootName], status: 'todo' });
+
+      const blockedClaim = await fetch(`${baseUrl}/tasks/${childName}/claim`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({ agent_id: 'coder' }),
+      });
+      expect(blockedClaim.status).toBe(409);
+      const blockedBody = await blockedClaim.json() as {
+        error?: string;
+        unresolved_dependencies?: Array<{ ref: string; status: string }>;
+      };
+      expect(blockedBody.error).toBe('task_dependency_incomplete');
+      expect(blockedBody.unresolved_dependencies).toEqual([{ ref: rootName, status: 'todo' }]);
+
+      const rootClaim = await fetch(`${baseUrl}/tasks/${rootName}/claim`, {
+        method: 'POST', headers: adminHeaders(TEAM), body: JSON.stringify({ agent_id: 'coder' }),
+      });
+      expect(rootClaim.status).toBe(200);
+      const rootDone = await fetch(`${baseUrl}/tasks/${rootName}/done`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({ agent_id: 'coder', acceptance_coverage: ['dependency root complete'] }),
+      });
+      expect(rootDone.status).toBe(200);
+
+      const childClaim = await fetch(`${baseUrl}/tasks/${childName}/claim`, {
+        method: 'POST', headers: adminHeaders(TEAM), body: JSON.stringify({ agent_id: 'coder' }),
+      });
+      expect(childClaim.status).toBe(200);
+      const childDone = await fetch(`${baseUrl}/tasks/${childName}/done`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({ agent_id: 'coder', acceptance_coverage: ['dependency-gated child complete'] }),
+      });
+      expect(childDone.status).toBe(200);
+    });
+  });
+
+  it('blocks done for unresolved and missing dependencies with task_dependency_incomplete', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    await db.tasks.create({
+      id: 'task_dependency_pending', name: 'dependency-pending', uuid: crypto.randomUUID(), team_id: teamId,
+      title: 'Dependency pending', description: 'Dependency remains todo', status: 'todo', created_by: dispatcherId,
+      owner: null, created_at: now, updated_at: now, completed_at: null,
+    });
+    await db.tasks.create({
+      id: 'task_dependency_blocked_done', name: 'dependency-blocked-done', uuid: crypto.randomUUID(), team_id: teamId,
+      title: 'Dependency blocked done', description: 'Cannot close before dependencies', status: 'doing', created_by: dispatcherId,
+      owner: targetId, created_at: now, updated_at: now, completed_at: null,
+      depends_on: JSON.stringify(['dependency-pending', 'dependency-missing']),
+    });
+
+    const blocked = await fetch(`${baseUrl}/tasks/dependency-blocked-done/done`, {
+      method: 'POST',
+      headers: adminHeaders(TEAM),
+      body: JSON.stringify({ agent_id: 'coder', acceptance_coverage: ['must not be accepted early'] }),
+    });
+    expect(blocked.status).toBe(409);
+    const body = await blocked.json() as {
+      error?: string;
+      unresolved_dependencies?: Array<{ ref: string; status: string }>;
+    };
+    expect(body.error).toBe('task_dependency_incomplete');
+    expect(body.unresolved_dependencies).toEqual([
+      { ref: 'dependency-pending', status: 'todo' },
+      expect.objectContaining({ ref: 'dependency-missing', status: 'missing' }),
+    ]);
+    expect((await db.tasks.getByNameForTeam('dependency-blocked-done', teamId))?.status).toBe('doing');
+  });
+
+  it('blocks anonymous remote task assignment before mutating ownership', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    await db.tasks.create({
+      id: 'task_remote_assign_guard',
+      name: 'remote-assign-guard',
+      uuid: crypto.randomUUID(),
+      team_id: teamId,
+      title: 'Remote assign guard',
+      description: 'Assignment must require an authorized caller',
+      status: 'todo',
+      created_by: dispatcherId,
+      owner: null,
+      created_at: now,
+      updated_at: now,
+      completed_at: null,
+    });
+
+    const rejected = await fetch(`${baseUrl}/remote`, {
+      method: 'POST',
+      headers: userHeaders(TEAM),
+      body: JSON.stringify({ command: '/task assign remote-assign-guard coder' }),
+    });
+    expect(rejected.status).toBe(200);
+    const rejectedBody = await rejected.json() as { ok?: boolean; error?: string; result?: { message?: string } };
+    expect(rejectedBody.ok).toBe(false);
+    expect(rejectedBody.error).toBe('task_assign_forbidden');
+    expect(rejectedBody.result?.message).toContain('requires an admin principal');
+
+    const stored = await db.tasks.getByNameForTeam('remote-assign-guard', teamId);
+    expect(stored).toMatchObject({ status: 'todo', owner: null });
+  });
+
+  it('blocks /task assign for unresolved dependencies with task_dependency_incomplete', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    await db.tasks.create({
+      id: 'task_dependency_assign_pending',
+      name: 'dependency-assign-pending',
+      uuid: crypto.randomUUID(),
+      team_id: teamId,
+      title: 'Dependency assign pending',
+      description: 'Dependency remains todo',
+      status: 'todo',
+      created_by: dispatcherId,
+      owner: null,
+      created_at: now,
+      updated_at: now,
+      completed_at: null,
+    });
+    await db.tasks.create({
+      id: 'task_dependency_assign_blocked',
+      name: 'dependency-assign-blocked',
+      uuid: crypto.randomUUID(),
+      team_id: teamId,
+      title: 'Dependency assign blocked',
+      description: 'Cannot assign before dependencies',
+      status: 'todo',
+      created_by: dispatcherId,
+      owner: null,
+      created_at: now,
+      updated_at: now,
+      completed_at: null,
+      depends_on: JSON.stringify(['dependency-assign-pending']),
+    });
+
+    const assigned = await fetch(`${baseUrl}/remote`, {
+      method: 'POST',
+      headers: adminHeaders(TEAM),
+      body: JSON.stringify({ command: '/task assign dependency-assign-blocked coder' }),
+    });
+    expect(assigned.status).toBe(200);
+    const body = await assigned.json() as {
+      ok?: boolean;
+      error?: string;
+      result?: { unresolved_dependencies?: Array<{ ref: string; status: string }> };
+    };
+    expect(body.ok).toBe(false);
+    expect(body.error).toBe('task_dependency_incomplete');
+    expect(body.result?.unresolved_dependencies).toEqual([{ ref: 'dependency-assign-pending', status: 'todo' }]);
+
+    const stored = await db.tasks.getByNameForTeam('dependency-assign-blocked', teamId);
+    expect(stored).toMatchObject({ status: 'todo', owner: null });
+  });
+
+  it('allows admin remote task assignment through the explicit operator path', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    await db.tasks.create({
+      id: 'task_remote_assign_admin',
+      name: 'remote-assign-admin',
+      uuid: crypto.randomUUID(),
+      team_id: teamId,
+      title: 'Remote assign admin',
+      description: 'Admin assignment remains available',
+      status: 'todo',
+      created_by: dispatcherId,
+      owner: null,
+      created_at: now,
+      updated_at: now,
+      completed_at: null,
+    });
+
+    const assigned = await fetch(`${baseUrl}/remote`, {
+      method: 'POST',
+      headers: adminHeaders(TEAM),
+      body: JSON.stringify({ command: '/task assign remote-assign-admin coder' }),
+    });
+    expect(assigned.status).toBe(200);
+    const assignedBody = await assigned.json() as { ok?: boolean; result?: { task?: { ownerName?: string; status?: string } } };
+    expect(assignedBody.ok).toBe(true);
+    expect(assignedBody.result?.task).toMatchObject({ ownerName: 'coder', status: 'doing' });
+
+    const stored = await db.tasks.getByNameForTeam('remote-assign-admin', teamId);
+    expect(stored).toMatchObject({ status: 'doing', owner: targetId });
+  });
+
+  it('supports repeated /task create --depends-on values and exposes them on task reads', async () => {
+    await withBriefValidationMode('enforce', async () => {
+      const command = '/task create "CLI dependency child" --name cli-dependency-child --depends-on dependency-a,dependency-b --depends-on dependency-c --goal goal_mqxibu5r_2k2my --expected-output "implementation patch and tests" --acceptance "covers CLI dependency parsing" --validation-path "coder and researcher" --out-of-scope "optional recommendations" --backlog-policy "Non-required recommendations become backlog candidates." --bittrees-relevance "medium: improves manager dependency routing for Bittrees work."';
+      const created = await fetch(`${baseUrl}/remote`, {
+        method: 'POST',
+        headers: adminHeaders(TEAM),
+        body: JSON.stringify({ from: 'manager', command }),
+      });
+      expect(created.status).toBe(200);
+      const createdBody = await created.json() as { ok?: boolean; result?: { task?: { dependsOn?: string[]; status?: string } } };
+      expect(createdBody.ok).toBe(true);
+      expect(createdBody.result?.task).toMatchObject({
+        dependsOn: ['dependency-a', 'dependency-b', 'dependency-c'],
+        status: 'todo',
+      });
+      const stored = await db.tasks.getByNameForTeam('cli-dependency-child', teamId);
+      expect(JSON.parse(stored?.depends_on || '[]')).toEqual(['dependency-a', 'dependency-b', 'dependency-c']);
     });
   });
 
@@ -1595,6 +1982,22 @@ describe('/talk-to auto-attach', () => {
   });
 
   it('rejects duplicate validator children for the same parent and purpose', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    await db.tasks.create({
+      id: 'task_parent_alpha',
+      name: 'parent-alpha',
+      uuid: crypto.randomUUID(),
+      team_id: teamId,
+      title: 'Parent alpha',
+      description: 'Live parent for validator child tests',
+      status: 'doing',
+      created_by: dispatcherId,
+      owner: dispatcherId,
+      created_at: now,
+      updated_at: now,
+      completed_at: null,
+    });
+
     const first = await fetch(`${baseUrl}/tasks`, {
       method: 'POST',
       headers: adminHeaders(TEAM),
@@ -1625,6 +2028,25 @@ describe('/talk-to auto-attach', () => {
     const duplicateBody = await duplicate.json() as { error: string; existing_task?: string };
     expect(duplicateBody.error).toBe('duplicate_validator_child_task');
     expect(duplicateBody.existing_task).toBe('validate-parent-alpha-coder');
+  });
+
+  it('rejects validator children whose parent_task does not resolve to a live task row', async () => {
+    const child = await fetch(`${baseUrl}/tasks`, {
+      method: 'POST',
+      headers: adminHeaders(TEAM),
+      body: JSON.stringify({
+        title: 'Validate missing parent coder',
+        name: 'validate-missing-parent-coder',
+        from: 'manager',
+        parent_task: 'missing-parent',
+        validation_purpose: 'coder technical validation',
+        ...validBriefFields(),
+      }),
+    });
+    expect(child.status).toBe(409);
+    const childBody = await child.json() as { error: string; message?: string };
+    expect(childBody.error).toBe('validator_parent_task_not_found');
+    expect(childBody.message).toContain('missing-parent');
   });
 
   it('rejects duplicate goal tasks by title overlap when no target is provided', async () => {
@@ -2038,6 +2460,47 @@ describe('/talk-to auto-attach', () => {
     expect(childByShortId.status).toBe(409);
     const childByShortIdBody = await childByShortId.json() as { error: string };
     expect(childByShortIdBody.error).toBe('validator_child_post_terminal_blocked');
+  });
+
+  it('blocks validator self-assignment when the target validator owns the parent task', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    await db.tasks.create({
+      id: 'task_coder_owned_parent',
+      name: 'coder-owned-parent',
+      uuid: crypto.randomUUID(),
+      team_id: teamId,
+      title: 'Coder owned parent',
+      description: 'Parent task owned by the validator candidate',
+      status: 'doing',
+      created_by: dispatcherId,
+      owner: targetId,
+      created_at: now,
+      updated_at: now,
+      completed_at: null,
+    });
+
+    const child = await fetch(`${baseUrl}/talk-to`, {
+      method: 'POST',
+      headers: adminHeaders(TEAM),
+      body: JSON.stringify({
+        to: 'coder',
+        from: 'manager',
+        message: 'Validate your own parent task.',
+        wait: false,
+        task: {
+          title: 'Validate coder owned parent',
+          name: 'validate-coder-owned-parent',
+          parent_task: 'coder-owned-parent',
+          validation_purpose: 'coder technical validation',
+          ...validBriefFields(),
+        },
+      }),
+    });
+    expect(child.status).toBe(409);
+    const childBody = await child.json() as { error: string; message?: string };
+    expect(childBody.error).toBe('validator_self_assignment_blocked');
+    expect(childBody.message).toContain('coder-owned-parent');
+    expect(await db.tasks.list({ teamId })).toHaveLength(1);
   });
 
   it('blocks validators from creating validator tasks and routes low-relevance live dispatch to backlog', async () => {
