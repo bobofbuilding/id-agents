@@ -381,14 +381,7 @@ export class CheckinService {
   }
 
   private async fetchTaskById(taskId: string): Promise<TaskRow | null> {
-    const placeholder = this.db.adapter.dialect === 'postgres' ? '$1' : '?';
-    const { rows } = await this.db.adapter.query<TaskRow>(
-      `SELECT id, name, uuid, team_id, title, description, status, created_by, owner,
-              created_at, updated_at, completed_at
-       FROM tasks WHERE id = ${placeholder}`,
-      [taskId],
-    );
-    return rows[0] ?? null;
+    return this.db.tasks.getById(taskId);
   }
 
   private async resolveAgentName(agentId: string): Promise<string | null> {

@@ -7,11 +7,33 @@ import type { TaskRow } from '../../types.js';
 export class SqliteTasksRepo implements TasksRepository {
   constructor(private readonly db: DbAdapter) {}
 
+  private parseRow(row: any): TaskRow | null {
+    if (!row) return null;
+    let dependsOn: unknown = row.depends_on;
+    if (typeof dependsOn === 'string') {
+      try {
+        dependsOn = JSON.parse(dependsOn);
+      } catch {
+        dependsOn = [];
+      }
+    }
+    return {
+      ...row,
+      depends_on: Array.isArray(dependsOn)
+        ? dependsOn.filter((dependency): dependency is string => typeof dependency === 'string')
+        : [],
+    };
+  }
+
+  private parseRows(rows: any[]): TaskRow[] {
+    return rows.map((row) => this.parseRow(row)!);
+  }
+
   async create(task: TaskRow, eventScheduleIds?: string[]): Promise<void> {
     await this.db.query(
       `INSERT INTO tasks
-         (id, name, uuid, team_id, title, description, status, created_by, owner, created_at, updated_at, completed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, name, uuid, team_id, title, description, depends_on, status, created_by, owner, created_at, updated_at, completed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         task.id,
         task.name,
@@ -19,6 +41,7 @@ export class SqliteTasksRepo implements TasksRepository {
         task.team_id,
         task.title,
         task.description,
+        JSON.stringify(task.depends_on ?? []),
         task.status,
         task.created_by,
         task.owner,
@@ -44,7 +67,15 @@ export class SqliteTasksRepo implements TasksRepository {
       `SELECT * FROM tasks WHERE name = ?`,
       [name],
     );
-    return rows[0] || null;
+    return this.parseRow(rows[0]);
+  }
+
+  async getById(taskId: string): Promise<TaskRow | null> {
+    const { rows } = await this.db.query<TaskRow>(
+      `SELECT * FROM tasks WHERE id = ?`,
+      [taskId],
+    );
+    return this.parseRow(rows[0]);
   }
 
   async getByNameForTeam(name: string, teamId: string): Promise<TaskRow | null> {
@@ -52,7 +83,7 @@ export class SqliteTasksRepo implements TasksRepository {
       `SELECT * FROM tasks WHERE name = ? AND team_id = ?`,
       [name, teamId],
     );
-    return rows[0] || null;
+    return this.parseRow(rows[0]);
   }
 
   async getByUuidPrefix(prefix: string): Promise<TaskRow[]> {
@@ -60,7 +91,7 @@ export class SqliteTasksRepo implements TasksRepository {
       `SELECT * FROM tasks WHERE uuid LIKE ? ORDER BY updated_at DESC`,
       [`${prefix}%`],
     );
-    return rows;
+    return this.parseRows(rows);
   }
 
   async list(filters?: {
@@ -99,7 +130,7 @@ export class SqliteTasksRepo implements TasksRepository {
       `SELECT * FROM tasks ${where} ORDER BY updated_at ${order}${limit ? ' LIMIT ?' : ''}`,
       limit ? [...params, limit] : params,
     );
-    return rows;
+    return this.parseRows(rows);
   }
 
   async updateFields(
@@ -204,6 +235,6 @@ export class SqliteTasksRepo implements TasksRepository {
        ORDER BY t.updated_at DESC`,
       [scheduleId],
     );
-    return rows;
+    return this.parseRows(rows);
   }
 }

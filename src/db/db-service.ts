@@ -546,6 +546,9 @@ export interface TasksRepository {
   /** Look up a task by its unique name slug (global, ignores team). */
   getByName(name: string): Promise<TaskRow | null>;
 
+  /** Look up a task by its durable internal id. */
+  getById(taskId: string): Promise<TaskRow | null>;
+
   /**
    * Look up a task by (team_id, name) — the new (team_id, name) unique key.
    * This is the preferred method for all team-scoped lookups.

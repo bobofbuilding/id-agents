@@ -505,6 +505,7 @@ export async function migratePostgres(adapter: DbAdapter): Promise<void> {
       team_id uuid REFERENCES teams(id) ON DELETE SET NULL,
       title text NOT NULL,
       description text,
+      depends_on jsonb NOT NULL DEFAULT '[]'::jsonb,
       status text NOT NULL,
       created_by text REFERENCES agents(id) ON DELETE SET NULL,
       owner text REFERENCES agents(id) ON DELETE SET NULL,
@@ -563,6 +564,7 @@ export async function migratePostgres(adapter: DbAdapter): Promise<void> {
   // Tasks: ensure uuid column exists for upgraded databases, then backfill
   // and enforce uniqueness. pgcrypto provides gen_random_uuid().
   await adapter.query(`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS uuid text;`);
+  await adapter.query(`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS depends_on jsonb NOT NULL DEFAULT '[]'::jsonb;`);
   await adapter.query(`UPDATE tasks SET uuid = gen_random_uuid()::text WHERE uuid IS NULL OR uuid = '';`);
   await adapter.query(`CREATE UNIQUE INDEX IF NOT EXISTS tasks_uuid_idx ON tasks(uuid);`);
 

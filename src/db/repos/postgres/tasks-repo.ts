@@ -7,11 +7,33 @@ import type { TaskRow } from '../../types.js';
 export class PgTasksRepo implements TasksRepository {
   constructor(private readonly db: DbAdapter) {}
 
+  private parseRow(row: any): TaskRow | null {
+    if (!row) return null;
+    let dependsOn: unknown = row.depends_on;
+    if (typeof dependsOn === 'string') {
+      try {
+        dependsOn = JSON.parse(dependsOn);
+      } catch {
+        dependsOn = [];
+      }
+    }
+    return {
+      ...row,
+      depends_on: Array.isArray(dependsOn)
+        ? dependsOn.filter((dependency): dependency is string => typeof dependency === 'string')
+        : [],
+    };
+  }
+
+  private parseRows(rows: any[]): TaskRow[] {
+    return rows.map((row) => this.parseRow(row)!);
+  }
+
   async create(task: TaskRow, eventScheduleIds?: string[]): Promise<void> {
     await this.db.query(
       `INSERT INTO tasks
-         (id, name, uuid, team_id, title, description, status, created_by, owner, created_at, updated_at, completed_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+         (id, name, uuid, team_id, title, description, depends_on, status, created_by, owner, created_at, updated_at, completed_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13)`,
       [
         task.id,
         task.name,
@@ -19,6 +41,7 @@ export class PgTasksRepo implements TasksRepository {
         task.team_id,
         task.title,
         task.description,
+        JSON.stringify(task.depends_on ?? []),
         task.status,
         task.created_by,
         task.owner,
@@ -44,7 +67,15 @@ export class PgTasksRepo implements TasksRepository {
       `SELECT * FROM tasks WHERE name = $1`,
       [name],
     );
-    return r.rows[0] || null;
+    return this.parseRow(r.rows[0]);
+  }
+
+  async getById(taskId: string): Promise<TaskRow | null> {
+    const r = await this.db.query<TaskRow>(
+      `SELECT * FROM tasks WHERE id = $1`,
+      [taskId],
+    );
+    return this.parseRow(r.rows[0]);
   }
 
   async getByNameForTeam(name: string, teamId: string): Promise<TaskRow | null> {
@@ -52,7 +83,7 @@ export class PgTasksRepo implements TasksRepository {
       `SELECT * FROM tasks WHERE name = $1 AND team_id = $2`,
       [name, teamId],
     );
-    return r.rows[0] || null;
+    return this.parseRow(r.rows[0]);
   }
 
   async getByUuidPrefix(prefix: string): Promise<TaskRow[]> {
@@ -60,7 +91,7 @@ export class PgTasksRepo implements TasksRepository {
       `SELECT * FROM tasks WHERE uuid LIKE $1 ORDER BY updated_at DESC`,
       [`${prefix}%`],
     );
-    return r.rows;
+    return this.parseRows(r.rows);
   }
 
   async list(filters?: {
@@ -101,7 +132,7 @@ export class PgTasksRepo implements TasksRepository {
       `SELECT * FROM tasks ${where} ORDER BY updated_at ${order}${limit ? ` LIMIT $${idx++}` : ''}`,
       params,
     );
-    return r.rows;
+    return this.parseRows(r.rows);
   }
 
   async updateFields(
@@ -210,6 +241,6 @@ export class PgTasksRepo implements TasksRepository {
        ORDER BY t.updated_at DESC`,
       [scheduleId],
     );
-    return r.rows;
+    return this.parseRows(r.rows);
   }
 }

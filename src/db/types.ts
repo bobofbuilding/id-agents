@@ -158,6 +158,8 @@ export interface TaskRow {
   team_id: string | null;
   title: string;
   description: string | null;
+  /** Same-team task names or ids that must be done before this task can run. */
+  depends_on: string[];
   status: 'todo' | 'doing' | 'done';
   created_by: string | null;
   owner: string | null;

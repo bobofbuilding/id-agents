@@ -382,6 +382,7 @@ export async function migrateSqlite(adapter: SqliteAdapter): Promise<void> {
       team_id TEXT REFERENCES teams(id) ON DELETE SET NULL,
       title TEXT NOT NULL,
       description TEXT,
+      depends_on TEXT NOT NULL DEFAULT '[]',
       status TEXT NOT NULL,
       created_by TEXT REFERENCES agents(id) ON DELETE SET NULL,
       owner TEXT REFERENCES agents(id) ON DELETE SET NULL,
@@ -499,6 +500,11 @@ export async function migrateSqlite(adapter: SqliteAdapter): Promise<void> {
   // Tasks: add uuid column for short-id lookups (#xxxxxxxx)
   try {
     adapter.exec(`ALTER TABLE tasks ADD COLUMN uuid TEXT`);
+  } catch {
+    // Column already exists in upgraded databases.
+  }
+  try {
+    adapter.exec(`ALTER TABLE tasks ADD COLUMN depends_on TEXT NOT NULL DEFAULT '[]'`);
   } catch {
     // Column already exists in upgraded databases.
   }
@@ -666,6 +672,7 @@ async function migrateTasks_TeamNameUnique(adapter: SqliteAdapter): Promise<void
       team_id TEXT REFERENCES teams(id) ON DELETE SET NULL,
       title TEXT NOT NULL,
       description TEXT,
+      depends_on TEXT NOT NULL DEFAULT '[]',
       status TEXT NOT NULL,
       created_by TEXT REFERENCES agents(id) ON DELETE SET NULL,
       owner TEXT REFERENCES agents(id) ON DELETE SET NULL,
