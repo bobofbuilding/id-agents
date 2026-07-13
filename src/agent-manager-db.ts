@@ -754,6 +754,8 @@ export class AgentManagerDb {
   private scheduleTargetWakeAttempts: Map<string, number> = new Map();
   private stalledNudges = new Map<string, StalledProbeState>(); // probe key -> throttle/count state
   private leadDelegationKickoffRetryTimers: Map<string, NodeJS.Timeout> = new Map();
+  private taskExecutionContinuationTimers: Map<string, NodeJS.Timeout> = new Map();
+  private taskExecutionContinuationAttempts: Map<string, { count: number; lastAt: number }> = new Map();
   private retentionService: RetentionService | null = null;
   private checkinService: CheckinService | null = null;
   /**
@@ -4941,6 +4943,82 @@ Return this JSON shape:
     });
   }
 
+  private taskExecutionContinuationDelayMs(): number {
+    const raw = Number(process.env.ID_TASK_EXECUTION_CONTINUATION_DELAY_MS || 5_000);
+    return Number.isFinite(raw) && raw >= 0 ? Math.max(1_000, Math.floor(raw)) : 5_000;
+  }
+
+  // Task titles are attacker/agent-controlled free text that lands directly in a
+  // live instruction sent to another agent's context (unlike the informational
+  // `("${title}")` echoes used elsewhere for API error strings). Collapse
+  // newlines/control chars and JSON-encode so embedded quotes or multi-line
+  // "new instruction" content can't be mistaken for part of the wrapping prompt.
+  private sanitizeTaskTitleForContinuationPrompt(title: string, maxLen = 200): string {
+    const collapsed = String(title ?? '').replace(/[\r\n\t]+/g, ' ').replace(/\s{2,}/g, ' ').trim();
+    const truncated = collapsed.length > maxLen ? `${collapsed.slice(0, maxLen)}…` : collapsed;
+    return JSON.stringify(truncated);
+  }
+
+  private pruneTaskExecutionContinuationAttempts(maxEntries = 2000, maxAgeMs = 24 * 60 * 60 * 1000): void {
+    // Entries persist until a task reaches `done`; a task abandoned in `doing`
+    // forever would otherwise pin its (capped) entry in this map permanently.
+    if (this.taskExecutionContinuationAttempts.size <= maxEntries) return;
+    const now = Date.now();
+    for (const [key, state] of this.taskExecutionContinuationAttempts) {
+      if (now - state.lastAt > maxAgeMs) this.taskExecutionContinuationAttempts.delete(key);
+    }
+  }
+
+  private scheduleTaskExecutionContinuation(teamId: string, task: TaskRow): void {
+    if (!task.owner || task.status !== 'doing') return;
+    const key = `${teamId}:${task.id}`;
+    if (this.taskExecutionContinuationTimers.has(key)) return;
+    if ((this.taskExecutionContinuationAttempts.get(key)?.count || 0) >= 2) return;
+
+    const timer = setTimeout(() => {
+      this.taskExecutionContinuationTimers.delete(key);
+      void (async () => {
+        const [freshTask, team] = await Promise.all([
+          this.db.tasks.getByNameForTeam(task.name, teamId).catch(() => null),
+          this.db.teams.getTeam(teamId).catch(() => null),
+        ]);
+        if (!freshTask || !team || freshTask.status !== 'doing' || !freshTask.owner) {
+          this.taskExecutionContinuationAttempts.delete(key);
+          return;
+        }
+        if ((await this.countActiveQueries(freshTask.owner)) > 0) {
+          this.scheduleTaskExecutionContinuation(teamId, freshTask);
+          return;
+        }
+
+        let owner = await this.db.agents.getById(freshTask.owner).catch(() => null);
+        if (!owner) return;
+        if (owner.status !== 'running') {
+          await this.wakeAssignedTaskOwner(teamId, team.name, freshTask, owner, 'stalled-owner');
+          owner = await this.db.agents.getById(freshTask.owner).catch(() => owner);
+        }
+        if (!owner || owner.status !== 'running') return;
+
+        const ref = this.taskShortRef(freshTask);
+        const executionInstruction = this.isLeadCoordinationParentTask(freshTask)
+          ? `Decompose it now into the minimum member-owned child tasks and report their refs; do not perform the whole objective yourself.`
+          : `Execute the next concrete step now and return completion evidence or a precise blocker.`;
+        const safeTitle = this.sanitizeTaskTitleForContinuationPrompt(freshTask.title);
+        const message = `Resume and complete task ${ref} (${safeTitle}). Your prior automated response said IN-PROGRESS, but that query ended and no execution session remained active. ${executionInstruction} Do not return another status-only acknowledgement.`;
+        const sent = await this.sendSupervisionAsk(team.name, owner.name, message);
+        if (sent) {
+          const prevAttempt = this.taskExecutionContinuationAttempts.get(key);
+          this.taskExecutionContinuationAttempts.set(key, { count: (prevAttempt?.count || 0) + 1, lastAt: Date.now() });
+          this.managerLog(`Dispatched execution continuation for task ${freshTask.name} to ${team.name}/${owner.name}`);
+        }
+      })().catch((err) => {
+        this.managerLog(`Task execution continuation failed for ${task.name}: ${err?.message || err}`);
+      });
+    }, this.taskExecutionContinuationDelayMs());
+    timer.unref?.();
+    this.taskExecutionContinuationTimers.set(key, timer);
+  }
+
   private async applyTaskControlReplyFromCompletedQuery(
     queryRow: QueryRow,
     payload: Record<string, unknown>,
@@ -4975,6 +5053,11 @@ Return this JSON shape:
     const actorAgentId = queryRow.agent_id ?? task.owner ?? null;
 
     if (effectiveParsed.action === 'done') {
+      const continuationKey = `${queryRow.team_id}:${task.id}`;
+      const continuationTimer = this.taskExecutionContinuationTimers.get(continuationKey);
+      if (continuationTimer) clearTimeout(continuationTimer);
+      this.taskExecutionContinuationTimers.delete(continuationKey);
+      this.taskExecutionContinuationAttempts.delete(continuationKey);
       await this.db.tasks.updateFields(task.id, {
         status: 'done',
         completed_at: nowSec,
@@ -5102,6 +5185,9 @@ Return this JSON shape:
         occurredAt,
       );
       await this.markTaskControlReplyApplied({ teamId: queryRow.team_id, queryId: queryRow.query_id, agentId: actorAgentId, occurredAt, task, action: effectiveParsed.action });
+      if (effectiveParsed.action === 'in_progress') {
+        this.scheduleTaskExecutionContinuation(queryRow.team_id, { ...task, updated_at: nowSec });
+      }
       this.managerLog(`Applied ${effectiveParsed.action} control reply for task ${task.name} from query ${queryRow.query_id}`);
       return { applied: true, action: effectiveParsed.action, task: task.name };
     }
@@ -17848,7 +17934,10 @@ Return this JSON shape:
   }
 
   private startIdleParkingSweeper(): void {
-    if (process.env.ID_IDLE_PARK_DISABLED === 'true') return;
+    // Keep the fleet warm by default. Process parking trades idle memory for
+    // cold starts and breaks the dashboard's availability
+    // contract, so operators must explicitly opt in when they want it.
+    if (process.env.ID_IDLE_PARK_DISABLED === 'true' || process.env.ID_IDLE_PARK_ENABLED !== 'true') return;
     const rawInterval = Number(process.env.ID_IDLE_PARK_INTERVAL_MS || 15 * 60 * 1000);
     const intervalMs = Number.isFinite(rawInterval) && rawInterval > 0
       ? Math.max(60_000, Math.floor(rawInterval))
@@ -19736,6 +19825,7 @@ Return this JSON shape:
       }
     }
     this.pruneStalledNudges(now, RENUDGE_MS, MAX_PROBES);
+    this.pruneTaskExecutionContinuationAttempts();
     if (nudged) console.log(`[Manager] Stalled-task sweep: probed ${nudged} stalled item(s)`);
   }
 
@@ -20251,6 +20341,11 @@ Return this JSON shape:
       clearTimeout(timer);
     }
     this.leadDelegationKickoffRetryTimers.clear();
+    for (const timer of this.taskExecutionContinuationTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.taskExecutionContinuationTimers.clear();
+    this.taskExecutionContinuationAttempts.clear();
     if (this.wss) {
       try { this.wss.close(); } catch { /* swallow */ }
       this.wss = null;
