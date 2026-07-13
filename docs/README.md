@@ -12,6 +12,7 @@ Documentation for the ID Agents multi-agent orchestration platform.
 
 ## Guides
 
+- [Cross-Platform Install Guide](./guides/cross-platform-install.md) - Clean-machine setup, updates, and troubleshooting for macOS, Linux, and Windows WSL
 - [Contributor Workflows Index](./guides/contributor-workflows.md) - Searchable entry point for onboarding, task ownership, handoffs, changes, and agent-library contributions
 - [Interactive Agent Guide](./guides/interactive-agent.md) - Run the interactive CLI
 - [Sync Command Guide](./guides/sync-command.md) - Update a running team without losing sessions (`/sync` vs `/deploy`)
