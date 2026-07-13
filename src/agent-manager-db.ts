@@ -24,6 +24,7 @@ import { privateKeyToAccount } from 'viem/accounts';
 import yaml from 'js-yaml';
 import { AgentRestServer } from './agent-rest-server.js';
 import { registerOnIdChain, createSubnameOnIdChain, setMultiChainAddresses } from './onchain/idchain-register.js';
+import { evaluatePrimaryNameGate, type PrimaryNameReceipt } from './onchain/ens-primary-guard.js';
 import { defaultDeliverFn, redactSshTarget, type DeliverFn } from './lib/ssh-deliver.js';
 import { probeRemoteAgent, defaultHealthProbeFn, type HealthProbeFn } from './lib/remote-heartbeat.js';
 import { filterClaudeEnvVars } from './lib/env-hygiene.js';
@@ -782,6 +783,8 @@ export class AgentManagerDb {
   private deliverFn: DeliverFn = defaultDeliverFn;
   /** Injectable onchain registration function — override in tests. */
   private registerOnIdChainFn: typeof registerOnIdChain = registerOnIdChain;
+  /** Injectable ENS primary-naming gate — override in tests. */
+  private evaluatePrimaryNameGateFn: typeof evaluatePrimaryNameGate = evaluatePrimaryNameGate;
   /** Injectable HTTP probe function — override in tests to mock remote health checks. */
   private healthProbeFn: HealthProbeFn = defaultHealthProbeFn;
   /**
@@ -3610,6 +3613,8 @@ Return this JSON shape:
       deliverFn?: DeliverFn;
       /** Override onchain registration function (for tests). */
       registerOnIdChainFn?: typeof registerOnIdChain;
+      /** Override ENS primary-naming gate (for tests). */
+      evaluatePrimaryNameGateFn?: typeof evaluatePrimaryNameGate;
       /** Override remote health probe function (for tests). */
       healthProbeFn?: HealthProbeFn;
       /**
@@ -3625,6 +3630,7 @@ Return this JSON shape:
     this.db = db;
     if (opts?.deliverFn) this.deliverFn = opts.deliverFn;
     if (opts?.registerOnIdChainFn) this.registerOnIdChainFn = opts.registerOnIdChainFn;
+    if (opts?.evaluatePrimaryNameGateFn) this.evaluatePrimaryNameGateFn = opts.evaluatePrimaryNameGateFn;
     if (opts?.healthProbeFn) this.healthProbeFn = opts.healthProbeFn;
     this.libraryRoot =
       opts && Object.prototype.hasOwnProperty.call(opts, 'libraryRoot')
@@ -6626,6 +6632,28 @@ Return this JSON shape:
       } catch (addrErr: any) {
         console.warn(`[Register] Multi-chain address setting failed: ${addrErr.message}`);
       }
+    }
+
+    // ── ENS primary-naming guard (fail-closed) ────────────────────────────
+    // Registration above only proves forward resolution (name -> address).
+    // identity_primary_status must never be marked 'verified' by anything
+    // other than this gate — a fresh agent stays 'pending'/'blocked' until
+    // real bidirectional (forward + reverse) proof exists. See
+    // src/onchain/ens-primary-guard.ts for why reverse verification is not
+    // yet possible and what has to land before it is.
+    const primaryNameReceipt: PrimaryNameReceipt = await this.evaluatePrimaryNameGateFn({
+      domain: newName,
+      walletAddress: (metadata as any).ows_address,
+    });
+    metadata = {
+      ...metadata,
+      identity_primary_status: primaryNameReceipt.status,
+      identity_primary_receipt: primaryNameReceipt,
+    };
+    if (primaryNameReceipt.status !== 'verified') {
+      console.warn(
+        `[Register] ${newName} identity_primary_status=${primaryNameReceipt.status}: ${primaryNameReceipt.reason}`,
+      );
     }
 
     await this.db.agents.updateIdentity(agent.id, {
