@@ -2,6 +2,9 @@
 
 Thank you for your interest in contributing to ID Agents! This document provides guidelines for contributing to the project.
 
+For a searchable map of onboarding, task ownership, handoffs, implementation,
+and agent-library workflows, start with the [Contributor Workflows Index](docs/guides/contributor-workflows.md).
+
 ## Getting Started
 
 1. Fork the repository

@@ -12,6 +12,7 @@ Documentation for the ID Agents multi-agent orchestration platform.
 
 ## Guides
 
+- [Contributor Workflows Index](./guides/contributor-workflows.md) - Searchable entry point for onboarding, task ownership, handoffs, changes, and agent-library contributions
 - [Interactive Agent Guide](./guides/interactive-agent.md) - Run the interactive CLI
 - [Sync Command Guide](./guides/sync-command.md) - Update a running team without losing sessions (`/sync` vs `/deploy`)
 - [Admin Control Guide](./guides/idagents-admin-control.md) - Programmatic team management via `/remote`, talk-to-manager, and agent reply polling
