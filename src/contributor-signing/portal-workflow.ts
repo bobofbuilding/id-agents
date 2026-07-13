@@ -16,7 +16,10 @@ import type { ContributorSigningPolicyService } from './policy-service.js';
  * authority.
  */
 export interface PortalIdentityVerifier<IdentityProof = unknown> {
-  verify(proof: IdentityProof): AuthenticatedCaller | null | Promise<AuthenticatedCaller | null>;
+  verify(
+    proof: IdentityProof,
+    request: Readonly<ContributorDecisionRequest>,
+  ): AuthenticatedCaller | null | Promise<AuthenticatedCaller | null>;
 }
 
 export interface PortalActionInput<IdentityProof = unknown> {
@@ -58,10 +61,11 @@ export class ContributorPortalWorkflow<IdentityProof = unknown, Result = unknown
     if (input.identity === null || input.identity === undefined) {
       return { status: 'denied', reason: 'identity proof is required' };
     }
+    const request = Object.freeze({ ...input.request });
 
     let caller: AuthenticatedCaller | null;
     try {
-      caller = await this.identities.verify(input.identity);
+      caller = await this.identities.verify(input.identity, request);
     } catch {
       return { status: 'denied', reason: 'identity proof verification failed' };
     }
@@ -69,15 +73,22 @@ export class ContributorPortalWorkflow<IdentityProof = unknown, Result = unknown
       return { status: 'denied', reason: 'identity proof verification failed' };
     }
 
-    const decision = this.policy.decide(input.request, caller);
+    let decision: ContributorDecisionRecord;
+    try {
+      decision = this.policy.decide(request, caller);
+    } catch {
+      return { status: 'denied', reason: 'authorization policy evaluation failed' };
+    }
     if (decision.decision !== 'approved') {
       return { status: 'denied', reason: decision.reason, decision };
     }
 
-    const result = await this.executeBoundedAction(
-      Object.freeze({ ...input.request }),
-      decision,
-    );
+    let result: Result;
+    try {
+      result = await this.executeBoundedAction(request, decision);
+    } catch {
+      return { status: 'denied', reason: 'bounded action execution failed', decision };
+    }
     return { status: 'executed', decision, result };
   }
 }

@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: MIT
 
 import { describe, expect, it, vi } from 'vitest';
-import { verifyMessage, type Address, type Hex } from 'viem';
+import type { Hex } from 'viem';
 import {
   ContributorChainRegistry,
   ContributorPortalWorkflow,
   ContributorSigningPolicyService,
   InMemoryAppendOnlyDecisionAuditLog,
   InMemoryNonceStore,
+  canonicalContributorIntentHash,
   type AuthenticatedCaller,
   type AuthorityResolver,
   type ContributorDecisionRequest,
@@ -19,28 +20,19 @@ import {
 } from '../../src/contributor-signing/index.js';
 
 const NOW = 1_800_000_000_000;
-const IDENTITY_MESSAGE = 'agent.bittrees.org|v1|chain:8453|org:bittrees-inc|agent:agent-7|nonce:identity-1';
-const SIGNER_ADDRESS = '0xeaDAAf441aD287768805D509657C19AF819cc07C' as Address;
 const VALID_SIGNATURE = '0x923b35bfd34e685d28bbcdfbc735e5f2095a113c8f6331d7c3afc7e702f5823e70f22921bed6145e1a9c7ccce9ae3931105baf01681f795ae41cd0a403cc1aa51b' as Hex;
 
 interface FixtureIdentityProof {
-  message: string;
+  domain: string;
+  chain_id: number;
+  org: string;
+  agent_id: string;
+  request_binding: string;
+  proof_nonce: string;
   signature: Hex;
 }
 
-// Public address/signature fixtures contain no private key or signing capability.
-const VALID_PROOF: FixtureIdentityProof = Object.freeze({
-  message: IDENTITY_MESSAGE,
-  signature: VALID_SIGNATURE,
-});
-const INVALID_PROOF: FixtureIdentityProof = Object.freeze({
-  message: IDENTITY_MESSAGE,
-  signature: `${VALID_SIGNATURE.slice(0, -1)}c` as Hex,
-});
-const DOMAIN_MISMATCH_PROOF: FixtureIdentityProof = Object.freeze({
-  message: IDENTITY_MESSAGE.replace('agent.bittrees.org', 'attacker.example'),
-  signature: VALID_SIGNATURE,
-});
+const INVALID_SIGNATURE = `${VALID_SIGNATURE.slice(0, -1)}c` as Hex;
 
 function config(): ContributorSigningConfig {
   return {
@@ -79,7 +71,26 @@ function request(overrides: Partial<ContributorDecisionRequest> = {}): Contribut
   };
 }
 
-function harness() {
+function proofFor(
+  intent: ContributorDecisionRequest,
+  overrides: Partial<FixtureIdentityProof> = {},
+): FixtureIdentityProof {
+  return Object.freeze({
+    domain: 'agent.bittrees.org',
+    chain_id: 8453,
+    org: intent.org,
+    agent_id: intent.agent_id,
+    request_binding: canonicalContributorIntentHash(intent),
+    proof_nonce: `proof-${intent.request_id}`,
+    signature: VALID_SIGNATURE,
+    ...overrides,
+  });
+}
+
+function harness(options: {
+  consumedProofNonces?: Set<string>;
+  policy?: ContributorSigningPolicyService;
+} = {}) {
   const caller: AuthenticatedCaller = {
     principal_id: 'session-agent-7',
     org: 'bittrees-inc',
@@ -108,7 +119,7 @@ function harness() {
     ETHEREUM_RPC_URL: 'http://127.0.0.1:8545',
     BASE_RPC_URL: 'http://127.0.0.1:8546',
   });
-  const policy = new ContributorSigningPolicyService(
+  const policy = options.policy ?? new ContributorSigningPolicyService(
     registry,
     authorities,
     delegations,
@@ -116,14 +127,17 @@ function harness() {
     new InMemoryAppendOnlyDecisionAuditLog(),
     () => NOW,
   );
+  const consumedProofNonces = options.consumedProofNonces ?? new Set<string>();
   const identities: PortalIdentityVerifier<FixtureIdentityProof> = {
-    verify: vi.fn(async proof => {
-      if (proof.message !== IDENTITY_MESSAGE) return null;
-      return await verifyMessage({
-        address: SIGNER_ADDRESS,
-        message: proof.message,
-        signature: proof.signature,
-      }) ? caller : null;
+    verify: vi.fn(async (proof, boundRequest) => {
+      if (proof.domain !== 'agent.bittrees.org') return null;
+      if (proof.chain_id !== 8453 || boundRequest.chain_id !== 8453) return null;
+      if (proof.org !== boundRequest.org || proof.agent_id !== boundRequest.agent_id) return null;
+      if (proof.request_binding !== canonicalContributorIntentHash(boundRequest)) return null;
+      if (proof.signature !== VALID_SIGNATURE) return null;
+      if (consumedProofNonces.has(proof.proof_nonce)) return null;
+      consumedProofNonces.add(proof.proof_nonce);
+      return caller;
     }),
   };
   const execute = vi.fn(async () => ({ application_id: 'application-123' }));
@@ -136,7 +150,7 @@ describe('contributor portal signer workflow matrix', () => {
     const { execute, workflow } = harness();
     const intent = request();
 
-    const outcome = await workflow.run({ identity: VALID_PROOF, request: intent });
+    const outcome = await workflow.run({ identity: proofFor(intent), request: intent });
 
     expect(outcome.status).toBe('executed');
     expect(outcome.decision.decision).toBe('approved');
@@ -150,12 +164,14 @@ describe('contributor portal signer workflow matrix', () => {
   });
 
   it.each([
-    ['invalid signature', INVALID_PROOF],
-    ['domain-mismatched signature', DOMAIN_MISMATCH_PROOF],
-  ])('fails closed for an %s', async (_label, identity) => {
+    ['invalid signature', { signature: INVALID_SIGNATURE }],
+    ['wrong-domain proof', { domain: 'attacker.example' }],
+    ['wrong-chain proof', { chain_id: 1 }],
+  ])('fails closed for an %s', async (_label, proofOverrides) => {
     const { execute, workflow } = harness();
+    const intent = request();
 
-    const outcome = await workflow.run({ identity, request: request() });
+    const outcome = await workflow.run({ identity: proofFor(intent, proofOverrides), request: intent });
 
     expect(outcome).toEqual({ status: 'denied', reason: 'identity proof verification failed' });
     expect(execute).not.toHaveBeenCalled();
@@ -173,26 +189,105 @@ describe('contributor portal signer workflow matrix', () => {
 
   it('fails closed when identity verification throws', async () => {
     const { execute, identities, workflow } = harness();
+    const intent = request();
     vi.mocked(identities.verify).mockRejectedValueOnce(new Error('verification backend unavailable'));
 
-    const outcome = await workflow.run({ identity: VALID_PROOF, request: request() });
+    const outcome = await workflow.run({ identity: proofFor(intent), request: intent });
 
     expect(outcome).toEqual({ status: 'denied', reason: 'identity proof verification failed' });
     expect(execute).not.toHaveBeenCalled();
   });
 
-  it('rejects a replayed nonce before a second bounded action can execute', async () => {
-    const { execute, workflow } = harness();
+  it('fails closed when policy evaluation throws', async () => {
+    const policy = { decide: vi.fn(() => { throw new Error('policy store unavailable'); }) } as unknown as ContributorSigningPolicyService;
+    const { execute, workflow } = harness({ policy });
+    const intent = request();
 
-    expect((await workflow.run({ identity: VALID_PROOF, request: request() })).status).toBe('executed');
+    const outcome = await workflow.run({ identity: proofFor(intent), request: intent });
+
+    expect(outcome).toEqual({ status: 'denied', reason: 'authorization policy evaluation failed' });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('returns a denial when the bounded action dependency throws', async () => {
+    const { execute, workflow } = harness();
+    const intent = request();
+    execute.mockRejectedValueOnce(new Error('executor unavailable'));
+
+    const outcome = await workflow.run({ identity: proofFor(intent), request: intent });
+
+    expect(outcome.status).toBe('denied');
+    expect(outcome.reason).toBe('bounded action execution failed');
+    expect(execute).toHaveBeenCalledOnce();
+  });
+
+  it('rejects a replayed request nonce before a second bounded action can execute', async () => {
+    const { execute, workflow } = harness();
+    const first = request();
+    const second = request({ request_id: 'request-2' });
+
+    expect((await workflow.run({ identity: proofFor(first), request: first })).status).toBe('executed');
     const replay = await workflow.run({
-      identity: VALID_PROOF,
-      request: request({ request_id: 'request-2' }),
+      identity: proofFor(second),
+      request: second,
     });
 
     expect(replay.status).toBe('denied');
     expect(replay.reason).toBe('nonce already used');
     expect(execute).toHaveBeenCalledOnce();
+  });
+
+  it('rejects replayed identity proofs before authorization can execute again', async () => {
+    const { execute, identities, workflow } = harness();
+    const intent = request();
+    const proof = proofFor(intent);
+
+    expect((await workflow.run({ identity: proof, request: intent })).status).toBe('executed');
+    const replay = await workflow.run({ identity: proof, request: intent });
+
+    expect(replay).toEqual({ status: 'denied', reason: 'identity proof verification failed' });
+    expect(identities.verify).toHaveBeenCalledTimes(2);
+    expect(execute).toHaveBeenCalledOnce();
+  });
+
+  it('rejects durable identity-proof replay after a workflow restart', async () => {
+    const durableProofNonces = new Set<string>();
+    const intent = request();
+    const first = harness({ consumedProofNonces: durableProofNonces });
+    const restarted = harness({ consumedProofNonces: durableProofNonces });
+
+    expect((await first.workflow.run({ identity: proofFor(intent), request: intent })).status).toBe('executed');
+    const replayAfterRestart = await restarted.workflow.run({
+      identity: proofFor(intent),
+      request: intent,
+    });
+
+    expect(replayAfterRestart).toEqual({ status: 'denied', reason: 'identity proof verification failed' });
+    expect(restarted.execute).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when the identity proof is bound to a different request', async () => {
+    const { execute, workflow } = harness();
+    const issuedFor = request();
+    const mutatedRequest = request({ request_id: 'request-mutated', payload_hash: 'sha256:mutated-payload' });
+
+    const outcome = await workflow.run({ identity: proofFor(issuedFor), request: mutatedRequest });
+
+    expect(outcome).toEqual({ status: 'denied', reason: 'identity proof verification failed' });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when the proof agent binding does not match the request', async () => {
+    const { execute, workflow } = harness();
+    const intent = request();
+
+    const outcome = await workflow.run({
+      identity: proofFor(intent, { agent_id: 'agent-8' }),
+      request: intent,
+    });
+
+    expect(outcome).toEqual({ status: 'denied', reason: 'identity proof verification failed' });
+    expect(execute).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -202,8 +297,9 @@ describe('contributor portal signer workflow matrix', () => {
     ['chain', { chain_id: 1 }],
   ])('keeps a valid signer outside the intended %s scope from executing', async (_label, overrides) => {
     const { execute, workflow } = harness();
+    const intent = request(overrides);
 
-    const outcome = await workflow.run({ identity: VALID_PROOF, request: request(overrides) });
+    const outcome = await workflow.run({ identity: proofFor(intent), request: intent });
 
     expect(outcome.status).toBe('denied');
     expect(execute).not.toHaveBeenCalled();
