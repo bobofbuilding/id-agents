@@ -24,7 +24,7 @@ To search this index only, use `rg -ni '<keyword>' docs/guides/contributor-workf
 | Pick up and complete assigned work | `task lifecycle`, `claim`, `doing`, `done`, `task` | [Task tracking](./tasks.md) | An auditable task transition |
 | Delegate or hand off a work slice | `delegate`, `handoff`, `brief`, `checkin`, `validation` | [Delegation runbook](./delegation-runbook.md) | A clear, supervised ownership transfer |
 | Prepare a dispatch-ready task brief | `task brief`, `acceptance criteria`, `validation path`, `scope` | [Task-brief template](./delegation-task-template.md) | A task another contributor can claim |
-| Implement, test, and submit a change | `code`, `test`, `build`, `commit`, `pull request` | [Making changes](../../CONTRIBUTING.md#making-changes) | A reviewable pull request |
+| Implement, preflight, test, and submit a change | `code`, `preflight`, `test`, `build`, `commit`, `pull request` | [Making changes](../../CONTRIBUTING.md#making-changes) | A reviewable pull request |
 | Add an agent or reusable skill | `agent library`, `skill`, `configs`, `license`, `notice` | [Agent library contributions](../../CONTRIBUTING.md#contributing-agent-library-entries) | A properly attributed library entry |
 | Share a generated artifact | `output`, `artifact`, `report`, `analysis` | [Agent outputs](./agent-outputs.md) | A retrievable artifact in `./output/` |
 | Reconcile a running team after config changes | `sync`, `deploy`, `workspace`, `agent config` | [Sync command](./sync-command.md) | A running team aligned with config |
@@ -77,12 +77,13 @@ When work produces a report, analysis, or generated artifact, follow the
 
 ## Change, test, review, and release
 
-**Keywords:** `code`, `test`, `build`, `commit`, `pull request`, `release`,
-`version`, `changelog`.
+**Keywords:** `code`, `preflight`, `test`, `build`, `commit`, `pull request`,
+`release`, `version`, `changelog`.
 
 1. Make focused TypeScript changes that follow existing code patterns.
-2. Add or update tests and run the applicable test command; run a build when
-   the change can affect types or packaging.
+2. Add or update tests, then run `npm run ci:preflight` to reproduce the
+   checked-in pull-request gate locally; run a build when the change can affect
+   types or packaging.
 3. Use a clear present-tense commit message and open a pull request with a
    concise description.
 4. For a release, follow the version, changelog, release-commit, and tag

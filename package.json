@@ -30,6 +30,7 @@
     "dev": "tsc --watch",
     "lint": "npm run typecheck",
     "typecheck": "tsc --noEmit",
+    "ci:preflight": "npm run lint && npm run typecheck && npm test",
     "agent:server": "npm run build && node dist/start-agent-rest-server.js",
     "agent:talk": "npm run build && node dist/agent-restap-cli.js",
     "claude": "npm run build && node dist/claude-agent-cli.js",

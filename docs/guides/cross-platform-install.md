@@ -119,11 +119,14 @@ npm --version
 
 npm ci
 npm run build
+npm run ci:preflight
 ```
 
 Use `npm ci` on clean machines because the repository includes
 `package-lock.json`. Use `npm install` only when intentionally updating the
-dependency lockfile.
+dependency lockfile. `npm run ci:preflight` runs the same lint, typecheck, and
+test gate that pull-request CI runs; it needs neither agent-runtime credentials
+nor a running manager.
 
 By default, ID Agents uses SQLite at `~/.id-agents/id-agents.db`; no database
 server is required. To use PostgreSQL or optional API keys, copy the example env
