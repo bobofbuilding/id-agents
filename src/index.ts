@@ -32,8 +32,6 @@ export type {
   SendMessageOptions,
   SendMessageResult,
   PollNewsOptions,
-  RegistryConfig,
-  RegisterOnchainResult,
   FileInfo,
   DeployConfig,
   DeployResult,

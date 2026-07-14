@@ -14,5 +14,4 @@ export * from './team-service.js';
 export * from './agent-service.js';
 export * from './messaging-service.js';
 export * from './file-service.js';
-export * from './registry-service.js';
 export * from './safe-compare.js';

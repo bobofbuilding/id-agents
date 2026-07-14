@@ -134,20 +134,6 @@ export interface PollNewsOptions {
   queryId?: string;
 }
 
-// ==================== Registry Types ====================
-
-export interface RegistryConfig {
-  chainId: number;
-  registryAddress: string;
-  registrarAddress?: string;
-}
-
-export interface RegisterOnchainResult {
-  txHash: string;
-  tokenId?: string;
-  domain?: string;
-}
-
 // ==================== File Types ====================
 
 export interface FileInfo {
