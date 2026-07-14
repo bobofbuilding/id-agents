@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.1.102-beta
+
+### Removed — ID Chain onchain registration
+
+- **Removed the entire ID Chain onchain agent-registration surface**, while fully preserving the OWS wallet capability. Gone: onchain registration and ENS name/subname registration (`src/onchain/idchain-register.ts`), the onchain-registry client (`src/core/registry-service.ts`) and `scripts/register-team.ts`; the `/agents/:id/onchain/register`, `/agents/by-name/:name/onchain/register`, `/agents/:id/onchain/redeliver-identity`, and `/registry*` HTTP routes; the `register`, `sync-wallets`, and `registry` remote commands; the `/register`, `/registry`, and `/public register-onchain` CLI commands; deploy-time auto-registration; the `onchain:` team-config block and per-agent `register` / `domain` / `tokenId` fields; the onchain / registrar / indexer environment variables; and the `idagents-register-public-agents` skill.
+
+### Kept
+
+- **OWS wallet capability preserved and decoupled from onchain.** `src/xmtp/ows-signer.ts`, on-demand wallet provisioning (`/agent <name> wallet provision`, deploy-time attach), `OWS_WALLET`, and XMTP signing all remain. Public-agent OWS-wallet provisioning was relocated out of the deleted onchain-register method into the `public-agent-remote` branch of `POST /agents/register`, so opted-in public agents still receive a wallet.
+- **Manager-join registration unchanged.** `POST /agents/register` (an agent joining a team roster) and legacy agent resolution by `domain` / `token_id` are retained; those columns are simply no longer populated by onchain code (not dropped).
+
+## 0.1.101-beta
+
+### Added
+
+- **gpt-5.6 codex models.** `gpt-5.6-luna`, `gpt-5.6-terra`, and `gpt-5.6-sol` pass through to `codex --model`, with TUI abbreviations (`g5.6-lun` / `g5.6-ter` / `g5.6-sol`).
+- **Per-agent reasoning effort for codex agents.** YAML `effort: low|medium|high|xhigh` maps to `codex -c model_reasoning_effort=<effort>` at spawn.
+
+### Changes
+
+- **TUI polish.** Three-letter agent statuses, online shown as a green dot only, an `EFF` column, and narrowed columns for more horizontal room.
+
 ## 0.1.100-beta
 
 ### Fixes
