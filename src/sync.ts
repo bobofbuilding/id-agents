@@ -37,8 +37,6 @@ const DIFF_FIELDS = [
   'heartbeat',
   'allowedTools',
   'description',
-  'domain',
-  'tokenId',
   'workingDirectory',
   'catalog',
 ] as const;
@@ -125,8 +123,6 @@ function configFields(spec: AgentSpec, defaultModel?: string): Record<string, st
     heartbeat: spec.heartbeat ? (typeof spec.heartbeat === 'number' ? String(spec.heartbeat) : JSON.stringify({ interval: spec.heartbeat.interval, message: spec.heartbeat.message })) : '',
     allowedTools: normalizeAllowedTools(spec.allowedTools),
     description: spec.description || '',
-    domain: spec.domain || '',
-    tokenId: spec.tokenId || '',
     workingDirectory: spec.workingDirectory || '',
     catalog: normalizeCatalog(spec.catalog),
   };
@@ -147,8 +143,6 @@ function runningFields(row: AgentRow): Record<string, string> {
     heartbeat: meta.heartbeat === true ? 'enabled' : '',
     allowedTools: normalizeAllowedTools(meta.allowed_tools),
     description: meta.description || '',
-    domain: row.domain || '',
-    tokenId: row.token_id || '',
     workingDirectory: row.working_directory || '',
     catalog: normalizeCatalog(meta.catalog),
   };
@@ -194,7 +188,9 @@ export function diffAgent(spec: AgentSpec, row: AgentRow, defaultModel?: string)
  * Given a list of config agent specs and a list of running DB rows,
  * produce a SyncPlan categorizing each agent.
  *
- * Agents are matched by name (config name or domain, matching DB row name).
+ * Agents are matched by config name against the DB row name, falling back
+ * to the row's stored `metadata.alias` — legacy rows renamed to an ENS
+ * domain keep their original config name there.
  */
 export function computeSyncPlan(
   configAgents: AgentSpec[],
@@ -204,17 +200,20 @@ export function computeSyncPlan(
   const plan: SyncPlan = { added: [], removed: [], changed: [], unchanged: [] };
 
   const runningByName = new Map<string, AgentRow>();
+  const runningByAlias = new Map<string, AgentRow>();
   for (const row of runningAgents) {
     runningByName.set(row.name, row);
+    const alias = (row.metadata as any)?.alias;
+    if (typeof alias === 'string' && alias) runningByAlias.set(alias, row);
   }
 
   const configNames = new Set<string>();
 
   for (const spec of configAgents) {
-    const name = spec.domain || spec.name;
+    const name = spec.name;
     configNames.add(name);
 
-    const row = runningByName.get(name);
+    const row = runningByName.get(name) ?? runningByAlias.get(name);
     if (!row) {
       plan.added.push({ name, category: 'new' });
       continue;

@@ -77,20 +77,6 @@ describe('diffAgent', () => {
     expect(changes).toContain('description');
   });
 
-  it('detects domain change', () => {
-    const spec = makeAgentSpec({ domain: 'alice.xid.eth' });
-    const row = makeAgentRow();
-    const changes = diffAgent(spec, row);
-    expect(changes).toContain('domain');
-  });
-
-  it('detects tokenId change', () => {
-    const spec = makeAgentSpec({ tokenId: '0xabc123' });
-    const row = makeAgentRow();
-    const changes = diffAgent(spec, row);
-    expect(changes).toContain('tokenId');
-  });
-
   it('detects skills change', () => {
     const spec = makeAgentSpec({ skills: ['identity', 'inter-agent'] });
     const row = makeAgentRow({
@@ -327,20 +313,34 @@ describe('computeSyncPlan', () => {
     expect(plan.unchanged.map(item => item.name)).toEqual(['alice', 'charlie']);
   });
 
-  it('matches agents by domain name', () => {
-    const configAgents = [makeAgentSpec({ name: 'alice', domain: 'alice.xid.eth' })];
-    const runningAgents = [makeAgentRow({
+  it('matches a legacy domain-named row via metadata.alias and retains stored identity', () => {
+    const configAgents = [makeAgentSpec({ name: 'alice' })];
+    const legacyRow = makeAgentRow({
       name: 'alice.xid.eth',
       domain: 'alice.xid.eth',
-      metadata: { alias: 'alice', description: 'A test agent', runtime: 'claude-agent-sdk', plugins: [], skills: [], allowed_tools: [] },
-    })];
+      token_id: 'agent-15',
+      metadata: {
+        name: 'alice',
+        alias: 'alice',
+        description: 'A test agent',
+        runtime: 'claude-agent-sdk',
+        plugins: [],
+        skills: [],
+        allowed_tools: [],
+      },
+    });
 
-    const plan = computeSyncPlan(configAgents, runningAgents);
+    const plan = computeSyncPlan(configAgents, [legacyRow]);
 
+    // Matched via alias — neither re-added nor removed.
+    expect(plan.added).toEqual([]);
+    expect(plan.removed).toEqual([]);
     expect(plan.unchanged.length).toBe(1);
-    expect(plan.unchanged[0].name).toBe('alice.xid.eth');
-    expect(plan.added.length).toBe(0);
-    expect(plan.removed.length).toBe(0);
+    expect(plan.unchanged[0].name).toBe('alice');
+
+    // Stored onchain identity is not config drift: no perpetual "changed"
+    // state that would rebuild the agent and clear domain/token_id.
+    expect(diffAgent(configAgents[0], legacyRow)).toEqual([]);
   });
 });
 

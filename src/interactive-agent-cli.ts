@@ -4457,7 +4457,7 @@ async function deployFromConfig(filePath: string, args: string[] = []) {
     }
 
     // Process config file with parameters
-    const { agents, teamContext, teamName: configTeam, errors, parameters, onchain } = processConfig(absolutePath, '/workspace', args);
+    const { agents, teamContext, teamName: configTeam, errors, parameters } = processConfig(absolutePath, '/workspace', args);
 
     if (errors.length > 0) {
       console.log(`\n${colors.red}❌ Config validation errors:${colors.reset}`);
@@ -4514,8 +4514,6 @@ async function deployFromConfig(filePath: string, args: string[] = []) {
             workingDirectory: agent.workingDirectory,
             agent: agent.agent,
             roleBody: agent.roleBody,
-            domain: agent.domain,
-            tokenId: agent.tokenId,
             address: agent.address,
             heartbeat: agent.heartbeat,
             metadata: {
@@ -4620,34 +4618,6 @@ async function deployFromConfig(filePath: string, args: string[] = []) {
             }
           }
 
-          // Auto-register local agent onchain if enabled
-          const shouldRegister = agent.register !== undefined ? agent.register : onchain?.register;
-          if (shouldRegister && result.id) {
-            console.log(`   ${colors.gray}⛓️  Auto-registering onchain...${colors.reset}`);
-
-            // Wait a moment for the local agent to start before registering
-            await new Promise(resolve => setTimeout(resolve, 2000));
-
-            try {
-              const regResponse = await managerFetch(`/agents/${encodeURIComponent(result.id)}/onchain/register`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' }
-              });
-
-              if (regResponse.ok) {
-                const regData: any = await regResponse.json();
-                const regDomain = regData.domain || regData.agent?.domain || agent.name;
-                console.log(`   ${colors.green}✅ Registered: ${regDomain}${colors.reset}`);
-                console.log(`   ${colors.gray}   TX: ${regData.txHash}${colors.reset}`);
-              } else {
-                const regError: any = await regResponse.json();
-                console.log(`   ${colors.yellow}⚠️  Onchain registration failed: ${regError.error || 'Unknown error'}${colors.reset}`);
-              }
-            } catch (regErr: any) {
-              console.log(`   ${colors.yellow}⚠️  Onchain registration failed: ${regErr.message}${colors.reset}`);
-            }
-          }
-
         } catch (err: any) {
           results.push({ name: agent.name, success: false, error: err.message });
           console.log(`   ${colors.red}❌ Error spawning local agent: ${err.message}${colors.reset}`);
@@ -4668,8 +4638,6 @@ async function deployFromConfig(filePath: string, args: string[] = []) {
         agent: agent.agent,  // Library overlay name (resolves configs/agents/<agent>/ into the runtime overlay target)
         roleBody: agent.roleBody,  // Agent role from .claude/agents/<name>.md (resolved by processConfig)
         heartbeat: agent.heartbeat,  // Number (seconds) or {interval, message} for legacy
-        domain: agent.domain,
-        tokenId: agent.tokenId,
         address: agent.address,
         metadata: {
           description: agent.description,
@@ -4702,51 +4670,6 @@ async function deployFromConfig(filePath: string, args: string[] = []) {
             }
           }
 
-          // Auto-register onchain if enabled (per-agent or global default)
-          const shouldRegister = agent.register !== undefined ? agent.register : onchain?.register;
-          if (shouldRegister && result.id) {
-            console.log(`   ${colors.gray}⛓️  Auto-registering onchain...${colors.reset}`);
-
-            try {
-              const regResponse = await managerFetch(`/agents/${encodeURIComponent(result.id)}/onchain/register`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' }
-              });
-
-              if (regResponse.ok) {
-                const regData: any = await regResponse.json();
-                const regDomain = regData.domain || regData.agent?.domain || result.name;
-                console.log(`   ${colors.green}✅ Registered: ${regDomain}${colors.reset}`);
-                console.log(`   ${colors.gray}   TX: ${regData.txHash}${colors.reset}`);
-
-                // Push updated identity to the running agent
-                const agentUrl = result.internal_url || result.url;
-                if (agentUrl && regData.agent) {
-                  try {
-                    const identityPayload = {
-                      tokenId: regData.tokenId,
-                      domain: regDomain
-                    };
-                    const identityRes = await fetch(`${agentUrl}/identity`, {
-                      method: 'PATCH',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify(identityPayload)
-                    });
-                    if (identityRes.ok) {
-                      console.log(`   ${colors.gray}   Identity pushed to agent${colors.reset}`);
-                    }
-                  } catch {
-                    // Non-critical - agent will still work, just won't know its tokenId
-                  }
-                }
-              } else {
-                const regText = await regResponse.text();
-                console.log(`   ${colors.yellow}⚠️  Registration failed: ${regText}${colors.reset}`);
-              }
-            } catch (regErr: any) {
-              console.log(`   ${colors.yellow}⚠️  Registration error: ${regErr.message}${colors.reset}`);
-            }
-          }
         }
       } catch (err: any) {
         results.push({ name: agent.name, success: false, error: err.message });

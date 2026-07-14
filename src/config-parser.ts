@@ -80,7 +80,6 @@ export interface AgentSpec {
   skills?: string[];                  // Skills to deploy (names match skills/<name>/SKILL.md)
   allowedTools?: string[];
   resources?: ResourceConfig;
-  register?: boolean;                 // Auto-register onchain after deploy
   local?: boolean;                    // Run locally using the selected runtime's local auth flow
   port?: number;                      // Port for local agents (auto-allocated if not specified)
   workingDirectory?: string;          // Working directory for local agents
@@ -89,8 +88,6 @@ export interface AgentSpec {
   talkTimeout?: number;               // Default timeout for /talk-to in ms (default: 120000, max: 600000)
   heartbeatFile?: string;             // Path to heartbeat yaml config (relative to config file)
   heartbeat?: number | HeartbeatConfig;  // Number = new model (seconds, reads HEARTBEAT.md), object = legacy (interval+message)
-  domain?: string;                    // ENS domain name (e.g., "x.agent-15.xid.eth")
-  tokenId?: string;                   // Namehash of the ENS domain (bytes32)
   address?: string;                   // Ethereum address (links to .env.<name>.<address> file)
   wallet?: boolean;                   // Opt-in to OWS wallet provisioning at deploy/sync.
                                       // Default: false. When true the deploy/sync path
@@ -123,13 +120,6 @@ export interface CalendarSpec {
   delivery?: ScheduleDeliveryMode;
 }
 
-export interface OnchainConfig {
-  registryAddress?: string;           // ERC-6551 registry address
-  registrarAddress?: string;          // Registrar contract for minting
-  chainId?: number;                   // Chain ID (default: 8453 for Base)
-  register?: boolean;                 // Auto-register all agents by default
-}
-
 /**
  * Parameter definition for config templates
  */
@@ -157,7 +147,6 @@ export interface DeployConfig {
   version: string;
   team?: string;
   parameters?: ConfigParameter[];
-  onchain?: OnchainConfig;              // Onchain registration settings
   org?: OrgConfig;                      // Organization chart
   calendar?: CalendarSpec[];            // Team calendar schedules
   defaults?: {
@@ -168,7 +157,6 @@ export interface DeployConfig {
     skills?: string[];                  // Default skills for all agents
     allowedTools?: string[];
     resources?: ResourceConfig;
-    register?: boolean;                 // Auto-register all agents onchain (default: undefined, use onchain.register)
     local?: boolean;                    // Run all agents locally by default
     dangerouslySkipPermissions?: boolean; // Default skip-permissions for all agents
     talkTimeout?: number;               // Default /talk-to timeout in ms
@@ -1237,11 +1225,6 @@ export function mergeDefaults(agent: AgentSpec, defaults: DeployConfig['defaults
     }
   }
 
-  // register: agent overrides defaults
-  if (merged.register === undefined && defaults.register !== undefined) {
-    merged.register = defaults.register;
-  }
-
   // wallet: agent overrides defaults. Leaving both unset means wallet is
   // opt-in off — the deploy/sync code treats only an explicit `true` as
   // "provision an OWS wallet now".
@@ -1259,7 +1242,7 @@ export function processConfig(
   filePath: string,
   workspacePath: string = '/workspace',
   args: string[] = []
-): { agents: AgentSpec[]; calendar: CalendarSpec[]; teamContext: string | null; teamName: string | null; errors: ValidationError[]; parameters?: ConfigParameter[]; onchain?: OnchainConfig; org?: OrgConfig } {
+): { agents: AgentSpec[]; calendar: CalendarSpec[]; teamContext: string | null; teamName: string | null; errors: ValidationError[]; parameters?: ConfigParameter[]; org?: OrgConfig } {
   // Get parameters first (for error messages)
   const parameters = getConfigParameters(filePath);
 
@@ -1338,5 +1321,5 @@ export function processConfig(
     ? loadTeamContext(resolvedConfig.team, workspacePath)
     : null;
 
-  return { agents, calendar: resolvedConfig.calendar || [], teamContext, teamName: resolvedConfig.team || null, errors: [], parameters, onchain: resolvedConfig.onchain, org: resolvedConfig.org };
+  return { agents, calendar: resolvedConfig.calendar || [], teamContext, teamName: resolvedConfig.team || null, errors: [], parameters, org: resolvedConfig.org };
 }

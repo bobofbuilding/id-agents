@@ -3184,9 +3184,6 @@ export class AgentManagerDb {
           this.deploySkillsToAgent(workingDirectory, skills, {
             DISPLAY_NAME: domain || name,
             TEAM: teamName,
-            ONCHAIN_IDENTITY: domain
-              ? `Your onchain identity is your ENS domain: **${domain}**`
-              : '',
             ORG_CONTEXT: '',
           }, { hasWallet: false, runtime: effectiveRuntime });
         }
@@ -6423,8 +6420,9 @@ export class AgentManagerDb {
 
         // --- CHANGED agents: in-place rebuild with same ID/port ---
         for (const item of plan.changed) {
-          const row = syncableRunning.find(r => r.name === item.name)!;
-          const spec = syncAgents.find(a => (a.domain || a.name) === item.name)!;
+          // Legacy rows renamed to an ENS domain match via metadata.alias.
+          const row = syncableRunning.find(r => r.name === item.name || (r.metadata as any)?.alias === item.name)!;
+          const spec = syncAgents.find(a => a.name === item.name)!;
 
           // If workingDirectory changed, treat as destroy + recreate
           const wdChanged = item.changes?.includes('workingDirectory');
@@ -6465,7 +6463,6 @@ export class AgentManagerDb {
             } catch { /* ignore */ }
           }
 
-          const configDomain = spec.domain;
           const normalizedSkills = normalizeConfigSkills(agentSkills);
 
           // 1. Deploy library-backed agent overlay into the runtime overlay target, if configured
@@ -6496,9 +6493,8 @@ export class AgentManagerDb {
           }, spec.wallet);
 
           this.deploySkillsToAgent(workingDirectory, agentSkills, {
-            DISPLAY_NAME: configDomain || spec.name,
+            DISPLAY_NAME: spec.name,
             TEAM: syncTeamName,
-            ONCHAIN_IDENTITY: configDomain ? `Your onchain identity is your ENS domain: **${configDomain}**` : '',
             ORG_CONTEXT: orgContext
               ? `\n## Your Role\n\n${orgContext}\n\nSee the full org chart at the shared team folder for details on all groups.`
               : '',
@@ -6538,7 +6534,8 @@ export class AgentManagerDb {
             port: row.port,
             model: effectiveModel,
             workingDirectory,
-            tokenId: spec.tokenId || row.token_id || undefined,
+            // Preserve the row's stored onchain identity; config no longer carries one.
+            tokenId: row.token_id || undefined,
           });
 
           if (spawnResult.success) {
@@ -6560,7 +6557,7 @@ export class AgentManagerDb {
 
         // --- NEW agents: spawn fresh (reuse deploy logic) ---
         for (const item of plan.added) {
-          const spec = syncAgents.find(a => (a.domain || a.name) === item.name)!;
+          const spec = syncAgents.find(a => a.name === item.name)!;
           const agentId = `agent_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
           try {
             const port = await this.dbNextPort(syncTeamId);
@@ -6576,9 +6573,6 @@ export class AgentManagerDb {
             const localPlugins = this.copyPluginsToAgent(spec.plugins || [], workingDirectory);
             const isAutomator = spec.type === 'automator';
             const agentType = spec.type || 'claude';
-            const configDomain = spec.domain;
-            const configTokenId = spec.tokenId;
-            const agentName = configDomain || spec.name;
 
             const agentSkills: string[] = spec.skills || [];
             const normalizedSkills = normalizeConfigSkills(agentSkills);
@@ -6615,9 +6609,8 @@ export class AgentManagerDb {
 
             // 2. Deploy team-level skills (runtime-aware)
             this.deploySkillsToAgent(workingDirectory, agentSkills, {
-              DISPLAY_NAME: configDomain || spec.name,
+              DISPLAY_NAME: spec.name,
               TEAM: syncTeamName,
-              ONCHAIN_IDENTITY: configDomain ? `Your onchain identity is your ENS domain: **${configDomain}**` : '',
               ORG_CONTEXT: orgContext
                 ? `\n## Your Role\n\n${orgContext}\n\nSee the full org chart at the shared team folder for details on all groups.`
                 : '',
@@ -6643,15 +6636,10 @@ export class AgentManagerDb {
 
             const metadata: AgentMetadata = walletMeta.metadata;
 
-            if (configDomain) {
-              metadata.idchain_domain = configDomain;
-              metadata.alias = spec.name;
-            }
-
             await this.db.agents.create({
               team_id: syncTeamId,
               id: agentId,
-              name: agentName,
+              name: spec.name,
               type: agentType,
               model: effectiveModel,
               port,
@@ -6661,8 +6649,6 @@ export class AgentManagerDb {
               created_at: Date.now(),
               metadata,
               runtime: effectiveRuntime,
-              token_id: configTokenId || null,
-              domain: configDomain || null,
             });
 
             const url = `http://localhost:${port}`;
@@ -6672,7 +6658,7 @@ export class AgentManagerDb {
 
             const spawnResult = await this.spawnLocalAgentProcess(syncTeamId, syncTeamName, {
               name: spec.name, id: agentId, port, model: effectiveModel,
-              workingDirectory, tokenId: configTokenId || undefined,
+              workingDirectory,
             });
 
             if (spawnResult.success) {
@@ -6716,7 +6702,7 @@ export class AgentManagerDb {
           try {
             const { generateOrgChart } = await import('./org-chart.js');
             const orgMd = generateOrgChart(syncTeamName, syncOrg, syncAgents.map(a => ({
-              name: a.name, description: a.description, domain: a.domain,
+              name: a.name, description: a.description,
             })));
             const teamDir = `${this.baseWorkDir}/teams/${syncTeamName}`;
             if (!existsSync(teamDir)) mkdirSync(teamDir, { recursive: true });
@@ -6806,7 +6792,7 @@ export class AgentManagerDb {
           };
         }
 
-        const { agents, calendar, errors, onchain, teamName: configTeam, org } = processConfig(absolutePath, this.baseWorkDir, deployArgs);
+        const { agents, calendar, errors, teamName: configTeam, org } = processConfig(absolutePath, this.baseWorkDir, deployArgs);
 
         // If config specifies a team, use that instead of the request's team
         let effectiveTeamId = teamId;
@@ -6844,7 +6830,6 @@ export class AgentManagerDb {
             const orgMd = generateOrgChart(effectiveTeamName, org, agents.map(a => ({
               name: a.name,
               description: a.description,
-              domain: a.domain,
             })));
             const teamDir = `${this.baseWorkDir}/teams/${effectiveTeamName}`;
             if (!existsSync(teamDir)) mkdirSync(teamDir, { recursive: true });
@@ -6873,7 +6858,7 @@ export class AgentManagerDb {
         }
 
         // Deploy each agent
-        const results: { name: string; id?: string; port?: number; success: boolean; error?: string; tokenId?: string }[] = [];
+        const results: { name: string; id?: string; port?: number; success: boolean; error?: string }[] = [];
 
         // Re-seed calendar schedules idempotently for this config source.
         if (this.schedulerService) {
@@ -6933,18 +6918,9 @@ export class AgentManagerDb {
               ...(agentConfig.catalog && { catalog: agentConfig.catalog })
             };
 
-            // Use ENS domain from config if available (preserves registration across redeploys)
-            const configDomain = agentConfig.domain;
-            const configTokenId = agentConfig.tokenId;
-            const agentName = configDomain || agentConfig.name;
-            if (configDomain) {
-              metadata.idchain_domain = configDomain;
-              metadata.alias = agentConfig.name;
-            }
-
             // Wallet opt-in (default off). Record the explicit choice in
             // metadata so the on-demand provisioning command and the
-            // onchain auto-provision gate can read it. Only call the `ows`
+            // wallet auto-provision gate can read it. Only call the `ows`
             // CLI when `wallet: true`.
             if (agentConfig.wallet !== undefined) {
               metadata.wallet = agentConfig.wallet;
@@ -6972,11 +6948,8 @@ export class AgentManagerDb {
               } catch { /* ignore */ }
             }
             this.deploySkillsToAgent(workingDirectory, agentSkills, {
-              DISPLAY_NAME: configDomain || agentConfig.name,
+              DISPLAY_NAME: agentConfig.name,
               TEAM: effectiveTeamName,
-              ONCHAIN_IDENTITY: configDomain
-                ? `Your onchain identity is your ENS domain: **${configDomain}**`
-                : '',
               ORG_CONTEXT: orgContext
                 ? `\n## Your Role\n\n${orgContext}\n\nSee the full org chart at the shared team folder for details on all groups.`
                 : '',
@@ -7000,7 +6973,7 @@ export class AgentManagerDb {
             }
 
             // Remove any existing agent with this name to avoid duplicates on redeploy
-            const existing = await this.db.agents.getByName(effectiveTeamId, agentName);
+            const existing = await this.db.agents.getByName(effectiveTeamId, agentConfig.name);
             if (existing) {
               // Kill the old process before deleting the DB row to prevent orphans
               if (existing.port) {
@@ -7011,11 +6984,11 @@ export class AgentManagerDb {
             }
 
             // Insert into database
-            console.log(`[Deploy] Storing agent: name=${agentName}, type=${agentType}, configType=${agentConfig.type}`);
+            console.log(`[Deploy] Storing agent: name=${agentConfig.name}, type=${agentType}, configType=${agentConfig.type}`);
             await this.db.agents.create({
               team_id: effectiveTeamId,
               id: agentId,
-              name: agentName,
+              name: agentConfig.name,
               type: agentType,
               model: effectiveModel,
               port,
@@ -7025,8 +6998,6 @@ export class AgentManagerDb {
               created_at: Date.now(),
               metadata,
               runtime: effectiveRuntime,
-              token_id: configTokenId || null,
-              domain: configDomain || null,
             });
 
             // All agents run locally - set up database and let CLI spawn the process
@@ -7045,7 +7016,6 @@ export class AgentManagerDb {
               port,
               model: effectiveModel,
               workingDirectory,
-              tokenId: configTokenId || undefined,
               address: (agentConfig as any).address || undefined
             });
 
@@ -7055,7 +7025,7 @@ export class AgentManagerDb {
               await this.schedulerService.seedSchedule(definition, agentIds);
             }
 
-            const result: { name: string; id: string; port: number; success: boolean; tokenId?: string; domain?: string; txHash?: string; local: boolean; workingDirectory: string; pid?: number; logFile?: string } = {
+            const result: { name: string; id: string; port: number; success: boolean; local: boolean; workingDirectory: string; pid?: number; logFile?: string } = {
               name: agentConfig.name,
               id: agentId,
               port,
@@ -7069,41 +7039,6 @@ export class AgentManagerDb {
               result.logFile = spawnResult.logFile;
               // Update status to running
               await this.db.agents.updateStatus(agentId, 'running');
-            }
-
-            // Auto-register onchain if enabled (automators never register)
-            const shouldRegister = !isAutomator && (agentConfig.register !== undefined ? agentConfig.register : onchain?.register);
-            if (shouldRegister) {
-              try {
-                // Fetch the agent row for registration
-                const agentRow = await this.db.agents.getById(agentId);
-                if (agentRow) {
-                  const regResult = await this.registerOnchainAndUpdateAgent(effectiveTeamId, agentRow);
-                  console.log(`[Deploy] Registration result: domain=${regResult.domain}, tokenId=${regResult.tokenId}, txHash=${regResult.txHash}`);
-                  result.tokenId = regResult.tokenId;
-                  result.domain = regResult.domain;
-                  result.txHash = regResult.txHash;
-
-                  // Update CLAUDE.md with agent's full identity after registration
-                  if (regResult.tokenId) {
-                    console.log(`[Deploy] Writing identity to CLAUDE.md at ${workingDirectory}`);
-                    try {
-                      const claudeDir = path.join(workingDirectory, '.claude');
-                      if (!existsSync(claudeDir)) {
-                        console.log(`[Deploy] Creating .claude directory: ${claudeDir}`);
-                        mkdirSync(claudeDir, { recursive: true });
-                      }
-                      this.updateClaudeMdIdentity(path.join(claudeDir, 'CLAUDE.md'), regResult.domain || agentConfig.name);
-                      console.log(`[Deploy] Updated CLAUDE.md with identity: ${regResult.domain || agentConfig.name}`);
-                    } catch (identityErr: any) {
-                      console.warn(`[Deploy] Failed to update identity in CLAUDE.md: ${identityErr.message}`);
-                    }
-                  }
-                }
-              } catch (regErr: any) {
-                // Registration failure is non-fatal
-                console.warn(`[Deploy] Auto-register failed for ${agentConfig.name}: ${regErr.message}`);
-              }
             }
 
             results.push(result);

@@ -8,7 +8,7 @@
  *   - Agent-level `wallet` overrides defaults in either direction.
  *   - `mergeDefaults` leaves the field undefined when neither side sets it,
  *     so the deploy/sync code can distinguish "explicitly off" from "never
- *     touched" (the onchain registration path uses this distinction).
+ *     touched" (the wallet auto-provision gate uses this distinction).
  */
 
 import { describe, expect, it } from 'vitest';
