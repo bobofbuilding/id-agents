@@ -32,5 +32,8 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Build
+        run: npm run build
+
       - name: Run CI preflight
         run: npm run ci:preflight
