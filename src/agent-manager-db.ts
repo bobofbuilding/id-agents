@@ -1234,6 +1234,34 @@ export class AgentManagerDb {
       registered_at: new Date().toISOString(),
     };
 
+    await this.stageAndDeliverIdentityFile(agent, identity);
+  }
+
+  /**
+   * Wallet-only identity delivery for remote public agents: pushes name,
+   * ows_address, and service_endpoint — no onchain fields — so the VPS
+   * runtime can advertise its wallet address after OWS provisioning.
+   */
+  private async stageAndDeliverRemoteWalletIdentity(agent: AgentRow): Promise<void> {
+    const metadata = (agent.metadata || {}) as Record<string, any>;
+    const identity = {
+      name: agent.name,
+      ows_address: metadata.ows_address || '',
+      service_endpoint: agent.public_endpoint_url || (agent.customer_domain ? `https://${agent.customer_domain}` : ''),
+      registered_at: new Date().toISOString(),
+    };
+
+    await this.stageAndDeliverIdentityFile(agent, identity);
+  }
+
+  /**
+   * Write an identity payload to the local staging directory and (if
+   * ssh_target is set) deliver it to the remote VPS over SCP.
+   *
+   * On SSH delivery failure the manager-side state is still authoritative;
+   * the manager logs a warning and returns successfully.
+   */
+  private async stageAndDeliverIdentityFile(agent: AgentRow, identity: Record<string, unknown>): Promise<void> {
     // Staging path: <baseWorkDir>/public-agents/<agent.id>/staging/identity.json
     const stagingDir = path.join(this.baseWorkDir, 'public-agents', agent.id, 'staging');
     mkdirSync(stagingDir, { recursive: true });
@@ -1255,7 +1283,7 @@ export class AgentManagerDb {
           `[Register] SSH delivery failed for agent ${agent.id} (${redactedTarget}): ` +
           `error=${deliverResult.error} stderr=${deliverResult.stderr ?? ''}`,
         );
-        // Do NOT throw — on-chain state is authoritative regardless.
+        // Do NOT throw — manager-side state is authoritative regardless.
       }
     }
   }
@@ -3345,6 +3373,19 @@ export class AgentManagerDb {
 
         const remoteWalletOptIn = wallet === true;
 
+        // Phase 4 security posture is stamped at manager-join so the DMZ
+        // semantics hold from the moment the row exists, independent of any
+        // later registration step.
+        const remoteMetadata: AgentMetadata = {
+          wallet: remoteWalletOptIn,
+          mesh_member: false,
+          mesh_reachable: false,
+          public_endpoint: true,
+          dmz: true,
+          allowed_inbound: ['public_http'],
+          allowed_outbound: ['openrouter'],
+        };
+
         await this.db.agents.create({
           team_id: teamId,
           id: remoteId,
@@ -3361,8 +3402,30 @@ export class AgentManagerDb {
           public_endpoint_url: public_endpoint_url,
           internal_endpoint_url: internal_endpoint_url ?? null,
           ssh_target: ssh_target ?? null,
-          metadata: { wallet: remoteWalletOptIn },
+          metadata: remoteMetadata,
         });
+
+        // Wallet opt-in: provision an OWS wallet at join time (the manager
+        // host owns the `ows` CLI; the VPS never sees key material).
+        // Non-fatal — the agent still joins without a wallet if OWS is
+        // missing or creation fails.
+        let responseMetadata: AgentMetadata = remoteMetadata;
+        if (remoteWalletOptIn) {
+          const row = await this.dbQueryAgentById(teamId, remoteId);
+          if (row) {
+            const refreshed = await this.provisionAgentWalletForRow(teamId, 'public', row);
+            if (refreshed) {
+              responseMetadata = (refreshed.metadata || remoteMetadata) as AgentMetadata;
+              try {
+                await this.stageAndDeliverRemoteWalletIdentity(refreshed);
+              } catch (err: any) {
+                console.warn(`[Register] Wallet identity delivery failed for "${remoteName}": ${err?.message || String(err)}`);
+              }
+            } else {
+              console.warn(`[Register] OWS not installed or wallet creation failed for remote agent "${remoteName}". Proceeding without wallet.`);
+            }
+          }
+        }
 
         return res.status(201).json({
           id: remoteId,
@@ -3376,7 +3439,7 @@ export class AgentManagerDb {
           public_endpoint_url,
           internal_endpoint_url: internal_endpoint_url ?? null,
           ssh_target: ssh_target ?? null,
-          metadata: { wallet: remoteWalletOptIn },
+          metadata: responseMetadata,
           health: 'unknown',
         });
       }
@@ -7152,6 +7215,15 @@ export class AgentManagerDb {
           const refreshed = await this.provisionAgentWalletForRow(teamId, teamName, agent);
           if (!refreshed) {
             return { ok: false, error: `Failed to provision OWS wallet for ${agent.name}` };
+          }
+          // Push the wallet identity to the remote VPS (non-fatal) so the
+          // public-agent can advertise its new address.
+          if (isRemoteEndpointRuntime(refreshed.runtime)) {
+            try {
+              await this.stageAndDeliverRemoteWalletIdentity(refreshed);
+            } catch (err: any) {
+              console.warn(`[Wallet] Identity delivery failed for ${refreshed.name}: ${err?.message || String(err)}`);
+            }
           }
           const provisionedMeta = (refreshed.metadata || {}) as Record<string, any>;
           return {

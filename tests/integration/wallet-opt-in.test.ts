@@ -120,10 +120,12 @@ describe('wallet opt-in manager integration', () => {
     return resp.json() as Promise<{ id: string; name: string }>;
   }
 
-  it('does not auto-provision remote wallets during onchain register when wallet is not enabled', async () => {
-    const agent = await registerRemoteAgent('walletless-remote');
+  it('does not auto-provision remote wallets at join or onchain register when wallet is not enabled', async () => {
     const getOrCreate = vi.fn(() => ({ walletName: 'public-walletless-remote', address: '0x1111' }));
     (manager as any).getOrCreateAgentWallet = getOrCreate;
+
+    const agent = await registerRemoteAgent('walletless-remote');
+    expect(getOrCreate).not.toHaveBeenCalled();
 
     const regResp = await fetch(`${baseUrl}/agents/${agent.id}/onchain/register`, {
       method: 'POST',
@@ -143,10 +145,13 @@ describe('wallet opt-in manager integration', () => {
     expect(detail.metadata?.ows_address).toBeUndefined();
   });
 
-  it('auto-provisions remote wallets during onchain register when wallet is enabled', async () => {
-    const agent = await registerRemoteAgent('wallet-enabled-remote', { wallet: true });
+  it('provisions remote wallets at manager-join when wallet is enabled; onchain register reuses them', async () => {
     const getOrCreate = vi.fn(() => ({ walletName: 'public-wallet-enabled-remote', address: '0x2222' }));
     (manager as any).getOrCreateAgentWallet = getOrCreate;
+
+    const agent = await registerRemoteAgent('wallet-enabled-remote', { wallet: true });
+    expect(getOrCreate).toHaveBeenCalledWith('public', 'wallet-enabled-remote');
+    expect(getOrCreate).toHaveBeenCalledTimes(1);
 
     const regResp = await fetch(`${baseUrl}/agents/${agent.id}/onchain/register`, {
       method: 'POST',
@@ -154,7 +159,9 @@ describe('wallet opt-in manager integration', () => {
       body: JSON.stringify({}),
     });
     expect(regResp.ok).toBe(true);
-    expect(getOrCreate).toHaveBeenCalledWith('public', 'wallet-enabled-remote');
+    // Onchain registration must not re-provision — the wallet was already
+    // attached at join time and the auto-provision gate is idempotent.
+    expect(getOrCreate).toHaveBeenCalledTimes(1);
 
     const detailResp = await fetch(`${baseUrl}/agents/${agent.id}`, {
       headers: adminHeaders('public'),
