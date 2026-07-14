@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.110]
+
+- Route confirmed subscription session, daily, weekly, and monthly caps to the next healthy authenticated subscription runtime before considering metered or local fallback.
+- Replay interrupted queries with their existing session context and restore the preferred runtime and model when its cooldown ends.
+- Skip cooling or failed-preflight subscription lanes and reject synthetic metered-overflow lanes when no metered credential is configured.
+
 ## [0.1.109]
 
 - Prevent manager event-loop stalls during retention by adding covering query/news indexes and bounding SQLite event, query, and news cleanup to 500 rows per pass.

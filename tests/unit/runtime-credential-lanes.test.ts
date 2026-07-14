@@ -139,6 +139,137 @@ describe('runtime credential lanes', () => {
     );
   });
 
+  it('moves a session-capped Claude agent to the next active subscription runtime and replays the query', async () => {
+    const agent = {
+      team_id: 'team-1',
+      id: 'agent-1',
+      name: 'hr-manager',
+      type: 'claude',
+      model: 'claude-opus-4-8',
+      port: 4311,
+      endpoint: 'http://localhost:4311',
+      working_directory: '/tmp/agent-1',
+      status: 'running',
+      created_at: 1,
+      registry: null,
+      metadata: { rateLimitSubscriptionRuntimes: ['codex', 'antigravity'] },
+      deleted_at: null,
+      runtime: 'claude-code-cli',
+      token_id: null,
+      domain: null,
+      api_key: null,
+      customer_domain: null,
+      public_endpoint_url: null,
+      internal_endpoint_url: null,
+      ssh_target: null,
+      last_seen: null,
+      last_probed_at: null,
+      last_error: null,
+      consecutive_failures: 0,
+    };
+    const db = fakeDb({
+      agents: { getById: vi.fn(async () => agent) },
+      queries: {
+        getByQueryIdForTeam: vi.fn(async () => ({
+          team_id: 'team-1',
+          agent_id: agent.id,
+          query_id: 'query-original',
+          status: 'failed',
+          prompt: 'triage the staffing plan',
+          created: 1,
+          completed: 2,
+          result: null,
+          error: 'session limit',
+          session_id: 'session-1',
+          owner_kind: 'agent',
+          owner_id: agent.id,
+          metadata: null,
+        })),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-subscription-runtime-test', db, { libraryRoot: null }) as any;
+    manager.isSubscriptionRuntimeActive = vi.fn((runtime: string) => runtime === 'codex');
+    manager.rebuildLocalClaudeAgent = vi.fn(async () => ({ success: true, pid: 1234 }));
+    manager.forwardToAgent = vi.fn(async () => ({ ok: true, data: { query_id: 'query-retry' } }));
+
+    const failover = await manager.handleRuntimeRateLimitFailover('team-1', 'legal', {
+      laneId: 'claude-code-cli:default',
+      runtime: 'claude-code-cli',
+      kind: 'subscription',
+      coolingUntilMs: Date.now() + 60_000,
+      observedAtMs: Date.now(),
+      reason: 'subscription_session_cap_unknown_window',
+      teamId: 'team-1',
+      agentId: agent.id,
+      queryId: 'query-original',
+    });
+
+    expect(failover).toMatchObject({
+      attempted: true,
+      success: true,
+      laneId: 'codex:default',
+      retryQueryId: 'query-retry',
+    });
+    expect(db.agents.updateStatus).toHaveBeenCalledWith(agent.id, 'pending', expect.objectContaining({
+      runtime: 'codex',
+      metadata: expect.objectContaining({
+        runtimeCredentialLane: 'codex:default',
+        runtimeRateLimitFailover: expect.objectContaining({
+          fromRuntime: 'claude-code-cli',
+          toRuntime: 'codex',
+          fromLaneId: 'claude-code-cli:default',
+        }),
+      }),
+    }));
+    expect(manager.forwardToAgent).toHaveBeenCalledWith(
+      'http://localhost:4311',
+      'triage the staffing plan',
+      'manager',
+      'session-1',
+    );
+    expect(db.queries.create).toHaveBeenCalledWith(
+      'team-1',
+      'query-retry',
+      agent.id,
+      'triage the staffing plan',
+      expect.any(Number),
+      'session-1',
+      undefined,
+      expect.objectContaining({
+        retry_of: 'query-original',
+        runtime: 'codex',
+        runtimeCredentialLane: 'codex:default',
+      }),
+    );
+  });
+
+  it('skips a cooling subscription runtime and selects the next active runtime', () => {
+    const manager = new AgentManagerDb('/tmp/id-agents-subscription-order-test', fakeDb(), { libraryRoot: null }) as any;
+    manager.runtimeLaneCooldowns.set('codex:default', {
+      laneId: 'codex:default',
+      runtime: 'codex',
+      kind: 'subscription',
+      coolingUntilMs: Date.now() + 60_000,
+      observedAtMs: Date.now(),
+      reason: 'subscription_monthly_cap',
+    });
+    manager.isSubscriptionRuntimeActive = vi.fn(() => true);
+
+    const fallback = manager.resolveRateLimitSubscriptionFallback({
+      id: 'agent-1',
+      name: 'hr-manager',
+      runtime: 'claude-code-cli',
+      model: 'claude-opus-4-8',
+      metadata: { rateLimitSubscriptionRuntimes: ['codex', 'antigravity', 'grok'] },
+    }, 'team-1', 'claude-code-cli');
+
+    expect(fallback).toEqual({
+      runtime: 'antigravity',
+      model: 'Gemini 3.5 Flash (Medium)',
+      laneId: 'antigravity:default',
+    });
+  });
+
   it('switches Codex models and replays work when the selected model is at capacity', async () => {
     const agent = {
       team_id: 'team-1',
@@ -363,6 +494,7 @@ describe('runtime credential lanes', () => {
       },
     });
     const manager = new AgentManagerDb('/tmp/id-agents-runtime-test', db, { libraryRoot: null }) as any;
+    manager.isSubscriptionRuntimeActive = vi.fn(() => false);
     manager.runtimeCredentialPoolByTeam.set('team-1', {
       lanes: [
         { id: 'sub-a', runtime: 'claude-code-cli', kind: 'subscription' },
@@ -479,6 +611,7 @@ describe('runtime credential lanes', () => {
       },
     });
     const manager = new AgentManagerDb('/tmp/id-agents-runtime-test', db, { libraryRoot: null }) as any;
+    manager.isSubscriptionRuntimeActive = vi.fn(() => false);
     manager.rebuildLocalClaudeAgent = vi.fn(async () => ({ success: true, pid: 1234 }));
     manager.forwardToAgent = vi.fn(async () => ({ ok: true, data: { query_id: 'query-retry' } }));
 
@@ -632,6 +765,7 @@ describe('runtime credential lanes', () => {
       },
     });
     const manager = new AgentManagerDb('/tmp/id-agents-runtime-test', db, { libraryRoot: null }) as any;
+    manager.isSubscriptionRuntimeActive = vi.fn(() => false);
     manager.runtimeCredentialPoolByTeam.set('team-1', {
       lanes: [
         { id: 'sub-a', runtime: 'claude-code-cli', kind: 'subscription' },
@@ -865,6 +999,67 @@ describe('runtime credential lanes', () => {
     );
   });
 
+  it('restores a cross-subscription fallback to its original runtime after cooldown', async () => {
+    const now = Date.now();
+    const fallbackAgent = {
+      team_id: 'team-1',
+      id: 'agent-1',
+      name: 'hr-manager',
+      type: 'claude',
+      model: '',
+      port: 4311,
+      endpoint: 'http://localhost:4311',
+      working_directory: '/tmp/agent-1',
+      status: 'running',
+      created_at: 1,
+      registry: null,
+      metadata: {
+        runtimeCredentialLane: 'codex:default',
+        runtimeRateLimitFailover: {
+          fromLaneId: 'claude-code-cli:default',
+          failedLaneId: 'claude-code-cli:default',
+          toLaneId: 'codex:default',
+          fromRuntime: 'claude-code-cli',
+          toRuntime: 'codex',
+          fromModel: 'claude-opus-4-8',
+          toModel: '',
+          reason: 'subscription_session_cap_unknown_window',
+        },
+      },
+      deleted_at: null,
+      runtime: 'codex',
+      token_id: null,
+      domain: null,
+      api_key: null,
+      customer_domain: null,
+      public_endpoint_url: null,
+      internal_endpoint_url: null,
+      ssh_target: null,
+      last_seen: null,
+      last_probed_at: null,
+      last_error: null,
+      consecutive_failures: 0,
+    };
+    const db = fakeDb({ agents: { updateStatus: vi.fn(async () => {}) } });
+    const manager = new AgentManagerDb('/tmp/id-agents-cross-runtime-restore-test', db, { libraryRoot: null }) as any;
+    manager.rebuildLocalClaudeAgent = vi.fn(async () => ({ success: true, pid: 1234 }));
+
+    const restored = await manager.restoreAgentFromRateLimitFallbackIfReady('team-1', 'legal', fallbackAgent, now);
+
+    expect(restored).toBe(true);
+    expect(db.agents.updateStatus).toHaveBeenCalledWith(fallbackAgent.id, 'pending', expect.objectContaining({
+      runtime: 'claude-code-cli',
+      model: 'claude-opus-4-8',
+      metadata: expect.objectContaining({
+        runtimeCredentialLane: 'claude-code-cli:default',
+        runtimeRateLimitRestore: expect.objectContaining({
+          fromRuntime: 'codex',
+          toRuntime: 'claude-code-cli',
+        }),
+      }),
+    }));
+  });
+
   it('does not restore agents while the original lane is still cooling', async () => {
     const now = Date.now();
     const fallbackAgent = {
@@ -1056,7 +1251,7 @@ describe('runtime credential lanes', () => {
     expect(db.agents.updateMetadata).toHaveBeenCalledWith('agent-1', expect.objectContaining({
       runtimeRateLimitRestore: expect.objectContaining({
         skippedAtMs: now,
-        reason: 'agent already left local fallback runtime',
+          reason: 'agent already left rate-limit fallback runtime',
         currentRuntime: 'codex',
         currentModel: 'gpt-5.5',
       }),
@@ -1190,6 +1385,7 @@ describe('runtime credential lanes', () => {
       },
     });
     const manager = new AgentManagerDb('/tmp/id-agents-runtime-test', db, { libraryRoot: null }) as any;
+    manager.isSubscriptionRuntimeActive = vi.fn(() => false);
     manager.runtimeCredentialPoolByTeam.set('team-1', {
       lanes: [
         { id: 'sub-a', runtime: 'claude-code-cli', kind: 'subscription' },

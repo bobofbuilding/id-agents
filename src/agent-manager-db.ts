@@ -629,6 +629,12 @@ interface RuntimeCredentialLane {
   env?: Record<string, string>;
 }
 
+interface RuntimeSubscriptionFallback {
+  runtime: HarnessType;
+  model: string;
+  laneId: string;
+}
+
 interface ProviderRuntimeAssignment {
   lane: string;
   name: string;
@@ -745,6 +751,7 @@ export class AgentManagerDb {
   private providerRuntimeAssignments: Map<string, ProviderRuntimeAssignment> = new Map();
   private runtimeFailoverRetryOf: Map<string, string> = new Map();
   private installedOllamaModelsCache: { at: number; models: string[] } | null = null;
+  private subscriptionRuntimeAvailabilityCache: Map<string, { checkedAt: number; active: boolean }> = new Map();
   private runtimeFallbackRestoreInFlight: Promise<void> | null = null;
   private lastRuntimeFallbackRestoreSweepAt = 0;
   private agentLifecycleLocks: Map<string, Promise<void>> = new Map();
@@ -5510,17 +5517,40 @@ Return this JSON shape:
       return this.handleRuntimeModelCapacityFallback(teamId, teamName, agent, cooldown);
     }
 
-    if (runtime !== 'claude-code-cli' && runtime !== 'claude-code-local') {
+    const isClaudeCliRuntime = runtime === 'claude-code-cli' || runtime === 'claude-code-local';
+    const nextLane = isClaudeCliRuntime
+      ? this.chooseRuntimeCredentialLane(runtime, cooldown.laneId, teamId, true)
+      : null;
+    if (this.canUseSubscriptionRuntimeFallback(cooldown) && nextLane?.kind !== 'subscription') {
+      const subscriptionFallback = await this.handleRuntimeRateLimitSubscriptionFallback(
+        teamId,
+        teamName,
+        agent,
+        runtime,
+        cooldown,
+      );
+      if (subscriptionFallback.attempted) return subscriptionFallback;
+    }
+
+    if (!isClaudeCliRuntime) {
       if (!this.canUseLocalFallbackForRuntimeRateLimit(cooldown)) return { attempted: false };
       const localFallback = await this.handleRuntimeRateLimitLocalFallback(teamId, teamName, agent, runtime, cooldown);
       return localFallback.attempted ? localFallback : { attempted: false };
     }
 
-    const nextLane = this.chooseRuntimeCredentialLane(runtime, cooldown.laneId, teamId, true);
+    if (!nextLane) return { attempted: false };
     if (nextLane.kind === 'metered-api') {
       if (this.canUseLocalFallbackForRuntimeRateLimit(cooldown)) {
         const localFallback = await this.handleRuntimeRateLimitLocalFallback(teamId, teamName, agent, runtime, cooldown);
         if (localFallback.attempted) return localFallback;
+      }
+      const hasMeteredCredential = Boolean(
+        nextLane.env?.ANTHROPIC_API_KEY
+        || process.env.ID_AGENT_OVERFLOW_ANTHROPIC_API_KEY
+        || process.env.ANTHROPIC_API_KEY,
+      );
+      if (nextLane.id.endsWith(':metered-overflow') && !hasMeteredCredential) {
+        return { attempted: false, error: 'no healthy subscription runtime or metered credential is available' };
       }
     }
 
@@ -5698,6 +5728,182 @@ Return this JSON shape:
     // agent to Ollama.
     return cooldown.kind === 'subscription'
       && (cooldown.reason === 'subscription_daily_cap' || cooldown.reason === 'subscription_weekly_cap');
+  }
+
+  private canUseSubscriptionRuntimeFallback(cooldown: RuntimeLaneCooldown): boolean {
+    return cooldown.kind === 'subscription' && /^subscription_(?:session|daily|weekly|monthly)_cap/.test(cooldown.reason);
+  }
+
+  private subscriptionFallbackRuntimeOrder(agent: AgentRow, currentRuntime: HarnessType): HarnessType[] {
+    const metadata = (agent.metadata as Record<string, unknown>) || {};
+    const configured = Array.isArray(metadata.rateLimitSubscriptionRuntimes)
+      ? metadata.rateLimitSubscriptionRuntimes.map(String)
+      : String(process.env.ID_RATE_LIMIT_SUBSCRIPTION_FALLBACKS || '')
+          .split(',')
+          .map((runtime) => runtime.trim())
+          .filter(Boolean);
+    const defaults: HarnessType[] = [
+      'claude-code-cli',
+      'codex',
+      'antigravity',
+      'grok',
+      'copilot',
+      'kiro-cli',
+      'cursor-cli',
+    ];
+    const raw = configured.length ? configured : defaults;
+    const normalized = raw
+      .filter((runtime) => isRuntimeId(runtime))
+      .map((runtime) => resolveRuntime(runtime) as HarnessType)
+      .filter((runtime) => runtime !== currentRuntime && runtime !== 'claude-code-local');
+    return [...new Set(normalized)];
+  }
+
+  private subscriptionFallbackModel(agent: AgentRow, runtime: HarnessType): string {
+    const metadata = (agent.metadata as Record<string, unknown>) || {};
+    const overrides = metadata.rateLimitSubscriptionModels && typeof metadata.rateLimitSubscriptionModels === 'object'
+      ? metadata.rateLimitSubscriptionModels as Record<string, unknown>
+      : {};
+    const override = typeof overrides[runtime] === 'string' ? String(overrides[runtime]).trim() : '';
+    return override || getDefaultModelForRuntime(runtime);
+  }
+
+  private isSubscriptionRuntimeActive(runtime: HarnessType, model: string): boolean {
+    const key = `${runtime}:${model}`;
+    const now = Date.now();
+    const ttlMs = Math.max(30_000, Number(process.env.ID_RUNTIME_PREFLIGHT_CACHE_MS || 5 * 60_000) || 5 * 60_000);
+    const cached = this.subscriptionRuntimeAvailabilityCache.get(key);
+    if (cached && now - cached.checkedAt < ttlMs) return cached.active;
+    const active = validateRuntimePreflight(runtime, model || undefined).length === 0;
+    this.subscriptionRuntimeAvailabilityCache.set(key, { checkedAt: now, active });
+    return active;
+  }
+
+  private resolveRateLimitSubscriptionFallback(
+    agent: AgentRow,
+    teamId: string,
+    currentRuntime: HarnessType,
+  ): RuntimeSubscriptionFallback | null {
+    for (const runtime of this.subscriptionFallbackRuntimeOrder(agent, currentRuntime)) {
+      const lane = this.chooseRuntimeCredentialLane(runtime, undefined, teamId);
+      if (lane.kind !== 'subscription' || this.isRuntimeLaneCooling(lane.id)) continue;
+      const model = this.subscriptionFallbackModel(agent, runtime);
+      if (!this.isSubscriptionRuntimeActive(runtime, model)) continue;
+      return { runtime, model, laneId: lane.id };
+    }
+    return null;
+  }
+
+  private async handleRuntimeRateLimitSubscriptionFallback(
+    teamId: string,
+    teamName: string,
+    agent: AgentRow,
+    fromRuntime: HarnessType,
+    cooldown: RuntimeLaneCooldown,
+  ): Promise<{ attempted: boolean; success?: boolean; pid?: number; retryQueryId?: string; laneId?: string; error?: string }> {
+    const fallback = this.resolveRateLimitSubscriptionFallback(agent, teamId, fromRuntime);
+    if (!fallback) return { attempted: false };
+
+    const metadata = (agent.metadata as Record<string, unknown>) || {};
+    const priorFailover = metadata.runtimeRateLimitFailover && typeof metadata.runtimeRateLimitFailover === 'object'
+      ? metadata.runtimeRateLimitFailover as Record<string, unknown>
+      : null;
+    const preferredRuntime = typeof priorFailover?.fromRuntime === 'string'
+      ? resolveRuntime(priorFailover.fromRuntime) as HarnessType
+      : fromRuntime;
+    const preferredModel = typeof priorFailover?.fromModel === 'string'
+      ? priorFailover.fromModel
+      : agent.model;
+    const preferredLaneId = this.preferredRuntimeLaneForRestore(
+      preferredRuntime,
+      teamId,
+      typeof priorFailover?.fromLaneId === 'string' ? priorFailover.fromLaneId : cooldown.laneId,
+    );
+    const nextMetadata: Record<string, unknown> = {
+      ...metadata,
+      runtimeCredentialLane: fallback.laneId,
+      runtimeRateLimitFailover: {
+        fromLaneId: preferredLaneId,
+        failedLaneId: cooldown.laneId,
+        toLaneId: fallback.laneId,
+        fromRuntime: preferredRuntime,
+        toRuntime: fallback.runtime,
+        fromModel: preferredModel,
+        toModel: fallback.model,
+        reason: cooldown.reason,
+        queryId: cooldown.queryId,
+        observedAtMs: Date.now(),
+      },
+      previousRuntimeBeforeRateLimit: preferredRuntime,
+      previousModelBeforeRateLimit: preferredModel,
+    };
+
+    await this.db.agents.updateStatus(agent.id, 'pending', {
+      runtime: fallback.runtime,
+      model: fallback.model,
+      metadata: nextMetadata,
+    });
+    const spawnResult = await this.rebuildLocalClaudeAgent(teamId, teamName, {
+      ...agent,
+      runtime: fallback.runtime,
+      model: fallback.model,
+      metadata: nextMetadata,
+    });
+    if (!spawnResult.success) {
+      return { attempted: true, success: false, pid: spawnResult.pid, laneId: fallback.laneId, error: spawnResult.error };
+    }
+    if (!cooldown.queryId) return { attempted: true, success: true, pid: spawnResult.pid, laneId: fallback.laneId };
+
+    const query = await this.db.queries.getByQueryIdForTeam(teamId, cooldown.queryId).catch(() => null);
+    if (!query?.prompt) {
+      return { attempted: true, success: true, pid: spawnResult.pid, laneId: fallback.laneId, error: 'original query not found for subscription-runtime replay' };
+    }
+    const result = await this.forwardToAgent(`http://localhost:${agent.port}`, query.prompt, 'manager', query.session_id ?? undefined);
+    if (!result.ok) {
+      return { attempted: true, success: false, pid: spawnResult.pid, laneId: fallback.laneId, error: result.error };
+    }
+
+    const retryQueryId = result.data?.query_id ? String(result.data.query_id) : undefined;
+    if (retryQueryId) {
+      this.runtimeFailoverRetryOf.set(retryQueryId, cooldown.queryId);
+      await this.db.queries.create(
+        teamId,
+        retryQueryId,
+        agent.id,
+        query.prompt,
+        Date.now(),
+        query.session_id ?? undefined,
+        undefined,
+        {
+          ...(query.metadata || {}),
+          retry_of: cooldown.queryId,
+          runtime: fallback.runtime,
+          model: fallback.model,
+          runtimeCredentialLane: fallback.laneId,
+          failedRuntimeCredentialLane: cooldown.laneId,
+        },
+      );
+    }
+
+    await this.db.news.add(teamId, agent.id, {
+      timestamp: Date.now(),
+      type: 'runtime.failover',
+      message: `Subscription cap detected; switched ${agent.name} from ${fromRuntime} to ${fallback.runtime}${retryQueryId ? ' and replayed the interrupted query' : ''}`,
+      data: {
+        fromRuntime: preferredRuntime,
+        fromModel: preferredModel,
+        fromLaneId: preferredLaneId,
+        failedLaneId: cooldown.laneId,
+        toRuntime: fallback.runtime,
+        toModel: fallback.model,
+        toLaneId: fallback.laneId,
+        retryQueryId,
+        retryOf: cooldown.queryId,
+      },
+      query_id: retryQueryId || cooldown.queryId,
+    }).catch(() => {});
+
+    return { attempted: true, success: true, pid: spawnResult.pid, retryQueryId, laneId: fallback.laneId };
   }
 
   private preferredRuntimeLaneForRestore(
@@ -6101,16 +6307,25 @@ Return this JSON shape:
       });
       return spawnResult.success;
     }
-    if (failover.toRuntime !== 'ollama') {
+    const failoverFromRuntime = typeof failover.fromRuntime === 'string'
+      ? resolveRuntime(failover.fromRuntime) as HarnessType
+      : undefined;
+    const failoverToRuntime = typeof failover.toRuntime === 'string'
+      ? resolveRuntime(failover.toRuntime) as HarnessType
+      : undefined;
+    const isCrossRuntimeFailover = Boolean(
+      failoverFromRuntime && failoverToRuntime && failoverFromRuntime !== failoverToRuntime,
+    );
+    if (!isCrossRuntimeFailover) {
       return this.restoreAgentCredentialLaneIfReady(teamId, teamName, agent, metadata, failover, now);
     }
-    if (agent.runtime !== 'ollama') {
+    if (agent.runtime !== failoverToRuntime) {
       const nextMetadata: Record<string, unknown> = {
         ...metadata,
         runtimeRateLimitRestore: {
           ...(metadata.runtimeRateLimitRestore && typeof metadata.runtimeRateLimitRestore === 'object' ? metadata.runtimeRateLimitRestore as Record<string, unknown> : {}),
           skippedAtMs: now,
-          reason: 'agent already left local fallback runtime',
+          reason: 'agent already left rate-limit fallback runtime',
           currentRuntime: agent.runtime,
           currentModel: agent.model,
         },
