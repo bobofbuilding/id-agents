@@ -12,6 +12,40 @@ function readRepositoryFile(relativePath: string): string {
   return fs.readFileSync(path.join(repositoryRoot, relativePath), 'utf8');
 }
 
+function markdownHeadingAnchor(heading: string): string {
+  return heading
+    .replace(/[`*_~]/g, '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s-]/gu, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-');
+}
+
+function expectLocalMarkdownLinksToResolve(relativePath: string): void {
+  const source = readRepositoryFile(relativePath);
+  const sourceDirectory = path.dirname(path.join(repositoryRoot, relativePath));
+  const linkTargets = [...source.matchAll(/\[[^\]]+\]\(([^)]+)\)/g)].map((match) => match[1]);
+
+  for (const target of linkTargets) {
+    if (/^[a-z]+:/i.test(target)) continue;
+
+    const [relativeTarget, fragment] = target.split('#', 2);
+    const targetPath = relativeTarget
+      ? path.resolve(sourceDirectory, relativeTarget)
+      : path.join(repositoryRoot, relativePath);
+
+    expect(fs.existsSync(targetPath), `${relativePath}: missing link target ${target}`).toBe(true);
+
+    if (fragment) {
+      const targetSource = fs.readFileSync(targetPath, 'utf8');
+      const anchors = [...targetSource.matchAll(/^#{1,6}\s+(.+)$/gm)]
+        .map((match) => markdownHeadingAnchor(match[1]));
+      expect(anchors, `${relativePath}: missing heading fragment ${target}`).toContain(fragment);
+    }
+  }
+}
+
 describe('onboarding and CI preflight contract', () => {
   it('checks in a reproducible pull-request preflight', () => {
     const workflow = parse(readRepositoryFile('.github/workflows/ci-preflight.yml')) as {
@@ -67,11 +101,21 @@ describe('onboarding and CI preflight contract', () => {
 
     expect(contributorGuide).toContain('# Contributor Workflows Index');
     expect(contributorGuide).toContain('## Search this documentation');
+    expect(contributorGuide).toContain('install');
+    expect(contributorGuide).toContain('update');
+    expect(contributorGuide).toContain('troubleshoot');
+    expect(contributorGuide).toContain('CI');
+    expect(contributorGuide).toContain('accessibility');
+    expect(contributorGuide).toContain('./cross-platform-install.md#5-safe-update-procedure');
+    expect(contributorGuide).toContain('../../.github/workflows/ci-preflight.yml');
+    expect(contributorGuide).toContain('../../mobile/src/screens/ScanScreen.tsx');
     expect(contributorGuide).toContain('task lifecycle');
     expect(contributorGuide).toContain('npm run ci:preflight');
     expect(contributingGuide).toContain('docs/guides/contributor-workflows.md');
     expect(contributingGuide).toContain('npm run ci:preflight');
     expect(docsIndex).toContain('./guides/cross-platform-install.md');
     expect(docsIndex).toContain('./guides/contributor-workflows.md');
+
+    expectLocalMarkdownLinksToResolve('docs/guides/contributor-workflows.md');
   });
 });

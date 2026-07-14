@@ -10,7 +10,7 @@ From the repository root, search headings, keywords, and linked guides:
 
 ```bash
 rg -ni --glob '*.md' \
-  'onboard|setup|task lifecycle|claim|done|handoff|delegat|test|pull request|release|agent library' \
+  'onboard|setup|install|update|troubleshoot|CI|accessib|task lifecycle|claim|done|handoff|delegat|test|pull request|release|agent library' \
   CONTRIBUTING.md docs/guides docs/README.md
 ```
 
@@ -20,25 +20,32 @@ To search this index only, use `rg -ni '<keyword>' docs/guides/contributor-workf
 
 | Workflow | Search keywords | Start here | Outcome |
 | --- | --- | --- | --- |
-| Onboard and set up a local checkout | `onboard`, `setup`, `install`, `build`, `test` | [Development setup](../../CONTRIBUTING.md#development-setup) | A working local environment |
+| Install a clean development host | `onboard`, `setup`, `install`, `macOS`, `Linux`, `WSL` | [Cross-platform prerequisites](./cross-platform-install.md#1-install-host-prerequisites) | A working local environment |
+| Update or troubleshoot a checkout | `update`, `upgrade`, `troubleshoot`, `runtime`, `port`, `SQLite` | [Safe update procedure](./cross-platform-install.md#5-safe-update-procedure) and [troubleshooting](./cross-platform-install.md#troubleshooting) | A current, diagnosed checkout |
 | Pick up and complete assigned work | `task lifecycle`, `claim`, `doing`, `done`, `task` | [Task tracking](./tasks.md) | An auditable task transition |
 | Delegate or hand off a work slice | `delegate`, `handoff`, `brief`, `checkin`, `validation` | [Delegation runbook](./delegation-runbook.md) | A clear, supervised ownership transfer |
 | Prepare a dispatch-ready task brief | `task brief`, `acceptance criteria`, `validation path`, `scope` | [Task-brief template](./delegation-task-template.md) | A task another contributor can claim |
-| Implement, preflight, test, and submit a change | `code`, `preflight`, `test`, `build`, `commit`, `pull request` | [Making changes](../../CONTRIBUTING.md#making-changes) | A reviewable pull request |
+| Run the pull-request CI gate | `CI`, `preflight`, `lint`, `typecheck`, `test`, `build` | [CI workflow](../../.github/workflows/ci-preflight.yml) and [local preflight](../../CONTRIBUTING.md#development-setup) | The same quality gate locally and in CI |
+| Review mobile accessibility | `accessibility`, `a11y`, `screen reader`, `label`, `hint`, `touch target` | [Accessibility verification](#mobile-accessibility-verification) | Accessible mobile interaction changes |
 | Add an agent or reusable skill | `agent library`, `skill`, `configs`, `license`, `notice` | [Agent library contributions](../../CONTRIBUTING.md#contributing-agent-library-entries) | A properly attributed library entry |
 | Share a generated artifact | `output`, `artifact`, `report`, `analysis` | [Agent outputs](./agent-outputs.md) | A retrievable artifact in `./output/` |
 | Reconcile a running team after config changes | `sync`, `deploy`, `workspace`, `agent config` | [Sync command](./sync-command.md) | A running team aligned with config |
 | Report a defect | `bug`, `issue`, `reproduce`, `logs` | [Reporting issues](../../CONTRIBUTING.md#reporting-issues) | An actionable bug report |
 
-## Onboarding and local development
+## Install, update, and troubleshoot a local checkout
 
-**Keywords:** `onboard`, `setup`, `install`, `environment`, `build`, `test`.
+**Keywords:** `onboard`, `setup`, `install`, `update`, `upgrade`, `troubleshoot`,
+`environment`, `build`, `test`, `macOS`, `Linux`, `WSL`.
 
-1. Follow [Getting started](../../CONTRIBUTING.md#getting-started): fork, clone,
-   install dependencies, and create your local environment file.
-2. Run the commands in [Development setup](../../CONTRIBUTING.md#development-setup)
+1. For a clean host, follow the [cross-platform install guide](./cross-platform-install.md),
+   including the platform-specific macOS, Linux, or Windows WSL prerequisites.
+2. For an existing checkout, use the [safe update procedure](./cross-platform-install.md#5-safe-update-procedure)
+   before changing dependencies or reconciling a running team.
+3. Diagnose dependency, runtime, port, authentication, WSL, permission, and
+   local SQLite failures through [Troubleshooting](./cross-platform-install.md#troubleshooting).
+4. Run the commands in [Development setup](../../CONTRIBUTING.md#development-setup)
    to build, develop, use the CLI, and test.
-3. Read [Project structure](../../CONTRIBUTING.md#project-structure) before making
+5. Read [Project structure](../../CONTRIBUTING.md#project-structure) before making
    a change so implementation, tests, docs, and library entries land in the
    expected locations.
 
@@ -91,6 +98,28 @@ When work produces a report, analysis, or generated artifact, follow the
 
 The canonical contribution requirements are in
 [Making changes](../../CONTRIBUTING.md#making-changes).
+
+## Mobile accessibility verification
+
+**Keywords:** `accessibility`, `a11y`, `screen reader`, `VoiceOver`, `TalkBack`,
+`label`, `hint`, `state`, `action`, `touch target`.
+
+For mobile interaction changes, keep form controls and actions understandable
+without relying on visual context. Verify accessible labels, hints, roles,
+disabled/selected/busy state, explicit accessibility actions, and at least
+44-point touch targets where applicable. The current reference surfaces are:
+
+- [Command input](../../mobile/src/components/CommandInput.tsx) for labeled input,
+  send-button state, and touch-target sizing.
+- [Server connection](../../mobile/src/screens/ScanScreen.tsx) for labeled fields,
+  permission actions, manual-entry actions, and busy state.
+- [Saved servers](../../mobile/src/screens/SettingsScreen.tsx) for selected state,
+  accessible activate/delete actions, and the add-server action.
+
+Search the implementation before review with
+`rg -n 'accessibility(Label|Hint|Role|State|Actions)|onAccessibilityAction|minHeight' mobile/src`.
+Exercise the changed flow with VoiceOver or TalkBack when device or simulator
+access is available, and record that manual result alongside automated checks.
 
 ## Agent-library and skill contributions
 
