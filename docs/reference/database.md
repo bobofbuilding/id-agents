@@ -88,8 +88,8 @@ CREATE TABLE agents (
 | `registry` | jsonb | Legacy registry data |
 | `metadata` | jsonb | Additional metadata |
 | `deleted_at` | bigint | Soft delete timestamp (null if active) |
-| `token_id` | text | Onchain token ID (if registered) |
-| `registry_7930` | text | ERC-7930 encoded registry address |
+| `token_id` | text | Legacy identity token ID (from the removed onchain registration; kept for resolution) |
+| `registry_7930` | text | Legacy ERC-7930 encoded registry address |
 
 **Indexes:**
 ```sql
@@ -107,7 +107,7 @@ CREATE INDEX agents_token_registry_idx ON agents(token_id, registry_7930)
 
 ### wallets
 
-Ethereum wallets for agents (for onchain registration).
+Legacy table — Ethereum wallets for agents. No longer written by application code (agent wallets are provisioned via OWS and referenced from agent metadata); the table remains for historical rows only.
 
 ```sql
 CREATE TABLE wallets (
@@ -130,9 +130,8 @@ CREATE TABLE wallets (
 | `created_at` | bigint | Creation timestamp (ms) |
 
 **Notes:**
-- One wallet per agent
-- Private keys are stored encrypted
-- Wallets are created on-demand when agent registers onchain
+- Legacy: no application code reads or writes this table anymore
+- One wallet per agent; private keys were stored per historical rows
 
 ---
 

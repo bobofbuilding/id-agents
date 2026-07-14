@@ -1,6 +1,6 @@
 ---
 name: identity
-description: Your agent identity — name, team, and onchain ENS domain. Always loaded so you know who you are.
+description: Your agent identity — name and team. Always loaded so you know who you are.
 ---
 
 # Identity

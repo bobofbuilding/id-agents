@@ -213,7 +213,6 @@ Each event has `seq` (cursor), `team`, `topic`, `actor`, `subject`, and a `data`
 | `/agent <name> probe` | Probe a single named agent's `/talk` dispatch path. See "Probe — verify agents respond on `/talk`" below. |
 | `/model <agent> <model>` | Change agent's model |
 | `/news [-l] <agent>` | Get agent's news feed (-l for full content) |
-| `/register <agent>` | Register agent onchain |
 | `/team` | Show current team |
 | `/teams` | List all teams |
 | `/team <name>` | Switch to or create team |
@@ -327,7 +326,7 @@ The wake message contains **no work instructions**. The agent must read `HEARTBE
 
 `/remote` is the primary dispatch surface, but public-team registration can also be driven through dedicated daemon endpoints when you want to skip command-string parsing.
 
-**Onchain registration (ID Chain + ERC-8004) is a separate skill.** Once a public-agent is registered with the manager here, invoke the `idagents-register-public-agents` skill to assign its xid.eth name and mint the ERC-8004 record whose `agentURI` advertises the MCP endpoint. That skill covers Base mainnet only and deliberately does NOT apply to local agents (use `/register <agent>` instead).
+Public-agent identity is manager-join only: `POST /agents/register` puts the agent on the manager's roster, and an optional OWS wallet (`wallet: true` in the body, or `/agent <name> wallet provision` later) delivers the agent's wallet address to its VPS.
 
 All public-team requests require two headers:
 
@@ -343,12 +342,12 @@ Same authorization rules as `/remote`: **ask before acting** on any write (regis
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/agents` | List agents in the current team. |
-| `POST` | `/agents/register` | Upsert a public-agent. Body: `{name, runtime:"public-agent-remote", customer_domain, public_endpoint_url, ssh_target?, internal_endpoint_url?}`. |
+| `POST` | `/agents/register` | Upsert a public-agent. Body: `{name, runtime:"public-agent-remote", customer_domain, public_endpoint_url, ssh_target?, internal_endpoint_url?, wallet?}`. `wallet: true` provisions an OWS wallet at join. |
 | `DELETE` | `/agents/:id` | Deregister by id (resolve name→id first via `/agents`). |
 
 ### Reserved names
 
-Certain agent names collide with CLI commands or daemon-owned identities and are rejected by the register endpoint (`{"error":"invalid_name", ...}`). Known reserved: `help`, `agents`, `status`, `team`, `deploy`, `ask`, `hey`, `delete`, `register`, `public`, `manager`. If you need one of these as a logical identifier, suffix it (`help-idagents`, `status-probe`, etc).
+Certain agent names collide with CLI commands or daemon-owned identities and are rejected by the register endpoint (`{"error":"invalid_name", ...}`). Known reserved: `help`, `agents`, `status`, `team`, `deploy`, `ask`, `hey`, `delete`, `public`, `manager`. If you need one of these as a logical identifier, suffix it (`help-idagents`, `status-probe`, etc).
 
 ## Agent Library & Team Configuration
 

@@ -31,7 +31,7 @@ Documentation for the ID Agents multi-agent orchestration platform.
 - [Configuration](./reference/configuration.md) - YAML configuration file reference
 - [Database Schema](./reference/database.md) - PostgreSQL database tables and schema
 - [Harnesses](./reference/harnesses.md) - LLM runtime backends (Claude Agent SDK, Claude Code CLI, Codex, Cursor)
-- [ID Indexer API](./reference/id-indexer-api.md) - Onchain agent registry indexer API
+- [ID Indexer API](./reference/id-indexer-api.md) - Historical: indexer API for the removed onchain registry integration
 
 ## Deployment
 
@@ -47,14 +47,13 @@ Documentation for the ID Agents multi-agent orchestration platform.
 Skills are deployed at deploy time to the runtime-appropriate directory: `.claude/skills/` for Claude agents, `.agents/skills/` for Codex agents, `.cursor/skills/` for Cursor (`cursor-cli`) agents. All configs should include `skills: [identity, inter-agent, catalog]` at minimum.
 
 - [Skills Overview](../skills/README.md) - Available skills and usage guide
-- [Identity](../skills/identity/SKILL.md) - Agent name, team, onchain domain
+- [Identity](../skills/identity/SKILL.md) - Agent name and team
 - [Inter-Agent](../skills/inter-agent/SKILL.md) - Agent-to-agent messaging via `/talk-to`
 - [Catalog](../skills/catalog/SKILL.md) - REST-AP self-description
 - [Task Discipline](../skills/task-discipline/SKILL.md) - Required task lifecycle for non-trivial work
 - [Wallet](../skills/wallet/SKILL.md) - OWS wallet operations
 - [XMTP](../skills/xmtp/SKILL.md) - Encrypted agent messaging
 - [Admin Control](../skills/idagents-admin-control/SKILL.md) - Remote CLI management
-- [Register Public Agents](../skills/idagents-register-public-agents/SKILL.md) - Register and manage public-agent metadata
 
 ## Plugins
 

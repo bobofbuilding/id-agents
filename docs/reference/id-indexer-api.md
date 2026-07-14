@@ -1,5 +1,7 @@
 # ID Indexer API Reference
 
+> **Historical document.** The id-agents manager no longer integrates with the ID Indexer — the onchain registry integration (`/registry pull` discovery and onchain registration) was removed. This reference is retained for the external indexer service only and does not describe a supported id-agents runtime capability.
+
 Complete API documentation for the ID Networks Indexer - tracking Agent Registry and Smart Credentials systems.
 
 ## Current Deployment Status

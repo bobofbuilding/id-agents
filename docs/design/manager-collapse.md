@@ -15,7 +15,7 @@ This design has shipped on `refactor/manager-collapse-cli` (final commit `b1b588
 - `workspace/manager/interactive-agent-identity.json` is no longer created or read.
 - `InteractiveAgentServer` remains in the codebase only for the human-as-agent path (`src/human-agent-cli.ts`), where a human can be `alice` on `:4000`. It is no longer used by the manager CLI.
 
-The rest of this document is preserved as historical design context. Tense and references to the "current" two-process state describe the pre-refactor world.
+The rest of this document is preserved as historical design context. Tense and references to the "current" two-process state describe the pre-refactor world. It also predates removal of the ID Chain registration integration; references below to onchain registration and registry routes are not supported runtime surfaces.
 
 ## Summary
 
@@ -463,12 +463,11 @@ Observed risk:
 - these docs still tell operators to run `npm run id-agents`, which currently implies both daemon behavior and interactive CLI behavior
 - after collapse, the CLI can still exist, but it must be described as a client to the already-running manager, not a second manager process
 
-Public-agent code paths are largely unaffected mechanically because they already target daemon surfaces:
+The surviving public-agent paths target manager-join and wallet daemon surfaces:
 
 - `src/cli/public-commands.ts`
-- `skills/idagents-register-public-agents/SKILL.md`
 - `skills/idagents-admin-control/SKILL.md`
-- `src/agent-manager-db.ts` public-agent registration and redelivery paths
+- `src/agent-manager-db.ts` public-agent manager-join and optional wallet-delivery paths
 
 The main public-agent impact is documentation clarity, not protocol rewiring.
 

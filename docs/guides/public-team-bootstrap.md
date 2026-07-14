@@ -80,7 +80,7 @@ The CLI resolves the `endpoints.talk` URL from the well-known document and POSTs
 /public remove docs.customer.com
 ```
 
-Type `yes` to confirm. This removes the manager registry entry only — the on-chain identity and the VPS service are unaffected.
+Type `yes` to confirm. This removes the manager's roster entry only — the VPS service itself is unaffected.
 
 To remove all public agents at once:
 

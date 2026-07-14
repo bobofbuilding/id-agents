@@ -4,7 +4,7 @@ This directory contains skills for agents and external tools.
 
 **Agent skills** (deployed to each agent's `.claude/skills/` at deploy time): `identity`, `inter-agent`, `catalog`, `wallet`, `xmtp`. All YAML configs should include `skills: [identity, inter-agent, catalog]` at minimum.
 
-**External skills** (used by external Claude Code sessions, not deployed to agents): `idagents-admin-control`, `idagents-team-builder`, `idagents-register-public-agents`.
+**External skills** (used by external Claude Code sessions, not deployed to agents): `idagents-admin-control`, `idagents-team-builder`.
 
 ## What are Skills?
 
@@ -14,7 +14,7 @@ Skills are packages of instructions and executable scripts that agents can refer
 
 ### identity
 
-Injected automatically — tells each agent its name, team, and onchain identity.
+Injected automatically — tells each agent its name and team.
 
 - `SKILL.md` - Frontmatter skill (auto-loaded)
 

@@ -51,7 +51,6 @@ Response:
 | `/agent <name> start\|stop\|rebuild` | Agent lifecycle |
 | `/model <agent> <model>` | Change agent model |
 | `/news [-l] <agent>` | Get agent news feed (`-l` for full content) |
-| `/register <agent>` | Register agent onchain |
 | `/team` | Show current team |
 | `/teams` | List all teams |
 | `/team <name>` | Switch to or create team |

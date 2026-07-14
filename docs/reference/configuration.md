@@ -1,6 +1,6 @@
 # Configuration Reference
 
-ID Agents supports YAML-based configuration files for defining agent deployments, team settings, and onchain registration.
+ID Agents supports YAML-based configuration files for defining agent deployments and team settings.
 
 ## Configuration File Format
 
@@ -11,12 +11,6 @@ team: my-team
 parameters:
   - name: environment
     default: development
-
-onchain:
-  chainId: 8453
-  registryAddress: "0x..."
-  registrarAddress: "0x..."
-  register: true
 
 defaults:
   runtime: claude-code
@@ -39,7 +33,6 @@ agents:
   - name: coder
     model: claude-sonnet-4-20250514
     heartbeat: 300  # seconds — agent reads HEARTBEAT.md checklist
-    register: true
   - name: researcher
     systemPrompt: "You are a research specialist."
 ```
@@ -99,30 +92,6 @@ agents:
 | `default` | No | Default value if not provided |
 | `description` | No | Human-readable description of the parameter |
 
-### onchain
-
-**Required:** No
-**Type:** Onchain object
-
-Configuration for onchain agent registration.
-
-```yaml
-onchain:
-  chainId: 8453
-  registryAddress: "0xABC..."
-  registrarAddress: "0xDEF..."
-  register: true
-```
-
-#### Onchain Object
-
-| Field | Required | Description |
-|-------|----------|-------------|
-| `chainId` | Yes | EVM chain ID (e.g., 8453 for Base) |
-| `registryAddress` | Yes | Agent registry contract address |
-| `registrarAddress` | No | Registrar contract address for registration |
-| `register` | No | Default registration setting for all agents |
-
 ### defaults
 
 **Required:** No
@@ -152,7 +121,7 @@ All configs should include `skills: [identity, inter-agent, catalog]` at minimum
 | `plugins` | Array | Optional plugins for agent runtimes that support them |
 | `allowedTools` | Array | Default tool restrictions for all agents |
 | `heartbeat` | Number or Object | Default heartbeat interval in seconds (or legacy `{interval, message}` object) |
-| `register` | Boolean | Default onchain registration setting (overrides `onchain.register` per agent) |
+| `wallet` | Boolean | Default OWS wallet opt-in for all agents |
 
 ### calendar
 
@@ -221,7 +190,7 @@ Each agent can have the following fields:
 | `plugins` | No | From defaults | Optional plugins for runtimes that support them |
 | `allowedTools` | No | From defaults | Restrict agent to specific tools |
 | `env` | No | `{}` | Environment variables for the agent process |
-| `register` | No | From onchain | Whether to register onchain |
+| `wallet` | No | From defaults | Opt in to OWS wallet provisioning at deploy/sync |
 | `workingDirectory` | No | - | Working directory for the agent process |
 | `agent` | No | - | Library agent entry name. Resolves to `configs/agents/<name>/` (Claude-native) or the `configs/agents/<name>.md` + `configs/agents/<name>/` sibling pair (AGENTS.md-native), and deploys to the runtime-aware overlay target before `skills` are applied |
 | `heartbeat` | No | - | Heartbeat interval in seconds, or legacy `{interval, message}` object |
@@ -239,7 +208,7 @@ agents:
       Focus on code quality and best practices.
     skills: [identity, inter-agent, catalog, wallet]
     heartbeat: 300
-    register: true
+    wallet: true
 ```
 
 ### Agent Library Example
@@ -346,7 +315,7 @@ Skills are instruction packages deployed at deploy time via `deploySkillsToAgent
 
 When both `defaults.skills` and agent-level `skills:` are present, the lists are merged and deduped. Agent-level `skills:` does not nest under `agent:` and does not replace the selected library entry.
 
-All configs should include `skills: [identity, inter-agent, catalog]` at minimum. The built-in skills are: `identity`, `inter-agent`, `catalog`, `task-discipline`, `wallet`, `xmtp`, `idagents-admin-control`, `idagents-register-public-agents`.
+All configs should include `skills: [identity, inter-agent, catalog]` at minimum. The built-in skills are: `identity`, `inter-agent`, `catalog`, `task-discipline`, `wallet`, `xmtp`, `idagents-admin-control`.
 
 ```yaml
 defaults:
@@ -512,12 +481,6 @@ parameters:
   - name: model_tier
     default: sonnet
 
-onchain:
-  chainId: 8453
-  registryAddress: "0x1234567890abcdef1234567890abcdef12345678"
-  registrarAddress: "0xabcdef1234567890abcdef1234567890abcdef12"
-  register: false
-
 defaults:
   runtime: claude-code
   model: claude-haiku-4-5-20251001
@@ -543,7 +506,6 @@ agents:
       You are the lead developer.
       Coordinate work and review code from other agents.
     heartbeat: 300
-    register: true
 
   # Standard developer
   - name: dev-frontend

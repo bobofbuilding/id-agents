@@ -1,5 +1,7 @@
 # Security Audit: ID Agents (2026-03-27)
 
+> **Historical snapshot (2026-03-27).** Findings reference the codebase as of the audit date; some cited modules (e.g. `src/onchain/idchain-register.ts`) and env vars have since been removed with the ID Chain integration.
+
 **Audited by:** agents.agent-16.xid.eth
 **Scope:** Full codebase — input validation, injection, secrets, path traversal, deploy-upsert, changes since last review
 **Method:** Parallel sub-agent audits (4 agents) with manual consolidation

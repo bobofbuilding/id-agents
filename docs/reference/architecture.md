@@ -18,7 +18,7 @@ The central process running on port 4100 (configurable via `--port` or `MANAGER_
 - Serves read-only library inventory via `/library/agents` and `/library/skills`
 - Routes fire-and-forget messages between agents via `/message`
 - Spawns and stops agent processes
-- Manages onchain ENS registration via id-cli
+- Provisions opt-in OWS wallets for agents (deploy/sync, manager-join, or on demand)
 - Runs health checks every 30 seconds (marks agents online/offline)
 - Serves the `/agents` list with health status
 - Owns the scheduling system (heartbeat + calendar)
@@ -49,7 +49,7 @@ Each agent runs as a separate Node.js process with its own Express server on a d
 - `GET /health` — Agent health check
 - `GET /.well-known/restap.json` — Service discovery catalog
 - `PATCH /catalog` — Update agent catalog metadata
-- `PATCH /identity` — Update agent's onchain identity (called by manager)
+- `PATCH /identity` — Update agent's identity (called by manager)
 
 ### 3. Interactive CLI (`src/interactive-agent-cli.ts`)
 
@@ -57,7 +57,7 @@ The user-facing terminal interface.
 
 **Responsibilities:**
 - Connects to the manager on startup (auto-starts it if not running)
-- Provides commands: `/ask`, `/deploy`, `/sync`, `/agents`, `/status`, `/register`, etc.
+- Provides commands: `/ask`, `/deploy`, `/sync`, `/agents`, `/status`, etc.
 - Polls agent news feeds for replies
 - Manages agent lifecycle (deploy, sync, rebuild, delete)
 - `/deploy` for clean/first-time deploys; [`/sync`](../guides/sync-command.md) for updating running teams (preserves sessions)
@@ -83,7 +83,7 @@ User types: /ask coder hello
 | Table | Purpose |
 |-------|---------|
 | `teams` | Team isolation (default: default) |
-| `agents` | Agent state — name, port, status, registry (ENS domain), metadata |
+| `agents` | Agent state — name, port, status, legacy identity columns (domain/token_id), metadata |
 | `news_items` | Async message feed per agent (with timestamps for polling) |
 | `queries` | Query tracking for reply routing between agents |
 | `wallets` | Deprecated — keys now stored in per-agent .env files |
@@ -92,7 +92,7 @@ User types: /ask coder hello
 
 | File | Purpose |
 |------|---------|
-| `src/agent-manager-db.ts` | Manager — routes, DB, spawning, registration, health checks |
+| `src/agent-manager-db.ts` | Manager — routes, DB, spawning, wallet provisioning, health checks |
 | `src/agent-rest-server.ts` | Preferred runtime-neutral entry point for the per-agent REST server |
 | `src/agent-rest-server.ts` | Runtime-neutral per-agent REST server export used by manager and local workers |
 | `src/claude-agent-server.ts` | Compatibility export layer for older imports of the agent REST server |
@@ -101,7 +101,6 @@ User types: /ask coder hello
 | `src/config-parser.ts` | YAML config parsing, parameter substitution, runtime-aware template loading |
 | `src/runtime/registry.ts` | Runtime registry: defaults, labels, auth/preflight, session policy, `getRuntimePaths()` |
 | `src/protocol-defaults.ts` | Framework protocol defaults prepended to every agent's personality file |
-| `src/onchain/idchain-register.ts` | ENS registration via id-cli |
 | `src/core/agent-identifier.ts` | ENS name parsing and display |
 | `src/db.ts` | PostgreSQL schema, migrations, connection pool |
 | `src/inter-agent-skill.ts` | Inter-agent communication skill injection |
@@ -141,14 +140,15 @@ All four spawn paths (deploy, sync-changed, sync-added, remote-deploy) follow th
 
 This ensures agent-specific files overlay team skills, and the personality file is always written last.
 
-## Onchain Identity
+## Agent Wallets (OWS)
 
-Each agent can register on ID Chain for a verifiable ENS name:
+Agents can opt in to a multi-chain OWS wallet:
 
-1. `/register <agent>` calls `id-cli register` → gets `agent-N.xid.eth`
-2. Automatically creates a subname: `<alias>.agent-N.xid.eth`
-3. The `tokenId` is the bytes32 namehash of the full ENS name
-4. Identity persisted in YAML config (`domain`, `tokenId`, `address` fields)
+1. `wallet: true` in the YAML config (per agent or under `defaults`) provisions a wallet at deploy/sync; for remote public agents the same flag on manager-join provisions on the manager host
+2. `/agent <name> wallet provision` provisions on demand for a running agent
+3. Wallet identifiers land in the agent's metadata (`ows_wallet`, `ows_address`); remote public agents additionally get a wallet identity file delivered over SSH
+
+Legacy note: agents registered under the removed ID Chain integration may still carry `domain`/`token_id` values and ENS-style names; resolvers continue to accept them.
 
 ## Health Monitoring
 
@@ -265,7 +265,7 @@ The manager sets these environment variables for every spawned agent:
 | `ID_TEAM` | Team name |
 | `MANAGER_URL` | Manager base URL |
 
-Each agent can also have its own `.env.<name>.<address>` file in the repo root containing a `PRIVATE_KEY` for onchain operations. The manager loads this file when spawning the agent and merges it into the process environment.
+Each agent can also have its own `.env.<name>.<address>` file in the repo root containing a `PRIVATE_KEY` for the agent's own use. The manager loads this file when spawning the agent and merges it into the process environment.
 
 ## Port Map
 

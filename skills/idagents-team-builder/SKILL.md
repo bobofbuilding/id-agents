@@ -110,12 +110,6 @@ The per-agent skill copy is **a full copy at deploy time**. Each agent owns its 
 version: "1"
 team: <team-name>
 
-# Optional, for onchain registration
-onchain:
-  register: false
-  chainId: 8453
-  registryAddress: "0x..."
-
 # Inherited by every agent EXCEPT workingDirectory (rule 1).
 defaults:
   local: true

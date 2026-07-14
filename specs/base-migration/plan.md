@@ -1,5 +1,7 @@
 # Base-Only Migration Plan
 
+> **Historical document.** This plan predates the removal of the ID Chain onchain-registration integration; the modules and flows it references (e.g. `src/onchain/idchain-register.ts`) no longer exist in the runtime.
+
 > Consolidate from 5 chains to Base only. Domain format changes from `agent-0.base.xid.eth` to `agent-0.xid.eth`. All alpha registrations abandoned.
 
 ## Summary

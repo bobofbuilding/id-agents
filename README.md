@@ -16,14 +16,13 @@ Run a team of AI coding agents from a single chat. Each agent is a real process 
 ## Key Features
 
 - **Multiple runtimes** - Claude Code CLI, OpenAI Codex, and Cursor CLI — mix and match in the same team
-- **Public-agent support** - register any REST-AP service that publishes `/.well-known/restap.json` with `service_type: "public-agent"` into the `public` team via `/public add <domain>`. The id-agents manager handles wallet provisioning, ID Chain registration, SSH-delivered identity files, heartbeat probes, and DMZ metadata. **[Juno](https://github.com/idchain-world/juno)** is the reference public-agent implementation we ship — capability-limited by design, safe to point at the internet — but any service that speaks the same protocol works
+- **Public-agent support** - register any REST-AP service that publishes `/.well-known/restap.json` with `service_type: "public-agent"` into the `public` team via `/public add <domain>`. The id-agents manager handles manager-join registration, optional OWS wallet provisioning with SSH-delivered wallet identity files, heartbeat probes, and DMZ metadata. **[Juno](https://github.com/idchain-world/juno)** is the reference public-agent implementation we ship — capability-limited by design, safe to point at the internet — but any service that speaks the same protocol works
 - **Task system** - Create, assign, claim, and track tasks across agents (`/task` commands + `/tasks` REST API)
 - **Check-ins** - Auto-attached supervision watches on delegated tasks. Wakes the dispatcher on a configurable interval if the delegate may be stalled; auto-closes when the linked task hits `done`
 - **Scheduling** - Heartbeat intervals and calendar events for automated recurring work
 - **Org chart** - Define team structure with groups and tags so agents know their peers and leads
 - **Skills & plugins** - Standard Claude Code skills and plugins, declared in config and deployed to each agent
-- **Agent wallets** - Automatic multi-chain wallets via [OWS](https://github.com/open-wallet-standard/core)
-- **Onchain identity** - ENS-based agent identity via ID Chain (e.g., `x.agent-15.xid.eth`)
+- **Agent wallets** - Opt-in multi-chain wallets via [OWS](https://github.com/open-wallet-standard/core) (`wallet: true` in config, or `/agent <name> wallet provision` on demand)
 - **Remote API** - Programmatic management via `/remote` endpoint and `/tasks` REST API
 - **TUI Dashboard** - Live terminal dashboard for the running team — agents list, news feed, message detail (`npm run tui:dev`)
 
@@ -83,7 +82,6 @@ Run a team of AI coding agents from a single chat. Each agent is a real process 
 - **Claude Pro or Max plan** (agents use your Claude Code subscription — no API key needed)
 - **OpenAI Codex CLI** (optional) — install from [github.com/openai/codex](https://github.com/openai/codex) and run `codex login`
 - **Cursor CLI** (optional) — install from [cursor.com](https://cursor.com) with `curl https://cursor.com/install -fsS | bash` and run `cursor-agent login` (or set `CURSOR_API_KEY`)
-- **[id-cli](https://github.com/idchain-world/id-cli)** (optional, for onchain agent registration)
 - **[OWS CLI](https://github.com/open-wallet-standard/core)** (optional, for agent wallets)
 
 > **Important:** You must be logged into Claude Code CLI before starting ID Agents. Run `claude login` in your terminal and complete the authentication. If you use Claude Code in VS Code, you still need to log in via the terminal — open VS Code's integrated terminal and run `claude login` there.
@@ -308,7 +306,6 @@ See [Scheduling Plan](./docs/SCHEDULING_PLAN.md) for the full design.
 /artifact <agent> <path>    # Read a file from agent's output directory
 /help                       # Show help
 /news [-l] <agent>          # Check recent messages (-l for full content)
-/register <agent>           # Register agent onchain
 /status                     # Check agent status
 /heartbeat                   # List heartbeats
 /heartbeat add <agent> <seconds> <message>  # Add heartbeat
@@ -370,7 +367,6 @@ This means any Claude Code instance on the same machine can coordinate with your
 - `/news [-l] <name>` - Check recent messages
 - `/output <name>` - List files in agent's output directory
 - `/artifact <name> <path>` - Read a file from agent's output directory
-- `/register <name>` - Register agent onchain
 - `/status` - Show status
 - `/heartbeat` - List heartbeats
 - `/heartbeat add <agent> <seconds> <message>` - Add heartbeat
@@ -473,7 +469,7 @@ Skills use the standard [Claude Code skill format](https://docs.anthropic.com/en
 
 | Skill | Description |
 |-------|-------------|
-| `identity` | Agent name, team, and onchain ENS domain |
+| `identity` | Agent name and team |
 | `inter-agent` | Messaging, delegation, news feed for multi-agent coordination |
 | `catalog` | REST-AP self-description visible to other agents |
 | `wallet` | OWS multi-chain wallet addresses (skipped if no wallet) |
@@ -535,8 +531,6 @@ See [Skills README](./skills/README.md) for the full skill directory listing.
 | `DATABASE_URL` | No | PostgreSQL connection string (SQLite used by default if not set) |
 | `ANTHROPIC_API_KEY` | No | Anthropic API key (not needed with Claude Pro or Max — run `claude login` instead) |
 | `CLAUDE_MODEL` | No | Default model (e.g., `claude-opus-4-6`) |
-| `OWS_REGISTRAR_WALLET` | No | OWS wallet name for onchain signing (recommended over raw key) |
-| `ID_REGISTRAR_PRIVATE_KEY` | No | Wallet private key for onchain registration (fallback if OWS not used) |
 | `PUBLIC_BASE_URL` | No | Public URL base for agents (e.g., `https://idbot.live`) |
 
 **Per-agent environment (set automatically by the manager):**
@@ -557,9 +551,6 @@ Deploy multiple agents from a config file:
 version: "1"
 team: my-team
 
-onchain:
-  chainId: 8453
-
 defaults:
   local: true
   runtime: claude-code-cli
@@ -575,8 +566,6 @@ agents:
     description: "Writes and reviews code"
     workingDirectory: /path/to/project
     heartbeat: 300  # seconds — agent reads HEARTBEAT.md
-    domain: coder.agent-1.xid.eth  # Preserved across redeploys
-    tokenId: "0xabcd..."               # Namehash of the ENS domain
   - name: researcher
     description: "Research and analysis"
     workingDirectory: /path/to/research
@@ -743,34 +732,16 @@ id-agents unsync <config> [--workspace <path>]    # remove managed files using t
 
 Press `l` for the agents library and `s` for the skills library from any TUI top-level view. Both are read-only list/detail views fed by the manager's `/library/agents` and `/library/skills` endpoints; `/library/teams` is the matching read endpoint for team templates. List and detail responses surface a **README-first `description`** — the inventory prefers the first body paragraph of the entry's `README.md` (or, for skills, the SKILL.md frontmatter `description:`) over a sparse config-derived summary. Set `ID_LIBRARY_ROOT` on the manager to point them at any clone of [public-agents](https://github.com/idchain-world/public-agents).
 
-## Onchain Identity
-
-Agents register on [ID Chain](https://github.com/idchain-world) for verifiable ENS-based identity:
-
-```
-/register my-agent
-```
-
-This does two things:
-1. Registers a sequential agent name (e.g., `agent-15.xid.eth`)
-2. Creates a subname with the agent's local alias (e.g., `x.agent-15.xid.eth`)
-
-The subname is the agent's primary identity. The `tokenId` is the bytes32 namehash of the full ENS name — the true onchain identifier.
-
-**Identity format:**
-- `x.agent-15.xid.eth` (default: alias.sequential-name.xid.eth)
-- `myagent.eth` (custom ENS name, linked via ENS)
-
-Once registered, the `domain` and `tokenId` can be saved in the YAML config to persist the identity across redeploys.
-
 ## Agent Wallets (OWS)
 
-If [OWS](https://github.com/open-wallet-standard/core) (Open Wallet Standard) is installed, each agent automatically gets a multi-chain wallet at deploy time. Wallets are encrypted in the OWS vault at `~/.ows/`.
+If [OWS](https://github.com/open-wallet-standard/core) (Open Wallet Standard) is installed, agents can opt in to a multi-chain wallet. Wallets are encrypted in the OWS vault at `~/.ows/`.
 
-**What happens at deploy:**
-1. Manager creates an OWS wallet per agent (e.g., `idchain-contracts`)
-2. Wallet addresses are written as ENS records via `/sync-wallets`
+**How wallets are provisioned:**
+1. Opt in per agent (or under `defaults`) with `wallet: true` in the YAML config — the manager creates an OWS wallet for the agent at deploy/sync time
+2. Or provision on demand for a running agent: `/agent <name> wallet provision`
 3. A `wallet` skill is deployed so the agent knows its own addresses
+
+For remote public agents (`/public add`), a wallet opted in at manager-join is provisioned on the manager host, and a wallet identity file (name, `ows_address`, service endpoint) is delivered to the agent's VPS over SSH so the agent can advertise its address.
 
 **Asking an agent for its address:**
 ```
@@ -778,18 +749,11 @@ If [OWS](https://github.com/open-wallet-standard/core) (Open Wallet Standard) is
 → bc1q3aat33mm4jd602y8q7g3w972g0a8zle72srkkz
 ```
 
-**Onchain signing:** The manager uses a separate registrar wallet (`OWS_REGISTRAR_WALLET`) for signing registration and record-setting transactions. The private key never leaves the OWS vault — signing is delegated to `ows sign tx` via [id-cli](https://github.com/idchain-world/id-cli).
+**OWS policies** can restrict which chains and contracts a wallet can interact with. Create a policy and attach it to an API key for scoped access:
 
 ```bash
-# .env
-OWS_REGISTRAR_WALLET=idchain-registrar
-```
-
-**OWS policies** can restrict which chains and contracts the registrar wallet can interact with. Create a policy and attach it to an API key for scoped access:
-
-```bash
-ows policy create --file idchain-policy.json
-ows key create --name "id-agents" --wallet idchain-registrar --policy idchain-only
+ows policy create --file my-policy.json
+ows key create --name "id-agents" --wallet my-wallet --policy my-policy
 # Set the API key for policy enforcement:
 # OWS_PASSPHRASE=ows_key_...
 ```

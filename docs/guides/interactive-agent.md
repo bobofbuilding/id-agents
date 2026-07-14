@@ -59,7 +59,6 @@ You should see only the team’s actual agents. The control-plane `manager` is c
 | `/sync <config>` | [Reconcile running team with config](./sync-command.md) |
 | `/help` | Show help |
 | `/news [-l] <agent>` | Check recent messages (-l for full content) |
-| `/register <agent>` | Register agent onchain |
 | `/status` | Check agent status |
 | `/team` | Show current team |
 | `/teams` | List all teams |

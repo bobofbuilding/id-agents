@@ -1,5 +1,7 @@
 # Public Team Project Review - 2026-04-18
 
+> **Historical review.** Snapshot of the project as of 2026-04-18, before the ID Chain onchain-registration integration was removed. Onchain/registry mechanics discussed below no longer exist in the runtime.
+
 Task: `cto-public-agent-project-review`
 
 ## Executive Summary

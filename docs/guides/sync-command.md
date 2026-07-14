@@ -66,8 +66,6 @@ These fields are compared to determine if an agent has changed:
 - `skills` — Skill list (order-independent)
 - `allowedTools` — Tool whitelist (order-independent)
 - `description` — Agent description
-- `domain` — ENS domain
-- `tokenId` — Onchain token ID
 - `heartbeat` — Heartbeat enabled/disabled
 - `workingDirectory` — Only compared when explicitly set in config
 

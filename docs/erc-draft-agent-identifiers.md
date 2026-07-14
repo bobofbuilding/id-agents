@@ -11,6 +11,8 @@ created: 2026-01-14
 requires: 7930
 ---
 
+> **Historical / research document.** This draft is retained for research purposes only. It does not describe a supported id-agents runtime capability — the ID Chain onchain-registration integration this work accompanied has been removed from the runtime.
+
 ## Abstract
 
 This ERC defines a format for identifying tokens in onchain registries using optional human readable aliases. A Token Identifier combines an optional human readable alias, a unique token ID from an onchain registry, and the registry location encoded as an [ERC-7930](./eip-7930.md) interoperable address. This format is useful for NFTs, RWAs, agents, and other tokenized assets. For example, agent registries like [ERC-8004](./eip-8004.md) can use this format to identify agents with human readable names.

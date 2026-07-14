@@ -1,5 +1,7 @@
 # Public Team Design
 
+> **Historical design document.** Written while the public-team feature set included ID Chain onchain registration. That integration has since been removed: public agents now get manager-join registration plus optional OWS wallet provisioning, with a wallet-only identity file (name, `ows_address`, service endpoint — no `idchain_domain`/`token_id`) delivered over SSH. References below to onchain registration, ENS names, registrar signing, and onchain identity delivery describe the historical design, not current runtime capability.
+
 ## Status: All Phases Complete
 
 Phases 1–7 have landed on `main`. The reference public-agent implementation lives at **[github.com/idchain-world/juno](https://github.com/idchain-world/juno)** — see its `docs/runbook.md` and `docs/deployment.md`.
