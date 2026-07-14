@@ -27,7 +27,14 @@ npm run id-agents
 
 # Run tests
 npm test
+
+# Run the same lint, typecheck, and test gate used by pull-request CI
+npm run ci:preflight
 ```
+
+Run `npm run ci:preflight` before opening a pull request. It is the local
+equivalent of the checked-in CI preflight workflow and does not require any
+credentials or running agent services.
 
 ## Project Structure
 
