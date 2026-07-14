@@ -99,10 +99,13 @@ export function ScanScreen({ navigation }: Props) {
         style={styles.container}
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
       >
-        <ScrollView contentContainerStyle={styles.formContainer}>
+        <ScrollView
+          contentContainerStyle={styles.formContainer}
+          keyboardShouldPersistTaps="handled"
+        >
           <Text style={styles.title}>Connect to Server</Text>
 
-          <Text style={styles.label}>Name</Text>
+          <Text nativeID="manual-server-name-label" style={styles.label}>Name</Text>
           <TextInput
             style={styles.input}
             value={name}
@@ -111,9 +114,13 @@ export function ScanScreen({ navigation }: Props) {
             placeholderTextColor={colors.textDim}
             autoCapitalize="none"
             autoCorrect={false}
+            accessibilityRole="text"
+            accessibilityLabelledBy="manual-server-name-label"
+            accessibilityLabel="Server name"
+            accessibilityHint="Optional. Enter a name for this saved server. If left blank, the hostname is used."
           />
 
-          <Text style={styles.label}>Server URL</Text>
+          <Text nativeID="manual-server-url-label" style={styles.label}>Server URL</Text>
           <TextInput
             style={styles.input}
             value={url}
@@ -123,9 +130,13 @@ export function ScanScreen({ navigation }: Props) {
             autoCapitalize="none"
             autoCorrect={false}
             keyboardType="url"
+            accessibilityRole="text"
+            accessibilityLabelledBy="manual-server-url-label"
+            accessibilityLabel="Server URL"
+            accessibilityHint="Required. Enter the full URL for the server."
           />
 
-          <Text style={styles.label}>API Key</Text>
+          <Text nativeID="manual-api-key-label" style={styles.label}>API Key</Text>
           <TextInput
             style={styles.input}
             value={apiKey}
@@ -135,9 +146,13 @@ export function ScanScreen({ navigation }: Props) {
             autoCapitalize="none"
             autoCorrect={false}
             secureTextEntry
+            accessibilityRole="text"
+            accessibilityLabelledBy="manual-api-key-label"
+            accessibilityLabel="API key"
+            accessibilityHint="Required. Enter the API key for this server."
           />
 
-          <Text style={styles.label}>Team</Text>
+          <Text nativeID="manual-team-label" style={styles.label}>Team</Text>
           <TextInput
             style={styles.input}
             value={team}
@@ -146,12 +161,20 @@ export function ScanScreen({ navigation }: Props) {
             placeholderTextColor={colors.textDim}
             autoCapitalize="none"
             autoCorrect={false}
+            accessibilityRole="text"
+            accessibilityLabelledBy="manual-team-label"
+            accessibilityLabel="Team"
+            accessibilityHint="Optional. Enter the team name. If left blank, default is used."
           />
 
           <TouchableOpacity
             style={[styles.connectButton, connecting && styles.buttonDisabled]}
             onPress={handleManualConnect}
             disabled={connecting}
+            accessibilityRole="button"
+            accessibilityLabel={connecting ? 'Connecting to server' : 'Connect to server'}
+            accessibilityHint="Tests these server details and saves the server if the connection succeeds."
+            accessibilityState={{ disabled: connecting, busy: connecting }}
           >
             {connecting ? (
               <ActivityIndicator color={colors.bg} />
@@ -163,6 +186,9 @@ export function ScanScreen({ navigation }: Props) {
           <TouchableOpacity
             style={styles.switchButton}
             onPress={() => setShowManual(false)}
+            accessibilityRole="button"
+            accessibilityLabel="Scan QR code instead"
+            accessibilityHint="Returns to the camera scanner."
           >
             <Text style={styles.switchButtonText}>Scan QR Code Instead</Text>
           </TouchableOpacity>
@@ -187,12 +213,21 @@ export function ScanScreen({ navigation }: Props) {
         <Text style={styles.description}>
           Camera access is needed to scan QR codes for quick server connection.
         </Text>
-        <TouchableOpacity style={styles.connectButton} onPress={requestPermission}>
+        <TouchableOpacity
+          style={styles.connectButton}
+          onPress={requestPermission}
+          accessibilityRole="button"
+          accessibilityLabel="Grant camera access"
+          accessibilityHint="Opens the camera permission prompt."
+        >
           <Text style={styles.connectButtonText}>Grant Access</Text>
         </TouchableOpacity>
         <TouchableOpacity
           style={styles.switchButton}
           onPress={() => setShowManual(true)}
+          accessibilityRole="button"
+          accessibilityLabel="Enter server details manually"
+          accessibilityHint="Opens the manual server connection form."
         >
           <Text style={styles.switchButtonText}>Enter Manually Instead</Text>
         </TouchableOpacity>
@@ -227,6 +262,9 @@ export function ScanScreen({ navigation }: Props) {
         <TouchableOpacity
           style={styles.switchButton}
           onPress={() => setShowManual(true)}
+          accessibilityRole="button"
+          accessibilityLabel="Enter server details manually"
+          accessibilityHint="Opens the manual server connection form."
         >
           <Text style={styles.switchButtonText}>Enter Manually</Text>
         </TouchableOpacity>
@@ -234,6 +272,9 @@ export function ScanScreen({ navigation }: Props) {
         <TouchableOpacity
           style={styles.switchButton}
           onPress={() => navigation.navigate('Settings')}
+          accessibilityRole="button"
+          accessibilityLabel="Saved servers"
+          accessibilityHint="Opens the saved server list."
         >
           <Text style={styles.switchButtonText}>Saved Servers</Text>
         </TouchableOpacity>
@@ -363,6 +404,9 @@ const styles = StyleSheet.create({
   switchButton: {
     paddingVertical: spacing.md,
     paddingHorizontal: spacing.lg,
+    minHeight: 44,
+    justifyContent: 'center',
+    alignItems: 'center',
   },
   switchButtonText: {
     fontFamily: fonts.mono,

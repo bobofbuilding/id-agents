@@ -31,6 +31,8 @@ export function CommandInput({
     // Keep keyboard open for rapid commands
   };
 
+  const canSend = text.trim().length > 0 && !disabled;
+
   return (
     <View style={styles.container}>
       <TextInput
@@ -47,11 +49,19 @@ export function CommandInput({
         returnKeyType="send"
         editable={!disabled}
         blurOnSubmit={false}
+        accessibilityRole="text"
+        accessibilityLabel="Command"
+        accessibilityHint="Enter a command to send to the connected agent terminal."
+        accessibilityState={{ disabled }}
       />
       <TouchableOpacity
-        style={[styles.button, disabled && styles.buttonDisabled]}
+        style={[styles.button, !canSend && styles.buttonDisabled]}
         onPress={handleSubmit}
-        disabled={disabled || !text.trim()}
+        disabled={!canSend}
+        accessibilityRole="button"
+        accessibilityLabel="Send command"
+        accessibilityHint="Submits the command in the terminal."
+        accessibilityState={{ disabled: !canSend }}
       >
         <Text style={styles.buttonText}>Send</Text>
       </TouchableOpacity>
@@ -81,15 +91,17 @@ const styles = StyleSheet.create({
     borderRadius: 6,
     paddingHorizontal: spacing.md,
     paddingVertical: spacing.sm,
-    minHeight: 40,
+    minHeight: 44,
   },
   button: {
     backgroundColor: colors.blue,
     paddingHorizontal: spacing.lg,
     paddingVertical: spacing.sm,
     borderRadius: 6,
-    minHeight: 40,
+    minHeight: 44,
+    minWidth: 64,
     justifyContent: 'center',
+    alignItems: 'center',
   },
   buttonDisabled: {
     opacity: 0.4,

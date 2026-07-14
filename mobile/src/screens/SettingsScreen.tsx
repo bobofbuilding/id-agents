@@ -67,6 +67,22 @@ export function SettingsScreen({ navigation }: Props) {
         style={[styles.serverRow, isCurrent && styles.serverRowActive]}
         onPress={() => handleSelect(item)}
         onLongPress={() => handleDelete(item)}
+        accessibilityRole="button"
+        accessibilityLabel={`${item.name}${isCurrent ? ', active server' : ''}. Server URL ${item.url}. Team ${item.team}.`}
+        accessibilityHint="Activates this saved server. Use the long press action to delete it."
+        accessibilityState={{ selected: isCurrent }}
+        accessibilityActions={[
+          { name: 'activate', label: 'Select server' },
+          { name: 'longpress', label: 'Delete server' },
+        ]}
+        onAccessibilityAction={(event) => {
+          if (event.nativeEvent.actionName === 'activate') {
+            handleSelect(item);
+          }
+          if (event.nativeEvent.actionName === 'longpress') {
+            handleDelete(item);
+          }
+        }}
       >
         <View style={styles.serverInfo}>
           <View style={styles.nameRow}>
@@ -102,6 +118,9 @@ export function SettingsScreen({ navigation }: Props) {
         <TouchableOpacity
           style={styles.addButton}
           onPress={() => navigation.navigate('Scan')}
+          accessibilityRole="button"
+          accessibilityLabel="Add server"
+          accessibilityHint="Opens the QR scanner and manual server connection form."
         >
           <Text style={styles.addButtonText}>+ Add Server</Text>
         </TouchableOpacity>
@@ -193,6 +212,8 @@ const styles = StyleSheet.create({
     padding: spacing.md,
     borderRadius: 6,
     alignItems: 'center',
+    justifyContent: 'center',
+    minHeight: 44,
   },
   addButtonText: {
     fontFamily: fonts.mono,
