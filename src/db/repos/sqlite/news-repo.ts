@@ -5,6 +5,8 @@ import type { InboxOwnerKind, NewsItemRow, NewsItemSummaryRow } from '../../type
 import type { DbAdapter } from '../../db-adapter.js';
 import { parseJsonObject, stringifyJson } from '../../db-json.js';
 
+const RETENTION_DELETE_BATCH = 500;
+
 function resolveNewsOwnership(
   teamId: string,
   agentId: string | null,
@@ -299,8 +301,15 @@ export class SqliteNewsRepo implements NewsRepository {
 
   async pruneByAge(teamId: string, beforeTimestamp: number): Promise<number> {
     const { rowCount } = await this.db.query(
-      'DELETE FROM news_items WHERE team_id = ? AND timestamp < ?',
-      [teamId, beforeTimestamp],
+      `DELETE FROM news_items
+       WHERE team_id = ?
+         AND id IN (
+           SELECT id FROM news_items
+           WHERE team_id = ? AND timestamp < ?
+           ORDER BY timestamp ASC, id ASC
+           LIMIT ?
+         )`,
+      [teamId, teamId, beforeTimestamp, RETENTION_DELETE_BATCH],
     );
     return rowCount ?? 0;
   }
@@ -310,6 +319,7 @@ export class SqliteNewsRepo implements NewsRepository {
     const total = await this.countForTeam(teamId);
     const excess = total - keepCount;
     if (excess <= 0) return 0;
+    const deleteCount = Math.min(excess, RETENTION_DELETE_BATCH);
     const { rowCount } = await this.db.query(
       `DELETE FROM news_items
        WHERE team_id = ?
@@ -319,7 +329,7 @@ export class SqliteNewsRepo implements NewsRepository {
            ORDER BY timestamp ASC, id ASC
            LIMIT ?
          )`,
-      [teamId, teamId, excess],
+      [teamId, teamId, deleteCount],
     );
     return rowCount ?? 0;
   }

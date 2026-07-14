@@ -6,6 +6,7 @@ import { DbAdapter, QueryResult } from './db-adapter.js';
 const DEFAULT_BUSY_TIMEOUT_MS = 30_000;
 const DEFAULT_LOCK_RETRY_WINDOW_MS = 30_000;
 const MAX_LOCK_RETRY_DELAY_MS = 750;
+const DEFAULT_SLOW_QUERY_MS = 500;
 
 function positiveEnvInt(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -31,6 +32,7 @@ export class SqliteAdapter implements DbAdapter {
   readonly dialect = 'sqlite' as const;
   private db: Database.Database;
   private readonly lockRetryWindowMs: number;
+  private readonly slowQueryMs: number;
 
   constructor(filePath: string) {
     const busyTimeoutMs = positiveEnvInt('ID_SQLITE_BUSY_TIMEOUT_MS', DEFAULT_BUSY_TIMEOUT_MS);
@@ -40,6 +42,7 @@ export class SqliteAdapter implements DbAdapter {
     this.db.pragma(`busy_timeout = ${busyTimeoutMs}`);
     this.db.pragma('synchronous = NORMAL');
     this.lockRetryWindowMs = positiveEnvInt('ID_SQLITE_LOCK_RETRY_MS', DEFAULT_LOCK_RETRY_WINDOW_MS);
+    this.slowQueryMs = positiveEnvInt('ID_SQLITE_SLOW_QUERY_MS', DEFAULT_SLOW_QUERY_MS);
   }
 
   /**
@@ -62,10 +65,12 @@ export class SqliteAdapter implements DbAdapter {
 
         if (/^\s*(SELECT|WITH)\b/i.test(normSql) || /\bRETURNING\b/i.test(normSql)) {
           const rows = stmt.all(...params) as T[];
+          this.warnIfSlow(normSql, started, rows.length);
           return { rows, rowCount: rows.length };
         }
 
         const info = stmt.run(...params);
+        this.warnIfSlow(normSql, started, info.changes);
         return { rows: [] as T[], rowCount: info.changes };
       } catch (err) {
         if (!isSqliteLockError(err)) throw err;
@@ -77,6 +82,13 @@ export class SqliteAdapter implements DbAdapter {
         attempt += 1;
       }
     }
+  }
+
+  private warnIfSlow(sql: string, started: number, rowCount: number): void {
+    const elapsedMs = Date.now() - started;
+    if (elapsedMs < this.slowQueryMs) return;
+    const summary = sql.replace(/\s+/g, ' ').trim().slice(0, 240);
+    console.warn(`[SQLite] slow query ${elapsedMs}ms rows=${rowCount}: ${summary}`);
   }
 
   exec(sql: string): void {

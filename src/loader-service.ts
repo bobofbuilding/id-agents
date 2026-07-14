@@ -13,12 +13,27 @@ import { execFileSync, spawn } from 'node:child_process';
 import { readFileSync, openSync, closeSync } from 'node:fs';
 import path from 'node:path';
 import { nodeOptionsForManager } from './lib/resource-limits.js';
+import { liveOriginalManagerPids, normalizeOriginalManagerPids } from './lib/manager-restart-guard.js';
 
 const LOADER_PORT = parseInt(process.env.LOADER_PORT || '3100');
 const MANAGER_PORT = parseInt(process.env.AGENT_MANAGER_PORT || '4100');
 // Trusted local setup — no auth
 const WORK_DIR = process.env.LOADER_WORK_DIR || process.cwd();
 const LOG_FILE = process.env.MANAGER_LOG_FILE || '/tmp/manager.log';
+const MANAGER_LAUNCHD_LABEL = process.env.MANAGER_LAUNCHD_LABEL || 'io.bittrees.idagents-manager';
+const MANAGER_SHUTDOWN_TIMEOUT_MS = Math.max(5_000, parseInt(process.env.MANAGER_SHUTDOWN_TIMEOUT_MS || '30000'));
+const MANAGER_RESTART_COOLDOWN_MS = Math.max(0, parseInt(process.env.MANAGER_RESTART_COOLDOWN_MS || '30000'));
+
+type RestartResult = {
+  success: boolean;
+  wasRunning: boolean;
+  pid?: number;
+  mode: 'launchd' | 'detached';
+  message: string;
+};
+
+let restartInFlight: Promise<RestartResult> | null = null;
+let lastRestartCompletedAt = 0;
 
 function log(msg: string) {
   console.log(`[Loader] ${msg}`);
@@ -65,6 +80,39 @@ function listPidsListeningOnManagerPort(): string[] {
   }
 }
 
+function pidIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function launchdTarget(): string {
+  const uid = process.getuid?.() ?? execFileSync('id', ['-u'], { encoding: 'utf8' }).trim();
+  return `gui/${uid}/${MANAGER_LAUNCHD_LABEL}`;
+}
+
+function launchdOwnsManager(): boolean {
+  if (process.platform !== 'darwin') return false;
+  try {
+    execFileSync('launchctl', ['print', launchdTarget()], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForPidsToExit(pids: number[], timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (pids.every(pid => !pidIsAlive(pid))) return true;
+    await new Promise(r => setTimeout(r, 250));
+  }
+  return pids.every(pid => !pidIsAlive(pid));
+}
+
 async function killManager(): Promise<boolean> {
   const myPid = process.pid;
   const pids = listPidsListeningOnManagerPort();
@@ -73,7 +121,7 @@ async function killManager(): Promise<boolean> {
     return true; // nothing running
   }
 
-  const pidList = pids.filter(p => p && parseInt(p) !== myPid);
+  const pidList = normalizeOriginalManagerPids(pids, myPid);
   if (pidList.length === 0) {
     log('No manager process found (only self)');
     return true;
@@ -81,23 +129,48 @@ async function killManager(): Promise<boolean> {
 
   for (const pid of pidList) {
     log(`Sending SIGTERM to ${pid}`);
-    try { process.kill(parseInt(pid), 'SIGTERM'); } catch {}
+    try { process.kill(pid, 'SIGTERM'); } catch {}
   }
 
-  // Wait up to 5 seconds for graceful shutdown
-  for (let i = 0; i < 10; i++) {
-    await new Promise(r => setTimeout(r, 500));
-    if (listPidsListeningOnManagerPort().length === 0) {
-      return true; // port is free
-    }
-  }
+  if (await waitForPidsToExit(pidList, MANAGER_SHUTDOWN_TIMEOUT_MS)) return true;
 
-  // Force kill
-  for (const pid of listPidsListeningOnManagerPort().filter(p => p && parseInt(p) !== myPid)) {
+  // Never re-query the port here: launchd may already have placed a healthy
+  // replacement on it. A force kill may target only the original process set.
+  for (const pid of liveOriginalManagerPids(pidList, pidIsAlive)) {
     log(`Force killing ${pid}`);
-    try { process.kill(parseInt(pid), 'SIGKILL'); } catch {}
+    try { process.kill(pid, 'SIGKILL'); } catch {}
   }
   return true;
+}
+
+async function restartLaunchdManager(wasRunning: boolean): Promise<RestartResult> {
+  const target = launchdTarget();
+  const originalPids = normalizeOriginalManagerPids(listPidsListeningOnManagerPort(), process.pid);
+
+  if (originalPids.length > 0) {
+    log(`Requesting graceful launchd restart for ${target} (pid${originalPids.length === 1 ? '' : 's'} ${originalPids.join(', ')})`);
+    execFileSync('launchctl', ['kill', 'SIGTERM', target], { stdio: 'ignore' });
+    if (!await waitForPidsToExit(originalPids, MANAGER_SHUTDOWN_TIMEOUT_MS)) {
+      log('Graceful shutdown timed out; asking launchd to stop its managed service');
+      execFileSync('launchctl', ['kill', 'SIGKILL', target], { stdio: 'ignore' });
+      await waitForPidsToExit(originalPids, 5_000);
+    }
+  } else {
+    log(`Manager is down; requesting launchd start for ${target}`);
+    execFileSync('launchctl', ['kickstart', target], { stdio: 'ignore' });
+  }
+
+  const started = await waitForManager();
+  const pid = listPidsListeningOnManagerPort()
+    .map(value => parseInt(value, 10))
+    .find(value => Number.isInteger(value) && value > 0);
+  return {
+    success: started,
+    wasRunning,
+    pid,
+    mode: 'launchd',
+    message: started ? 'Manager restarted successfully' : 'Manager failed to start (check launchd and manager logs)',
+  };
 }
 
 function startManager(): { pid: number | undefined } {
@@ -150,6 +223,25 @@ async function waitForManager(maxAttempts = 30, intervalMs = 1000): Promise<bool
   return false;
 }
 
+async function restartManager(): Promise<RestartResult> {
+  const wasRunning = (await pingManager()).ok;
+  log(`Manager was ${wasRunning ? 'running' : 'down'}`);
+
+  if (launchdOwnsManager()) return restartLaunchdManager(wasRunning);
+
+  await killManager();
+  log('Old process stopped');
+  const { pid } = startManager();
+  const started = await waitForManager();
+  return {
+    success: started,
+    wasRunning,
+    pid,
+    mode: 'detached',
+    message: started ? 'Manager restarted successfully' : 'Manager failed to start (check /logs)',
+  };
+}
+
 function readLogs(lines = 50): string[] {
   try {
     const content = readFileSync(LOG_FILE, 'utf-8');
@@ -195,28 +287,28 @@ const server = http.createServer(async (req, res) => {
 
     // Restart manager
     if (req.method === 'POST' && url.pathname === '/restart-manager') {
-      log('Restart requested');
-      const wasRunning = (await pingManager()).ok;
-      log(`Manager was ${wasRunning ? 'running' : 'down'}`);
+      const now = Date.now();
+      if (!restartInFlight && lastRestartCompletedAt > 0 && now - lastRestartCompletedAt < MANAGER_RESTART_COOLDOWN_MS) {
+        const manager = await pingManager();
+        return json(res, manager.ok ? 200 : 429, {
+          success: manager.ok,
+          coalesced: true,
+          message: manager.ok ? 'Manager was restarted recently and is healthy' : 'Manager restart is cooling down',
+        });
+      }
 
-      // Kill existing
-      await killManager();
-      log('Old process killed');
+      const coalesced = restartInFlight != null;
+      if (!restartInFlight) {
+        log('Restart requested');
+        restartInFlight = restartManager().finally(() => {
+          lastRestartCompletedAt = Date.now();
+          restartInFlight = null;
+        });
+      }
 
-      // Start new
-      const { pid } = startManager();
-      log(`New manager spawned (pid: ${pid})`);
-
-      // Wait for it to come up
-      const started = await waitForManager();
-      log(started ? 'Manager is up' : 'Manager failed to start');
-
-      return json(res, started ? 200 : 503, {
-        success: started,
-        wasRunning,
-        pid,
-        message: started ? 'Manager restarted successfully' : 'Manager failed to start (check /logs)',
-      });
+      const result = await restartInFlight;
+      log(result.success ? 'Manager is up' : 'Manager failed to start');
+      return json(res, result.success ? 200 : 503, { ...result, coalesced });
     }
 
     json(res, 404, { error: 'not found' });

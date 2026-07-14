@@ -7,6 +7,7 @@ import { parseJsonObject, stringifyJson } from '../../db-json.js';
 
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 1000;
+const RETENTION_DELETE_BATCH = 500;
 
 export class SqliteEventsRepo implements EventsRepository {
   constructor(private readonly db: DbAdapter) {}
@@ -88,8 +89,15 @@ export class SqliteEventsRepo implements EventsRepository {
 
   async pruneByAge(teamId: string, beforeOccurredAt: number): Promise<number> {
     const { rowCount } = await this.db.query(
-      `DELETE FROM event_log WHERE team_id = ? AND occurred_at < ?`,
-      [teamId, beforeOccurredAt],
+      `DELETE FROM event_log
+       WHERE team_id = ?
+         AND seq IN (
+           SELECT seq FROM event_log
+           WHERE team_id = ? AND occurred_at < ?
+           ORDER BY seq ASC
+           LIMIT ?
+         )`,
+      [teamId, teamId, beforeOccurredAt, RETENTION_DELETE_BATCH],
     );
     return rowCount ?? 0;
   }
@@ -99,6 +107,7 @@ export class SqliteEventsRepo implements EventsRepository {
     const total = await this.countForTeam(teamId);
     const excess = total - keepCount;
     if (excess <= 0) return 0;
+    const deleteCount = Math.min(excess, RETENTION_DELETE_BATCH);
     const { rowCount } = await this.db.query(
       `DELETE FROM event_log
        WHERE team_id = ?
@@ -108,7 +117,7 @@ export class SqliteEventsRepo implements EventsRepository {
            ORDER BY seq ASC
            LIMIT ?
          )`,
-      [teamId, teamId, excess],
+      [teamId, teamId, deleteCount],
     );
     return rowCount ?? 0;
   }

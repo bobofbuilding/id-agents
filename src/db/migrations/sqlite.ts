@@ -544,8 +544,11 @@ export async function migrateSqlite(adapter: SqliteAdapter): Promise<void> {
   }
   adapter.exec(`
     CREATE INDEX IF NOT EXISTS queries_team_owner_idx ON queries(team_id, owner_kind, owner_id);
+    CREATE INDEX IF NOT EXISTS queries_retention_idx ON queries(team_id, status, completed, created, query_id);
+    CREATE INDEX IF NOT EXISTS queries_agent_status_created_idx ON queries(agent_id, status, created);
     CREATE INDEX IF NOT EXISTS news_items_team_owner_time_idx ON news_items(team_id, owner_kind, owner_id, timestamp);
     CREATE INDEX IF NOT EXISTS news_items_owner_query_idx ON news_items(team_id, owner_kind, owner_id, query_id);
+    CREATE INDEX IF NOT EXISTS news_items_team_time_id_idx ON news_items(team_id, timestamp, id);
   `);
   if (!(await hasSqliteMigrationMarker(adapter, OWNER_BACKFILL_MARKER))) {
     await adapter.query(`

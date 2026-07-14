@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.109]
+
+- Prevent manager event-loop stalls during retention by adding covering query/news indexes and bounding SQLite event, query, and news cleanup to 500 rows per pass.
+- Make macOS manager restarts launchd-aware: request graceful replacement, wait up to 30 seconds, never kill a newly spawned replacement, coalesce concurrent restart requests, and apply a restart cooldown.
+- Add configurable SQLite slow-query diagnostics through `ID_SQLITE_SLOW_QUERY_MS` and regression coverage for manager restart PID guards.
+- Restore the `lint`, `typecheck`, and self-contained build-first `ci:preflight` package scripts required by the checked-in release workflow and contributing guide.
+
 ## [0.1.108]
 
 - Harden Claude CLI rate-limit handling: require trusted structured/status/reset evidence, preserve confirmed daily/weekly subscription-cap fallback, keep session/monthly/API/unknown limits off Ollama, and cover Codex model-capacity fallback/replay/restore behavior.

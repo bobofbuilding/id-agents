@@ -1,6 +1,6 @@
 {
   "name": "id-agents",
-  "version": "0.1.108",
+  "version": "0.1.109",
   "description": "Multi-agent orchestration platform with REST-AP interfaces",
   "type": "module",
   "main": "dist/index.js",
@@ -28,6 +28,9 @@
     "workspace:gc": "node scripts/workspace-gc.mjs",
     "prepublishOnly": "npm run verify:release-schema && npm run build",
     "dev": "tsc --watch",
+    "lint": "npm run typecheck",
+    "typecheck": "tsc --noEmit",
+    "ci:preflight": "npm run build && npm run lint && npm run typecheck && npm test",
     "agent:server": "npm run build && node dist/start-agent-rest-server.js",
     "agent:talk": "npm run build && node dist/agent-restap-cli.js",
     "claude": "npm run build && node dist/claude-agent-cli.js",

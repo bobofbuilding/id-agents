@@ -313,11 +313,16 @@ export async function migratePostgres(adapter: DbAdapter): Promise<void> {
   `);
 
   await adapter.query(`CREATE INDEX IF NOT EXISTS queries_team_owner_idx ON queries(team_id, owner_kind, owner_id);`);
+  await adapter.query(`CREATE INDEX IF NOT EXISTS queries_retention_idx ON queries(team_id, status, completed, created, query_id);`);
+  await adapter.query(`CREATE INDEX IF NOT EXISTS queries_agent_status_created_idx ON queries(agent_id, status, created);`);
   await adapter.query(
     `CREATE INDEX IF NOT EXISTS news_items_team_owner_time_idx ON news_items(team_id, owner_kind, owner_id, timestamp);`,
   );
   await adapter.query(
     `CREATE INDEX IF NOT EXISTS news_items_owner_query_idx ON news_items(team_id, owner_kind, owner_id, query_id);`,
+  );
+  await adapter.query(
+    `CREATE INDEX IF NOT EXISTS news_items_team_time_id_idx ON news_items(team_id, timestamp, id);`,
   );
 
   // 7) Indexes (only if the expected columns exist)

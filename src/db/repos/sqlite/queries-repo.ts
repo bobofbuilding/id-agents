@@ -6,6 +6,7 @@ import type { DbAdapter } from '../../db-adapter.js';
 import { parseJsonObject, stringifyJson } from '../../db-json.js';
 
 const TERMINAL_STATUSES = ['completed', 'failed', 'cancelled', 'expired'] as const;
+const RETENTION_DELETE_BATCH = 500;
 
 function resolveQueryOwnership(
   teamId: string,
@@ -117,9 +118,16 @@ export class SqliteQueriesRepo implements QueriesRepository {
     const r = await this.db.query(
       `DELETE FROM queries
        WHERE team_id = ?
-         AND status IN (${placeholders})
-         AND COALESCE(completed, created) < ?`,
-      [teamId, ...TERMINAL_STATUSES, beforeCompletedOrCreated],
+         AND query_id IN (
+           SELECT query_id
+           FROM queries
+           WHERE team_id = ?
+             AND status IN (${placeholders})
+             AND COALESCE(completed, created) < ?
+           ORDER BY COALESCE(completed, created) ASC, created ASC, query_id ASC
+           LIMIT ?
+         )`,
+      [teamId, teamId, ...TERMINAL_STATUSES, beforeCompletedOrCreated, RETENTION_DELETE_BATCH],
     );
     return r.rowCount ?? 0;
   }
@@ -138,6 +146,7 @@ export class SqliteQueriesRepo implements QueriesRepository {
     const excess = total - keepCount;
     if (excess <= 0) return 0;
 
+    const deleteCount = Math.min(excess, RETENTION_DELETE_BATCH);
     const r = await this.db.query(
       `DELETE FROM queries
        WHERE team_id = ?
@@ -149,7 +158,7 @@ export class SqliteQueriesRepo implements QueriesRepository {
            ORDER BY COALESCE(completed, created) ASC, created ASC, query_id ASC
            LIMIT ?
          )`,
-      [teamId, teamId, ...TERMINAL_STATUSES, excess],
+      [teamId, teamId, ...TERMINAL_STATUSES, deleteCount],
     );
     return r.rowCount ?? 0;
   }
