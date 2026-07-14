@@ -344,3 +344,42 @@ describe('Deprecated /message route mesh gate', () => {
     expect(body.error).toBe('not_mesh_reachable');
   });
 });
+
+// Migrated from the public-onchain suite: a public-team agent must not be
+// routable by principals of another team, independent of any registration step.
+describe('Cross-team boundary — idchain cannot talk to public-team agent', () => {
+  let publicTeamAgentName: string;
+
+  beforeAll(async () => {
+    await db.teams.getOrCreateTeamId('public');
+    const resp = await fetch(`${baseUrl}/agents/register`, {
+      method: 'POST',
+      headers: adminHeaders('public'),
+      body: JSON.stringify({
+        name: `boundary-agent-${Date.now()}`,
+        runtime: 'public-agent-remote',
+        customer_domain: 'boundary-test.example.com',
+        public_endpoint_url: 'https://boundary-test.example.com',
+      }),
+    });
+    expect(resp.status).toBe(201);
+    const body = await resp.json() as any;
+    publicTeamAgentName = body.name;
+  });
+
+  it('POST /talk-to from idchain principal targeting public agent is rejected', async () => {
+    const res = await fetch(`${baseUrl}/talk-to`, {
+      method: 'POST',
+      headers: adminHeaders('idchain'),
+      body: JSON.stringify({
+        to: publicTeamAgentName,
+        message: 'hello from idchain',
+      }),
+    });
+    // Must not succeed — idchain cannot route to public-team agents.
+    // The manager returns 4xx when the agent is not found in the team.
+    expect(res.ok).toBe(false);
+    const body = await res.json() as any;
+    expect(body.error).toBeTruthy();
+  });
+});

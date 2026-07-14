@@ -2,10 +2,12 @@
 /**
  * Public Onchain Integration Tests — Phase 4
  *
- * Tests wallet provisioning, on-chain registration branching, identity file
- * staging, SSH delivery, security metadata flags, idempotency (already-registered),
- * force redeliver, SSH failure non-fatal behavior, team boundary regression, and
- * response-shape / secret hygiene.
+ * Tests the daemon-side on-chain registration routes: identity file staging,
+ * SSH delivery, SSH failure non-fatal behavior, and security metadata flags.
+ * (CLI-side onchain commands were removed; the daemon routes remain for
+ * legacy API compatibility until the daemon-side removal commit. Team
+ * boundary and response-redaction coverage moved to mesh-membership and
+ * response-redaction suites.)
  *
  * Strategy:
  *   - In-process manager with in-memory SQLite.
@@ -13,7 +15,7 @@
  *   - Tiny http.createServer stands in for the remote VPS well-known endpoint.
  */
 
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import * as http from 'http';
 import * as os from 'os';
 import * as path from 'path';
@@ -29,11 +31,7 @@ import { SqliteSchedulesRepo } from '../../src/db/repos/sqlite/schedules-repo.js
 import { SqliteTasksRepo } from '../../src/db/repos/sqlite/tasks-repo.js';
 import type { DeliverFn, DeliverResult } from '../../src/lib/ssh-deliver.js';
 import type { IdChainRegisterResult } from '../../src/onchain/idchain-register.js';
-import {
-  addPublicAgent,
-  registerPublicOnchain,
-  listPublicAgents,
-} from '../../src/cli/public-commands.js';
+import { addPublicAgent } from '../../src/cli/public-commands.js';
 
 // ─── DB factory (in-memory) ──────────────────────────────────────────────────
 
@@ -236,82 +234,6 @@ async function registerFreshAgent(domainSuffix: string, opts?: {
   return { id: agent.id, domain, name: agent.name };
 }
 
-// ─── 1. Happy path ────────────────────────────────────────────────────────────
-
-describe('1. Happy path — addPublicAgent --onchain', () => {
-  let agentId: string;
-  let agentDomain: string;
-  let agentName: string;
-  let onchainDomain: string;
-
-  beforeAll(async () => {
-    const domain = `happy-path-${Date.now()}.example.com`;
-    mockWkDomain = domain;
-    const sshTarget = 'deploy@192.168.1.100';
-
-    const result = await addPublicAgent(
-      domain,
-      { sshTarget, onchain: true },
-      deps,
-    );
-    expect(result.ok).toBe(true);
-    if (!result.ok) return;
-
-    // Fetch agent details
-    const listResp = await customFetch(`${managerBaseUrl}/agents`, {
-      headers: adminHeaders('public'),
-    }) as any;
-    const listBody = await listResp.json() as any;
-    const agent = listBody.agents.find((a: any) => a.customer_domain === domain);
-    expect(agent).toBeDefined();
-    agentId = agent.id;
-    agentDomain = domain;
-    agentName = agent.name || agent.alias;
-    onchainDomain = agent.domain || (agent.metadata as any)?.idchain_domain;
-  });
-
-  it('agent is persisted with correct fields', async () => {
-    const resp = await customFetch(`${managerBaseUrl}/agents/${agentId}`, {
-      headers: adminHeaders('public'),
-    }) as any;
-    expect(resp.ok).toBe(true);
-    const body = await resp.json() as any;
-    expect(body.customer_domain).toBe(agentDomain);
-    expect(body.deploymentShape).toBe('remote-endpoint');
-    expect(body.runtime).toBe('public-agent-remote');
-    expect(body.public_endpoint_url).toBe(`https://${agentDomain}`);
-  });
-
-  it('registerOnIdChain was called with the agent sublabel', () => {
-    // At least one call must have been made
-    expect(registerStub.calls.length).toBeGreaterThan(0);
-  });
-
-  it('identity file is staged at correct path', () => {
-    const stagingDir = path.join(workDir, 'public-agents', agentId, 'staging');
-    expect(fs.existsSync(stagingDir)).toBe(true);
-    const identityPath = path.join(stagingDir, 'identity.json');
-    expect(fs.existsSync(identityPath)).toBe(true);
-  });
-
-  it('SSH delivery was called with the correct ssh_target', () => {
-    const deliverCall = deliverStub.calls.find((c) => c.sshTarget === 'deploy@192.168.1.100');
-    expect(deliverCall).toBeDefined();
-    expect(deliverCall!.remotePath).toBe('/opt/public-agent/identity.json');
-  });
-
-  it('metadata has correct security flags', async () => {
-    const resp = await customFetch(`${managerBaseUrl}/agents/${agentId}`, {
-      headers: adminHeaders('public'),
-    }) as any;
-    const body = await resp.json() as any;
-    const meta = body.metadata as any;
-    expect(meta.mesh_member).toBe(false);
-    expect(meta.dmz).toBe(true);
-    expect(meta.idchain_domain).toBeTruthy();
-  });
-});
-
 // ─── 2. Identity file schema ──────────────────────────────────────────────────
 
 describe('2. Identity file schema', () => {
@@ -344,72 +266,6 @@ describe('2. Identity file schema', () => {
     const parsedDate = new Date(identity.registered_at);
     expect(parsedDate.toISOString()).toBe(identity.registered_at);
     expect(parsedDate.getFullYear()).toBeGreaterThanOrEqual(2025);
-  });
-});
-
-// ─── 3. Register-onchain no-op (already registered) ─────────────────────────
-
-describe('3. register-onchain — no-op when already registered', () => {
-  it('returns already_registered without calling registerOnIdChain again', async () => {
-    const { id: agentId, domain: agentDomain } = await registerFreshAgent(`noop-${Date.now()}`);
-
-    // Register on-chain first
-    const regResp = await customFetch(`${managerBaseUrl}/agents/${agentId}/onchain/register`, {
-      method: 'POST',
-      headers: adminHeaders('public'),
-      body: JSON.stringify({}),
-    }) as any;
-    expect(regResp.ok).toBe(true);
-    const regBody = await regResp.json() as any;
-    const idchainDomain = regBody.domain;
-
-    const countBefore = registerStub.calls.length;
-    const deliverCountBefore = deliverStub.calls.length;
-
-    // Use customer_domain as ref (stable across on-chain registration)
-    const result = await registerPublicOnchain(agentDomain, { force: false }, deps);
-    expect(result.ok).toBe(true);
-    if (!result.ok) return;
-    expect((result as any).alreadyRegistered).toBe(true);
-    expect((result as any).idchain_domain).toBe(idchainDomain);
-
-    // No new on-chain call
-    expect(registerStub.calls.length).toBe(countBefore);
-    // No new SSH delivery
-    expect(deliverStub.calls.length).toBe(deliverCountBefore);
-  });
-});
-
-// ─── 4. Register-onchain --force redeliver ────────────────────────────────────
-
-describe('4. register-onchain --force — SSH delivery re-invoked', () => {
-  it('skips registerOnIdChain but calls deliverFn again', async () => {
-    const { id: agentId, domain: agentDomain } = await registerFreshAgent(`force-${Date.now()}`, {
-      sshTarget: 'deploy@force-host.example.com',
-    });
-
-    // Register on-chain first
-    const regResp = await customFetch(`${managerBaseUrl}/agents/${agentId}/onchain/register`, {
-      method: 'POST',
-      headers: adminHeaders('public'),
-      body: JSON.stringify({}),
-    }) as any;
-    expect(regResp.ok).toBe(true);
-
-    const countBefore = registerStub.calls.length;
-    const deliverCountBefore = deliverStub.calls.length;
-
-    // Use customer_domain as ref (stable across on-chain registration)
-    const result = await registerPublicOnchain(agentDomain, { force: true }, deps);
-    expect(result.ok).toBe(true);
-
-    // On-chain registration NOT called again
-    expect(registerStub.calls.length).toBe(countBefore);
-
-    // Redeliver endpoint should trigger a new SSH delivery attempt
-    // (delivery call count may increase if agent has ssh_target)
-    // Either redeliver happened or we got a meaningful success
-    expect((result as any).message).toBeDefined();
   });
 });
 
@@ -494,114 +350,6 @@ describe('5. SSH delivery failure — non-fatal', () => {
     // SSH delivery was attempted
     expect(failDeliverStub.calls.length).toBeGreaterThan(0);
     expect(failDeliverStub.calls[0].sshTarget).toBe('deploy@unreachable.example.com');
-  });
-});
-
-// ─── 6. Team boundary regression ─────────────────────────────────────────────
-
-describe('6. Team boundary regression — idchain cannot talk to public agent', () => {
-  let publicAgentName: string;
-
-  beforeAll(async () => {
-    const domain = `boundary-test-${Date.now()}.example.com`;
-    mockWkDomain = domain;
-    const resp = await customFetch(`${managerBaseUrl}/agents/register`, {
-      method: 'POST',
-      headers: adminHeaders('public'),
-      body: JSON.stringify({
-        name: `boundary-agent-${Date.now()}`,
-        runtime: 'public-agent-remote',
-        customer_domain: domain,
-        public_endpoint_url: `https://${domain}`,
-      }),
-    }) as any;
-    expect(resp.status).toBe(201);
-    const body = await resp.json() as any;
-    publicAgentName = body.name;
-  });
-
-  it('POST /talk-to from idchain principal targeting public agent is rejected', async () => {
-    const res = await customFetch(`${managerBaseUrl}/talk-to`, {
-      method: 'POST',
-      headers: adminHeaders('idchain'),
-      body: JSON.stringify({
-        to: publicAgentName,
-        message: 'hello from idchain',
-      }),
-    }) as any;
-    // Must not succeed — idchain cannot route to public agents
-    // The manager returns 4xx when agent is not found in the team
-    expect(res.ok).toBe(false);
-    const body = await res.json() as any;
-    expect(body.error).toBeTruthy();
-  });
-});
-
-// ─── 7. Response shape — no secrets ──────────────────────────────────────────
-
-describe('7. Response shape — no secrets in GET /agents', () => {
-  let agentId: string;
-
-  beforeAll(async () => {
-    const domain = `secret-test-${Date.now()}.example.com`;
-    mockWkDomain = domain;
-
-    // Register and then register on-chain to get idchain_domain
-    const regResp = await customFetch(`${managerBaseUrl}/agents/register`, {
-      method: 'POST',
-      headers: adminHeaders('public'),
-      body: JSON.stringify({
-        name: `secret-test-${Date.now()}`,
-        runtime: 'public-agent-remote',
-        customer_domain: domain,
-        public_endpoint_url: `https://${domain}`,
-      }),
-    }) as any;
-    const regBody = await regResp.json() as any;
-    agentId = regBody.id;
-
-    await customFetch(`${managerBaseUrl}/agents/${agentId}/onchain/register`, {
-      method: 'POST',
-      headers: adminHeaders('public'),
-      body: JSON.stringify({}),
-    }) as any;
-  });
-
-  it('response includes runtime, deploymentShape, public_endpoint_url, customer_domain, idchain_domain', async () => {
-    const resp = await customFetch(`${managerBaseUrl}/agents`, {
-      headers: adminHeaders('public'),
-    }) as any;
-    const body = await resp.json() as any;
-    const agent = body.agents.find((a: any) => a.id === agentId);
-    expect(agent).toBeDefined();
-    expect(agent.runtime).toBe('public-agent-remote');
-    expect(agent.deploymentShape).toBe('remote-endpoint');
-    expect(agent.public_endpoint_url).toBeTruthy();
-    expect(agent.customer_domain).toBeTruthy();
-  });
-
-  it('response does NOT contain env-var secret names', async () => {
-    const resp = await customFetch(`${managerBaseUrl}/agents`, {
-      headers: adminHeaders('public'),
-    }) as any;
-    const bodyText = await resp.text();
-    // These env-var names must never appear in the response
-    expect(bodyText).not.toContain('OPENROUTER_API_KEY');
-    expect(bodyText).not.toContain('OWS_REGISTRAR_WALLET');
-    expect(bodyText).not.toContain('ID_REGISTRAR_PRIVATE_KEY');
-    expect(bodyText).not.toContain('PRIVATE_KEY');
-  });
-
-  it('response does NOT contain private key hex strings (> 40 chars)', async () => {
-    const resp = await customFetch(`${managerBaseUrl}/agents`, {
-      headers: adminHeaders('public'),
-    }) as any;
-    const bodyText = await resp.text();
-    // Private keys are 64-char hex (66 with 0x prefix).
-    // Ethereum addresses are 40 hex chars (42 with 0x). Skip those.
-    const longHexPattern = /0x[0-9a-f]{43,}/gi;
-    const matches = bodyText.match(longHexPattern) ?? [];
-    expect(matches).toHaveLength(0);
   });
 });
 

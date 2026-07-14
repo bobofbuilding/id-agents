@@ -21,7 +21,6 @@ import {
   addPublicAgent,
   listPublicAgents,
   removePublicAgent,
-  registerPublicOnchain,
 } from './cli/public-commands.js';
 import {
   maybeRunWorkspaceSyncCli,
@@ -93,12 +92,10 @@ const HELP_ITEMS: Array<{ cmd: string; desc: string; indent?: boolean }> = [
   { cmd: '/artifact <agent> <path>', desc: 'Read file from agent output directory' },
   { cmd: '/news [-l] <agent>', desc: 'Check recent messages (-l for full content)' },
   { cmd: '/public', desc: 'List registered public-team agents' },
-  { cmd: '/public add <domain> [--ssh-target=user@host] [--internal-port=N] [--onchain] [--registrar=<name>]', desc: 'Register a remote public-agent' },
-  { cmd: '/public register-onchain <name|domain> [--force]', desc: 'Register public agent on ID Chain (--force re-delivers identity.json)' },
+  { cmd: '/public add <domain> [--ssh-target=user@host] [--internal-port=N]', desc: 'Register a remote public-agent' },
   { cmd: '/public remove <name|domain>', desc: 'Deregister a public-team agent' },
   { cmd: '/public <n|domain> <msg>', desc: 'Chat with a public agent by index or domain' },
   { cmd: '/public clear', desc: 'Remove all public-team agents (with confirmation)' },
-  { cmd: '/register <agent>', desc: 'Register agent onchain' },
   { cmd: '/respond <num|query_id> [msg]', desc: 'Respond to pending manager inbox work' },
   { cmd: '/heartbeat', desc: 'List heartbeats' },
   { cmd: '/heartbeat add <agent> <seconds> <message>', desc: 'Add heartbeat' },
@@ -2800,94 +2797,6 @@ async function handleLine(line: string) {
     return;
   }
 
-  if (input === '/registry') {
-    if (!(await checkManager())) {
-      showManagerNotRunningError();
-      rl.prompt();
-      return;
-    }
-    await showDefaultRegistry();
-    rl.prompt();
-    return;
-  }
-
-  if (input === '/registry push') {
-    if (!(await checkManager())) {
-      showManagerNotRunningError();
-      rl.prompt();
-      return;
-    }
-    await registryPush();
-    rl.prompt();
-    return;
-  }
-
-  if (input === '/registry pull' || input.startsWith('/registry pull ')) {
-    if (!(await checkManager())) {
-      showManagerNotRunningError();
-      rl.prompt();
-      return;
-    }
-    const arg = input.substring('/registry pull'.length).trim();
-    if (!arg) {
-      console.log(`\n${colors.red}❌ Usage: /registry pull <agent-ids>${colors.reset}`);
-      console.log(`${colors.gray}Example: /registry pull 1,2,3${colors.reset}`);
-      console.log(`${colors.gray}Example: /registry pull 1 2 3${colors.reset}\n`);
-      rl.prompt();
-      return;
-    }
-
-    // Parse agent IDs from space/comma separated string
-    const agentIds = arg.split(/[,\s]+/).filter(id => id.trim()).map(id => id.trim());
-    if (agentIds.length === 0) {
-      console.log(`\n${colors.red}❌ No valid agent IDs found${colors.reset}\n`);
-      rl.prompt();
-      return;
-    }
-
-    await registryPull({ agentIds });
-    rl.prompt();
-    return;
-  }
-
-
-  if (input.startsWith('/registry set ')) {
-    if (!(await checkManager())) {
-      showManagerNotRunningError();
-      rl.prompt();
-      return;
-    }
-    const rest = input.substring('/registry set '.length).trim();
-    const parts = rest.split(' ');
-    const chainId = parts[0];
-    const registryAddress = parts[1];
-    if (!chainId || !registryAddress) {
-      console.log(`\n${colors.red}❌ Usage: /registry set <chainId> <registryAddress>${colors.reset}\n`);
-      rl.prompt();
-      return;
-    }
-    await setDefaultRegistry(parseInt(chainId), registryAddress);
-    rl.prompt();
-    return;
-  }
-
-  if (input.startsWith('/registry set-registrar ')) {
-    if (!(await checkManager())) {
-      showManagerNotRunningError();
-      rl.prompt();
-      return;
-    }
-    const registrarAddress = input.substring('/registry set-registrar '.length).trim();
-    if (!registrarAddress) {
-      console.log(`\n${colors.red}❌ Usage: /registry set-registrar <address>${colors.reset}\n`);
-      rl.prompt();
-      return;
-    }
-    await setRegistrarAddress(registrarAddress);
-    rl.prompt();
-    return;
-  }
-
   // /update <agent> [--wallet <addr>] [--name <newname>]
   if (input.startsWith('/update ')) {
     if (!(await checkManager())) {
@@ -2933,65 +2842,6 @@ async function handleLine(line: string) {
     } catch (err: any) {
       console.log(`\n${colors.red}❌ Error: ${err.message}${colors.reset}\n`);
     }
-    rl.prompt();
-    return;
-  }
-
-  if (input === '/sync-wallets') {
-    if (!(await checkManager())) {
-      showManagerNotRunningError();
-      rl.prompt();
-      return;
-    }
-    console.log(`\n${colors.gray}⛓️  Syncing wallet addresses for registered agents...${colors.reset}\n`);
-    try {
-      const response = await managerFetch('/remote', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ command: '/sync-wallets' })
-      });
-      const result: any = await response.json();
-      if (!result.ok) {
-        console.log(`${colors.red}❌ ${result.error}${colors.reset}\n`);
-      } else {
-        const data = result.result;
-        if (data.results) {
-          for (const r of data.results) {
-            if (r.status === 'synced') {
-              console.log(`${colors.green}✅ ${r.name}${colors.reset} — ${r.set.join(', ') || 'no chains set'}`);
-            } else if (r.status === 'skipped') {
-              console.log(`${colors.gray}⏭️  ${r.name}${colors.reset} — ${r.reason}`);
-            } else {
-              console.log(`${colors.red}❌ ${r.name}${colors.reset} — ${r.error || 'unknown error'}`);
-            }
-          }
-          console.log(`\n${colors.bold}Summary:${colors.reset} ${data.synced} synced, ${data.skipped} skipped, ${data.failed} failed\n`);
-        }
-      }
-    } catch (err: any) {
-      console.log(`${colors.red}❌ Error: ${err.message}${colors.reset}\n`);
-    }
-    rl.prompt();
-    return;
-  }
-
-  if (input.startsWith('/register ')) {
-    if (!(await checkManager())) {
-      showManagerNotRunningError();
-      rl.prompt();
-      return;
-    }
-    const agentName = input.substring(10).trim();
-    if (!agentName) {
-      console.log(`\n${colors.red}❌ Usage: /register <agent-name>${colors.reset}\n`);
-      rl.prompt();
-      return;
-    }
-    const corrected = agentName.toLowerCase() === 'manger' ? 'manager' : agentName;
-    if (agentName.toLowerCase() === 'manger') {
-      console.log(`${colors.yellow}⚠️  Interpreting "/register manger" as "/register manager"${colors.reset}`);
-    }
-    await registerAgentOnchain(corrected);
     rl.prompt();
     return;
   }
@@ -3404,58 +3254,25 @@ async function handleLine(line: string) {
 
     const rest = input === '/public' ? '' : input.slice('/public '.length).trim();
 
-    // /public add <domain> [--ssh-target=...] [--internal-port=N] [--onchain] [--registrar=<name>]
+    // /public add <domain> [--ssh-target=...] [--internal-port=N]
     if (rest.startsWith('add ')) {
       const addArgs = parseArgs(rest.slice('add '.length));
       const domain = addArgs.find((a) => !a.startsWith('--'));
       if (!domain) {
-        console.log(`\n${colors.red}❌ Usage: /public add <domain> [--ssh-target=user@host] [--internal-port=N] [--onchain] [--registrar=<name>]${colors.reset}\n`);
+        console.log(`\n${colors.red}❌ Usage: /public add <domain> [--ssh-target=user@host] [--internal-port=N]${colors.reset}\n`);
         rl.prompt();
         return;
       }
       const sshFlag = addArgs.find((a) => a.startsWith('--ssh-target='));
       const portFlag = addArgs.find((a) => a.startsWith('--internal-port='));
-      const registrarFlag = addArgs.find((a) => a.startsWith('--registrar='));
       const sshTarget = sshFlag ? sshFlag.slice('--ssh-target='.length) : null;
       const internalPort = portFlag ? parseInt(portFlag.slice('--internal-port='.length), 10) : null;
-      const onchain = addArgs.includes('--onchain');
-      const registrar = registrarFlag ? registrarFlag.slice('--registrar='.length) : undefined;
 
       (async () => {
         try {
-          const result = await addPublicAgent(domain, { sshTarget, internalPort, onchain, registrar }, publicDeps);
+          const result = await addPublicAgent(domain, { sshTarget, internalPort }, publicDeps);
           if (result.ok) {
             console.log(`\n${colors.green}✅ ${result.message}${colors.reset}\n`);
-          } else {
-            console.log(`\n${colors.red}❌ ${result.error}${colors.reset}\n`);
-          }
-        } catch (err: any) {
-          console.log(`\n${colors.red}❌ Error: ${err?.message ?? String(err)}${colors.reset}\n`);
-        }
-        rl.prompt();
-      })();
-      return;
-    }
-
-    // /public register-onchain <name|domain> [--force]
-    if (rest.startsWith('register-onchain ') || rest === 'register-onchain') {
-      const roArgs = rest === 'register-onchain' ? [] : parseArgs(rest.slice('register-onchain '.length));
-      const ref = roArgs.find((a) => !a.startsWith('--'));
-      if (!ref) {
-        console.log(`\n${colors.red}❌ Usage: /public register-onchain <name|domain> [--force]${colors.reset}\n`);
-        rl.prompt();
-        return;
-      }
-      const force = roArgs.includes('--force');
-      (async () => {
-        try {
-          const result = await registerPublicOnchain(ref, { force }, publicDeps);
-          if (result.ok) {
-            if ((result as any).alreadyRegistered) {
-              console.log(`\n${colors.yellow}agent already on-chain at ${(result as any).idchain_domain}${colors.reset}\n`);
-            } else {
-              console.log(`\n${colors.green}✅ ${result.message}${colors.reset}\n`);
-            }
           } else {
             console.log(`\n${colors.red}❌ ${result.error}${colors.reset}\n`);
           }
@@ -4317,242 +4134,6 @@ async function deleteAgent(agentNameOrId: string) {
     console.log(`\n${colors.red}❌ Error: ${error.message}${colors.reset}\n`);
   }
 }
-
-async function showDefaultRegistry() {
-  try {
-    // Fetch both registry and registrar info
-    const [registryResp, registrarResp] = await Promise.all([
-      managerFetch('/registry/default'),
-      managerFetch('/registry/registrar')
-    ]);
-
-    console.log(`\n${colors.bold}${colors.cyan}⛓️  Onchain Registry Configuration${colors.reset}`);
-
-    if (registryResp.ok) {
-      const registryData: any = await registryResp.json();
-      const reg = registryData.registry;
-      console.log(`   ${colors.gray}Chain ID:${colors.reset} ${reg.chainId}`);
-      console.log(`   ${colors.gray}Registry:${colors.reset} ${reg.registryAddress}`);
-    } else {
-      console.log(`   ${colors.red}❌ Could not fetch registry info${colors.reset}`);
-    }
-
-    if (registrarResp.ok) {
-      const registrarData: any = await registrarResp.json();
-      console.log(`   ${colors.gray}Registrar:${colors.reset} ${registrarData.registrarAddress}`);
-    } else {
-      console.log(`   ${colors.red}❌ Could not fetch registrar info${colors.reset}`);
-    }
-
-    console.log();
-  } catch (error: any) {
-    console.log(`\n${colors.red}❌ Error: ${error.message}${colors.reset}\n`);
-  }
-}
-
-async function setDefaultRegistry(chainId: number, registryAddress: string) {
-  try {
-    const response = await managerFetch('/registry/default', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chainId, registryAddress })
-    });
-    if (!response.ok) {
-      const text = await response.text();
-      console.log(`\n${colors.red}❌ Could not set default registry: ${text}${colors.reset}\n`);
-      return;
-    }
-    const data: any = await response.json();
-    console.log(`\n${colors.green}✅ Default registry updated${colors.reset}`);
-    console.log(`   ${colors.gray}Chain ID:${colors.reset} ${data.registry.chainId}`);
-    console.log(`   ${colors.gray}Address:${colors.reset} ${data.registry.registryAddress}\n`);
-  } catch (error: any) {
-    console.log(`\n${colors.red}❌ Error: ${error.message}${colors.reset}\n`);
-  }
-}
-
-async function setRegistrarAddress(registrarAddress: string) {
-  try {
-    const response = await managerFetch('/registry/registrar', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ registrarAddress })
-    });
-    if (!response.ok) {
-      const text = await response.text();
-      console.log(`\n${colors.red}❌ Could not set registrar address: ${text}${colors.reset}\n`);
-      return;
-    }
-    const data: any = await response.json();
-    console.log(`\n${colors.green}✅ Registrar address updated${colors.reset}`);
-    console.log(`   ${colors.gray}Address:${colors.reset} ${data.registrarAddress}\n`);
-  } catch (error: any) {
-    console.log(`\n${colors.red}❌ Error: ${error.message}${colors.reset}\n`);
-  }
-}
-
-async function registryPush() {
-  try {
-    console.log(`\n${colors.gray}⤴️  /registry push ...${colors.reset}`);
-    const response = await managerFetch('/registry/push', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({})
-    });
-    if (!response.ok) {
-      const text = await response.text();
-      console.log(`\n${colors.red}❌ Registry push failed: ${text}${colors.reset}\n`);
-      return;
-    }
-    const data: any = await response.json();
-    console.log(`\n${colors.green}✅ Registry push complete${colors.reset}`);
-    console.log(`   ${colors.gray}Registered:${colors.reset} ${data.summary?.registered ?? 0}`);
-    console.log(`   ${colors.gray}Skipped:${colors.reset} ${data.summary?.skipped ?? 0}`);
-    console.log(`   ${colors.gray}Failed:${colors.reset} ${data.summary?.failed ?? 0}\n`);
-  } catch (error: any) {
-    console.log(`\n${colors.red}❌ Error: ${error.message}${colors.reset}\n`);
-  }
-}
-
-async function registryPull(opts: { agentIds?: string[] } = {}) {
-  try {
-    console.log(`\n${colors.gray}⤵️  /registry pull ...${colors.reset}`);
-    const response = await managerFetch('/registry/pull', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ agentIds: opts.agentIds, spawn: true })
-    });
-    if (!response.ok) {
-      const text = await response.text();
-      console.log(`\n${colors.red}❌ Registry pull failed: ${text}${colors.reset}\n`);
-      return;
-    }
-    const data: any = await response.json();
-    console.log(`\n${colors.green}✅ Registry pull complete${colors.reset}`);
-    if (data.discovery) {
-      const d = data.discovery;
-      console.log(`   ${colors.gray}Agents:${colors.reset} fetched ${d.fetched ?? 0}, upserted ${d.upserted ?? 0}`);
-      if (typeof d.spawned === 'number') {
-        console.log(`   ${colors.gray}Spawned:${colors.reset} ${d.spawned}`);
-      }
-      if (Array.isArray(d.errors) && d.errors.length > 0) {
-        console.log(`   ${colors.yellow}Discovery warnings:${colors.reset} ${d.errors.join('; ')}`);
-      }
-    }
-    console.log(`   ${colors.gray}Updated:${colors.reset} ${data.summary?.updated ?? 0}`);
-    console.log(`   ${colors.gray}Skipped:${colors.reset} ${data.summary?.skipped ?? 0}`);
-    console.log(`   ${colors.gray}Failed:${colors.reset} ${data.summary?.failed ?? 0}\n`);
-  } catch (error: any) {
-    console.log(`\n${colors.red}❌ Error: ${error.message}${colors.reset}\n`);
-  }
-}
-
-// ==================== API KEY MANAGEMENT ====================
-
-
-/** Non-interactive registration for /remote usage */
-async function registerAgentOnchainRemote(agent: any): Promise<{ success: boolean; result?: string; error?: string }> {
-  try {
-    const response = await managerFetch(`/agents/${encodeURIComponent(agent.id)}/onchain/register`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' }
-    });
-    if (!response.ok) {
-      const text = await response.text();
-      return { success: false, error: `Registration failed: ${text}` };
-    }
-    const data: any = await response.json();
-    const fullDomain = data.domain || data.agent?.domain || data.tokenId;
-
-    // Push identity to running agent
-    const agentUrl = agent.internal_url || agent.url;
-    if (agentUrl && data.agent) {
-      try {
-        await fetch(`${agentUrl}/identity`, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ tokenId: data.tokenId, domain: fullDomain })
-        });
-      } catch { /* non-critical */ }
-    }
-
-    return { success: true, result: `Registered "${agent.name}" as ${fullDomain} (tx: ${data.txHash})` };
-  } catch (err: any) {
-    return { success: false, error: err.message };
-  }
-}
-
-async function registerAgentOnchain(agentName: string) {
-  try {
-    // Resolve to an id first so name collisions (e.g. onchain agents named "manager") can't cause surprises.
-    const agent = await resolveAgent(agentName);
-    if (!agent?.id) {
-      return;
-    }
-
-    const currentDomain = agent?.domain ? String(agent.domain) : (agent?.tokenId ? String(agent.tokenId) : '');
-    if (currentDomain) {
-      console.log(`\n${colors.yellow}⚠️  "${agentName}" already has an ID Chain registration (${currentDomain}).${colors.reset}`);
-      console.log(
-        `${colors.yellow}⚠️  /register will create a NEW ID Chain name and update this agent to point at it.${colors.reset}`
-      );
-      console.log(`${colors.gray}   (The old token will still exist onchain; this just changes what this agent is "linked" to.)${colors.reset}`);
-      console.log(`${colors.gray}   Type ${colors.bold}REGISTER${colors.reset}${colors.gray} to confirm, or anything else to cancel.${colors.reset}\n`);
-
-      const confirmed: string = await new Promise((resolve) => {
-        rl.question(`${colors.cyan}>>${colors.reset} `, (answer) => resolve(answer.trim()));
-      });
-
-      if (confirmed !== 'REGISTER') {
-        console.log(`\n${colors.yellow}❌ Register cancelled${colors.reset}\n`);
-        return;
-      }
-    }
-
-    console.log(`\n${colors.gray}⛓️  Registering "${getAgentDisplayName(agent)}" on ID Chain...${colors.reset}`);
-    console.log(`${colors.gray}   Submitting registration via id-cli. This may take 15-30 seconds.${colors.reset}\n`);
-
-    const response = await managerFetch(`/agents/${encodeURIComponent(agent.id)}/onchain/register`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' }
-    });
-    if (!response.ok) {
-      const text = await response.text();
-      console.log(`\n${colors.red}❌ Failed to register onchain: ${text}${colors.reset}\n`);
-      return;
-    }
-    const data: any = await response.json();
-    const fullDomain = data.domain || data.agent?.domain || data.tokenId;
-    console.log(`\n${colors.green}✅ Agent "${agentName}" registered on ID Chain${colors.reset}`);
-    console.log(`   ${colors.gray}Domain:${colors.reset} ${fullDomain}`);
-    console.log(`   ${colors.gray}Transaction:${colors.reset} ${data.txHash}`);
-
-    // Push updated identity to the running agent
-    const agentUrl = agent.internal_url || agent.url;
-    if (agentUrl && data.agent) {
-      try {
-        const identityPayload = {
-          tokenId: data.tokenId,
-          domain: fullDomain
-        };
-        const identityRes = await fetch(`${agentUrl}/identity`, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(identityPayload)
-        });
-        if (identityRes.ok) {
-          console.log(`   ${colors.gray}Identity pushed to agent${colors.reset}`);
-        }
-      } catch {
-        // Non-critical - agent will still work, just won't know its tokenId
-      }
-    }
-    console.log('');
-  } catch (error: any) {
-    console.log(`\n${colors.red}❌ Error: ${error.message}${colors.reset}\n`);
-  }
-}
-
 
 async function listAgents(_showAll: boolean = false) {
   try {

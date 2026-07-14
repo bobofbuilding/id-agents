@@ -244,3 +244,44 @@ describe('Non-admin principal gets redacted record', () => {
     expect(agent.metadata?.auth_key_ref).toBeUndefined();
   });
 });
+
+// Migrated from the public-onchain suite: whole-body secret hygiene for the
+// team agent listing, regardless of principal-level redaction rules.
+describe('GET /agents response body — secret hygiene', () => {
+  it('response includes runtime, deploymentShape, public_endpoint_url, customer_domain', async () => {
+    const resp = await fetch(`${baseUrl}/agents`, {
+      headers: adminHeaders('public'),
+    });
+    const body = await resp.json() as any;
+    const agent = body.agents.find((a: any) => a.id === agentId);
+    expect(agent).toBeDefined();
+    expect(agent.runtime).toBe('public-agent-remote');
+    expect(agent.deploymentShape).toBe('remote-endpoint');
+    expect(agent.public_endpoint_url).toBeTruthy();
+    expect(agent.customer_domain).toBeTruthy();
+  });
+
+  it('response does NOT contain env-var secret names', async () => {
+    const resp = await fetch(`${baseUrl}/agents`, {
+      headers: adminHeaders('public'),
+    });
+    const bodyText = await resp.text();
+    // These env-var names must never appear in the response
+    expect(bodyText).not.toContain('OPENROUTER_API_KEY');
+    expect(bodyText).not.toContain('OWS_REGISTRAR_WALLET');
+    expect(bodyText).not.toContain('ID_REGISTRAR_PRIVATE_KEY');
+    expect(bodyText).not.toContain('PRIVATE_KEY');
+  });
+
+  it('response does NOT contain private key hex strings (> 40 chars)', async () => {
+    const resp = await fetch(`${baseUrl}/agents`, {
+      headers: adminHeaders('public'),
+    });
+    const bodyText = await resp.text();
+    // Private keys are 64-char hex (66 with 0x prefix).
+    // Ethereum addresses are 40 hex chars (42 with 0x). Skip those.
+    const longHexPattern = /0x[0-9a-f]{43,}/gi;
+    const matches = bodyText.match(longHexPattern) ?? [];
+    expect(matches).toHaveLength(0);
+  });
+});
