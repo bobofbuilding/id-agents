@@ -3,9 +3,9 @@
 const RESERVED_WORDS = new Set([
   'delete', 'list', 'create', 'deploy', 'sync', 'spawn', 'kill', 'stop',
   'start', 'rebuild', 'status', 'schedule', 'tasks', 'team',
-  'teams', 'ask', 'hey', 'news', 'register', 'configs', 'registry',
+  'teams', 'ask', 'hey', 'news', 'configs',
   'keys', 'meta', 'pay', 'heartbeat', 'heartbeats', 'cancel', 'clear',
-  'update', 'help', 'sync-wallets', 'artifact', 'output', 'verify',
+  'update', 'help', 'artifact', 'output', 'verify',
   'manager',
 ]);
 

@@ -6,7 +6,7 @@
  * Runtime (live HTTP servers) still live in-memory, but all durable state is in the DB.
  *
  * Wallet management: agents no longer have individual wallets stored in the DB.
- * Onchain operations use either an OWS wallet (OWS_REGISTRAR_WALLET) or raw key (PRIVATE_KEY).
+ * OWS wallets are provisioned per-agent on opt-in (metadata.wallet === true).
  * Per-agent keys can be provided via .env.<agent_id> files in the repo root.
  */
 
@@ -18,11 +18,8 @@ import { existsSync, mkdirSync, rmSync, readFileSync, writeFileSync, readdirSync
 import { execFileSync, spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import { WebSocketServer, WebSocket } from 'ws';
-import { type Address, type Hex } from 'viem';
-import { privateKeyToAccount } from 'viem/accounts';
 import yaml from 'js-yaml';
 import { AgentRestServer } from './agent-rest-server.js';
-import { registerOnIdChain, createSubnameOnIdChain, setMultiChainAddresses } from './onchain/idchain-register.js';
 import { defaultDeliverFn, redactSshTarget, type DeliverFn } from './lib/ssh-deliver.js';
 import { probeRemoteAgent, defaultHealthProbeFn, type HealthProbeFn } from './lib/remote-heartbeat.js';
 import { filterClaudeEnvVars } from './lib/env-hygiene.js';
@@ -310,11 +307,6 @@ export async function discoverRestAPEndpoints(baseEndpoint: string): Promise<{ t
   return { talk: '/talk', news: '/news', schedule: null };
 }
 
-type AgentRegistryId = {
-  chainId: number;
-  registryAddress: string;
-};
-
 type AgentMetadata = Record<string, any> & {
   name?: string;
   service_type?: string;  // e.g., "REST-AP", "MCP", "A2A"
@@ -380,8 +372,6 @@ export class AgentManagerDb {
   private managementPort: number = 4100;
   /** Injectable SSH delivery function — override in tests. */
   private deliverFn: DeliverFn = defaultDeliverFn;
-  /** Injectable onchain registration function — override in tests. */
-  private registerOnIdChainFn: typeof registerOnIdChain = registerOnIdChain;
   /** Injectable HTTP probe function — override in tests to mock remote health checks. */
   private healthProbeFn: HealthProbeFn = defaultHealthProbeFn;
   /**
@@ -405,8 +395,6 @@ export class AgentManagerDb {
     opts?: {
       /** Override SSH delivery function (for tests). */
       deliverFn?: DeliverFn;
-      /** Override onchain registration function (for tests). */
-      registerOnIdChainFn?: typeof registerOnIdChain;
       /** Override remote health probe function (for tests). */
       healthProbeFn?: HealthProbeFn;
       /**
@@ -421,7 +409,6 @@ export class AgentManagerDb {
     this.baseWorkDir = baseWorkDir;
     this.db = db;
     if (opts?.deliverFn) this.deliverFn = opts.deliverFn;
-    if (opts?.registerOnIdChainFn) this.registerOnIdChainFn = opts.registerOnIdChainFn;
     if (opts?.healthProbeFn) this.healthProbeFn = opts.healthProbeFn;
     this.libraryRoot =
       opts && Object.prototype.hasOwnProperty.call(opts, 'libraryRoot')
@@ -997,244 +984,6 @@ export class AgentManagerDb {
 
   private async dbNextPort(_teamId?: string): Promise<number> {
     return this.db.agents.nextPort();
-  }
-
-  /**
-   * Get the shared deployer address.
-   * Uses OWS wallet if OWS_REGISTRAR_WALLET is set, otherwise derives from PRIVATE_KEY.
-   */
-  private getDeployerAddress(): string | null {
-    const owsWallet = process.env.OWS_REGISTRAR_WALLET;
-    if (owsWallet) {
-      try {
-        const output = execFileSync('ows', ['wallet', 'list'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 10000 });
-        let inWallet = false;
-        for (const line of output.split('\n')) {
-          if (line.includes('Name:') && line.includes(owsWallet)) { inWallet = true; continue; }
-          if (inWallet && line.includes('Name:')) break;
-          if (inWallet) {
-            const match = line.trim().match(/^eip155:1\s.*→\s*(0x[0-9a-fA-F]+)/);
-            if (match) return match[1];
-          }
-        }
-        return null;
-      } catch {
-        return null;
-      }
-    }
-    const pk = process.env.AGENT_PRIVATE_KEY || process.env.PRIVATE_KEY;
-    if (!pk) return null;
-    const account = privateKeyToAccount(pk as Hex);
-    return account.address;
-  }
-
-  private async getDefaultRegistry(teamId: string): Promise<AgentRegistryId> {
-    const cfg = await this.db.teams.getConfig(teamId);
-    const chainId = parseInt(String(cfg.default_chain_id || process.env.ID_DEFAULT_CHAIN_ID || '8453'));
-    const registryAddress =
-      (cfg.default_registry_address ||
-        process.env.AGENT_REGISTRY_ADDRESS ||
-        process.env.ID_DEFAULT_REGISTRY_ADDRESS ||
-        '0x2b39585cc5004712c938480cd7ff5b97d2bbf433') as string;
-    return { chainId, registryAddress };
-  }
-
-  private async getRegistrarAddress(teamId: string): Promise<Address> {
-    const cfg = await this.db.teams.getConfig(teamId);
-    const registrarAddressEnv = process.env.AGENT_REGISTRAR_ADDRESS || process.env.ID_REGISTRAR_ADDRESS;
-    const addr = (cfg.registrar_address || cfg.sepolia_registrar_address || registrarAddressEnv) as string | undefined;
-    if (!addr) throw new Error('Missing registrar address (set config.registrar_address or env AGENT_REGISTRAR_ADDRESS)');
-    return addr as Address;
-  }
-
-  private async setRegistrarAddress(teamId: string, registrarAddress: string): Promise<void> {
-    await this.db.teams.setRegistrarAddress(teamId, String(registrarAddress));
-  }
-
-  private async setDefaultRegistry(teamId: string, chainId: number, registryAddress: string): Promise<void> {
-    await this.db.teams.setDefaultRegistry(teamId, String(chainId), String(registryAddress));
-  }
-
-  private async registerOnchainAndUpdateAgent(teamId: string, agent: AgentRow): Promise<{ txHash: string; tokenId: string; domain: string }> {
-    const isRemote = isRemoteEndpointRuntime(agent.runtime);
-
-    // ── Phase 4: wallet provisioning for remote agents ──────────────────────
-    // For public-agent-remote, provision an OWS wallet before registration so
-    // multi-chain address records can be set.  For local agents the wallet is
-    // already attached via the normal deploy path.
-    //
-    if (isRemote && !(agent.metadata as any)?.ows_wallet && this.isWalletProvisioningEnabled(agent.metadata)) {
-      const refreshed = await this.provisionAgentWalletForRow(teamId, 'public', agent);
-      if (refreshed) {
-        agent = refreshed;
-      } else {
-        console.warn(`[Register] OWS not installed or wallet creation failed for remote agent "${agent.name}". Proceeding without wallet.`);
-      }
-    }
-
-    // Support OWS wallet or raw private key for signing
-    const owsRegistrarWallet = process.env.OWS_REGISTRAR_WALLET;
-    const pk = !owsRegistrarWallet ? (process.env.ID_REGISTRAR_PRIVATE_KEY || process.env.PRIVATE_KEY) : undefined;
-    if (!owsRegistrarWallet && !pk) throw new Error('Missing signer. Set OWS_REGISTRAR_WALLET or PRIVATE_KEY.');
-    const signerOpts = owsRegistrarWallet ? { wallet: owsRegistrarWallet } : { privateKey: pk! };
-
-    const defaultReg = await this.getDefaultRegistry(teamId);
-    const chainId = defaultReg.chainId;
-    const registryAddress = defaultReg.registryAddress as Address;
-
-    // Build text records for registration
-    const textRecords: Record<string, string> = {};
-    textRecords['description'] = `${agent.name} agent`;
-
-    // Determine the agent's endpoint for the ENSIP-26 records.
-    // Remote agents advertise their public HTTPS endpoint; local agents use the
-    // manager-local URL or the PUBLIC_BASE_URL override.
-    const publicBaseUrl = process.env.PUBLIC_BASE_URL;
-    const agentEndpoint = isRemote
-      ? (agent.public_endpoint_url || `https://${agent.customer_domain}`)
-      : (publicBaseUrl
-          ? `${publicBaseUrl.replace(/\/+$/, '')}`
-          : (agent.type === 'virtual'
-              ? (agent.endpoint as string)
-              : ((agent.metadata as any)?.service || `http://localhost:${agent.port}`)));
-
-    console.log(`[Register] Registering "${agent.name}" on ID Chain (Base)...`);
-
-    // Register via id-cli with sublabel (Base only)
-    // e.g., --sublabel x → x.agent-8.xid.eth in one transaction
-    const originalAlias = ((agent.metadata as any)?.alias || agent.name);
-    const result = await this.registerOnIdChainFn({
-      sublabel: originalAlias,
-      textRecords,
-      ...signerOpts,
-    });
-
-    // ENSIP-26 agent endpoints can be set later via:
-    //   id-cli set-agent-endpoints <domain> --a2a <url>
-    // Skipped by default for private/local systems.
-
-    // Use the label as tokenId for backward compat; domain is the primary identifier
-    const tokenId = result.label;
-
-    // Update metadata – preserve the original local alias so the agent
-    // can still be found by its pre-registration name after `name` is
-    // changed to the full ENS domain.
-    let metadata = (agent.metadata || {}) as AgentMetadata;
-    const newName = result.domain; // Already includes sublabel (e.g., x.agent-8.xid.eth)
-    metadata = {
-      ...metadata,
-      idchain_domain: newName,
-      service_type: 'REST-AP',
-      alias: originalAlias,
-    };
-
-    // ── Phase 4: security metadata flags for remote agents ───────────────────
-    if (isRemote) {
-      metadata = {
-        ...metadata,
-        mesh_member: false,
-        mesh_reachable: false,
-        public_endpoint: true,
-        dmz: true,
-        allowed_inbound: ['public_http'],
-        allowed_outbound: ['openrouter'],
-      };
-    }
-
-    // Keep the agent's internal endpoint for manager-to-agent communication
-    const isLocalAgent = (metadata as any).local === true;
-    const dbEndpoint = isRemote
-      ? (agent.endpoint || agentEndpoint)
-      : (isLocalAgent ? (agent.endpoint || `http://localhost:${agent.port}`) : agentEndpoint);
-
-    // Set multi-chain address records if agent has an OWS wallet
-    const owsWalletName = (metadata as any).ows_wallet;
-    if (owsWalletName) {
-      try {
-        const addrResult = await setMultiChainAddresses({
-          name: newName,
-          walletName: owsWalletName,
-          ...signerOpts,
-        });
-        if (addrResult.set.length > 0) {
-          console.log(`[Register] Set ${addrResult.set.length} address records: ${addrResult.set.join(', ')}`);
-        }
-      } catch (addrErr: any) {
-        console.warn(`[Register] Multi-chain address setting failed: ${addrErr.message}`);
-      }
-    }
-
-    await this.db.agents.updateIdentity(agent.id, {
-      name: newName,
-      token_id: tokenId,
-      domain: newName,
-      endpoint: dbEndpoint,
-      metadata,
-    });
-
-    if (isRemote) {
-      // ── Phase 4: push identity.json to the remote VPS ─────────────────────
-      // Write to staging dir first, then attempt SCP delivery.
-      await this.stageAndDeliverRemoteIdentity(agent, newName, tokenId, metadata);
-    } else {
-      // ── Local agent identity push ──────────────────────────────────────────
-      // Update running server identity
-      const server = this.runningServers.get(this.key(teamId, agent.id));
-      if (server) {
-        server.setIdentity({ name: newName, metadata, tokenId, domain: newName });
-      }
-
-      // Push identity to running agent process
-      if (agent.type === 'claude' && agent.port && !server) {
-        try {
-          const agentUrl = isLocalAgent
-            ? (agent.endpoint || `http://localhost:${agent.port}`)
-            : `http://id-agent-${agent.id}:4100`;
-          const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-          const identityRes = await fetch(`${agentUrl}/identity`, {
-            method: 'PATCH',
-            headers,
-            body: JSON.stringify({ tokenId, domain: newName })
-          });
-          if (identityRes.ok) {
-            console.log(`✅ Updated identity for ${originalAlias}: ${newName}`);
-          } else {
-            console.warn(`⚠️ Failed to update identity for ${originalAlias}: ${identityRes.status}`);
-          }
-        } catch (err: any) {
-          console.warn(`⚠️ Could not update identity for ${originalAlias}: ${err.message}`);
-        }
-      }
-    }
-
-    console.log(`✅ Registered ${originalAlias} as ${newName} (tx: ${result.txHash})`);
-    return { txHash: result.txHash, tokenId, domain: newName };
-  }
-
-  /**
-   * Write identity.json to the local staging directory and (if ssh_target is
-   * set) deliver it to the remote VPS over SCP.
-   *
-   * On SSH delivery failure the on-chain state is still authoritative; the
-   * manager logs a warning and returns successfully.
-   */
-  private async stageAndDeliverRemoteIdentity(
-    agent: AgentRow,
-    idchainDomain: string,
-    tokenId: string,
-    metadata: AgentMetadata,
-  ): Promise<void> {
-    // Build the identity object per § 8 schema
-    const identity = {
-      name: idchainDomain,
-      ows_address: (metadata as any).ows_address || '',
-      idchain_domain: idchainDomain,
-      token_id: tokenId,
-      service_endpoint: agent.public_endpoint_url || `https://${agent.customer_domain}` || '',
-      registered_at: new Date().toISOString(),
-    };
-
-    await this.stageAndDeliverIdentityFile(agent, identity);
   }
 
   /**
@@ -2843,40 +2592,6 @@ export class AgentManagerDb {
       }
     });
 
-    this.managementApp.get('/registry/default', async (req, res) => {
-      const { id: teamId } = await this.getTeam(req);
-      res.json({ registry: await this.getDefaultRegistry(teamId) });
-    });
-
-    this.managementApp.post('/registry/default', async (req, res) => {
-      const { id: teamId } = await this.getTeam(req);
-      const { chainId, registryAddress } = req.body || {};
-      const parsedChainId = parseInt(String(chainId));
-      if (!parsedChainId || !registryAddress) {
-        return res.status(400).json({ error: 'Missing chainId or registryAddress' });
-      }
-      await this.setDefaultRegistry(teamId, parsedChainId, registryAddress);
-      res.json({ registry: await this.getDefaultRegistry(teamId) });
-    });
-
-    this.managementApp.get('/registry/registrar', async (req, res) => {
-      const { id: teamId } = await this.getTeam(req);
-      try {
-        const registrarAddress = await this.getRegistrarAddress(teamId);
-        res.json({ registrarAddress });
-      } catch (e: any) {
-        res.status(500).json({ error: e?.message || String(e) });
-      }
-    });
-
-    this.managementApp.post('/registry/registrar', async (req, res) => {
-      const { id: teamId } = await this.getTeam(req);
-      const { registrarAddress } = req.body || {};
-      if (!registrarAddress) return res.status(400).json({ error: 'Missing registrarAddress' });
-      await this.setRegistrarAddress(teamId, String(registrarAddress));
-      res.json({ registrarAddress: String(registrarAddress) });
-    });
-
     this.managementApp.get('/agents', async (req, res) => {
       const { id: teamId } = await this.getTeam(req);
       // ?all=true includes automator agents (normally hidden)
@@ -3048,19 +2763,10 @@ export class AgentManagerDb {
           // Count agents in this team
           const agentCount = await this.db.agents.count(team.id);
 
-          // Get registry info from config
-          const config = team.config || {};
-          const registryInfo = {
-            chainId: (config as any).default_chain_id,
-            registryAddress: (config as any).default_registry_address,
-            registrarAddress: (config as any).registrar_address || (config as any).sepolia_registrar_address
-          };
-
           return {
             id: team.id,
             name: team.name,
             agentCount: parseInt(agentCount || '0'),
-            registry: registryInfo,
             createdAt: team.created_at
           };
         })
@@ -3256,9 +2962,8 @@ export class AgentManagerDb {
           runtime: effectiveRuntime,
         });
 
-        // Derive agent_account from request address, or fall back to shared deployer key
-        const deployerAddress = this.getDeployerAddress();
-        const agentAccount = address || deployerAddress;
+        // Derive agent_account from the explicit request address, if provided
+        const agentAccount = address || null;
         const updatedMeta = { ...metadata, ...(agentAccount && { agent_account: agentAccount }) };
         await this.db.agents.updateMetadata(id, updatedMeta);
 
@@ -3326,10 +3031,8 @@ export class AgentManagerDb {
     this.managementApp.post('/agents/register', async (req, res) => {
       const { id: teamId } = await this.getTeam(req);
 
-      // Branch: public-agent-remote registration (Phase 2)
-      // A request with runtime==='public-agent-remote' registers an externally-deployed
-      // agent as a registry entry. No port allocation, no process spawn, no well-known
-      // fetch, no on-chain registration (those are Phase 3–5).
+      // A request with runtime==='public-agent-remote' adds an externally deployed
+      // agent to the manager roster. It has no local port or process.
       if ((req.body as any)?.runtime === 'public-agent-remote') {
         const {
           name: remoteName,
@@ -3510,16 +3213,6 @@ export class AgentManagerDb {
         domain: reqDomain,
       });
 
-      // Set agent_account from shared deployer key for display/identity purposes
-      let nextMeta = meta;
-      if (!nextMeta.agent_account) {
-        const deployerAddress = this.getDeployerAddress();
-        if (deployerAddress) {
-          nextMeta = { ...nextMeta, agent_account: deployerAddress };
-          await this.db.agents.updateMetadata(id, nextMeta);
-        }
-      }
-
       res.status(201).json({
         id,
         name,
@@ -3528,7 +3221,7 @@ export class AgentManagerDb {
         url: endpoint,
         restap: `${endpoint}/.well-known/restap.json`,
         domain: reqDomain,
-        metadata: nextMeta
+        metadata: meta
       });
     });
 
@@ -3588,100 +3281,6 @@ export class AgentManagerDb {
     // Note: Agent catalogs are managed by agents themselves via their /catalog endpoint
     // This follows REST-AP where each agent owns its own /.well-known/restap.json
     // To view an agent's catalog, fetch their restap.json: GET {agent.url}/.well-known/restap.json
-
-    this.managementApp.post('/agents/:id/onchain/register', async (req, res) => {
-      const { id: teamId } = await this.getTeam(req);
-      const agent = await this.dbQueryAgentById(teamId, req.params.id);
-      if (!agent) return res.status(404).json({ error: 'Agent not found' });
-
-      // ?redeliver=1 — re-push identity.json to remote VPS without re-running
-      // the on-chain registration step (only meaningful for remote agents that
-      // are already registered).
-      const redeliver = req.query.redeliver === '1' || req.body?.redeliver === true;
-      if (redeliver && isRemoteEndpointRuntime(agent.runtime)) {
-        const idchainDomain = (agent.metadata as any)?.idchain_domain || agent.domain;
-        if (!idchainDomain) {
-          return res.status(400).json({ error: 'Agent is not yet registered on-chain. Cannot redeliver.' });
-        }
-        try {
-          await this.stageAndDeliverRemoteIdentity(agent, idchainDomain, agent.token_id || '', agent.metadata as AgentMetadata || {});
-          return res.json({ ok: true, redelivered: true, domain: idchainDomain, agent: { id: agent.id } });
-        } catch (e: any) {
-          return res.status(500).json({ error: e?.message || String(e) });
-        }
-      }
-
-      try {
-        const result = await this.registerOnchainAndUpdateAgent(teamId, agent);
-
-        // Update CLAUDE.md with agent's full identity (local agents only)
-        if (result.tokenId && agent.working_directory && !isRemoteEndpointRuntime(agent.runtime)) {
-          try {
-            const claudeDir = path.join(agent.working_directory, '.claude');
-            if (!existsSync(claudeDir)) {
-              mkdirSync(claudeDir, { recursive: true });
-            }
-            this.updateClaudeMdIdentity(path.join(claudeDir, 'CLAUDE.md'), result.domain || result.tokenId || agent.name);
-            console.log(`[Register] Updated CLAUDE.md with identity: ${result.domain || result.tokenId || agent.name}`);
-          } catch (identityErr: any) {
-            console.warn(`[Register] Failed to update CLAUDE.md: ${identityErr.message}`);
-          }
-        }
-
-        const fresh = await this.dbQueryAgentById(teamId, agent.id);
-        res.json({ ok: true, ...result, agent: { id: agent.id, name: agent.name, domain: fresh?.domain, tokenId: fresh?.token_id } });
-      } catch (e: any) {
-        res.status(500).json({ error: e?.message || String(e) });
-      }
-    });
-
-    // Redeliver identity file to remote VPS without re-running on-chain registration.
-    this.managementApp.post('/agents/:id/onchain/redeliver-identity', async (req, res) => {
-      const { id: teamId } = await this.getTeam(req);
-      const agent = await this.dbQueryAgentById(teamId, req.params.id);
-      if (!agent) return res.status(404).json({ error: 'Agent not found' });
-      if (!isRemoteEndpointRuntime(agent.runtime)) {
-        return res.status(400).json({ error: 'redeliver_not_supported', message: 'Only public-agent-remote agents support identity redelivery.' });
-      }
-      const idchainDomain = (agent.metadata as any)?.idchain_domain || agent.domain;
-      if (!idchainDomain) {
-        return res.status(400).json({ error: 'Agent is not yet registered on-chain. Cannot redeliver.' });
-      }
-      try {
-        await this.stageAndDeliverRemoteIdentity(agent, idchainDomain, agent.token_id || '', agent.metadata as AgentMetadata || {});
-        return res.json({ ok: true, redelivered: true, domain: idchainDomain, agent: { id: agent.id } });
-      } catch (e: any) {
-        return res.status(500).json({ error: e?.message || String(e) });
-      }
-    });
-
-    this.managementApp.post('/agents/by-name/:name/onchain/register', async (req, res) => {
-      const { id: teamId } = await this.getTeam(req);
-      const agent = await this.dbQueryAgentByNameMostRecent(teamId, req.params.name);
-      if (!agent) return res.status(404).json({ error: 'Agent not found' });
-      try {
-        const result = await this.registerOnchainAndUpdateAgent(teamId, agent);
-
-        // Update CLAUDE.md with agent's full identity (local agents only)
-        if (result.tokenId && agent.working_directory && !isRemoteEndpointRuntime(agent.runtime)) {
-          try {
-            const claudeDir = path.join(agent.working_directory, '.claude');
-            if (!existsSync(claudeDir)) {
-              mkdirSync(claudeDir, { recursive: true });
-            }
-            this.updateClaudeMdIdentity(path.join(claudeDir, 'CLAUDE.md'), result.domain || result.tokenId || agent.name);
-            console.log(`[Register] Updated CLAUDE.md with identity: ${result.domain || result.tokenId || agent.name}`);
-          } catch (identityErr: any) {
-            console.warn(`[Register] Failed to update CLAUDE.md: ${identityErr.message}`);
-          }
-        }
-
-        const fresh = await this.dbQueryAgentById(teamId, agent.id);
-        res.json({ ok: true, ...result, agent: { id: agent.id, name: agent.name, domain: fresh?.domain, tokenId: fresh?.token_id } });
-      } catch (e: any) {
-        res.status(500).json({ error: e?.message || String(e) });
-      }
-    });
 
     this.managementApp.post('/agents/:id/model', async (req, res) => {
       const { id: teamId, name: teamName } = await this.getTeam(req);
@@ -3833,435 +3432,6 @@ export class AgentManagerDb {
       res.json({ message: 'Agent deleted', id: agent.id, name: agent.name });
       this.broadcastAgentsChanged(teamId, { reason: 'remove', removed: [agent.name] });
     });
-
-    this.managementApp.post('/registry/push', async (req, res) => {
-      const { id: teamId } = await this.getTeam(req);
-      const includeVirtual = Boolean(req.body?.includeVirtual);
-      const agents = await this.dbListAgents(teamId);
-      const targets = includeVirtual ? agents : agents.filter(a => a.type === 'claude');
-
-      const results: any[] = [];
-      let registered = 0;
-      let skipped = 0;
-      let failed = 0;
-
-      for (const agent of targets) {
-        if (agent.token_id || agent.domain) {
-          skipped++;
-          results.push({ name: agent.name, id: agent.id, status: 'skipped', reason: 'already-registered', tokenId: agent.token_id, domain: agent.domain });
-          continue;
-        }
-        if (agent.type === 'virtual' && !agent.metadata?.agent_account) {
-          skipped++;
-          results.push({ name: agent.name, id: agent.id, status: 'skipped', reason: 'virtual-missing-agent_account' });
-          continue;
-        }
-
-        try {
-          const out = await this.registerOnchainAndUpdateAgent(teamId, agent);
-          registered++;
-          results.push({ name: agent.name, id: agent.id, status: 'registered', ...out });
-        } catch (e: any) {
-          failed++;
-          results.push({ name: agent.name, id: agent.id, status: 'failed', error: e?.message || String(e) });
-        }
-      }
-
-      res.json({ ok: true, includeVirtual, summary: { registered, skipped, failed }, results });
-    });
-
-    this.managementApp.post('/registry/pull', async (req, res) => {
-      const { id: teamId, name: teamName } = await this.getTeam(req);
-      const baseUrl = String(req.body?.baseUrl || process.env.ID_INDEXER_BASE_URL || 'https://id-indexer.onrender.com');
-      const indexerApiKey = process.env.ID_INDEXER_API_KEY;
-      const requestedChainId = req.body?.chainId ? parseInt(String(req.body.chainId)) : undefined;
-      const requestedRegistryAddress = req.body?.registryAddress ? String(req.body.registryAddress) : undefined;
-
-      // Require specific agent IDs to prevent pulling too many agents
-      const agentIds = Array.isArray(req.body?.agentIds) ? req.body.agentIds.map(String).filter(Boolean) : [];
-      if (agentIds.length === 0) {
-        return res.status(400).json({
-          error: 'Missing agent IDs. Use /registry pull <agent-ids> (space or comma separated)'
-        });
-      }
-
-      // Optional: also spawn local runtime-backed agents (with HTTP servers) for onchain agents we discover.
-      // This "materializes" the registry into a runnable local network.
-      const spawnServers = req.body?.spawn === undefined ? false : Boolean(req.body?.spawn);
-
-      const discovery: {
-        baseUrl: string;
-        chainId?: number;
-        registryAddress?: string;
-        agentIds: string[];
-        fetched: number;
-        upserted: number;
-        spawned?: number;
-        total?: number;
-        errors: string[];
-      } = {
-        baseUrl,
-        agentIds,
-        fetched: 0,
-        upserted: 0,
-        errors: []
-      };
-
-      const discoveredOnchain: Array<{
-        chainId: number;
-        registryAddress: string;
-        tokenId: string;
-        nameHint: string;
-      }> = [];
-
-      // Also discover agents from the indexer (registry-wide) and upsert them into the local DB.
-      // This makes "pull" behave more like "git pull": you can populate your local network from the registry.
-      try {
-        const defaultReg = await this.getDefaultRegistry(teamId);
-        const chainId = requestedChainId || defaultReg.chainId;
-        const registryAddress = requestedRegistryAddress || defaultReg.registryAddress;
-
-        discovery.chainId = chainId;
-        discovery.registryAddress = registryAddress;
-
-        // Fetch specific agent IDs from the indexer
-        for (const agentId of agentIds) {
-          try {
-            const params = new URLSearchParams();
-            params.set('agentId', agentId);
-            params.set('chainId', String(chainId));
-            if (requestedRegistryAddress) params.set('registry', String(requestedRegistryAddress));
-
-            const agentUrl = `${baseUrl}/api/agents/${agentId}?${params.toString()}`;
-            const agentResp = await fetch(agentUrl, {
-              headers: indexerApiKey ? { Authorization: `Bearer ${indexerApiKey}` } : undefined
-            });
-
-            if (!agentResp.ok) {
-              discovery.errors.push(`agent ${agentId}: HTTP ${agentResp.status} ${agentResp.statusText}`);
-              continue;
-            }
-
-            const ra = await agentResp.json() as any;
-            discovery.fetched += 1;
-
-            const tokenId = String(ra.agentId || ra.mintNumber || agentId).trim();
-            const regAddr = String(ra.registryAddress || registryAddress).trim();
-            if (!tokenId || !regAddr) {
-              discovery.errors.push(`agent ${agentId}: missing tokenId or registryAddress`);
-              continue;
-            }
-
-            const reg = {
-              chainId: ra.chainId || chainId,
-              registryAddress: regAddr,
-              tokenId
-            };
-
-            const shortReg = regAddr.slice(0, 6) + '…' + regAddr.slice(-4);
-            const nameHint =
-              typeof ra.endpointType === 'string' && ra.endpointType.trim()
-                ? `${ra.endpointType}:${shortReg}:${tokenId}`
-                : `agent:${shortReg}:${tokenId}`;
-
-            discoveredOnchain.push({
-              chainId: ra.chainId || chainId,
-              registryAddress: regAddr,
-              tokenId,
-              nameHint
-            });
-
-            const isPublicAgentType = (ra.endpointType || '').toLowerCase() === 'public-agent';
-
-            const metadata: any = {
-              name: nameHint,
-              service_type: ra.endpointType || 'REST-AP',
-              endpoint: ra.endpoint,
-              agent_account: ra.agentAccount,
-              // Discovery-only semantics (Option A): public-agent identities are imported
-              // as discovery records — visible in /agents but not routable via inter-agent
-              // mesh. mesh_member:false + discovery_only:true signal this to operators.
-              // The mesh-membership gate in handleMessage blocks routing without needing
-              // a separate DB column (metadata flags are sufficient for Phase 6A).
-              // TODO (Phase 6B): add --promote flag to the /registry/pull CLI command
-              // so operators can opt a discovered public-agent into the mesh explicitly.
-              // See design doc §6A.3 for discovery-only vs full-member semantics.
-              ...(isPublicAgentType ? { mesh_member: false, discovery_only: true } : {}),
-            };
-
-            // If we already have this onchain agent locally (e.g., a spawned claude agent with the same tokenId),
-            // merge into that record instead of creating a separate virtual duplicate.
-            // TODO: move to repository — token_id-only lookup across types
-            const existing = await this.db.adapter.query<{ id: string; type: string }>(
-              `SELECT id, type
-               FROM agents
-               WHERE team_id = $1
-                 AND deleted_at IS NULL
-                 AND token_id = $2
-               ORDER BY created_at DESC
-               LIMIT 1`,
-              [teamId, tokenId]
-            );
-
-            if (existing.rowCount && existing.rows[0]?.id) {
-              const existingId = existing.rows[0].id;
-              const existingType = existing.rows[0].type;
-              // Merge metadata; don't stomp local endpoint/port for claude agents.
-              const currentAgent = await this.db.agents.getById(existingId);
-              const currentMeta = (currentAgent?.metadata || {}) as any;
-              // When merging a public-agent type, preserve discovery-only flags.
-              const mergedMeta = { ...currentMeta, ...metadata, name: currentMeta.name || metadata.name };
-              if (isPublicAgentType) {
-                mergedMeta.mesh_member = false;
-                mergedMeta.discovery_only = true;
-              }
-
-              // TODO: move to repository — conditional endpoint update
-              await this.db.adapter.query(
-                `UPDATE agents
-                 SET token_id = $3,
-                     metadata = $4,
-                     endpoint = CASE WHEN $5 = 'virtual' THEN $6 ELSE endpoint END,
-                     deleted_at = NULL
-                 WHERE team_id = $1 AND id = $2`,
-                [teamId, existingId, tokenId, mergedMeta, existingType, ra.endpoint || null]
-              );
-
-              // TODO: move to repository — delete virtual agent by id with type guard
-              const onchainId = `onchain_${chainId}_${regAddr}_${tokenId}`;
-              await this.db.adapter.query(`DELETE FROM agents WHERE team_id = $1 AND id = $2 AND type = 'virtual'`, [
-                teamId,
-                onchainId
-              ]);
-
-              discovery.upserted += 1;
-              continue;
-            }
-
-            // Otherwise upsert as a stable virtual id
-            const id = `onchain_${chainId}_${regAddr}_${tokenId}`;
-            await this.db.agents.upsert({
-              team_id: teamId,
-              id,
-              name: nameHint,
-              type: 'virtual',
-              model: 'external',
-              port: 0,
-              endpoint: ra.endpoint || null,
-              working_directory: '',
-              status: 'running',
-              created_at: Date.now(),
-              metadata,
-              token_id: tokenId,
-              runtime: isPublicAgentType ? 'public-agent-remote' : 'claude-agent-sdk',
-            });
-            discovery.upserted += 1;
-          } catch (e: any) {
-            discovery.errors.push(`agent ${agentId}: ${e?.message || String(e)}`);
-          }
-        }
-      } catch (e: any) {
-        discovery.errors.push(`discovery: ${e?.message || String(e)}`);
-      }
-
-      // Optional: spawn local runtime-backed agents for the onchain entries (so they have HTTP servers).
-      // NOTE: This does NOT try to contact the remote endpoint; it creates local agents that represent the onchain identities.
-      if (spawnServers && discoveredOnchain.length > 0) {
-        try {
-          const defaultModel = process.env.CLAUDE_MODEL || 'claude-haiku-4-5-20251001';
-          const sharedDirectory = `${this.baseWorkDir}/teams/${teamName}`;
-          let spawned = 0;
-
-          // Spawn local runtime-backed agents for the agents we just pulled
-
-          for (const agent of discoveredOnchain) {
-            const tokenId = agent.tokenId;
-
-            // Never spawn a local runtime-backed copy for an interactive agent already linked to this token.
-            const interactiveAgent = await this.db.agents.findByRegistry(
-              teamId, String(agent.chainId), String(agent.registryAddress), tokenId
-            );
-            if (interactiveAgent && interactiveAgent.type === 'interactive') continue;
-
-            // If a local runtime-backed agent already exists for this token, ensure its server is running.
-            const existingClaudeAgent = await this.db.agents.findByRegistry(
-              teamId, String(agent.chainId), String(agent.registryAddress), tokenId
-            );
-            if (existingClaudeAgent && existingClaudeAgent.type === 'claude') {
-              const a = existingClaudeAgent;
-              const key = this.key(teamId, a.id);
-              if (!this.runningServers.get(key)) {
-                try {
-                  const workingDirectory = a.working_directory || `${this.baseWorkDir}/agents/${a.id}`;
-                  if (!existsSync(workingDirectory)) mkdirSync(workingDirectory, { recursive: true });
-                  const server = new AgentRestServer({
-                    model: a.model || defaultModel,
-                    workingDirectory,
-                    sharedDirectory,
-                    agentName: a.name,
-                    agentIdentity: { name: a.name, network: teamName, tokenId, metadata: (a.metadata || {}) as any },
-                    db: { db: this.db, teamId: teamId, agentId: a.id }
-                  });
-                  await server.start(a.port);
-                  this.runningServers.set(key, server);
-                } catch (e: any) {
-                  discovery.errors.push(`start-${tokenId}: ${e?.message || String(e)}`);
-                }
-              }
-              continue;
-            }
-
-            // Create and start a new local runtime-backed agent representing this onchain identity.
-            const claudeId = `agent_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
-            const port = await this.dbNextPort(teamId);
-            const workingDirectory = `${this.baseWorkDir}/agents/${claudeId}`;
-            if (!existsSync(workingDirectory)) mkdirSync(workingDirectory, { recursive: true });
-
-            const nameHint = agent.nameHint;
-
-            // Ensure handle uniqueness (keep handles stable and unique even if onchain display names collide)
-            let handle = nameHint;
-            const existingByName = await this.db.agents.getByName(teamId, handle);
-            if (existingByName) {
-              handle = `${nameHint}_${tokenId}`;
-            }
-
-            let metadata: AgentMetadata = {
-              name: handle,
-              service_type: 'REST-AP',
-              endpoint: `http://localhost:${port}`
-            };
-
-            await this.db.agents.create({
-              team_id: teamId,
-              id: claudeId,
-              name: handle,
-              type: 'claude',
-              model: defaultModel,
-              port,
-              endpoint: null,
-              working_directory: workingDirectory,
-              status: 'starting',
-              created_at: Date.now(),
-              metadata,
-              token_id: tokenId,
-            });
-
-            const deployerAddress = this.getDeployerAddress();
-            let finalMeta = metadata;
-            if (deployerAddress) {
-              finalMeta = { ...metadata, agent_account: deployerAddress };
-              await this.db.agents.updateMetadata(claudeId, finalMeta);
-            }
-
-            const server = new AgentRestServer({
-              model: defaultModel,
-              workingDirectory,
-              sharedDirectory,
-              agentName: handle,
-              agentIdentity: { name: handle, network: teamName, tokenId, metadata: finalMeta },
-              db: { db: this.db, teamId: teamId, agentId: claudeId }
-            });
-            await server.start(port);
-            this.runningServers.set(this.key(teamId, claudeId), server);
-            await this.db.agents.updateStatus(claudeId, 'running');
-
-            spawned++;
-          }
-
-          discovery.spawned = spawned;
-        } catch (e: any) {
-          discovery.errors.push(`spawn: ${e?.message || String(e)}`);
-        }
-      }
-
-      // Refresh local list after best-effort discovery upsert
-      const agents = await this.dbListAgents(teamId);
-
-      const results: any[] = [];
-      let updated = 0;
-      let skipped = 0;
-      let failed = 0;
-
-      const defaultReg = await this.getDefaultRegistry(teamId);
-      for (const agent of agents) {
-        const tokenId = agent.token_id;
-        if (!tokenId) {
-          skipped++;
-          results.push({ name: agent.name, id: agent.id, status: 'skipped', reason: 'missing-tokenId' });
-          continue;
-        }
-
-        try {
-          const url = `${baseUrl}/api/agents/${defaultReg.chainId}/${defaultReg.registryAddress}/${tokenId}/metadata`;
-          const resp = await fetch(url, {
-            headers: indexerApiKey ? { Authorization: `Bearer ${indexerApiKey}` } : undefined
-          });
-          if (!resp.ok) {
-            failed++;
-            results.push({ name: agent.name, id: agent.id, status: 'failed', error: `HTTP ${resp.status} ${resp.statusText}` });
-            continue;
-          }
-
-          const meta = (await resp.json()) as any;
-          const endpoints: any[] = Array.isArray(meta?.endpoints) ? meta.endpoints : [];
-
-          const agentWalletEndpoint = endpoints.find(
-            e => String(e?.name).toLowerCase() === 'agentwallet' || String(e?.name).toLowerCase() === 'agent_wallet'
-          );
-          const agentWalletStr = agentWalletEndpoint?.endpoint as string | undefined;
-          const agentAccount =
-            typeof agentWalletStr === 'string' && agentWalletStr.includes(':')
-              ? agentWalletStr.split(':').slice(-1)[0]
-              : undefined;
-
-          const primaryEndpoint = endpoints.find(e => String(e?.name).toLowerCase() !== 'agentwallet' && typeof e?.endpoint === 'string');
-
-          const isManager = agent.id === 'virtual_manager' || agent.name === 'manager';
-          const isReservedManagerName = typeof meta?.name === 'string' && meta.name.trim().toLowerCase() === 'manager';
-          const nextMetadata = {
-            ...(agent.metadata || {}),
-            // The local manager agent is special: never let onchain name changes overwrite it.
-            // Also treat "manager" as a reserved display name: don't allow other agents to take it via onchain metadata,
-            // since it creates confusing duplicates in the CLI.
-            name: isManager
-              ? agent.metadata?.name || 'manager'
-              : isReservedManagerName
-                ? agent.name
-                : typeof meta?.name === 'string'
-                  ? meta.name
-                  : agent.metadata?.name,
-            description: typeof meta?.description === 'string' ? meta.description : agent.metadata?.description,
-            image: typeof meta?.image === 'string' ? meta.image : agent.metadata?.image,
-            service_type: typeof primaryEndpoint?.name === 'string' ? primaryEndpoint.name : agent.metadata?.service_type,
-            endpoint: typeof primaryEndpoint?.endpoint === 'string' ? primaryEndpoint.endpoint : agent.metadata?.service,
-            agent_account: agentAccount || agent.metadata?.agent_account
-          };
-
-          await this.db.agents.updateMetadata(agent.id, nextMetadata);
-
-          // Update running server identity
-          const server = this.runningServers.get(this.key(teamId, agent.id));
-          if (server && agent.type === 'claude') {
-            server.setIdentity({
-              name: agent.name,
-              metadata: nextMetadata,
-              tokenId: agent.token_id || undefined,
-              domain: agent.domain || undefined
-            });
-          }
-
-          updated++;
-          results.push({ name: agent.name, id: agent.id, status: 'updated', tokenId });
-        } catch (e: any) {
-          failed++;
-          results.push({ name: agent.name, id: agent.id, status: 'failed', error: e?.message || String(e) });
-        }
-      }
-
-      res.json({ ok: true, baseUrl, discovery, summary: { updated, skipped, failed }, results });
-    });
-
 
 
 
@@ -6248,83 +5418,6 @@ export class AgentManagerDb {
         return { ok: true, result: news };
       }
 
-      case 'register': {
-        // Register an agent onchain
-        const agentName = args[0];
-        if (!agentName) {
-          return { ok: false, error: 'Usage: /register <agent-name>' };
-        }
-
-        const a = await this.db.agents.getByName(teamId, agentName);
-
-        if (!a) {
-          return { ok: false, error: `Agent "${agentName}" not found` };
-        }
-
-        // Call the existing onchain register endpoint
-        try {
-          const regResult = await this.registerOnchainAndUpdateAgent(teamId, a);
-          return {
-            ok: true,
-            result: {
-              agent: agentName,
-              tokenId: regResult.tokenId,
-              domain: regResult.domain,
-              txHash: regResult.txHash
-            }
-          };
-        } catch (err: any) {
-          return { ok: false, error: `Registration failed: ${err.message}` };
-        }
-      }
-
-      case 'sync-wallets': {
-        // Set multi-chain wallet addresses for all registered agents
-        const owsRegWallet = process.env.OWS_REGISTRAR_WALLET;
-        const syncPk = !owsRegWallet ? (process.env.ID_REGISTRAR_PRIVATE_KEY || process.env.PRIVATE_KEY) : undefined;
-        if (!owsRegWallet && !syncPk) {
-          return { ok: false, error: 'Missing signer. Set OWS_REGISTRAR_WALLET or PRIVATE_KEY.' };
-        }
-        const syncSignerOpts = owsRegWallet ? { wallet: owsRegWallet } : { privateKey: syncPk! };
-
-        const agents = await this.dbListAgents(teamId);
-        const results: any[] = [];
-        let synced = 0;
-        let skipped = 0;
-        let failed = 0;
-
-        for (const agent of agents) {
-          const domain = agent.domain || (agent.metadata as any)?.idchain_domain;
-          const owsWallet = (agent.metadata as any)?.ows_wallet;
-
-          if (!domain) {
-            skipped++;
-            results.push({ name: agent.name, status: 'skipped', reason: 'no domain' });
-            continue;
-          }
-          if (!owsWallet) {
-            skipped++;
-            results.push({ name: agent.name, status: 'skipped', reason: 'no OWS wallet' });
-            continue;
-          }
-
-          try {
-            const addrResult = await setMultiChainAddresses({
-              name: domain,
-              walletName: owsWallet,
-              ...syncSignerOpts,
-            });
-            synced++;
-            results.push({ name: agent.name, domain, status: 'synced', set: addrResult.set, skipped: addrResult.skipped });
-          } catch (err: any) {
-            failed++;
-            results.push({ name: agent.name, status: 'failed', error: err.message });
-          }
-        }
-
-        return { ok: true, result: { synced, skipped, failed, results } };
-      }
-
       case 'sync': {
         // Sync running team with a config file — reconcile the diff
         // Usage: /sync <config> [param=value ...] [--dry-run] [--verbose]
@@ -7310,67 +6403,6 @@ export class AgentManagerDb {
         return { ok: true, result: { configs } };
       }
 
-      case 'registry': {
-        // /registry - show default registry
-        // /registry push - push agents to registry
-        // /registry pull <ids> - pull agents from registry
-        // /registry set <chainId> <address> - set default registry
-        // /registry set-registrar <address> - set registrar
-        const subCmd = args[0];
-
-        if (!subCmd) {
-          // Show default registry
-          const chainId = process.env.REGISTRY_CHAIN_ID || '8453';
-          const registryAddress = process.env.REGISTRY_ADDRESS || '';
-          const registrarAddress = process.env.REGISTRAR_ADDRESS || '';
-          return {
-            ok: true,
-            result: {
-              chainId,
-              registryAddress: registryAddress || '(not set)',
-              registrarAddress: registrarAddress || '(not set)'
-            }
-          };
-        }
-
-        if (subCmd === 'push') {
-          // Push all unregistered agents to registry
-          const agents = await this.dbListAgents(teamId);
-          const unregistered = agents.filter(a => !a.token_id && a.type === 'claude');
-          const results: { name: string; tokenId?: string; domain?: string; error?: string }[] = [];
-
-          for (const agent of unregistered) {
-            try {
-              const regResult = await this.registerOnchainAndUpdateAgent(teamId, agent);
-              results.push({ name: agent.name, tokenId: regResult.tokenId, domain: regResult.domain });
-            } catch (err: any) {
-              results.push({ name: agent.name, error: err.message });
-            }
-          }
-
-          return { ok: true, result: { registered: results } };
-        }
-
-        if (subCmd === 'pull') {
-          const agentIds = args.slice(1).join(' ').split(/[\s,]+/).filter(Boolean);
-          if (agentIds.length === 0) {
-            return { ok: false, error: 'Usage: /registry pull <agent-ids>' };
-          }
-          // This would need the actual registry pull implementation
-          return { ok: false, error: 'Registry pull not yet implemented in remote endpoint' };
-        }
-
-        if (subCmd === 'set') {
-          return { ok: false, error: 'Registry set requires environment variable changes (REGISTRY_CHAIN_ID, REGISTRY_ADDRESS)' };
-        }
-
-        if (subCmd === 'set-registrar') {
-          return { ok: false, error: 'Registry set-registrar requires environment variable changes (REGISTRAR_ADDRESS)' };
-        }
-
-        return { ok: false, error: 'Usage: /registry [push|pull <ids>]' };
-      }
-
       case 'teams': {
         // List all teams
         const teams = await this.db.teams.listTeams();
@@ -8020,7 +7052,7 @@ export class AgentManagerDb {
       }
 
       default:
-        return { ok: false, error: `Unknown command: ${action}. Available: agents, status, schedule, delete, ask, hey, news, register, deploy, agent, model, tasks, task, configs, registry, teams, team, keys, meta, pay, heartbeat, heartbeats, cancel, clear, list, update, sync-wallets` };
+        return { ok: false, error: `Unknown command: ${action}. Available: agents, status, schedule, delete, ask, hey, news, deploy, agent, model, tasks, task, configs, teams, team, keys, meta, pay, heartbeat, heartbeats, cancel, clear, list, update` };
     }
   }
 
@@ -8709,9 +7741,8 @@ export class AgentManagerDb {
    * Wallet opt-in: provision (or reuse) an OWS wallet for an existing
    * agent row, persist `wallet: true` plus the wallet identifiers on the
    * row's metadata, and return the refreshed row. Returns `null` if OWS
-   * is not installed or wallet creation fails. Used by both the on-demand
-   * `/agent <name> wallet provision` command and the onchain registration
-   * auto-provision path.
+   * is not installed or wallet creation fails. Used by manager-join and the
+   * on-demand `/agent <name> wallet provision` command.
    */
   private async provisionAgentWalletForRow(
     teamId: string,
@@ -8964,18 +7995,6 @@ export class AgentManagerDb {
       console.error(`[Manager] Failed to spawn agent ${agentData.name}: ${err.message}`);
       return { success: false, error: err.message };
     }
-  }
-
-  /**
-   * Update or create a CLAUDE.md file with the agent's identity.
-   * Replaces any existing identity section to prevent duplicates.
-   */
-  private updateClaudeMdIdentity(claudeMdPath: string, identityName: string): void {
-    const identitySection = `# Your Identity\n\nYou are **${identityName}** - always use this full name when introducing yourself or signing messages.\n`;
-    let existingContent = existsSync(claudeMdPath) ? readFileSync(claudeMdPath, 'utf-8') : '';
-    // Strip any existing identity sections to prevent duplicates
-    existingContent = existingContent.replace(/# Your Identity\n\nYou are \*\*[^*]+\*\*[^\n]*\n+/g, '').replace(/^\n+/, '');
-    writeFileSync(claudeMdPath, identitySection + (existingContent ? '\n' + existingContent : ''));
   }
 
   private listPidsListeningOnPort(port: number): number[] {

@@ -55,12 +55,6 @@ export interface TeamsRepository {
   /** List all teams with their full config (for /projects compat). */
   listTeamsWithConfig(): Promise<TeamRow[]>;
 
-  /** Set the registrar_address in the team config. */
-  setRegistrarAddress(teamId: string, address: string): Promise<void>;
-
-  /** Set both default_chain_id and default_registry_address in the team config. */
-  setDefaultRegistry(teamId: string, chainId: string, registryAddress: string): Promise<void>;
-
   /** Permanently delete a team row. */
   deleteTeam(teamId: string): Promise<void>;
 }
@@ -121,12 +115,6 @@ export interface AgentsRepository {
 
   /** Find the interactive-type agent for a team (most recent, non-deleted). */
   findInteractive(teamId: string): Promise<AgentRow | null>;
-
-  /**
-   * Find an agent by onchain registry identity (chainId + registryAddress + tokenId).
-   * Matches against the registry JSONB column.
-   */
-  findByRegistry(teamId: string, chainId: string, registryAddress: string, tokenId: string): Promise<AgentRow | null>;
 
   /**
    * Find agents that have heartbeat enabled in their metadata.

@@ -217,25 +217,6 @@ export class PgAgentsRepo implements AgentsRepository {
     return r.rows[0] || null;
   }
 
-  async findByRegistry(
-    teamId: string,
-    chainId: string,
-    registryAddress: string,
-    tokenId: string,
-  ): Promise<AgentRow | null> {
-    const r = await this.db.query<AgentRow>(
-      `SELECT * FROM agents
-       WHERE team_id = $1
-         AND deleted_at IS NULL
-         AND (registry->>'chainId') = $2
-         AND LOWER(registry->>'registryAddress') = LOWER($3)
-         AND (registry->>'tokenId') = $4
-       LIMIT 1`,
-      [teamId, chainId, registryAddress, tokenId],
-    );
-    return r.rows[0] || null;
-  }
-
   async findHeartbeat(teamId: string): Promise<AgentRow[]> {
     const r = await this.db.query<AgentRow>(
       `SELECT * FROM agents WHERE team_id = $1 AND metadata->>'heartbeat' = 'true' AND deleted_at IS NULL`,

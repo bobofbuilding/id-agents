@@ -56,25 +56,6 @@ export class PgTeamsRepo implements TeamsRepository {
     return r.rows;
   }
 
-  async setRegistrarAddress(teamId: string, address: string): Promise<void> {
-    await this.db.query(
-      `UPDATE teams
-       SET config = jsonb_set(config, '{registrar_address}', to_jsonb($2::text), true)
-       WHERE id = $1`,
-      [teamId, String(address)],
-    );
-  }
-
-  async setDefaultRegistry(teamId: string, chainId: string, registryAddress: string): Promise<void> {
-    await this.db.query(
-      `UPDATE teams
-       SET config = jsonb_set(jsonb_set(config, '{default_chain_id}', to_jsonb($2::text), true),
-                              '{default_registry_address}', to_jsonb($3::text), true)
-       WHERE id = $1`,
-      [teamId, String(chainId), String(registryAddress)],
-    );
-  }
-
   async deleteTeam(teamId: string): Promise<void> {
     await this.db.query('DELETE FROM teams WHERE id = $1', [teamId]);
   }

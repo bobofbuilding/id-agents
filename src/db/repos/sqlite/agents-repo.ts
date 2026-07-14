@@ -250,25 +250,6 @@ export class SqliteAgentsRepo implements AgentsRepository {
     return this.parseRow(rows[0]);
   }
 
-  async findByRegistry(
-    teamId: string,
-    chainId: string,
-    registryAddress: string,
-    tokenId: string,
-  ): Promise<AgentRow | null> {
-    const { rows } = await this.db.query(
-      `SELECT * FROM agents
-       WHERE team_id = ?
-         AND json_extract(registry, '$.chainId') = ?
-         AND LOWER(json_extract(registry, '$.registryAddress')) = LOWER(?)
-         AND json_extract(registry, '$.tokenId') = ?
-         AND deleted_at IS NULL
-       LIMIT 1`,
-      [teamId, chainId, registryAddress, tokenId],
-    );
-    return this.parseRow(rows[0]);
-  }
-
   async findHeartbeat(teamId: string): Promise<AgentRow[]> {
     const { rows } = await this.db.query(
       `SELECT * FROM agents

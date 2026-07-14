@@ -61,27 +61,6 @@ export class SqliteTeamsRepo implements TeamsRepository {
     return rows.map(r => ({ ...r, config: parseJsonObject(r.config) }));
   }
 
-  async setRegistrarAddress(teamId: string, address: string): Promise<void> {
-    // Read-merge-write: no jsonb_set in SQLite
-    const config = await this.getConfig(teamId);
-    config.registrar_address = address;
-    await this.db.query(
-      `UPDATE teams SET config = ? WHERE id = ?`,
-      [stringifyJson(config), teamId],
-    );
-  }
-
-  async setDefaultRegistry(teamId: string, chainId: string, registryAddress: string): Promise<void> {
-    // Read-merge-write: no jsonb_set in SQLite
-    const config = await this.getConfig(teamId);
-    config.default_chain_id = chainId;
-    config.default_registry_address = registryAddress;
-    await this.db.query(
-      `UPDATE teams SET config = ? WHERE id = ?`,
-      [stringifyJson(config), teamId],
-    );
-  }
-
   async deleteTeam(teamId: string): Promise<void> {
     await this.db.query(`DELETE FROM teams WHERE id = ?`, [teamId]);
   }
