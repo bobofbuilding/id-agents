@@ -1,4 +1,4 @@
-export function statusColor(status: string): string {
+export function statusColor(status: string | undefined): string {
   switch (status) {
     case 'running':
       return 'green';
@@ -12,14 +12,14 @@ export function statusColor(status: string): string {
   }
 }
 
-export function healthColor(health: string): string {
+export function healthColor(health: string | undefined): string {
   if (health === 'online') return 'green';
   if (health === 'unstable') return 'yellow';
   if (health === 'offline') return 'red';
   return 'gray';
 }
 
-export function healthDot(health: string): string {
+export function healthDot(health: string | undefined): string {
   if (health === 'online') return '●';
   if (health === 'unstable') return '●';
   if (health === 'offline') return '○';

@@ -1,484 +1,190 @@
+// SPDX-License-Identifier: MIT
+/**
+ * Compatibility adapter over the renderer-neutral dashboard-core client.
+ *
+ * The transport, DTO mapping, validation, and `/remote` consolidation now live
+ * in `src/dashboard-core/api/*`. This module preserves the exact free-function
+ * surface the TUI has always imported from `./api/manager.js` — same names,
+ * same argument order, same behavior — by delegating each call to an injected
+ * `ManagerClient`. The client defaults its `fetch` to a late-bound
+ * `globalThis.fetch`, so tests that stub `globalThis.fetch` keep working.
+ */
+
+import { ManagerClient } from '../../dashboard-core/api/client.js';
 import type {
   Agent,
-  AgentsResponse,
+  InstallLibraryTeamRequest,
+  InstallLibraryTeamResponse,
+  LibraryAgentDetailResponse,
+  LibraryAgentListResponse,
+  LibrarySkillDetailResponse,
+  LibrarySkillListResponse,
+  LibraryTeamDetailResponse,
+  LibraryTeamListResponse,
   NewsItem,
-  RemoteNewsResponse,
-  RemoteSchedulesResponse,
-  RemoteTasksResponse,
   Schedule,
   Task,
   Team,
-  TeamsResponse,
-} from './types.js';
+} from '../../dashboard-core/api/types.js';
 
+// Re-export the transport error classes and every DTO type so existing
+// `import { ... } from './api/manager.js'` call sites resolve unchanged.
+export { NetworkError, ManagerError, ManagerClient } from '../../dashboard-core/api/client.js';
+export * from '../../dashboard-core/api/types.js';
+
+/** Resolve the manager base URL from the environment (TUI default). */
 export function getManagerUrl(): string {
   return process.env.MANAGER_URL ?? 'http://localhost:4100';
 }
 
-async function getJson<T>(url: string, signal: AbortSignal): Promise<T> {
-  const res = await fetch(url, { signal });
-  if (!res.ok) {
-    throw new Error(`GET ${url} → ${res.status} ${res.statusText}`);
-  }
-  return (await res.json()) as T;
+function client(manager: string): ManagerClient {
+  return new ManagerClient({ baseUrl: manager });
 }
 
-// Phase 6: typed error classes so the TUI can render transient
-// connectivity issues differently from semantic manager rejections.
-// NetworkError = couldn't reach / server transient (fetch threw, 5xx).
-// ManagerError = server understood and explicitly rejected (4xx, or
-// `{ok:false, error}` envelope from /remote handlers).
-export class NetworkError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'NetworkError';
-  }
-}
-export class ManagerError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'ManagerError';
-  }
-}
-
-// Generic POST to the manager's `/remote` proxy. Mirrors the call shape
-// already used by fetchTasks/fetchAgentNews/fetchSchedulesForTeam — those
-// can migrate onto this helper in Phase 2 when more commands land. For
-// Phase 1 the only call site is the command-bar `agents` handler path.
-interface RemoteEnvelope<T> { ok: boolean; result?: T; error?: string }
-export async function runRemoteCommand<T = unknown>(
+export function runRemoteCommand<T = unknown>(
   manager: string,
   executor: string,
   command: string,
   signal: AbortSignal,
   teamName?: string,
 ): Promise<T> {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (teamName) headers['x-id-team'] = teamName;
-  let res: Response;
-  try {
-    res = await fetch(`${manager}/remote`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ agent: executor, command }),
-      signal,
-    });
-  } catch (err: unknown) {
-    // Connect refused, DNS, abort, etc. — transient/network class.
-    const msg = err instanceof Error ? err.message : String(err);
-    throw new NetworkError(msg);
-  }
-  if (!res.ok) {
-    // 5xx → server transient; 4xx → semantic ("you sent something wrong").
-    if (res.status >= 500) {
-      throw new NetworkError(`POST /remote → ${res.status} ${res.statusText}`);
-    }
-    throw new ManagerError(`POST /remote → ${res.status} ${res.statusText}`);
-  }
-  const data = (await res.json()) as RemoteEnvelope<T>;
-  if (!data.ok) {
-    throw new ManagerError(data.error ?? 'unknown manager error');
-  }
-  return data.result as T;
+  return client(manager).runRemoteCommand<T>(executor, command, signal, teamName);
 }
 
-export async function fetchTeams(manager: string, signal: AbortSignal): Promise<Team[]> {
-  const data = await getJson<TeamsResponse>(`${manager}/teams`, signal);
-  return (data.teams ?? []).filter((t) => t.name.toLowerCase() !== 'all');
+export function fetchTeams(manager: string, signal: AbortSignal): Promise<Team[]> {
+  return client(manager).fetchTeams(signal);
 }
 
-export async function fetchAgentsByTeam(
+export function fetchAgentsByTeam(
   manager: string,
   team: string,
   signal: AbortSignal,
 ): Promise<Agent[]> {
-  const url = `${manager}/agents?team=${encodeURIComponent(team)}`;
-  const data = await getJson<AgentsResponse>(url, signal);
-  return (data.agents ?? []).map((a) => ({ ...a, teamName: team }));
+  return client(manager).fetchAgentsByTeam(team, signal);
 }
 
-export async function fetchTasks(
+export function fetchAgentsAllTeams(
+  manager: string,
+  teams: Team[],
+  signal: AbortSignal,
+): Promise<Agent[]> {
+  return client(manager).fetchAgentsAllTeams(teams, signal);
+}
+
+export function fetchTasks(
   manager: string,
   executor: string,
   signal: AbortSignal,
   teamName?: string,
 ): Promise<Task[]> {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (teamName) headers['x-id-team'] = teamName;
-  const res = await fetch(`${manager}/remote`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({ agent: executor, command: '/task' }),
-    signal,
-  });
-  if (!res.ok) {
-    throw new Error(`POST /remote → ${res.status} ${res.statusText}`);
-  }
-  const data = (await res.json()) as RemoteTasksResponse;
-  if (!data.ok) {
-    throw new Error(data.error ?? 'unknown manager error');
-  }
-  return data.result?.tasks ?? [];
+  return client(manager).fetchTasks(executor, signal, teamName);
 }
 
-// Fan out per-team in parallel so the union of all teams' tasks is what
-// the tasks view sees as "allTasks". Mirrors fetchAgentsAllTeams. This is
-// what keeps task counts stable when the operator switches teams: the
-// fetcher doesn't depend on selectedTeam, so allTasks.length is constant
-// and only the client-side filter narrows visibleTasks.
-export async function fetchTasksAllTeams(
+export function fetchTasksAllTeams(
   manager: string,
   executor: string,
   teams: Team[],
   signal: AbortSignal,
 ): Promise<Task[]> {
-  if (teams.length === 0) return [];
-  const results = await Promise.all(
-    teams.map((t) => fetchTasks(manager, executor, signal, t.name)),
-  );
-  return results.flat();
+  return client(manager).fetchTasksAllTeams(executor, teams, signal);
 }
 
-export async function fetchAgentNews(
+export function fetchAgentNews(
   manager: string,
   executor: string,
   target: string,
   signal: AbortSignal,
   teamName?: string,
 ): Promise<NewsItem[]> {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (teamName) headers['x-id-team'] = teamName;
-  const res = await fetch(`${manager}/remote`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({ agent: executor, command: `/news ${target}` }),
-    signal,
-  });
-  if (!res.ok) {
-    throw new Error(`POST /remote → ${res.status} ${res.statusText}`);
-  }
-  const data = (await res.json()) as RemoteNewsResponse;
-  if (!data.ok) {
-    throw new Error(data.error ?? 'unknown manager error');
-  }
-  return data.result?.items ?? [];
+  return client(manager).fetchAgentNews(executor, target, signal, teamName);
 }
 
-export async function fetchLatestNewsTs(
+export function fetchLatestNewsTs(
   manager: string,
   executor: string,
   targetName: string,
   signal: AbortSignal,
   teamName?: string,
 ): Promise<number | null> {
-  const items = await fetchAgentNews(manager, executor, targetName, signal, teamName);
-  if (items.length === 0) return null;
-  let max = 0;
-  for (const it of items) if (it.timestamp > max) max = it.timestamp;
-  return max > 0 ? max : null;
+  return client(manager).fetchLatestNewsTs(executor, targetName, signal, teamName);
 }
 
-export async function fetchAgentsLatestNewsTs(
+export function fetchAgentsLatestNewsTs(
   manager: string,
   executor: string,
   agents: Agent[],
   signal: AbortSignal,
 ): Promise<Map<string, number | null>> {
-  if (agents.length === 0) return new Map();
-  const results = await Promise.all(
-    agents.map(async (a) => {
-      try {
-        const ts = await fetchLatestNewsTs(manager, executor, a.name, signal, a.teamName);
-        return [a.id, ts] as const;
-      } catch {
-        return [a.id, null] as const;
-      }
-    }),
-  );
-  return new Map(results);
+  return client(manager).fetchAgentsLatestNewsTs(executor, agents, signal);
 }
 
-export async function fetchSchedulesForTeam(
+export function fetchSchedulesForTeam(
   manager: string,
   executor: string,
   teamName: string,
   signal: AbortSignal,
 ): Promise<Schedule[]> {
-  const res = await fetch(`${manager}/remote`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-id-team': teamName,
-    },
-    body: JSON.stringify({ agent: executor, command: '/schedule list' }),
-    signal,
-  });
-  if (!res.ok) {
-    throw new Error(`POST /remote → ${res.status} ${res.statusText}`);
-  }
-  const data = (await res.json()) as RemoteSchedulesResponse;
-  if (!data.ok) {
-    throw new Error(data.error ?? 'unknown manager error');
-  }
-  const list = data.result?.schedules ?? [];
-  return list.map((s) => ({ ...s, teamName }));
+  return client(manager).fetchSchedulesForTeam(executor, teamName, signal);
 }
 
-export async function fetchSchedulesAllTeams(
+export function fetchSchedulesAllTeams(
   manager: string,
   executor: string,
   teams: Team[],
   signal: AbortSignal,
 ): Promise<Schedule[]> {
-  if (teams.length === 0) return [];
-  const results = await Promise.all(
-    teams.map((t) => fetchSchedulesForTeam(manager, executor, t.name, signal)),
-  );
-  const merged = new Map<string, Schedule>();
-  for (const list of results) {
-    for (const s of list) {
-      if (!merged.has(s.id)) merged.set(s.id, s);
-    }
-  }
-  return [...merged.values()];
+  return client(manager).fetchSchedulesAllTeams(executor, teams, signal);
 }
 
-export async function fetchAgentsAllTeams(
-  manager: string,
-  teams: Team[],
-  signal: AbortSignal,
-): Promise<Agent[]> {
-  if (teams.length === 0) return [];
-  const results = await Promise.all(
-    teams.map((t) => fetchAgentsByTeam(manager, t.name, signal)),
-  );
-  const merged = new Map<string, Agent>();
-  for (const list of results) {
-    for (const agent of list) {
-      if (!merged.has(agent.id)) merged.set(agent.id, agent);
-    }
-  }
-  return [...merged.values()];
-}
-
-/* ------------------------------------------------------------------ */
-/*  Slice 8: library inventory (manager /library/* endpoints)          */
-/* ------------------------------------------------------------------ */
-
-export type LibraryAgentShape = 'claude-native' | 'agents-md-native';
-
-export interface LibraryAgentRow {
-  name: string;
-  shape: LibraryAgentShape;
-  hasReadme: boolean;
-  hasLicense: boolean;
-  subfolders: string[];
-  source_path: string;
-  /**
-   * README-first description from the manager. First body paragraph of
-   * the entry's README.md, or null when no README is present. Slice-2
-   * inventory contract — prefer this over any config-derived summary.
-   */
-  description: string | null;
-}
-
-export interface LibraryAgentListResponse {
-  libraryRoot: string | null;
-  entries: LibraryAgentRow[];
-  errors: Array<{ name: string; code: string; message: string }>;
-}
-
-export interface LibraryAgentDetailResponse extends LibraryAgentRow {
-  memoryFile: string;
-  readme: string | null;
-  memory: string;
-  bundledSkills: string[];
-}
-
-export interface LibrarySkillRow {
-  name: string;
-  hasSkillMd: boolean;
-  source_path: string;
-  /**
-   * README-first description from the manager. SKILL.md frontmatter
-   * `description:` first, then first body paragraph; null when neither
-   * is available. Slice-2 inventory contract.
-   */
-  description: string | null;
-}
-
-export interface LibrarySkillListResponse {
-  libraryRoot: string | null;
-  entries: LibrarySkillRow[];
-}
-
-export interface LibrarySkillDetailResponse extends LibrarySkillRow {
-  skillFile: string;
-  skillName: string | null;
-  description: string | null;
-  bodyLength: number;
-}
-
-export async function fetchLibraryAgents(
+export function fetchLibraryAgents(
   manager: string,
   signal: AbortSignal,
 ): Promise<LibraryAgentListResponse> {
-  return getJson<LibraryAgentListResponse>(`${manager}/library/agents`, signal);
+  return client(manager).fetchLibraryAgents(signal);
 }
 
-export async function fetchLibraryAgent(
+export function fetchLibraryAgent(
   manager: string,
   name: string,
   signal: AbortSignal,
 ): Promise<LibraryAgentDetailResponse | null> {
-  const res = await fetch(`${manager}/library/agents/${encodeURIComponent(name)}`, { signal });
-  if (res.status === 404) return null;
-  if (!res.ok) {
-    throw new Error(`GET /library/agents/${name} → ${res.status} ${res.statusText}`);
-  }
-  return (await res.json()) as LibraryAgentDetailResponse;
+  return client(manager).fetchLibraryAgent(name, signal);
 }
 
-export async function fetchLibrarySkills(
+export function fetchLibrarySkills(
   manager: string,
   signal: AbortSignal,
 ): Promise<LibrarySkillListResponse> {
-  return getJson<LibrarySkillListResponse>(`${manager}/library/skills`, signal);
+  return client(manager).fetchLibrarySkills(signal);
 }
 
-export async function fetchLibrarySkill(
+export function fetchLibrarySkill(
   manager: string,
   name: string,
   signal: AbortSignal,
 ): Promise<LibrarySkillDetailResponse | null> {
-  const res = await fetch(`${manager}/library/skills/${encodeURIComponent(name)}`, { signal });
-  if (res.status === 404) return null;
-  if (!res.ok) {
-    throw new Error(`GET /library/skills/${name} → ${res.status} ${res.statusText}`);
-  }
-  return (await res.json()) as LibrarySkillDetailResponse;
+  return client(manager).fetchLibrarySkill(name, signal);
 }
 
-/* ------------------------------------------------------------------ */
-/*  Slice 4: library teams + install (manager /library/teams + /install) */
-/* ------------------------------------------------------------------ */
-
-export interface LibraryTeamRow {
-  name: string;
-  hasReadme: boolean;
-  hasLicense: boolean;
-  hasTeamYaml: boolean;
-  source_path: string;
-  /**
-   * README-first description from the manager. First body paragraph of
-   * the team's README.md, or null when no README is present. Slice-2
-   * inventory contract.
-   */
-  description: string | null;
-}
-
-export interface LibraryTeamListResponse {
-  libraryRoot: string | null;
-  entries: LibraryTeamRow[];
-}
-
-export interface LibraryTeamDetailResponse extends LibraryTeamRow {
-  teamYamlFile: string;
-  readme: string | null;
-  teamYaml: string;
-  declaredTeam: string | null;
-  agents: string[];
-}
-
-export async function fetchLibraryTeams(
+export function fetchLibraryTeams(
   manager: string,
   signal: AbortSignal,
 ): Promise<LibraryTeamListResponse> {
-  return getJson<LibraryTeamListResponse>(`${manager}/library/teams`, signal);
+  return client(manager).fetchLibraryTeams(signal);
 }
 
-export async function fetchLibraryTeam(
+export function fetchLibraryTeam(
   manager: string,
   name: string,
   signal: AbortSignal,
 ): Promise<LibraryTeamDetailResponse | null> {
-  const res = await fetch(`${manager}/library/teams/${encodeURIComponent(name)}`, { signal });
-  if (res.status === 404) return null;
-  if (!res.ok) {
-    throw new Error(`GET /library/teams/${name} → ${res.status} ${res.statusText}`);
-  }
-  return (await res.json()) as LibraryTeamDetailResponse;
+  return client(manager).fetchLibraryTeam(name, signal);
 }
 
-export interface InstallLibraryTeamRequest {
-  template: string;
-  dest: string;
-  force?: boolean;
-}
-
-export interface InstallLibraryTeamSuccess {
-  ok: true;
-  kind: 'team';
-  template: string;
-  dest: string;
-  destPath: string;
-  overwritten: boolean;
-  declaredTeamBefore: string | null;
-  declaredTeamAfter: string;
-}
-
-export interface InstallLibraryTeamFailure {
-  ok: false;
-  error: string;
-  status: number;
-  [k: string]: unknown;
-}
-
-export type InstallLibraryTeamResponse =
-  | InstallLibraryTeamSuccess
-  | InstallLibraryTeamFailure;
-
-// POST /library/install — wraps the backend selector grammar
-// (from: "team:<template>", to: "team:<dest>") behind a typed
-// helper for the TUI install prompt. Returns a normalized result
-// so the caller can render success/failure without rewriting the
-// `team:` envelope at every call site.
-export async function installLibraryTeam(
+export function installLibraryTeam(
   manager: string,
   req: InstallLibraryTeamRequest,
   signal: AbortSignal,
 ): Promise<InstallLibraryTeamResponse> {
-  const body = {
-    from: `team:${req.template}`,
-    to: `team:${req.dest}`,
-    force: req.force === true,
-  };
-  let res: Response;
-  try {
-    res = await fetch(`${manager}/library/install`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal,
-    });
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    throw new NetworkError(msg);
-  }
-  const text = await res.text();
-  let parsed: Record<string, unknown> = {};
-  try {
-    parsed = text ? (JSON.parse(text) as Record<string, unknown>) : {};
-  } catch {
-    parsed = { error: text || res.statusText };
-  }
-  if (!res.ok) {
-    return {
-      ok: false,
-      status: res.status,
-      error: typeof parsed.error === 'string' ? parsed.error : `HTTP ${res.status}`,
-      ...parsed,
-    };
-  }
-  return parsed as unknown as InstallLibraryTeamSuccess;
+  return client(manager).installLibraryTeam(req, signal);
 }

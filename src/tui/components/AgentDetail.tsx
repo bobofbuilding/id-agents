@@ -48,8 +48,8 @@ export function AgentDetail(props: AgentDetailProps): React.ReactElement {
 
   lines.push({ label: 'name', value: agent.alias ?? agent.name });
   lines.push({ label: 'runtime', value: agent.metadata?.runtime ?? '—' });
-  lines.push({ label: 'health', value: agent.health, color: healthColor(agent.health) });
-  lines.push({ label: 'status', value: agent.status });
+  lines.push({ label: 'health', value: agent.health ?? '—', color: healthColor(agent.health) });
+  lines.push({ label: 'status', value: agent.status ?? '—' });
 
   if (isRemote) {
     lines.push({ label: '', value: '' });

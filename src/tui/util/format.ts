@@ -1,4 +1,5 @@
-export function humanizeUptime(startMs: number, nowMs: number): string {
+export function humanizeUptime(startMs: number | undefined, nowMs: number): string {
+  if (startMs == null) return 'new';
   const s = Math.max(0, Math.floor((nowMs - startMs) / 1000));
   if (s < 60) return 'new';
   if (s < 3600) return `${Math.floor(s / 60)}m`;

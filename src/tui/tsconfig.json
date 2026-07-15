@@ -2,9 +2,20 @@
   "extends": "../../tsconfig.json",
   "compilerOptions": {
     "jsx": "react",
-    "rootDir": ".",
-    "outDir": "../../dist/tui"
+    // rootDir is the repo `src/` (one level up) so the renderer-neutral
+    // `src/dashboard-core/*` modules the TUI now imports are inside the
+    // compilation root — no rootDir violation and no separate build step.
+    // outDir is the repo `dist/` so paths mirror the source layout:
+    //   src/tui/index.tsx        -> dist/tui/index.js  (published entrypoint)
+    //   src/dashboard-core/*.ts  -> dist/dashboard-core/*.js
+    // A standalone `tsc -p src/tui/tsconfig.json` from a clean dist therefore
+    // compiles everything it needs and still emits dist/tui/index.js.
+    "rootDir": "../",
+    "outDir": "../../dist"
   },
+  // `include` stays scoped to the TUI; dashboard-core is pulled in through
+  // its imports (its only dependency is itself), so no other src/ subtree is
+  // dragged into this build.
   "include": ["**/*.ts", "**/*.tsx"],
   "exclude": []
 }

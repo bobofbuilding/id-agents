@@ -55,7 +55,7 @@ const REMOTE_COLS = {
 
 const NEWS_GLYPH = '●';
 
-function renderHealth(health: string): string {
+function renderHealth(health: string | undefined): string {
   // Online → green dot only (drop the literal "online" label). Other states
   // keep the dot plus a short label.
   if (health === 'online') return healthDot(health);
