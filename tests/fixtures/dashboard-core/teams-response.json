@@ -1,0 +1,7 @@
+{
+  "teams": [
+    { "id": "t-all", "name": "all", "agentCount": 0 },
+    { "id": "t-idchain", "name": "idchain", "agentCount": 2 },
+    { "id": "t-dappa", "name": "Dappa", "agentCount": 1 }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "topLevelArray": [
+    { "a": 1, "b": 2 },
+    { "a": 3, "b": 4 }
+  ],
+  "singleArrayField": { "rows": [{ "x": 1 }, { "x": 2 }] },
+  "multipleArrayFields": { "a": [{ "x": 1 }], "b": [{ "y": 2 }] },
+  "noCommonKeys": { "rows": [{ "a": 1 }, { "b": 2 }] },
+  "emptyArray": { "rows": [] },
+  "scalar": 42
+}

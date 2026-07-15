@@ -1,0 +1,54 @@
+{
+  "heartbeat": {
+    "id": "s-hb",
+    "title": "heartbeat every hour",
+    "kind": "heartbeat",
+    "active": true,
+    "targets": ["coder"],
+    "intervalSeconds": 3600,
+    "timezone": null,
+    "localTimeSeconds": null,
+    "localDate": null,
+    "daysOfWeek": null,
+    "createdAt": 1000
+  },
+  "heartbeatInactive": {
+    "id": "s-hb-off",
+    "title": "disabled heartbeat",
+    "kind": "heartbeat",
+    "active": false,
+    "targets": ["coder"],
+    "intervalSeconds": 3600,
+    "timezone": null,
+    "localTimeSeconds": null,
+    "localDate": null,
+    "daysOfWeek": null,
+    "createdAt": 1000
+  },
+  "calendarDaily": {
+    "id": "s-cal-daily",
+    "title": "daily 09:00 UTC",
+    "kind": "calendar",
+    "active": true,
+    "targets": ["coder"],
+    "intervalSeconds": null,
+    "timezone": "UTC",
+    "localTimeSeconds": 32400,
+    "localDate": null,
+    "daysOfWeek": "mon,tue,wed,thu,fri,sat,sun",
+    "createdAt": 1000
+  },
+  "calendarOnce": {
+    "id": "s-cal-once",
+    "title": "one-off 2030-01-01 01:00 UTC",
+    "kind": "calendar",
+    "active": true,
+    "targets": ["coder"],
+    "intervalSeconds": null,
+    "timezone": "UTC",
+    "localTimeSeconds": 3600,
+    "localDate": "2030-01-01",
+    "daysOfWeek": null,
+    "createdAt": 1000
+  }
+}
