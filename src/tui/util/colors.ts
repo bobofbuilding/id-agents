@@ -1,61 +1,56 @@
+// SPDX-License-Identifier: MIT
+/**
+ * Terminal (Ink) color mapping. The SEMANTIC classification lives in
+ * renderer-neutral `dashboard-core/status.ts`; this file is the TUI's palette
+ * that turns those semantic values into Ink color names. Outputs are identical
+ * to the pre-extraction implementation (see the dashboard-core baseline test).
+ */
+
+import {
+  type NewsAgeBucket,
+  type StatusSeverity,
+  healthGlyph,
+  healthSeverity,
+  newsAgeBucket,
+  statusSeverity,
+  taskGlyph,
+  taskSeverity,
+} from '../../dashboard-core/status.js';
+
+const SEVERITY_INK: Record<StatusSeverity, string> = {
+  ok: 'green',
+  warn: 'yellow',
+  error: 'red',
+  neutral: 'gray',
+};
+
+const NEWS_INK: Record<NewsAgeBucket, string> = {
+  fresh: 'greenBright',
+  recent: 'green',
+  stale: 'yellow',
+  old: 'gray',
+};
+
 export function statusColor(status: string | undefined): string {
-  switch (status) {
-    case 'running':
-      return 'green';
-    case 'offline':
-      return 'red';
-    case 'starting':
-    case 'stopping':
-      return 'yellow';
-    default:
-      return 'gray';
-  }
+  return SEVERITY_INK[statusSeverity(status)];
 }
 
 export function healthColor(health: string | undefined): string {
-  if (health === 'online') return 'green';
-  if (health === 'unstable') return 'yellow';
-  if (health === 'offline') return 'red';
-  return 'gray';
+  return SEVERITY_INK[healthSeverity(health)];
 }
 
 export function healthDot(health: string | undefined): string {
-  if (health === 'online') return '●';
-  if (health === 'unstable') return '●';
-  if (health === 'offline') return '○';
-  return '○'; // registered / unknown — never probed
+  return healthGlyph(health);
 }
 
-/**
- * Age-based color for a news item. Derived purely from the item's timestamp
- * and a shared cooldown epoch (updated on a 10-second tick by App), never
- * from a free-running Date.now() inside render. Bands are discrete so output
- * is byte-stable within each band.
- */
 export function taskStatusColor(status: string): string {
-  switch (status) {
-    case 'todo':
-      return 'yellow';
-    case 'doing':
-      return 'green';
-    case 'done':
-      return 'gray';
-    default:
-      return 'gray';
-  }
+  return SEVERITY_INK[taskSeverity(status)];
 }
 
 export function taskStatusGlyph(status: string): string {
-  if (status === 'done') return '●';
-  if (status === 'doing') return '●';
-  if (status === 'todo') return '○';
-  return '·';
+  return taskGlyph(status);
 }
 
 export function newsAgeColor(timestampMs: number, cooldownEpochMs: number): string {
-  const ageSec = Math.max(0, Math.floor((cooldownEpochMs - timestampMs) / 1000));
-  if (ageSec < 60) return 'greenBright';
-  if (ageSec < 300) return 'green';
-  if (ageSec < 900) return 'yellow';
-  return 'gray';
+  return NEWS_INK[newsAgeBucket(timestampMs, cooldownEpochMs)];
 }

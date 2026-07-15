@@ -63,6 +63,16 @@ import { usePolling } from './hooks/usePolling.js';
 import { humanizeUptime } from './util/format.js';
 import { newsAgeColor } from './util/colors.js';
 import {
+  orderTeams,
+  filterAgentsByTeam,
+  computeTeamCounts,
+  localAgentIds as selectLocalAgentIds,
+  filterTasksByTeam,
+  sortNewsByTimestamp,
+  filterCalendarSchedules,
+  clampScroll,
+} from '../dashboard-core/selectors/index.js';
+import {
   fetchRssForPids,
   formatTotalMemory,
   totalMemoryColor as totalMemColor,
@@ -311,11 +321,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
   // Always render `public` immediately after the `All` chip, then the rest in
   // the order the manager returned them. Keeps the public team a stable
   // anchor as new teams are added.
-  const teams = useMemo(() => {
-    const pub = teamsRaw.filter((t) => t.name === 'public');
-    const rest = teamsRaw.filter((t) => t.name !== 'public');
-    return [...pub, ...rest];
-  }, [teamsRaw]);
+  const teams = useMemo(() => orderTeams(teamsRaw), [teamsRaw]);
 
   const agentsFetcher = useCallback(
     (signal: AbortSignal): Promise<Agent[]> => {
@@ -365,21 +371,11 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
   }, [allAgents, latestNewsTsById, cooldownEpoch]);
 
   const visibleAgents = useMemo(
-    () =>
-      selectedTeam === null
-        ? allAgents
-        : allAgents.filter((a) => a.teamName === selectedTeam),
+    () => filterAgentsByTeam(allAgents, selectedTeam),
     [allAgents, selectedTeam],
   );
 
-  const teamCounts = useMemo(() => {
-    const counts = new Map<string, number>();
-    for (const a of allAgents) {
-      if (!a.teamName) continue;
-      counts.set(a.teamName, (counts.get(a.teamName) ?? 0) + 1);
-    }
-    return counts;
-  }, [allAgents]);
+  const teamCounts = useMemo(() => computeTeamCounts(allAgents), [allAgents]);
 
   const pollTs = staticMode
     ? staticAllAgents !== null
@@ -439,15 +435,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
   }, [memoryPoll.data]);
   // Only local agents contribute to total memory — remote agents have no
   // RSS. Build a set of local agent IDs so the sum excludes remote rows.
-  const localAgentIds = useMemo(() => {
-    const s = new Set<string>();
-    for (const a of allAgents) {
-      const isRemote = a.deploymentShape === 'remote-endpoint' ||
-        a.metadata?.runtime === 'public-agent-remote';
-      if (!isRemote) s.add(a.id);
-    }
-    return s;
-  }, [allAgents]);
+  const localAgentIds = useMemo(() => selectLocalAgentIds(allAgents), [allAgents]);
 
   const totalMemoryBytes = useMemo(() => {
     let sum = 0;
@@ -489,10 +477,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
   );
   const allTasks = tasksPoll.data ?? [];
   const visibleTasks = useMemo(
-    () =>
-      selectedTeam === null
-        ? allTasks
-        : allTasks.filter((t) => t.teamName === selectedTeam),
+    () => filterTasksByTeam(allTasks, selectedTeam),
     [allTasks, selectedTeam],
   );
   const tasksTotal = visibleTasks.length;
@@ -508,21 +493,9 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
   }, [allTasks, tasksPoll.lastUpdated]);
 
   useEffect(() => {
-    if (tasksTotal === 0) {
-      if (taskSelectedIndex !== 0) setTaskSelectedIndex(0);
-      if (taskWindowStart !== 0) setTaskWindowStart(0);
-      return;
-    }
-    const clampedSel = Math.min(taskSelectedIndex, tasksTotal - 1);
-    if (clampedSel !== taskSelectedIndex) setTaskSelectedIndex(clampedSel);
-    const maxStart = Math.max(0, tasksTotal - tasksWindowSize);
-    let nextStart = taskWindowStart;
-    if (clampedSel < nextStart) nextStart = clampedSel;
-    if (clampedSel >= nextStart + tasksWindowSize)
-      nextStart = clampedSel - tasksWindowSize + 1;
-    if (nextStart > maxStart) nextStart = maxStart;
-    if (nextStart < 0) nextStart = 0;
-    if (nextStart !== taskWindowStart) setTaskWindowStart(nextStart);
+    const next = clampScroll(taskSelectedIndex, taskWindowStart, tasksTotal, tasksWindowSize);
+    if (next.index !== taskSelectedIndex) setTaskSelectedIndex(next.index);
+    if (next.windowStart !== taskWindowStart) setTaskWindowStart(next.windowStart);
   }, [tasksTotal, taskSelectedIndex, taskWindowStart, tasksWindowSize]);
 
   const selectedTaskName = visibleTasks[taskSelectedIndex]?.name ?? null;
@@ -545,10 +518,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
   // Calendar excludes heartbeat-kind schedules — those already appear on
   // the Heartbeats page, so duplicating them here just adds noise.
   const calendarSchedules = useMemo(
-    () =>
-      allSchedules.filter(
-        (s) => s.kind !== 'heartbeat' && !/^Heartbeat:\s/i.test(s.title),
-      ),
+    () => filterCalendarSchedules(allSchedules),
     [allSchedules],
   );
   const schedTotal = calendarSchedules.length;
@@ -582,39 +552,15 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
   const hbTotal = heartbeatRows.length;
 
   useEffect(() => {
-    if (hbTotal === 0) {
-      if (hbSelectedIndex !== 0) setHbSelectedIndex(0);
-      if (hbWindowStart !== 0) setHbWindowStart(0);
-      return;
-    }
-    const clampedSel = Math.min(hbSelectedIndex, hbTotal - 1);
-    if (clampedSel !== hbSelectedIndex) setHbSelectedIndex(clampedSel);
-    const maxStart = Math.max(0, hbTotal - heartbeatsWindowSize);
-    let nextStart = hbWindowStart;
-    if (clampedSel < nextStart) nextStart = clampedSel;
-    if (clampedSel >= nextStart + heartbeatsWindowSize)
-      nextStart = clampedSel - heartbeatsWindowSize + 1;
-    if (nextStart > maxStart) nextStart = maxStart;
-    if (nextStart < 0) nextStart = 0;
-    if (nextStart !== hbWindowStart) setHbWindowStart(nextStart);
+    const next = clampScroll(hbSelectedIndex, hbWindowStart, hbTotal, heartbeatsWindowSize);
+    if (next.index !== hbSelectedIndex) setHbSelectedIndex(next.index);
+    if (next.windowStart !== hbWindowStart) setHbWindowStart(next.windowStart);
   }, [hbTotal, hbSelectedIndex, hbWindowStart, heartbeatsWindowSize]);
 
   useEffect(() => {
-    if (schedTotal === 0) {
-      if (schedSelectedIndex !== 0) setSchedSelectedIndex(0);
-      if (schedWindowStart !== 0) setSchedWindowStart(0);
-      return;
-    }
-    const clampedSel = Math.min(schedSelectedIndex, schedTotal - 1);
-    if (clampedSel !== schedSelectedIndex) setSchedSelectedIndex(clampedSel);
-    const maxStart = Math.max(0, schedTotal - calendarWindowSize);
-    let nextStart = schedWindowStart;
-    if (clampedSel < nextStart) nextStart = clampedSel;
-    if (clampedSel >= nextStart + calendarWindowSize)
-      nextStart = clampedSel - calendarWindowSize + 1;
-    if (nextStart > maxStart) nextStart = maxStart;
-    if (nextStart < 0) nextStart = 0;
-    if (nextStart !== schedWindowStart) setSchedWindowStart(nextStart);
+    const next = clampScroll(schedSelectedIndex, schedWindowStart, schedTotal, calendarWindowSize);
+    if (next.index !== schedSelectedIndex) setSchedSelectedIndex(next.index);
+    if (next.windowStart !== schedWindowStart) setSchedWindowStart(next.windowStart);
   }, [schedTotal, schedSelectedIndex, schedWindowStart, calendarWindowSize]);
 
   const tasksTeamCounts = useMemo(() => {
@@ -627,21 +573,9 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
   }, [allTasks]);
 
   useEffect(() => {
-    if (total === 0) {
-      if (selectedIndex !== 0) setSelectedIndex(0);
-      if (windowStart !== 0) setWindowStart(0);
-      return;
-    }
-    const clampedSel = Math.min(selectedIndex, total - 1);
-    if (clampedSel !== selectedIndex) setSelectedIndex(clampedSel);
-    const maxStart = Math.max(0, total - agentsWindowSize);
-    let nextStart = windowStart;
-    if (clampedSel < nextStart) nextStart = clampedSel;
-    if (clampedSel >= nextStart + agentsWindowSize)
-      nextStart = clampedSel - agentsWindowSize + 1;
-    if (nextStart > maxStart) nextStart = maxStart;
-    if (nextStart < 0) nextStart = 0;
-    if (nextStart !== windowStart) setWindowStart(nextStart);
+    const next = clampScroll(selectedIndex, windowStart, total, agentsWindowSize);
+    if (next.index !== selectedIndex) setSelectedIndex(next.index);
+    if (next.windowStart !== windowStart) setWindowStart(next.windowStart);
   }, [total, selectedIndex, windowStart, agentsWindowSize]);
 
   const selectedAgent = visibleAgents[selectedIndex] ?? null;
@@ -665,7 +599,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
   );
   const newsItems = newsPoll.data ?? [];
   const sortedNewsItems = useMemo(
-    () => [...newsItems].sort((a, b) => b.timestamp - a.timestamp),
+    () => sortNewsByTimestamp(newsItems),
     [newsItems],
   );
   const newsTotal = sortedNewsItems.length;
@@ -677,21 +611,9 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
   const [agentDetailScroll, setAgentDetailScroll] = useState(0);
 
   useEffect(() => {
-    if (newsTotal === 0) {
-      if (newsSelectedIndex !== 0) setNewsSelectedIndex(0);
-      if (newsWindowStart !== 0) setNewsWindowStart(0);
-      return;
-    }
-    const clampedSel = Math.min(newsSelectedIndex, newsTotal - 1);
-    if (clampedSel !== newsSelectedIndex) setNewsSelectedIndex(clampedSel);
-    const maxStart = Math.max(0, newsTotal - newsWindowSize);
-    let nextStart = newsWindowStart;
-    if (clampedSel < nextStart) nextStart = clampedSel;
-    if (clampedSel >= nextStart + newsWindowSize)
-      nextStart = clampedSel - newsWindowSize + 1;
-    if (nextStart > maxStart) nextStart = maxStart;
-    if (nextStart < 0) nextStart = 0;
-    if (nextStart !== newsWindowStart) setNewsWindowStart(nextStart);
+    const next = clampScroll(newsSelectedIndex, newsWindowStart, newsTotal, newsWindowSize);
+    if (next.index !== newsSelectedIndex) setNewsSelectedIndex(next.index);
+    if (next.windowStart !== newsWindowStart) setNewsWindowStart(next.windowStart);
   }, [newsTotal, newsSelectedIndex, newsWindowStart, newsWindowSize]);
 
   const teamOptions: Array<string | null> = useMemo(
