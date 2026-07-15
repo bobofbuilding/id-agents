@@ -42,12 +42,21 @@ export function localAgentIds(agents: Agent[]): Set<string> {
   return s;
 }
 
-/** Count of agents per team name (agents without a team are skipped). */
-export function computeTeamCounts(agents: Agent[]): Map<string, number> {
+/**
+ * Count rows per team name, skipping rows without a team. Renderer-neutral and
+ * generic over anything team-scoped (agents, tasks, …) so agent and task team
+ * counts share one seam.
+ */
+export function countByTeam<T extends { teamName?: string }>(items: T[]): Map<string, number> {
   const counts = new Map<string, number>();
-  for (const a of agents) {
-    if (!a.teamName) continue;
-    counts.set(a.teamName, (counts.get(a.teamName) ?? 0) + 1);
+  for (const item of items) {
+    if (!item.teamName) continue;
+    counts.set(item.teamName, (counts.get(item.teamName) ?? 0) + 1);
   }
   return counts;
+}
+
+/** Count of agents per team name (agents without a team are skipped). */
+export function computeTeamCounts(agents: Agent[]): Map<string, number> {
+  return countByTeam(agents);
 }

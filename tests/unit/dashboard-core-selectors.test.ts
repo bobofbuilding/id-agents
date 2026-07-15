@@ -11,6 +11,7 @@ import {
   isRemoteAgent,
   localAgentIds,
   computeTeamCounts,
+  countByTeam,
   filterTasksByTeam,
   sortNewsByTimestamp,
   filterCalendarSchedules,
@@ -82,6 +83,31 @@ describe('selectors/agents', () => {
     expect(counts.get('y')).toBe(1);
     expect(counts.size).toBe(2);
   });
+
+  it('countByTeam is the shared seam for agents, tasks, and skips team-less rows', () => {
+    // Agents
+    const agentCounts = countByTeam([
+      agent('1', { teamName: 'x' }),
+      agent('2', { teamName: 'x' }),
+      agent('3'),
+    ]);
+    expect(agentCounts.get('x')).toBe(2);
+    expect(agentCounts.size).toBe(1);
+
+    // Tasks flow through the same generic seam
+    const taskCounts = countByTeam([
+      task('a', { teamName: 'x' }),
+      task('b', { teamName: 'y' }),
+      task('c', { teamName: 'y' }),
+      task('d'), // team-less → skipped
+    ]);
+    expect(taskCounts.get('x')).toBe(1);
+    expect(taskCounts.get('y')).toBe(2);
+    expect(taskCounts.size).toBe(2);
+
+    // computeTeamCounts delegates to countByTeam
+    expect(computeTeamCounts([agent('1', { teamName: 'z' })]).get('z')).toBe(1);
+  });
 });
 
 describe('selectors/tasks + news', () => {
@@ -111,11 +137,19 @@ describe('selectors/schedule filtering', () => {
 });
 
 describe('selectors/selection clamping', () => {
-  it('clampIndex bounds the index into [0, total)', () => {
+  it('clampIndex bounds the index into [0, total) — including negatives', () => {
     expect(clampIndex(3, 0)).toBe(0);
     expect(clampIndex(2, 10)).toBe(2);
     expect(clampIndex(20, 10)).toBe(9);
     expect(clampIndex(5, 5)).toBe(4);
+    // Lower-bound clamp: a negative index resolves to 0, never negative.
+    expect(clampIndex(-1, 10)).toBe(0);
+    expect(clampIndex(-5, 3)).toBe(0);
+  });
+
+  it('clampScroll never returns a negative index', () => {
+    expect(clampScroll(-1, 3, 10, 5)).toEqual({ index: 0, windowStart: 0 });
+    expect(clampScroll(-4, 0, 10, 5)).toEqual({ index: 0, windowStart: 0 });
   });
 
   it('clampScroll resets on empty and keeps an in-range selection visible', () => {

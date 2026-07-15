@@ -12,3 +12,9 @@
 export * from './api/types.js';
 export * from './api/validation.js';
 export * from './api/client.js';
+
+// Commit 3: renderer-neutral display + domain seams.
+export * from './formatters/index.js';
+export * from './status.js';
+export * from './schedule.js';
+export * from './selectors/index.js';

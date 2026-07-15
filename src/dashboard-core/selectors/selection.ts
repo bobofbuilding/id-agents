@@ -9,7 +9,9 @@
 /** Clamp a selection index into `[0, total)`. Empty list → 0. */
 export function clampIndex(index: number, total: number): number {
   if (total <= 0) return 0;
-  return Math.min(index, total - 1);
+  // Bound BOTH ends: a negative index (e.g. from a rapid decrement) resolves
+  // to 0, an over-range index to total-1.
+  return Math.max(0, Math.min(index, total - 1));
 }
 
 export interface ScrollState {
@@ -32,7 +34,7 @@ export function clampScroll(
   windowSize: number,
 ): ScrollState {
   if (total <= 0) return { index: 0, windowStart: 0 };
-  const clampedIndex = Math.min(index, total - 1);
+  const clampedIndex = Math.max(0, Math.min(index, total - 1));
   const maxStart = Math.max(0, total - windowSize);
   let nextStart = windowStart;
   if (clampedIndex < nextStart) nextStart = clampedIndex;

@@ -66,6 +66,7 @@ import {
   orderTeams,
   filterAgentsByTeam,
   computeTeamCounts,
+  countByTeam,
   localAgentIds as selectLocalAgentIds,
   filterTasksByTeam,
   sortNewsByTimestamp,
@@ -563,14 +564,7 @@ export function App({ staticMode = false }: AppProps = {}): React.ReactElement {
     if (next.windowStart !== schedWindowStart) setSchedWindowStart(next.windowStart);
   }, [schedTotal, schedSelectedIndex, schedWindowStart, calendarWindowSize]);
 
-  const tasksTeamCounts = useMemo(() => {
-    const counts = new Map<string, number>();
-    for (const t of allTasks) {
-      if (!t.teamName) continue;
-      counts.set(t.teamName, (counts.get(t.teamName) ?? 0) + 1);
-    }
-    return counts;
-  }, [allTasks]);
+  const tasksTeamCounts = useMemo(() => countByTeam(allTasks), [allTasks]);
 
   useEffect(() => {
     const next = clampScroll(selectedIndex, windowStart, total, agentsWindowSize);
