@@ -44,9 +44,21 @@ function computeIntegrityHash(prevHash: string | null, event: Omit<ConnectorAudi
   return crypto.createHash('sha256').update(canonical).digest('hex');
 }
 
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      out[key] = canonicalize((value as Record<string, unknown>)[key]);
+    }
+    return out;
+  }
+  return value;
+}
+
 /** SHA-256 helper for callers to hash their already-redacted argument objects before passing argsHash in. */
 export function hashSanitizedArgs(sanitizedArgs: unknown): string {
-  return crypto.createHash('sha256').update(JSON.stringify(sanitizedArgs ?? null)).digest('hex');
+  return crypto.createHash('sha256').update(JSON.stringify(canonicalize(sanitizedArgs ?? null))).digest('hex');
 }
 
 export class ConnectorAuditLog {

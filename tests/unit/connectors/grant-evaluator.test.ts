@@ -103,6 +103,15 @@ describe('evaluateGrant', () => {
     expect(result.denyCode).toBe('resource_scope_violation');
   });
 
+  it('denies a scoped grant when the invocation omits proof for that scope', () => {
+    const result = evaluateGrant({
+      ...baseInput,
+      candidateGrants: [makeGrant({ resourceScope: { recipientDomainsAllow: ['example.com'] } })],
+    });
+    expect(result.allowed).toBe(false);
+    expect(result.denyCode).toBe('resource_scope_violation');
+  });
+
   it('allows when the requested resource matches the grant scope', () => {
     const result = evaluateGrant({
       ...baseInput,
@@ -110,5 +119,39 @@ describe('evaluateGrant', () => {
       requestedResource: { accountRef: 'mailbox-a' },
     });
     expect(result.allowed).toBe(true);
+  });
+
+  it('requires every requested recipient domain to be in the grant allow-list', () => {
+    const allowed = evaluateGrant({
+      ...baseInput,
+      candidateGrants: [makeGrant({ resourceScope: { recipientDomainsAllow: ['example.com', 'bittrees.org'] } })],
+      requestedResource: { recipientDomains: ['example.com', 'bittrees.org'] },
+    });
+    expect(allowed.allowed).toBe(true);
+
+    const denied = evaluateGrant({
+      ...baseInput,
+      candidateGrants: [makeGrant({ resourceScope: { recipientDomainsAllow: ['example.com'] } })],
+      requestedResource: { recipientDomains: ['example.com', 'outside.test'] },
+    });
+    expect(denied.allowed).toBe(false);
+    expect(denied.denyCode).toBe('resource_scope_violation');
+  });
+
+  it('enforces maxResults grant caps when present', () => {
+    const allowed = evaluateGrant({
+      ...baseInput,
+      candidateGrants: [makeGrant({ resourceScope: { maxResults: 10 } })],
+      requestedResource: { maxResults: 10 },
+    });
+    expect(allowed.allowed).toBe(true);
+
+    const denied = evaluateGrant({
+      ...baseInput,
+      candidateGrants: [makeGrant({ resourceScope: { maxResults: 10 } })],
+      requestedResource: { maxResults: 11 },
+    });
+    expect(denied.allowed).toBe(false);
+    expect(denied.denyCode).toBe('resource_scope_violation');
   });
 });

@@ -201,6 +201,141 @@ describe('ConnectorRouter', () => {
     expect(result.denyCode).toBe('invalid_args');
   });
 
+  it('rejects non-empty args for capabilities with an empty input schema', async () => {
+    const { router, connection } = await setup();
+    const result = await router.route(
+      invocation({ capabilityId: 'gmail.labels.list', connection, args: { unexpected: 'x' } }),
+    );
+    expect(result.status).toBe('denied');
+    expect(result.denyCode).toBe('invalid_args');
+  });
+
+  it('rejects wrong primitive and enum args before grant or backend dispatch', async () => {
+    const { router, grants, connection } = await setup();
+    await grants.issueGrant({
+      agentId: AGENT_ID,
+      tenantId: TENANT_ID,
+      connectionId: connection.id,
+      capabilityId: 'gmail.messages.search',
+      connectorVersion: GMAIL_MANIFEST_VERSION,
+      effect: 'allow',
+      issuedBy: 'operator-1',
+      reason: 'test',
+    });
+    const wrongType = await router.route(
+      invocation({ capabilityId: 'gmail.messages.search', connection, args: { query: 'x', maxResults: '10' } }),
+    );
+    expect(wrongType.status).toBe('denied');
+    expect(wrongType.denyCode).toBe('invalid_args');
+
+    const badEnum = await router.route(
+      invocation({ capabilityId: 'gmail.messages.get', connection, args: { messageId: 'm1', format: 'raw' } }),
+    );
+    expect(badEnum.status).toBe('denied');
+    expect(badEnum.denyCode).toBe('invalid_args');
+  });
+
+  it('denies draft creation when requested recipients exceed the grant recipient-domain scope', async () => {
+    const { router, grants, connection } = await setup();
+    await grants.issueGrant({
+      agentId: AGENT_ID,
+      tenantId: TENANT_ID,
+      connectionId: connection.id,
+      capabilityId: 'gmail.drafts.create',
+      connectorVersion: GMAIL_MANIFEST_VERSION,
+      effect: 'allow',
+      resourceScope: { recipientDomainsAllow: ['example.com'] },
+      issuedBy: 'operator-1',
+      reason: 'test',
+    });
+
+    const result = await router.route(
+      invocation({
+        capabilityId: 'gmail.drafts.create',
+        connection,
+        args: { to: ['ok@example.com', 'blocked@outside.test'], subject: 's', body: 'b' },
+      }),
+    );
+    expect(result.status).toBe('denied');
+    expect(result.denyCode).toBe('resource_scope_violation');
+  });
+
+  it('passes external-recipient context into conditional approval policies', async () => {
+    const { router, grants, approvalPolicies, connection } = await setup();
+    await grants.issueGrant({
+      agentId: AGENT_ID,
+      tenantId: TENANT_ID,
+      connectionId: connection.id,
+      capabilityId: 'gmail.drafts.create',
+      connectorVersion: GMAIL_MANIFEST_VERSION,
+      effect: 'allow',
+      resourceScope: { recipientDomainsAllow: ['example.com'] },
+      issuedBy: 'operator-1',
+      reason: 'test',
+    });
+    await approvalPolicies.upsertPolicy({
+      capabilityId: 'gmail.drafts.create',
+      mode: 'confirm',
+      conditions: { externalRecipient: true },
+    });
+
+    const result = await router.route(
+      invocation({
+        capabilityId: 'gmail.drafts.create',
+        connection,
+        idempotencyKey: 'draft-create-approval-context',
+        args: { to: ['Reviewer <person@example.com>'], subject: 's', body: 'b' },
+      }),
+    );
+    expect(result.status).toBe('approval_required');
+    expect(result.approvalRequestId).toBeTruthy();
+  });
+
+  it('requires an idempotency key before side-effecting draft capabilities can reach approval or backend dispatch', async () => {
+    const { router, grants, connection } = await setup();
+    await grants.issueGrant({
+      agentId: AGENT_ID,
+      tenantId: TENANT_ID,
+      connectionId: connection.id,
+      capabilityId: 'gmail.drafts.create',
+      connectorVersion: GMAIL_MANIFEST_VERSION,
+      effect: 'allow',
+      issuedBy: 'operator-1',
+      reason: 'test',
+    });
+
+    const result = await router.route(
+      invocation({
+        capabilityId: 'gmail.drafts.create',
+        connection,
+        args: { to: ['person@example.com'], subject: 's', body: 'b' },
+      }),
+    );
+    expect(result.status).toBe('denied');
+    expect(result.denyCode).toBe('idempotency_required');
+  });
+
+  it('enforces maxResults grant caps before backend dispatch', async () => {
+    const { router, grants, connection } = await setup();
+    await grants.issueGrant({
+      agentId: AGENT_ID,
+      tenantId: TENANT_ID,
+      connectionId: connection.id,
+      capabilityId: 'gmail.messages.search',
+      connectorVersion: GMAIL_MANIFEST_VERSION,
+      effect: 'allow',
+      resourceScope: { maxResults: 5 },
+      issuedBy: 'operator-1',
+      reason: 'test',
+    });
+
+    const result = await router.route(
+      invocation({ capabilityId: 'gmail.messages.search', connection, args: { query: 'is:unread', maxResults: 6 } }),
+    );
+    expect(result.status).toBe('denied');
+    expect(result.denyCode).toBe('resource_scope_violation');
+  });
+
   it('routes a granted read capability through to the backend and gets a safe not-connected result (no live network)', async () => {
     const { router, grants, connection } = await setup();
     await grants.issueGrant({
@@ -254,7 +389,13 @@ describe('ConnectorRouter', () => {
 
     const requestId = crypto.randomUUID();
     const first = await router.route(
-      invocation({ requestId, capabilityId: 'gmail.drafts.send', connection, args: { draftId: 'd1' } }),
+      invocation({
+        requestId,
+        capabilityId: 'gmail.drafts.send',
+        connection,
+        idempotencyKey: 'draft-send-approved',
+        args: { draftId: 'd1' },
+      }),
     );
     expect(first.status).toBe('approval_required');
     expect(first.approvalRequestId).toBeTruthy();
@@ -266,6 +407,7 @@ describe('ConnectorRouter', () => {
         requestId,
         capabilityId: 'gmail.drafts.send',
         connection,
+        idempotencyKey: 'draft-send-approved',
         args: { draftId: 'd1' },
         approvalRequestId: first.approvalRequestId,
       }),
@@ -290,7 +432,13 @@ describe('ConnectorRouter', () => {
 
     const requestId = crypto.randomUUID();
     const first = await router.route(
-      invocation({ requestId, capabilityId: 'gmail.drafts.send', connection, args: { draftId: 'd1' } }),
+      invocation({
+        requestId,
+        capabilityId: 'gmail.drafts.send',
+        connection,
+        idempotencyKey: 'draft-send-denied',
+        args: { draftId: 'd1' },
+      }),
     );
     await approvalRequests.decide(first.approvalRequestId!, 'denied', 'operator-1');
 
@@ -299,12 +447,74 @@ describe('ConnectorRouter', () => {
         requestId,
         capabilityId: 'gmail.drafts.send',
         connection,
+        idempotencyKey: 'draft-send-denied',
         args: { draftId: 'd1' },
         approvalRequestId: first.approvalRequestId,
       }),
     );
     expect(second.status).toBe('denied');
     expect(second.denyCode).toBe('approval_denied');
+  });
+
+  it('replays a scoped idempotency key with the same args hash without invoking the backend again', async () => {
+    const { router, grants, auditLog, connection } = await setup();
+    await grants.issueGrant({
+      agentId: AGENT_ID,
+      tenantId: TENANT_ID,
+      connectionId: connection.id,
+      capabilityId: 'gmail.drafts.create',
+      connectorVersion: GMAIL_MANIFEST_VERSION,
+      effect: 'allow',
+      issuedBy: 'operator-1',
+      reason: 'test',
+    });
+
+    const args = { to: ['person@example.com'], subject: 's', body: 'b' };
+    const first = await router.route(
+      invocation({ capabilityId: 'gmail.drafts.create', connection, idempotencyKey: 'draft-create-replay', args }),
+    );
+    const second = await router.route(
+      invocation({ capabilityId: 'gmail.drafts.create', connection, idempotencyKey: 'draft-create-replay', args }),
+    );
+
+    expect(first.status).toBe('provider_error');
+    expect(second.status).toBe('provider_error');
+    const events = await auditLog.listAll();
+    expect(events.map((event) => event.action)).toEqual(['connector.invoke', 'connector.idempotent_replay']);
+  });
+
+  it('denies idempotency-key reuse with different args for the same scoped invocation lane', async () => {
+    const { router, grants, connection } = await setup();
+    await grants.issueGrant({
+      agentId: AGENT_ID,
+      tenantId: TENANT_ID,
+      connectionId: connection.id,
+      capabilityId: 'gmail.drafts.create',
+      connectorVersion: GMAIL_MANIFEST_VERSION,
+      effect: 'allow',
+      issuedBy: 'operator-1',
+      reason: 'test',
+    });
+
+    await router.route(
+      invocation({
+        capabilityId: 'gmail.drafts.create',
+        connection,
+        idempotencyKey: 'draft-create-conflict',
+        args: { to: ['person@example.com'], subject: 's', body: 'one' },
+      }),
+    );
+    const conflict = await router.route(
+      invocation({
+        capabilityId: 'gmail.drafts.create',
+        connection,
+        idempotencyKey: 'draft-create-conflict',
+        args: { to: ['person@example.com'], subject: 's', body: 'two' },
+      }),
+    );
+
+    expect(conflict.status).toBe('denied');
+    expect(conflict.denyCode).toBe('idempotency_conflict');
   });
 
   it('writes an audit event for every terminal decision, in order', async () => {

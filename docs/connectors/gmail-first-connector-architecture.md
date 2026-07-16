@@ -56,22 +56,36 @@ Implemented in `src/connectors/runtime/router.ts` (`ConnectorRouter.route`):
    deployment must pass this map; it is not wired automatically.
 4. **Connection binding + status** — the connection must belong to the same
    agent/tenant/connector/version and be `active`.
-5. **Argument shape validation** — structural check against the manifest's
-   `inputSchema` (`runtime/router.ts#validateArgs`); unknown or missing
-   required fields deny before touching a grant.
+5. **Argument shape validation** — runtime check against the manifest's
+   `inputSchema` (`runtime/router.ts#validateArgs`); unknown fields,
+   missing required fields, wrong primitive array/scalar types, and enum
+   misses deny before touching a grant. Capabilities with an empty schema
+   accept only an empty/missing args object.
 6. **Grant evaluation** — `grants/grant-evaluator.ts#evaluateGrant`.
    Deny-overrides-allow; absence of any grant is deny; expired/revoked grants
-   are ignored for allow purposes.
+   are ignored for allow purposes. The router derives invocation resource
+   context before evaluation (`accountRef` from the connection, recipient
+   domains from `to`, and read caps such as `maxResults`/`maxMessages`), so
+   constrained grants fail closed when the invocation cannot prove it is
+   inside scope.
+6b. **Side-effect idempotency key** — any capability whose manifest
+   `sideEffect` is not `none` must supply an `idempotencyKey` before approval
+   or backend dispatch. Missing keys deny with `idempotency_required`.
 7. **Approval policy** — `policy/approval-policy.ts#resolveApprovalMode`. A
    capability's manifest approval mode is a floor; an
    `ApprovalPolicyRecord` may only make it stricter. `always`/`confirm`
    short-circuits to an `approval_required` result with a single-use
    `ApprovalRequestRecord` (`policy/approval-requests-repo.ts`) bound to the
    exact args hash; a second call must supply the approved request's id and
-   a matching args hash to proceed.
-8. **Idempotency guard + backend dispatch + audit** — a side-effecting call
-   with an `idempotencyKey` short-circuits to the previously recorded result
-   instead of re-invoking the backend. Otherwise the router resolves the
+   a matching args hash to proceed. Conditional policy rows receive derived
+   invocation context, including external-recipient and attachment signals,
+   before the backend is considered.
+8. **Idempotency guard + backend dispatch + audit** — a scoped replay
+   (same request id, or same agent/tenant/connector/version/capability/
+   connection/idempotency key with the same args hash) short-circuits to the
+   previously recorded result instead of re-invoking the backend. Reusing an
+   idempotency key with different args denies with `idempotency_conflict`.
+   Otherwise the router resolves the
    manifest's `backend.binding` name to a reviewed origin/identity
    (`catalog/backend-bindings.ts`) — never from agent input — and calls the
    matching `ConnectorBackend.invoke`. Every branch, including every deny,

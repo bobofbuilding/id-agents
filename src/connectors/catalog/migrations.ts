@@ -120,7 +120,7 @@ const SQLITE_DDL = `
     completed_at INTEGER
   );
   CREATE UNIQUE INDEX IF NOT EXISTS connector_invocations_idempotency_idx
-    ON connector_invocations(connector_id, capability_id, idempotency_key)
+    ON connector_invocations(agent_id, tenant_id, connector_id, connector_version, capability_id, connection_id, idempotency_key)
     WHERE idempotency_key IS NOT NULL;
 
   CREATE TABLE IF NOT EXISTS connector_audit_events (
@@ -262,7 +262,7 @@ const POSTGRES_DDL = `
     completed_at BIGINT
   );
   CREATE UNIQUE INDEX IF NOT EXISTS connector_invocations_idempotency_idx
-    ON connector_invocations(connector_id, capability_id, idempotency_key)
+    ON connector_invocations(agent_id, tenant_id, connector_id, connector_version, capability_id, connection_id, idempotency_key)
     WHERE idempotency_key IS NOT NULL;
 
   CREATE TABLE IF NOT EXISTS connector_audit_events (

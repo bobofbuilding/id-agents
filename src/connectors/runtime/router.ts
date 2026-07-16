@@ -10,6 +10,7 @@
  *   4. connection binding + status check
  *   5. argument shape validation
  *   6. grant evaluation (deny-overrides-allow)
+ *   6b. side-effect idempotency-key requirement
  *   7. approval policy (may short-circuit with approval_required)
  *   8. idempotency guard + backend dispatch + audit write
  *
@@ -25,18 +26,13 @@ import type { ConnectorRegistry } from '../catalog/connector-registry.js';
 import { resolveBindingOrigin } from '../catalog/backend-bindings.js';
 import type { ConnectorConnectionsRepo } from '../connections/connections-repo.js';
 import type { ConnectorGrantsRepo } from '../grants/grants-repo.js';
-import { evaluateGrant } from '../grants/grant-evaluator.js';
+import { evaluateGrant, type RequestedResource } from '../grants/grant-evaluator.js';
 import type { ApprovalPolicyRepo } from '../policy/approval-policy-repo.js';
 import type { ApprovalRequestsRepo } from '../policy/approval-requests-repo.js';
-import { resolveApprovalMode } from '../policy/approval-policy.js';
+import { resolveApprovalMode, type ApprovalContext } from '../policy/approval-policy.js';
 import { ConnectorAuditLog, hashSanitizedArgs } from '../audit/audit-log.js';
 import type { DbAdapter } from '../../db/db-adapter.js';
-import type { CapabilityManifestEntry, ConnectorInvocation, ConnectorResult, DenyCode } from '../types.js';
-
-export interface ApprovalContextInput {
-  externalRecipient?: boolean;
-  hasAttachment?: boolean;
-}
+import type { CapabilityManifestEntry, ConnectionRecord, ConnectorInvocation, ConnectorResult, DenyCode } from '../types.js';
 
 export interface RouterDeps {
   db: DbAdapter;
@@ -58,21 +54,105 @@ function isOptionalField(schemaValue: unknown): boolean {
   return typeof schemaValue === 'string' && schemaValue.endsWith('?');
 }
 
-/** Minimal structural check: every declared required key present, no undeclared keys. Not a full JSON-schema validator by design — see manifest-validator.ts for the publish-time shape check. */
+function schemaBase(schemaValue: string): string {
+  return isOptionalField(schemaValue) ? schemaValue.slice(0, -1) : schemaValue;
+}
+
+function matchesSchemaValue(schemaValue: unknown, value: unknown): boolean {
+  if (typeof schemaValue !== 'string') return true;
+  const expected = schemaBase(schemaValue);
+  if (expected.includes('|')) return typeof value === 'string' && expected.split('|').includes(value);
+  if (expected === 'string') return typeof value === 'string';
+  if (expected === 'number') return typeof value === 'number' && Number.isFinite(value);
+  if (expected === 'boolean') return typeof value === 'boolean';
+  if (expected === 'string[]') return Array.isArray(value) && value.every((item) => typeof item === 'string');
+  return true;
+}
+
+/** Minimal runtime schema check: every required key present, no undeclared keys, and primitive/enum declarations match. */
 function validateArgs(capability: CapabilityManifestEntry, args: unknown): boolean {
   const schema = capability.inputSchema ?? {};
   const schemaKeys = Object.keys(schema);
-  if (schemaKeys.length === 0) return true;
-  if (typeof args !== 'object' || args === null) return false;
-  const argKeys = Object.keys(args as Record<string, unknown>);
+  if (schemaKeys.length === 0) {
+    return args == null || (typeof args === 'object' && !Array.isArray(args) && Object.keys(args).length === 0);
+  }
+  if (typeof args !== 'object' || args === null || Array.isArray(args)) return false;
+  const argsRecord = args as Record<string, unknown>;
+  const argKeys = Object.keys(argsRecord);
 
   for (const key of argKeys) {
     if (!schemaKeys.includes(key)) return false;
+    if (!matchesSchemaValue(schema[key], argsRecord[key])) return false;
   }
   for (const key of schemaKeys) {
-    if (!isOptionalField(schema[key]) && !argKeys.includes(key)) return false;
+    if (!isOptionalField(schema[key]) && !Object.prototype.hasOwnProperty.call(argsRecord, key)) return false;
   }
   return true;
+}
+
+function asArgsRecord(args: unknown): Record<string, unknown> {
+  return typeof args === 'object' && args !== null ? (args as Record<string, unknown>) : {};
+}
+
+function stringArrayField(args: Record<string, unknown>, key: string): string[] {
+  const value = args[key];
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+}
+
+function extractDomain(recipient: string): string | null {
+  const trimmed = recipient.trim();
+  const angleAddress = /<([^<>@\s]+@[^<>\s]+)>$/.exec(trimmed);
+  const address = angleAddress?.[1] ?? trimmed;
+  const match = /@([^@\s>]+)$/.exec(address);
+  return match ? match[1].toLowerCase() : null;
+}
+
+function recipientDomainsFromArgs(args: Record<string, unknown>): string[] {
+  const domains = new Set<string>();
+  for (const recipient of stringArrayField(args, 'to')) {
+    const domain = extractDomain(recipient);
+    if (domain) domains.add(domain);
+  }
+  return [...domains];
+}
+
+function hasAttachmentContext(args: Record<string, unknown>): boolean {
+  if (args.hasAttachment === true) return true;
+  if (typeof args.attachmentId === 'string' && args.attachmentId.trim().length > 0) return true;
+  for (const key of ['attachments', 'attachmentIds']) {
+    const value = args[key];
+    if (Array.isArray(value) && value.length > 0) return true;
+  }
+  return false;
+}
+
+function deriveRequestedResource(
+  connection: ConnectionRecord,
+  args: unknown,
+): RequestedResource {
+  const argsRecord = asArgsRecord(args);
+  const recipientDomains = recipientDomainsFromArgs(argsRecord);
+  const requested: RequestedResource = {
+    accountRef: connection.vaultCredentialRef ?? connection.id,
+  };
+  if (recipientDomains.length === 1) requested.recipientDomain = recipientDomains[0];
+  if (recipientDomains.length > 0) requested.recipientDomains = recipientDomains;
+  if (typeof argsRecord.label === 'string') requested.label = argsRecord.label;
+  if (typeof argsRecord.maxResults === 'number') requested.maxResults = argsRecord.maxResults;
+  if (typeof argsRecord.maxMessages === 'number') requested.maxResults = argsRecord.maxMessages;
+  return requested;
+}
+
+function deriveApprovalContext(args: unknown): ApprovalContext {
+  const argsRecord = asArgsRecord(args);
+  return {
+    externalRecipient: recipientDomainsFromArgs(argsRecord).length > 0,
+    hasAttachment: hasAttachmentContext(argsRecord),
+  };
+}
+
+function requiresIdempotency(capability: CapabilityManifestEntry): boolean {
+  return capability.sideEffect !== 'none';
 }
 
 export class ConnectorRouter {
@@ -99,6 +179,27 @@ export class ConnectorRouter {
         timestamp: now,
       });
       return { status: 'denied', requestId: invocation.requestId, denyCode };
+    };
+
+    const auditReplay = async (
+      status: ConnectorResult['status'],
+      connectorVersion: string,
+      capabilityId: string,
+      argsHash: string,
+    ): Promise<ConnectorResult> => {
+      await this.deps.auditLog.append({
+        requestId: invocation.requestId,
+        actorAgentId: invocation.agentId,
+        action: 'connector.idempotent_replay',
+        connectorId: invocation.connectorId,
+        connectorVersion,
+        capabilityId,
+        decision: status,
+        denyCode: null,
+        argsHash,
+        timestamp: now,
+      });
+      return { status, requestId: invocation.requestId };
     };
 
     // 1. Feature-flag gate.
@@ -148,14 +249,23 @@ export class ConnectorRouter {
       connectionId: invocation.connectionId,
       candidateGrants: candidates,
       now,
+      requestedResource: deriveRequestedResource(connection, invocation.args),
     });
     if (!grantResult.allowed) return deny(grantResult.denyCode ?? 'no_grant', version, capability.id);
 
+    const argsHash = hashSanitizedArgs(invocation.args);
+
+    // 6b. Side-effect idempotency requirement. Read-only calls may omit this;
+    // draft/send/modify/delete-class calls must supply it before approval or
+    // backend dispatch can be considered.
+    if (requiresIdempotency(capability) && !invocation.idempotencyKey) {
+      return deny('idempotency_required', version, capability.id);
+    }
+
     // 7. Approval policy.
     const policies = await this.deps.approvalPolicies.listForCapability(capability.id);
-    const approvalContext: ApprovalContextInput = {};
+    const approvalContext = deriveApprovalContext(invocation.args);
     const approval = resolveApprovalMode(capability, invocation.agentId, invocation.tenantId, policies, approvalContext);
-    const argsHash = hashSanitizedArgs(invocation.args);
 
     if (approval.mode === 'deny') return deny('approval_denied', version, capability.id);
 
@@ -192,13 +302,35 @@ export class ConnectorRouter {
     }
 
     // 8. Idempotency guard + backend dispatch.
+    const existingByRequestId = await this.deps.db.query<{ status: ConnectorResult['status']; args_hash: string | null }>(
+      `SELECT status, args_hash FROM connector_invocations WHERE request_id = $1`,
+      [invocation.requestId],
+    );
+    if (existingByRequestId.rows.length > 0) {
+      const existing = existingByRequestId.rows[0];
+      if (existing.args_hash !== argsHash) return deny('idempotency_conflict', version, capability.id);
+      return auditReplay(existing.status, version, capability.id, argsHash);
+    }
+
     if (invocation.idempotencyKey) {
-      const existing = await this.deps.db.query<{ status: string }>(
-        `SELECT status FROM connector_invocations WHERE connector_id = $1 AND capability_id = $2 AND idempotency_key = $3`,
-        [invocation.connectorId, capability.id, invocation.idempotencyKey],
+      const existing = await this.deps.db.query<{ status: ConnectorResult['status']; args_hash: string | null }>(
+        `SELECT status, args_hash FROM connector_invocations
+         WHERE agent_id = $1 AND tenant_id = $2 AND connector_id = $3 AND connector_version = $4
+           AND capability_id = $5 AND connection_id = $6 AND idempotency_key = $7`,
+        [
+          invocation.agentId,
+          invocation.tenantId,
+          invocation.connectorId,
+          version,
+          capability.id,
+          invocation.connectionId,
+          invocation.idempotencyKey,
+        ],
       );
       if (existing.rows.length > 0) {
-        return { status: existing.rows[0].status as ConnectorResult['status'], requestId: invocation.requestId };
+        const existingRow = existing.rows[0];
+        if (existingRow.args_hash !== argsHash) return deny('idempotency_conflict', version, capability.id);
+        return auditReplay(existingRow.status, version, capability.id, argsHash);
       }
     }
 
@@ -225,6 +357,11 @@ export class ConnectorRouter {
     }
 
     const result = await backend.invoke({ capability, connection, args: invocation.args, requestId: invocation.requestId });
+    const resultStatus: ConnectorResult['status'] = result.ok
+      ? 'ok'
+      : result.errorKind === 'retryable'
+        ? 'retryable_error'
+        : 'provider_error';
 
     await this.deps.db.query(
       `INSERT INTO connector_invocations (
@@ -240,7 +377,7 @@ export class ConnectorRouter {
         version,
         capability.id,
         invocation.connectionId,
-        result.ok ? 'ok' : 'provider_error',
+        resultStatus,
         null,
         argsHash,
         now,
@@ -255,7 +392,7 @@ export class ConnectorRouter {
       connectorId: invocation.connectorId,
       connectorVersion: version,
       capabilityId: capability.id,
-      decision: result.ok ? 'ok' : 'provider_error',
+      decision: resultStatus,
       denyCode: null,
       argsHash,
       timestamp: now,
