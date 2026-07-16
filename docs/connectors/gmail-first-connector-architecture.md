@@ -44,6 +44,16 @@ Implemented in `src/connectors/runtime/router.ts` (`ConnectorRouter.route`):
 3. **Hard-deny check** — a capability with `hardDeny: true` in its manifest
    entry (e.g. `gmail.messages.send`) is denied before any grant is
    evaluated.
+3b. **Capability-specific feature-flag gate** — beyond the per-connector
+   flag, individual capabilities may require their own flag
+   (`RouterDeps.capabilityFlagGate`, keyed by capability id). Gmail wires
+   `CONNECTOR_CAPABILITY_FLAG_GATE` (`config/feature-flags.ts`) so
+   `gmail.drafts.send` also requires `gmailSendEnabled`, independent of
+   `gmailConnectorEnabled` gating the rest of the connector — this is what
+   makes stage 3 (read/draft live, send still off) and stage 4 (send flipped
+   for the pilot cohort) distinct, enforceable states rather than a single
+   flag covering both. Whoever instantiates `ConnectorRouter` for a real
+   deployment must pass this map; it is not wired automatically.
 4. **Connection binding + status** — the connection must belong to the same
    agent/tenant/connector/version and be `active`.
 5. **Argument shape validation** — structural check against the manifest's
