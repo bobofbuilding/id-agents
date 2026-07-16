@@ -3,9 +3,10 @@
  * Connector runtime router. Implements the default-deny routing sequence
  * from docs/connectors/gmail-first-connector-architecture.md#default-deny-routing-order:
  *
- *   1. feature-flag gate
+ *   1. feature-flag gate (master switch + per-connector flag)
  *   2. exact-pin capability resolution (registry; unknown => deny)
  *   3. hard-deny check
+ *   3b. capability-specific feature-flag gate (e.g. gmailSendEnabled)
  *   4. connection binding + status check
  *   5. argument shape validation
  *   6. grant evaluation (deny-overrides-allow)
@@ -49,6 +50,8 @@ export interface RouterDeps {
   featureFlags: ConnectorFeatureFlags;
   /** connectorId -> flag name that must be true for that connector, beyond the master switch. */
   connectorFlagGate: Record<string, keyof ConnectorFeatureFlags>;
+  /** capabilityId -> flag name that must be true for that specific capability, beyond its connector's flag. See CONNECTOR_CAPABILITY_FLAG_GATE. */
+  capabilityFlagGate?: Record<string, keyof ConnectorFeatureFlags>;
 }
 
 function isOptionalField(schemaValue: unknown): boolean {
@@ -112,6 +115,13 @@ export class ConnectorRouter {
 
     // 3. Hard-deny check.
     if (capability.hardDeny) return deny('capability_hard_denied', version, capability.id);
+
+    // 3b. Capability-specific feature-flag gate (e.g. gmailSendEnabled gating
+    // gmail.drafts.send beyond gmailConnectorEnabled).
+    const capabilityGateFlag = this.deps.capabilityFlagGate?.[capability.id];
+    if (capabilityGateFlag && !this.deps.featureFlags[capabilityGateFlag]) {
+      return deny('feature_disabled', version, capability.id);
+    }
 
     // 4. Connection binding + status.
     const connection = await this.deps.connections.getById(invocation.connectionId);

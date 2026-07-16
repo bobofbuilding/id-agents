@@ -15,7 +15,11 @@ import { OAuthApiBackend } from '../../../src/connectors/backends/oauth-api-back
 import { FakeVaultCredentialBroker } from '../../../src/connectors/credentials/credential-broker.js';
 import { bootstrapGmailConnector } from '../../../src/connectors/providers/gmail/bootstrap.js';
 import { GMAIL_CONNECTOR_ID, GMAIL_MANIFEST_VERSION } from '../../../src/connectors/providers/gmail/gmail-manifest.js';
-import { DEFAULT_CONNECTOR_FEATURE_FLAGS, type ConnectorFeatureFlags } from '../../../src/connectors/config/feature-flags.js';
+import {
+  CONNECTOR_CAPABILITY_FLAG_GATE,
+  DEFAULT_CONNECTOR_FEATURE_FLAGS,
+  type ConnectorFeatureFlags,
+} from '../../../src/connectors/config/feature-flags.js';
 import type { ConnectionRecord, ConnectorInvocation } from '../../../src/connectors/types.js';
 
 const AGENT_ID = 'agent-a';
@@ -54,6 +58,7 @@ async function setup(flagOverrides: Partial<ConnectorFeatureFlags> = {}) {
     backends: { oauth_api: oauthBackend },
     featureFlags,
     connectorFlagGate: { [GMAIL_CONNECTOR_ID]: 'gmailConnectorEnabled' },
+    capabilityFlagGate: CONNECTOR_CAPABILITY_FLAG_GATE,
   });
 
   const connection = await connections.create({
@@ -121,6 +126,39 @@ describe('ConnectorRouter', () => {
     const result = await router.route(invocation({ capabilityId: 'gmail.messages.send', connection, args: {} }));
     expect(result.status).toBe('denied');
     expect(result.denyCode).toBe('capability_hard_denied');
+  });
+
+  it('denies gmail.drafts.send when gmailSendEnabled is false even with an allow grant', async () => {
+    const { router, grants, connection } = await setup({ gmailSendEnabled: false });
+    await grants.issueGrant({
+      agentId: AGENT_ID,
+      tenantId: TENANT_ID,
+      connectionId: connection.id,
+      capabilityId: 'gmail.drafts.send',
+      connectorVersion: GMAIL_MANIFEST_VERSION,
+      effect: 'allow',
+      issuedBy: 'operator-1',
+      reason: 'test',
+    });
+    const result = await router.route(invocation({ capabilityId: 'gmail.drafts.send', connection, args: { draftId: 'd1' } }));
+    expect(result.status).toBe('denied');
+    expect(result.denyCode).toBe('feature_disabled');
+  });
+
+  it('does not gate read/draft capabilities on gmailSendEnabled', async () => {
+    const { router, grants, connection } = await setup({ gmailSendEnabled: false });
+    await grants.issueGrant({
+      agentId: AGENT_ID,
+      tenantId: TENANT_ID,
+      connectionId: connection.id,
+      capabilityId: 'gmail.messages.search',
+      connectorVersion: GMAIL_MANIFEST_VERSION,
+      effect: 'allow',
+      issuedBy: 'operator-1',
+      reason: 'test',
+    });
+    const result = await router.route(invocation({ capabilityId: 'gmail.messages.search', connection, args: { query: 'x' } }));
+    expect(result.status).not.toBe('denied');
   });
 
   it('denies when there is no active connection', async () => {

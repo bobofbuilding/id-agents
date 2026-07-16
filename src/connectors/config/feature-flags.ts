@@ -75,3 +75,17 @@ export function loadConnectorFeatureFlags(
     mcpBackendEnabled: coerceBool(env.ID_CONNECTORS_MCP_ENABLED, merged.mcpBackendEnabled),
   };
 }
+
+/**
+ * Capability-specific flag gate: beyond the per-connector flag, some
+ * individual capabilities require their own additional flag before the
+ * router will consider them. Keyed by capability id (not connector id) so a
+ * single connector can stage send-class operations behind a narrower flag
+ * than its read/draft capabilities. See ConnectorRouter step 3b
+ * (runtime/router.ts) for where this is enforced, and
+ * docs/connectors/gmail-first-connector-architecture.md#staged-rollout
+ * stage 4 for the rollout sequencing this exists to support.
+ */
+export const CONNECTOR_CAPABILITY_FLAG_GATE: Record<string, keyof ConnectorFeatureFlags> = {
+  'gmail.drafts.send': 'gmailSendEnabled',
+};
