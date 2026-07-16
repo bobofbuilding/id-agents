@@ -169,6 +169,8 @@ export type DenyCode =
   | 'feature_disabled'
   | 'backend_not_allowlisted'
   | 'invalid_args'
+  | 'idempotency_required'
+  | 'idempotency_conflict'
   | 'approval_denied'
   | 'approval_expired';
 

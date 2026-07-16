@@ -8,6 +8,15 @@
 
 import type { CapabilityGrantRecord, DenyCode, ResourceScope } from '../types.js';
 
+export interface RequestedResource {
+  accountRef?: string;
+  label?: string;
+  recipientDomain?: string;
+  recipientDomains?: string[];
+  maxResults?: number;
+  attachmentBytes?: number;
+}
+
 export interface GrantEvaluationInput {
   agentId: string;
   tenantId: string;
@@ -17,7 +26,7 @@ export interface GrantEvaluationInput {
   candidateGrants: CapabilityGrantRecord[];
   now: number;
   /** Optional invocation-time resource references to check against each grant's resourceScope. */
-  requestedResource?: { accountRef?: string; label?: string; recipientDomain?: string };
+  requestedResource?: RequestedResource;
 }
 
 export interface GrantEvaluationResult {
@@ -26,14 +35,34 @@ export interface GrantEvaluationResult {
   matchedGrant?: CapabilityGrantRecord;
 }
 
-function scopeAllows(scope: ResourceScope, requested?: GrantEvaluationInput['requestedResource']): boolean {
-  if (!requested) return true;
-  if (scope.accountRef && requested.accountRef && scope.accountRef !== requested.accountRef) return false;
-  if (scope.labels && requested.label && !scope.labels.includes(requested.label)) return false;
+function normalizeDomain(domain: string): string {
+  return domain.trim().toLowerCase();
+}
+
+function requestedRecipientDomains(requested?: RequestedResource): string[] {
+  if (!requested) return [];
+  const domains = new Set<string>();
+  if (requested.recipientDomain) domains.add(normalizeDomain(requested.recipientDomain));
+  for (const domain of requested.recipientDomains ?? []) domains.add(normalizeDomain(domain));
+  return [...domains];
+}
+
+function scopeAllows(scope: ResourceScope, requested?: RequestedResource): boolean {
+  if (scope.accountRef && requested?.accountRef !== scope.accountRef) return false;
+  if (scope.labels?.length) {
+    if (!requested?.label) return false;
+    if (!scope.labels.includes(requested.label)) return false;
+  }
+  if (scope.recipientDomainsAllow?.length) {
+    const allowed = new Set(scope.recipientDomainsAllow.map(normalizeDomain));
+    const requestedDomains = requestedRecipientDomains(requested);
+    if (requestedDomains.length === 0) return false;
+    if (!requestedDomains.every((domain) => allowed.has(domain))) return false;
+  }
+  if (scope.maxResults != null && (requested?.maxResults == null || requested.maxResults > scope.maxResults)) return false;
   if (
-    scope.recipientDomainsAllow &&
-    requested.recipientDomain &&
-    !scope.recipientDomainsAllow.includes(requested.recipientDomain)
+    scope.maxAttachmentBytes != null &&
+    (requested?.attachmentBytes == null || requested.attachmentBytes > scope.maxAttachmentBytes)
   ) {
     return false;
   }
