@@ -3,6 +3,7 @@ import { Box, Text } from 'ink';
 import type { NewsItem } from '../api/types.js';
 import { padRight, truncate } from '../util/format.js';
 import { newsAgeColor } from '../util/colors.js';
+import { newsParty, newsPartyLabel } from '../../dashboard-core/selectors/news.js';
 
 interface NewsViewProps {
   agentName: string | null;
@@ -167,30 +168,8 @@ function oneLine(s: string): string {
 // for outbound, blank for self-status events. 'remote' is rewritten to
 // 'manager' for UI clarity; underlying data is unchanged.
 function extractParty(item: NewsItem): string {
-  const d = (item.data ?? {}) as Record<string, unknown>;
-  const normalize = (v: unknown): string => {
-    const raw = typeof v === 'string' ? v : '';
-    return raw === 'remote' ? 'manager' : raw;
-  };
-  const from = normalize(d.from);
-  const to = normalize(d.to);
-  const type = item.type;
-  if (type.startsWith('outbound')) {
-    return to ? `  to: ${to}` : '';
-  }
-  if (type === 'query.received') {
-    return `from: ${from || 'manager'}`;
-  }
-  if (
-    type === 'reply' ||
-    type === 'notify' ||
-    type === 'message' ||
-    type === 'news.received' ||
-    type === 'inbound.reply'
-  ) {
-    return from ? `from: ${from}` : '';
-  }
-  return '';
+  // Shared derivation so the TUI and desktop news views stay in parity.
+  return newsPartyLabel(newsParty(item));
 }
 
 // The agent news log uses "remote" as the protocol-level name for the
