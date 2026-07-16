@@ -1,0 +1,6 @@
+{
+  "applicantId": "app_testnet_001",
+  "role": "research-contributor",
+  "statement": "Local Anvil proof fixture only",
+  "evidence": ["ipfs://example-testnet-only"]
+}

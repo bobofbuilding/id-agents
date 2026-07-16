@@ -1,0 +1,42 @@
+{
+  "$schema": "./scoped-module.stub.schema.json",
+  "status": "STUB_REQUIRES_WALLET_ENGINEER_FINALIZATION",
+  "network": {
+    "chainId": 84532,
+    "name": "base-sepolia"
+  },
+  "safe": {
+    "address": "TODO_WALLET_ENGINEER_TESTNET_SAFE_ADDRESS",
+    "module": "TODO_WALLET_ENGINEER_CHOOSE_ALLOWANCE_OR_ROLE_MODULE"
+  },
+  "targets": [
+    {
+      "address": "0x4200000000000000000000000000000000000021",
+      "label": "Base Sepolia EAS",
+      "allowedSelectors": ["attest((bytes32,(address,uint64,bool,bytes32,bytes,uint256)))"],
+      "maxValueWei": "0"
+    },
+    {
+      "address": "TODO_WALLET_ENGINEER_TESTNET_ESCROW_ADDRESS",
+      "label": "Bittrees Escrow V2 testnet",
+      "allowedSelectors": [
+        "release(uint256,uint32)",
+        "refund(uint256,uint32)",
+        "raiseDispute(uint256,uint32,bytes32,bytes32)"
+      ],
+      "maxValueWei": "0"
+    }
+  ],
+  "spendCaps": {
+    "nativeWeiPerTransaction": "0",
+    "nativeWeiPerDay": "0",
+    "erc20Allowances": []
+  },
+  "todo": [
+    "WALLET_ENGINEER: select and pin the audited Safe module implementation/version.",
+    "WALLET_ENGINEER: replace testnet Safe and escrow placeholders after validator review.",
+    "WALLET_ENGINEER: convert function signatures to exact bytes4 selectors and add negative authorization tests.",
+    "WALLET_ENGINEER: define nonce/session expiry/revocation and signer quorum boundaries.",
+    "WALLET_ENGINEER: keep this configuration testnet-only; do not grant production authority."
+  ]
+}
