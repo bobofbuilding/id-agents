@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.103-beta
+
+### Added — reusable dashboard-core library + package exports
+
+- **Extracted the renderer-neutral `dashboard-core` domain layer out of the terminal TUI** into `src/dashboard-core/` (manager API client + DTOs/validation, command catalog/parser/confirmation policy, formatters, selectors, status/schedule). The TUI now consumes it; behavior is unchanged.
+- **Package exports** so external consumers can import the shared surface: `id-agents/dashboard-core` and `id-agents/manager-entry`, plus a `prepare` build hook (for git-dependency installs) and `QUICKSTART.md`/`scripts/detect-runtimes.sh` added to the published `files`.
+- **Packed-consumer contract test** verifying an external ESM consumer imports the public dashboard-core surface and resolves the manager entry.
+
 ## 0.1.102-beta
 
 ### Removed — ID Chain onchain registration
