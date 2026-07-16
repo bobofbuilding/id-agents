@@ -5,6 +5,18 @@
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./dashboard-core": {
+      "types": "./dist/dashboard-core/index.d.ts",
+      "default": "./dist/dashboard-core/index.js"
+    },
+    "./manager-entry": "./dist/start-agent-manager.js",
+    "./package.json": "./package.json"
+  },
   "bin": {
     "id-agents": "./dist/interactive-agent-cli.js",
     "id-agents-dashboard": "./dist/tui/index.js"
@@ -24,6 +36,7 @@
     "build:core": "tsc",
     "build:tui": "tsc -p src/tui/tsconfig.json",
     "build": "npm run build:core && npm run build:tui",
+    "prepare": "npm run build",
     "prepublishOnly": "npm run build",
     "dev": "tsc --watch",
     "agent:server": "npm run build && node dist/start-agent-rest-server.js",
@@ -52,6 +65,9 @@
     "plugins/**/*",
     "configs/**/*",
     "README.md",
+    "QUICKSTART.md",
+    "MANAGER-POLLING.md",
+    "scripts/detect-runtimes.sh",
     "LICENSE",
     "CONTRIBUTING.md"
   ],
