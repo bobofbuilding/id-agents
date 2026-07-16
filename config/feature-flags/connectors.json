@@ -1,0 +1,7 @@
+{
+  "$comment": "Connector rollout flags. Every flag defaults to false (fail closed). Flip only per docs/connectors/gmail-first-connector-architecture.md#staged-rollout, one stage at a time, with the named operator's sign-off recorded in the rollout log referenced there.",
+  "connectorsEnabled": false,
+  "gmailConnectorEnabled": false,
+  "gmailSendEnabled": false,
+  "mcpBackendEnabled": false
+}
