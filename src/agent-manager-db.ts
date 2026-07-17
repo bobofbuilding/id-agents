@@ -83,6 +83,8 @@ import {
   type TaskBriefValidationResult,
   type TaskCompletionValidationResult,
 } from './task-brief-validation.js';
+import { resolveAgentTaskWriteCapability } from './task-capability.js';
+import { taskLifecycleMcpServerSpec } from './task-lifecycle-mcp-server.js';
 import {
   emitQueryDelivered,
   emitQueryExpired,
@@ -7031,7 +7033,11 @@ Return this JSON shape:
     };
   }
 
-  private effectiveMcpServersForAgent(metadata: AgentMetadata | null | undefined): McpServerSpec[] {
+  private effectiveMcpServersForAgent(
+    metadata: AgentMetadata | null | undefined,
+    agentRow?: AgentRow | null,
+    teamName?: string,
+  ): McpServerSpec[] {
     const explicit = Array.isArray(metadata?.mcpServers)
       ? (metadata!.mcpServers as McpServerSpec[]).filter((server) => server && typeof server.name === 'string' && server.name.trim())
       : [];
@@ -7041,7 +7047,37 @@ Return this JSON shape:
       const brain = this.defaultBrainMcpServer();
       if (brain) byName.set(brain.name, brain);
     }
+    if (!byName.has('task-lifecycle')) {
+      const taskLifecycle = this.defaultTaskLifecycleMcpServer(metadata, agentRow ?? null, teamName);
+      if (taskLifecycle) byName.set(taskLifecycle.name, taskLifecycle);
+    }
     return [...byName.values()];
+  }
+
+  /**
+   * Auto-attach the narrow task-lifecycle MCP server (task_get/task_claim/
+   * task_done — see ./task-lifecycle-mcp-server.ts) for agents that declare
+   * `metadata.capabilities.taskLifecycleMcp = true`. This is the route
+   * `resolveAgentTaskWriteCapability` (./task-capability.ts) reports as
+   * `'mcp'` for agents with no shell/HTTP tool grant — without this wiring
+   * that route would be preflight-approved but never actually spawnable.
+   */
+  private defaultTaskLifecycleMcpServer(
+    metadata: AgentMetadata | null | undefined,
+    agentRow: AgentRow | null,
+    teamName?: string,
+  ): McpServerSpec | null {
+    const capabilities = (metadata as any)?.capabilities as { taskLifecycleMcp?: boolean } | undefined;
+    if (!capabilities?.taskLifecycleMcp) return null;
+    const agentName = agentRow?.name;
+    if (!agentName) return null;
+    const entrypoint = path.resolve(__dirname, 'task-lifecycle-mcp-server.js');
+    if (!existsSync(entrypoint)) return null;
+    return taskLifecycleMcpServerSpec(entrypoint, {
+      agentName,
+      managerUrl: 'http://127.0.0.1:4100',
+      team: teamName,
+    });
   }
 
   private brainToolStatusForAgent(a: AgentRow): Record<string, unknown> {
@@ -12392,6 +12428,18 @@ Return this JSON shape:
           teamName: taskTeamName,
         });
 
+        // Dispatch capability preflight: never auto-assign a fresh task to a
+        // configured default owner with no usable task-write route — that
+        // would create a 'doing' task nobody can act on. Fall back to
+        // unowned/todo instead of stranding it.
+        if (defaultOwner.owner) {
+          const defaultOwnerCapability = resolveAgentTaskWriteCapability(defaultOwner.owner);
+          if (!defaultOwnerCapability.capable) {
+            defaultOwner.warning = defaultOwnerCapability.reason;
+            defaultOwner.owner = null;
+          }
+        }
+
         // Generate or validate name slug, scoped to (team_id, name) uniqueness
         let name = rawName ? normalizeAlias(rawName) : normalizeAlias(title);
         if (rawName) {
@@ -17069,6 +17117,23 @@ Return this JSON shape:
 
           const { agent, error } = await this.resolveSingleAgentForCommand(resolveTeam, agentRef);
           if (!agent) return { ok: false, error: error || `Agent "${agentRef}" not found` };
+
+          // Dispatch capability preflight: an agent with no declared shell/HTTP
+          // access (and no task-lifecycle MCP route configured) can never claim
+          // or complete a task assigned to it — fail clearly here instead of
+          // leaving the task 'doing'-and-owned with nobody able to act on it.
+          const capabilityCheck = resolveAgentTaskWriteCapability(agent);
+          if (!capabilityCheck.capable) {
+            return {
+              ok: false,
+              error: 'missing_required_capability',
+              result: {
+                missing_required_capability: capabilityCheck.missing_required_capability,
+                message: capabilityCheck.reason,
+              },
+            };
+          }
+
           const taskTeamIdForGuard = task.team_id || teamId;
           const taskTeamRowForGuard = await this.db.teams.getTeam(taskTeamIdForGuard).catch(() => null);
           const assignmentAuth = await this.authorizeTaskAssignCommand({
@@ -17108,11 +17173,23 @@ Return this JSON shape:
           if (task.status !== 'doing' && !(await this.hasDoingTaskRoom(task.team_id || teamId))) {
             return { ok: false, error: await this.doingTaskLimitMessage(task.team_id || teamId) };
           }
-          await this.db.tasks.updateFields(task.id, {
-            owner: agent.id,
-            status: 'doing',
-            updated_at: now,
+          // CAS-guarded against the task row we just read: a concurrent claim,
+          // done, or assign between resolveTaskRef() and here must not be
+          // silently overwritten (that would strand whichever agent believed
+          // it owned the task).
+          const assigned = await this.db.tasks.assignAtomic(task.id, agent.id, now, {
+            status: task.status,
+            owner: task.owner,
           });
+          if (!assigned) {
+            return {
+              ok: false,
+              error: 'task_changed_concurrently',
+              result: {
+                message: `Task "${task.name}" was modified by another operation before assignment completed. Re-fetch the task and retry.`,
+              },
+            };
+          }
 
           const updated = await this.db.tasks.getByNameForTeam(task.name, teamId);
           const ownerWake = updated
@@ -18844,6 +18921,8 @@ Return this JSON shape:
       owner: AgentRow,
       assignOpts: { wakeBeforeClaim?: boolean; allowLeadCoordinationBacklog?: boolean } = {},
     ): Promise<{ assigned: boolean; reason: string; owner?: AgentRow; dispatched?: boolean }> => {
+      const capabilityCheck = resolveAgentTaskWriteCapability(owner);
+      if (!capabilityCheck.capable) return { assigned: false, reason: 'owner_lacks_task_write_capability' };
       const stalledBacklog = await this.stalledOwnerBacklogGuard({
         teamId: teamRow.id,
         teamName: teamRow.name,

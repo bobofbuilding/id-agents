@@ -182,6 +182,25 @@ export class PgTasksRepo implements TasksRepository {
     return r.rowCount > 0;
   }
 
+  async assignAtomic(
+    taskId: string,
+    ownerId: string,
+    updatedAt: number,
+    expected: { status: 'todo' | 'doing' | 'done'; owner: string | null },
+  ): Promise<boolean> {
+    const ownerClause = expected.owner === null ? 'owner IS NULL' : 'owner = $5';
+    const params = expected.owner === null
+      ? [taskId, ownerId, updatedAt, expected.status]
+      : [taskId, ownerId, updatedAt, expected.status, expected.owner];
+    const r = await this.db.query(
+      `UPDATE tasks
+       SET owner = $2, status = 'doing', updated_at = $3
+       WHERE id = $1 AND status = $4 AND ${ownerClause}`,
+      params,
+    );
+    return r.rowCount > 0;
+  }
+
   async delete(taskId: string): Promise<void> {
     await this.db.query(`DELETE FROM tasks WHERE id = $1`, [taskId]);
   }

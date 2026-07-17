@@ -3417,6 +3417,53 @@ describe('stalled task sweeper', () => {
     );
   });
 
+  it('skips an otherwise idle agent that declares no task-write route', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    // Named so the incapable candidate sorts first alphabetically (matches
+    // the aaa-stalled/zzz-fresh pattern above) — otherwise the capable
+    // candidate would be tried first and the skip path would never run.
+    const incapableOwner = agent({
+      id: 'agent-incapable',
+      name: 'aaa-incapable-worker',
+      metadata: { capabilities: { shell: false, http: false, taskLifecycleMcp: false } },
+    });
+    const capableOwner = agent({ id: 'agent-capable', name: 'zzz-capable-worker' });
+    const queued = task({
+      id: 'queued-task',
+      name: 'queued-task',
+      uuid: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+      title: 'Queued task',
+      status: 'todo',
+      owner: null,
+      updated_at: nowSec - 900,
+    });
+    const db = fakeDb({
+      agents: {
+        list: vi.fn(async () => [incapableOwner, capableOwner]),
+        getById: vi.fn(async (id: string) =>
+          id === incapableOwner.id ? incapableOwner : id === capableOwner.id ? capableOwner : null),
+      },
+      tasks: {
+        list: vi.fn(async () => []),
+        getByNameForTeam: vi.fn(async () => queued),
+        claim: vi.fn(async () => true),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-capability-autoassign-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const result = await manager.assignUnownedTodoTask(queued, team(), NOW_MS);
+
+    expect(result).toMatchObject({ assigned: true, owner: expect.objectContaining({ id: capableOwner.id }) });
+    expect(db.tasks.claim).toHaveBeenCalledWith('queued-task', capableOwner.id, nowSec, { maxDoingForTeam: expect.any(Number) });
+    expect(db.tasks.claim).not.toHaveBeenCalledWith('queued-task', incapableOwner.id, expect.any(Number), expect.any(Object));
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'zzz-capable-worker',
+      expect.stringContaining('TASK DELEGATION from manager'),
+    );
+  });
+
   it('does not auto-assign executor work to protected task-manager agents', async () => {
     const nowSec = Math.floor(NOW_MS / 1000);
     const taskMaster = agent({ id: 'task-master-1', name: 'task-master' });

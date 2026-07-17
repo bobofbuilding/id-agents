@@ -11,6 +11,7 @@ import fetch from 'node-fetch';
 import { createHarness, HarnessType, AgentHarness, HarnessMessage } from './harness/index.js';
 import type { RuntimeRateLimitSignal } from './harness/rate-limit.js';
 import { parseMcpServersEnv } from './harness/mcp.js';
+import type { McpServerSpec } from './harness/types.js';
 import { withInterAgentSkill } from './inter-agent-skill.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -180,6 +181,50 @@ export function allowedToolsForPrompt(prompt: string, configuredAllowedTools: st
     return configuredAllowedTools.filter((tool) => CONTROL_PLANE_DELEGATION_TOOLS.has(tool));
   }
   return configuredAllowedTools.filter((tool) => CONTROL_PLANE_READONLY_TOOLS.has(tool));
+}
+
+const TASK_LIFECYCLE_MCP_SERVER_NAME = 'task-lifecycle';
+export const TASK_LIFECYCLE_MCP_TOOLS = [
+  'mcp__task-lifecycle__task_get',
+  'mcp__task-lifecycle__task_claim',
+  'mcp__task-lifecycle__task_done',
+];
+
+/**
+ * Dispatch capability preflight for MCP: decide whether the narrow
+ * task-lifecycle MCP server (task_get/task_claim/task_done — see
+ * ./task-lifecycle-mcp-server.ts) stays attached for this dispatch, and
+ * which of its tool names to allow.
+ *
+ * The general control-plane-readonly policy strips *all* MCP access
+ * (`suppressMcp`) down to Read/Glob/Grep — but that tier (stalled-task
+ * probes, validation requests, status checks) is exactly where an agent
+ * with no Bash/WebFetch grant most needs a way to act on a task. This
+ * function is the one exception to that suppression: it survives only for
+ * genuine read-only control-plane prompts, not delegation (which already
+ * carries Bash) or the operator fast lane (which explicitly forbids task
+ * mutation).
+ */
+export function resolveTaskLifecycleMcpAttachment(params: {
+  configuredMcpServers: McpServerSpec[] | undefined;
+  suppressMcp: boolean;
+  isDelegationControl: boolean;
+  operatorDirectResponse: boolean;
+}): { mcpServers: McpServerSpec[] | undefined; extraAllowedTools: string[] } {
+  const taskLifecycleServer = params.configuredMcpServers?.find(
+    (server) => server?.name === TASK_LIFECYCLE_MCP_SERVER_NAME,
+  );
+
+  if (!params.suppressMcp) {
+    return { mcpServers: params.configuredMcpServers, extraAllowedTools: [] };
+  }
+
+  const readOnlyControlPlane = !params.isDelegationControl && !params.operatorDirectResponse;
+  if (readOnlyControlPlane && taskLifecycleServer) {
+    return { mcpServers: [taskLifecycleServer], extraAllowedTools: [...TASK_LIFECYCLE_MCP_TOOLS] };
+  }
+
+  return { mcpServers: undefined, extraAllowedTools: [] };
 }
 
 function readControlPlaneTimeoutEnv(name: string, defaultMs: number): number {
@@ -2748,12 +2793,21 @@ ${prompt}`
       const suppressMcp = operatorDirectResponse || shouldSuppressMcpForPrompt(policyPrompt);
       const isDelegationControl = suppressMcp && isDelegationPrompt(policyPrompt);
       const executionPolicy = operatorDirectResponse || (suppressMcp && !isDelegationControl) ? 'control-plane-readonly' : 'default';
-      const allowedTools = operatorDirectResponse
+      const baseAllowedTools = operatorDirectResponse
         ? this.allowedTools.filter((tool) => CONTROL_PLANE_READONLY_TOOLS.has(tool))
         : allowedToolsForPrompt(policyPrompt, this.allowedTools);
-      const mcpServers = suppressMcp ? undefined : parseMcpServersEnv(process.env.ID_MCP_SERVERS);
+      const taskLifecycleAttachment = resolveTaskLifecycleMcpAttachment({
+        configuredMcpServers: parseMcpServersEnv(process.env.ID_MCP_SERVERS),
+        suppressMcp,
+        isDelegationControl,
+        operatorDirectResponse,
+      });
+      const allowedTools = taskLifecycleAttachment.extraAllowedTools.length > 0
+        ? [...baseAllowedTools, ...taskLifecycleAttachment.extraAllowedTools]
+        : baseAllowedTools;
+      const mcpServers = taskLifecycleAttachment.mcpServers;
       if (suppressMcp && process.env.ID_MCP_SERVERS) {
-        console.log(`${logTime()} [Agent] MCP suppressed for control-plane prompt ${queryId}`);
+        console.log(`${logTime()} [Agent] MCP suppressed for control-plane prompt ${queryId}${taskLifecycleAttachment.mcpServers ? ' (task-lifecycle exempted)' : ''}`);
       }
       if (operatorDirectResponse) {
         console.log(`${logTime()} [Agent] Operator fast-lane tool policy for ${queryId}: ${allowedTools.join(', ') || '(none)'}`);

@@ -176,6 +176,23 @@ export class SqliteTasksRepo implements TasksRepository {
     return rowCount > 0;
   }
 
+  async assignAtomic(
+    taskId: string,
+    ownerId: string,
+    updatedAt: number,
+    expected: { status: 'todo' | 'doing' | 'done'; owner: string | null },
+  ): Promise<boolean> {
+    const ownerClause = expected.owner === null ? 'owner IS NULL' : 'owner = ?';
+    const ownerParams = expected.owner === null ? [] : [expected.owner];
+    const { rowCount } = await this.db.query(
+      `UPDATE tasks
+       SET owner = ?, status = 'doing', updated_at = ?
+       WHERE id = ? AND status = ? AND ${ownerClause}`,
+      [ownerId, updatedAt, taskId, expected.status, ...ownerParams],
+    );
+    return rowCount > 0;
+  }
+
   async delete(taskId: string): Promise<void> {
     await this.db.query(`DELETE FROM tasks WHERE id = ?`, [taskId]);
   }

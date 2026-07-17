@@ -599,6 +599,22 @@ export interface TasksRepository {
     options?: { maxDoingForTeam?: number },
   ): Promise<boolean>;
 
+  /**
+   * Atomically (re)assign a task to a new owner, guarded by the status/owner
+   * the caller last read (`expected`). Sets owner, status='doing', and
+   * updated_at. Returns false — without writing anything — if the task's
+   * current status/owner no longer match `expected`, so a concurrent claim,
+   * done, or assign can't be silently stomped by a stale assignment. Unlike
+   * `claim`, this allows reassigning a task that is already 'doing' (admin
+   * override), not just claiming a 'todo' one.
+   */
+  assignAtomic(
+    taskId: string,
+    ownerId: string,
+    updatedAt: number,
+    expected: { status: 'todo' | 'doing' | 'done'; owner: string | null },
+  ): Promise<boolean>;
+
   /** Delete a task by id (task_event_links cascade). */
   delete(taskId: string): Promise<void>;
 
