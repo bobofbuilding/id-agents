@@ -3,5 +3,6 @@
   "connectorsEnabled": false,
   "gmailConnectorEnabled": false,
   "gmailSendEnabled": false,
+  "gmailFullBodyReadEnabled": false,
   "mcpBackendEnabled": false
 }

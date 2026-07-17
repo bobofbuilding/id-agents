@@ -13,11 +13,12 @@ import type { ConnectorManifest } from '../../../src/connectors/types.js';
 
 /**
  * Frozen copy of the hand-written Gmail v1 manifest this adapter replaced
- * (pre-adapter commit c57777a). Asserting the adapter-built manifest is
- * deep-equal (and therefore hash-equal) to this fixture is the regression
- * guard: it proves generalizing Gmail onto the universal mail schema did not
- * change a single capability id, field, or the manifest hash that existing
- * migrations/grants/audit rows are keyed on.
+ * (pre-adapter commit eab5b0e, the last hand-written state before
+ * generalizing onto the universal mail schema). Asserting the adapter-built
+ * manifest is deep-equal (and therefore hash-equal) to this fixture is the
+ * regression guard: it proves generalizing Gmail onto the universal mail
+ * schema did not change a single capability id, field, or the manifest hash
+ * that existing migrations/grants/audit rows are keyed on.
  */
 const PRE_ADAPTER_GMAIL_MANIFEST: ConnectorManifest = {
   connectorId: 'gmail',
@@ -40,7 +41,21 @@ const PRE_ADAPTER_GMAIL_MANIFEST: ConnectorManifest = {
       risk: 'read',
       sideEffect: 'none',
       approval: 'auto',
-      inputSchema: { messageId: 'string', format: 'metadata|snippet|full' },
+      inputSchema: { messageId: 'string', format: 'metadata|snippet' },
+      notes: 'Metadata/snippet only. Full body is a separate, stricter capability — see gmail.messages.get_full.',
+    },
+    {
+      id: 'gmail.messages.get_full',
+      operation: 'get_full',
+      resource: 'messages',
+      risk: 'read',
+      sideEffect: 'none',
+      approval: 'confirm',
+      inputSchema: { messageId: 'string' },
+      notes:
+        'Full message body content. Split out of gmail.messages.get and gated behind its own feature flag ' +
+        '(gmailFullBodyReadEnabled, off by default) plus per-invocation confirmation — full body is materially ' +
+        'more sensitive than metadata/snippet reads.',
     },
     {
       id: 'gmail.threads.get',
@@ -70,6 +85,30 @@ const PRE_ADAPTER_GMAIL_MANIFEST: ConnectorManifest = {
       inputSchema: { messageId: 'string', attachmentId: 'string' },
     },
     {
+      id: 'gmail.attachments.download',
+      operation: 'download',
+      resource: 'attachments',
+      risk: 'read',
+      sideEffect: 'none',
+      approval: 'auto',
+      inputSchema: { messageId: 'string', attachmentId: 'string', maxBytes: 'number' },
+      hardCapAttachmentBytes: 10_000_000,
+      notes:
+        'Caller must declare an expected maxBytes; the router denies with attachment_cap_exceeded above ' +
+        "GMAIL_ATTACHMENT_DOWNLOAD_HARD_CAP_BYTES regardless of any grant, and a grant's maxAttachmentBytes " +
+        'may narrow that further.',
+    },
+    {
+      id: 'gmail.drafts.reply',
+      operation: 'reply',
+      resource: 'drafts',
+      risk: 'write',
+      sideEffect: 'draft',
+      approval: 'auto',
+      inputSchema: { threadId: 'string', messageId: 'string', to: 'string[]', body: 'string' },
+      notes: 'Draft-first reply, mirrors gmail.drafts.create. Still requires gmail.drafts.send + approval to send.',
+    },
+    {
       id: 'gmail.drafts.create',
       operation: 'create',
       resource: 'drafts',
@@ -94,8 +133,12 @@ const PRE_ADAPTER_GMAIL_MANIFEST: ConnectorManifest = {
       risk: 'external-write',
       sideEffect: 'send',
       approval: 'always',
-      inputSchema: { draftId: 'string' },
-      notes: 'Draft-first send. Approval must bind the exact recipient/body/attachment hash and an idempotency key.',
+      inputSchema: { draftId: 'string', to: 'string[]?' },
+      notes:
+        'Draft-first send. Approval must bind the exact recipient/body/attachment hash and an idempotency key. ' +
+        'Callers should declare `to` so the router can enforce recipient-domain grant scope at send time, not ' +
+        'just at draft-create time; a scoped grant fails closed if `to` is omitted. Verifying `to` matches the ' +
+        'underlying draft is Slice 5 (live backend) work — this slice only wires the policy-plane check.',
     },
     {
       id: 'gmail.messages.send',

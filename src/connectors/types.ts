@@ -30,6 +30,13 @@ export interface CapabilityManifestEntry {
   inputSchema?: Record<string, unknown>;
   /** true when the capability is hard-denied at launch regardless of any grant. */
   hardDeny?: boolean;
+  /**
+   * Absolute per-invocation byte ceiling for capabilities that move
+   * attachment bytes (e.g. downloads), enforced by the router regardless of
+   * any grant's `maxAttachmentBytes` — a grant may narrow this further, but
+   * never widen past it.
+   */
+  hardCapAttachmentBytes?: number;
   notes?: string;
 }
 
@@ -169,6 +176,7 @@ export type DenyCode =
   | 'feature_disabled'
   | 'backend_not_allowlisted'
   | 'invalid_args'
+  | 'attachment_cap_exceeded'
   | 'idempotency_required'
   | 'idempotency_conflict'
   | 'approval_denied'

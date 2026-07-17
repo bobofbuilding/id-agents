@@ -65,6 +65,7 @@ function buildCapability(entry: MailCapabilitySchemaEntry, def: MailProviderDefi
     approval: merged.approval,
     ...(merged.inputSchema !== undefined ? { inputSchema: merged.inputSchema } : {}),
     ...(merged.hardDeny !== undefined ? { hardDeny: merged.hardDeny } : {}),
+    ...(merged.hardCapAttachmentBytes !== undefined ? { hardCapAttachmentBytes: merged.hardCapAttachmentBytes } : {}),
     ...(merged.notes !== undefined ? { notes: merged.notes } : {}),
   };
 }

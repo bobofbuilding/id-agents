@@ -39,6 +39,14 @@ export interface MailCapabilitySchemaEntry {
   approval: ApprovalMode;
   inputSchema?: Record<string, unknown>;
   hardDeny?: boolean;
+  /**
+   * Absolute per-invocation byte ceiling for capabilities that move
+   * attachment bytes, enforced by the router regardless of any grant. Leave
+   * unset at the schema level — a provider sets its own conservative pilot
+   * default via MailProviderDefinition.capabilityOverrides (see Gmail's
+   * GMAIL_ATTACHMENT_DOWNLOAD_HARD_CAP_BYTES).
+   */
+  hardCapAttachmentBytes?: number;
   notes?: string;
 }
 
@@ -65,7 +73,21 @@ export const MAIL_CAPABILITY_SCHEMA: MailCapabilitySchemaEntry[] = [
     risk: 'read',
     sideEffect: 'none',
     approval: 'auto',
-    inputSchema: { messageId: 'string', format: 'metadata|snippet|full' },
+    inputSchema: { messageId: 'string', format: 'metadata|snippet' },
+    notes: 'Metadata/snippet only. Full body is a separate, stricter capability — see messages.get_full.',
+  },
+  {
+    key: 'messages.get_full',
+    resource: 'messages',
+    operation: 'get_full',
+    risk: 'read',
+    sideEffect: 'none',
+    approval: 'confirm',
+    inputSchema: { messageId: 'string' },
+    notes:
+      'Full message body content. Split out of messages.get and gated behind per-invocation confirmation plus ' +
+      'whatever additional feature flag a provider layers on top of its base connector flag — full body is ' +
+      'materially more sensitive than metadata/snippet reads.',
   },
   {
     key: 'threads.get',
@@ -95,6 +117,30 @@ export const MAIL_CAPABILITY_SCHEMA: MailCapabilitySchemaEntry[] = [
     inputSchema: { messageId: 'string', attachmentId: 'string' },
   },
   {
+    key: 'attachments.download',
+    resource: 'attachments',
+    operation: 'download',
+    risk: 'read',
+    sideEffect: 'none',
+    approval: 'auto',
+    inputSchema: { messageId: 'string', attachmentId: 'string', maxBytes: 'number' },
+    notes:
+      'Caller must declare an expected maxBytes; the router denies with attachment_cap_exceeded above the ' +
+      "capability's hardCapAttachmentBytes regardless of any grant, and a grant's maxAttachmentBytes may narrow " +
+      'that further. Providers should set hardCapAttachmentBytes via capabilityOverrides to their own ' +
+      'conservative pilot default.',
+  },
+  {
+    key: 'drafts.reply',
+    resource: 'drafts',
+    operation: 'reply',
+    risk: 'write',
+    sideEffect: 'draft',
+    approval: 'auto',
+    inputSchema: { threadId: 'string', messageId: 'string', to: 'string[]', body: 'string' },
+    notes: 'Draft-first reply, mirrors drafts.create. Still requires drafts.send + approval to send.',
+  },
+  {
     key: 'drafts.create',
     resource: 'drafts',
     operation: 'create',
@@ -119,8 +165,11 @@ export const MAIL_CAPABILITY_SCHEMA: MailCapabilitySchemaEntry[] = [
     risk: 'external-write',
     sideEffect: 'send',
     approval: 'always',
-    inputSchema: { draftId: 'string' },
-    notes: 'Draft-first send. Approval must bind the exact recipient/body/attachment hash and an idempotency key.',
+    inputSchema: { draftId: 'string', to: 'string[]?' },
+    notes:
+      'Draft-first send. Approval must bind the exact recipient/body/attachment hash and an idempotency key. ' +
+      'Callers should declare `to` so the router can enforce recipient-domain grant scope at send time, not ' +
+      'just at draft-create time; a scoped grant fails closed if `to` is omitted.',
   },
   {
     key: 'messages.send',

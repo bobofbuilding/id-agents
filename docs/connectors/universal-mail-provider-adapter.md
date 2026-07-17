@@ -27,9 +27,13 @@ router's default-deny sequence.
 ## Contract
 
 - `providers/mail/mail-schema.ts` — `MAIL_CAPABILITY_SCHEMA`: the universal,
-  provider-neutral capability set (search/get/list messages & threads,
-  folders, attachment metadata, draft create/update/send, direct-send and
-  destructive/account-control operations hard-denied). Order is significant —
+  provider-neutral capability set (search/get/get_full/list messages &
+  threads, folders, attachment metadata/download, draft create/update/reply/
+  send, direct-send and destructive/account-control operations hard-denied).
+  `get_full` and `attachments.download` carry their own approval/cap
+  treatment — a provider sets its own conservative attachment byte ceiling
+  via `capabilityOverrides` (see Gmail's
+  `GMAIL_ATTACHMENT_DOWNLOAD_HARD_CAP_BYTES`). Order is significant —
   it is preserved into the generated manifest's `capabilities` array and
   therefore affects `manifestHash` (see `catalog/manifest-validator.ts`
   `hashManifest`/`canonicalize`, which sorts object keys but not array order).
@@ -81,3 +85,16 @@ discipline in gmail-first-connector-architecture.md:
 
 None of steps 2–4 are implied or started by this change — it only
 generalizes the manifest-shape half of the Gmail slice.
+
+## Reconciliation with the Gmail send-scope/read-tier/reply/attachment-cap slice
+
+This adapter (`fbcfe1a`) and the Gmail send-scope, read-tier split, reply,
+and attachment-cap prereqs slice (`eab5b0e`) were developed in parallel off
+a shared ancestor (`d1aacce`) and landed together: `get_full`,
+`attachments.download` (with `hardCapAttachmentBytes`), `drafts.reply`, and
+`drafts.send`'s `to` field were folded into `MAIL_CAPABILITY_SCHEMA` (not
+left as Gmail-only additions) so any future mail provider gets the same
+read-tier split, attachment cap, and recipient-scoped send for free. Gmail's
+capability-specific notes (e.g. referencing `gmailFullBodyReadEnabled` by
+name) live in `GMAIL_PROVIDER_DEFINITION.capabilityOverrides`, not the
+shared schema, since flag names are per-provider.

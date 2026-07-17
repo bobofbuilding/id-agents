@@ -154,4 +154,28 @@ describe('evaluateGrant', () => {
     expect(denied.allowed).toBe(false);
     expect(denied.denyCode).toBe('resource_scope_violation');
   });
+
+  it('enforces maxAttachmentBytes grant caps when present', () => {
+    const allowed = evaluateGrant({
+      ...baseInput,
+      candidateGrants: [makeGrant({ resourceScope: { maxAttachmentBytes: 1_000 } })],
+      requestedResource: { attachmentBytes: 1_000 },
+    });
+    expect(allowed.allowed).toBe(true);
+
+    const denied = evaluateGrant({
+      ...baseInput,
+      candidateGrants: [makeGrant({ resourceScope: { maxAttachmentBytes: 1_000 } })],
+      requestedResource: { attachmentBytes: 1_001 },
+    });
+    expect(denied.allowed).toBe(false);
+    expect(denied.denyCode).toBe('resource_scope_violation');
+
+    const missingProof = evaluateGrant({
+      ...baseInput,
+      candidateGrants: [makeGrant({ resourceScope: { maxAttachmentBytes: 1_000 } })],
+    });
+    expect(missingProof.allowed).toBe(false);
+    expect(missingProof.denyCode).toBe('resource_scope_violation');
+  });
 });

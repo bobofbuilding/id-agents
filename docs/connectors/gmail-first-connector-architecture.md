@@ -61,13 +61,24 @@ Implemented in `src/connectors/runtime/router.ts` (`ConnectorRouter.route`):
    missing required fields, wrong primitive array/scalar types, and enum
    misses deny before touching a grant. Capabilities with an empty schema
    accept only an empty/missing args object.
+5b. **Attachment byte hard cap** — a capability may declare
+   `hardCapAttachmentBytes` in its manifest entry (currently
+   `gmail.attachments.download`, capped at
+   `GMAIL_ATTACHMENT_DOWNLOAD_HARD_CAP_BYTES`). The router denies with
+   `attachment_cap_exceeded` above that ceiling regardless of any grant —
+   a manifest-declared floor, not something a grant can widen. A grant's
+   `resourceScope.maxAttachmentBytes` (step 6) may narrow the effective cap
+   further per agent/tenant.
 6. **Grant evaluation** — `grants/grant-evaluator.ts#evaluateGrant`.
    Deny-overrides-allow; absence of any grant is deny; expired/revoked grants
    are ignored for allow purposes. The router derives invocation resource
    context before evaluation (`accountRef` from the connection, recipient
-   domains from `to`, and read caps such as `maxResults`/`maxMessages`), so
-   constrained grants fail closed when the invocation cannot prove it is
-   inside scope.
+   domains from `to`, read caps such as `maxResults`/`maxMessages`, and
+   attachment size from `maxBytes`), so constrained grants fail closed when
+   the invocation cannot prove it is inside scope. `gmail.drafts.send` now
+   accepts an optional `to` for this same reason: a grant scoped by
+   `recipientDomainsAllow` fails closed on send (not just on draft creation)
+   if the caller omits `to`.
 6b. **Side-effect idempotency key** — any capability whose manifest
    `sideEffect` is not `none` must supply an `idempotencyKey` before approval
    or backend dispatch. Missing keys deny with `idempotency_required`.
@@ -122,18 +133,20 @@ bootstrapped via `providers/gmail/bootstrap.ts`:
 
 | Capability | Approval | Notes |
 |---|---|---|
-| `gmail.messages.search` / `.get`, `gmail.threads.get`, `gmail.labels.list`, `gmail.attachments.metadata` | `auto` | Read-only. |
-| `gmail.drafts.create` / `.update` | `auto` | Draft-only, no send. |
-| `gmail.drafts.send` | `always` | Draft-first send; approval binds to the exact args hash. |
+| `gmail.messages.search` / `.get`, `gmail.threads.get`, `gmail.labels.list`, `gmail.attachments.metadata` | `auto` | Read-only. `.get` is metadata/snippet only. |
+| `gmail.messages.get_full` | `confirm` | Full message body. Split out of `.get`; also gated by `gmailFullBodyReadEnabled`. |
+| `gmail.attachments.download` | `auto` | Read-only; hard-capped at `GMAIL_ATTACHMENT_DOWNLOAD_HARD_CAP_BYTES`, narrowable per grant via `maxAttachmentBytes`. |
+| `gmail.drafts.create` / `.update` / `.reply` | `auto` | Draft-only, no send. `.reply` mirrors `.create` for a threaded reply. |
+| `gmail.drafts.send` | `always` | Draft-first send; approval binds to the exact args hash. Accepts optional `to` so recipient-domain grant scope is enforced at send time too. |
 | `gmail.messages.send`, `gmail.messages.trash`, `gmail.messages.delete`, `gmail.settings.forwarding` | `deny` (`hardDeny: true`) | Hard-denied at launch regardless of any grant. |
 
 ## Feature flags
 
 `config/feature-flags/connectors.json`, loaded by
 `src/connectors/config/feature-flags.ts` with `ID_CONNECTORS_*` env
-overrides. All four flags default to `false`:
+overrides. All five flags default to `false`:
 `connectorsEnabled`, `gmailConnectorEnabled`, `gmailSendEnabled`,
-`mcpBackendEnabled`.
+`gmailFullBodyReadEnabled`, `mcpBackendEnabled`.
 
 ## Staged rollout
 
@@ -179,11 +192,23 @@ the `connector_*` tables and touches nothing else.
 
 ## Open decisions
 
-Unresolved and explicitly out of scope for this slice: vault/credential
+Resolved by this prerequisite slice (policy-plane only — no live wiring):
+full message body access is now a distinct capability
+(`gmail.messages.get_full`) behind its own flag and `confirm` approval,
+separate from the metadata/snippet tier; attachment download is modeled as
+`gmail.attachments.download` with a conservative hard cap
+(`GMAIL_ATTACHMENT_DOWNLOAD_HARD_CAP_BYTES`, `10_000_000` bytes) pending
+operator sign-off on a larger value once real traffic is observed; a
+draft-first reply path (`gmail.drafts.reply`) exists alongside `.create`;
+and `gmail.drafts.send` carries an optional `to` so recipient-domain grant
+scope applies at send time, not only at draft-create time (verifying `to`
+against the underlying draft's actual recipients is Stage 3/Slice 5 live
+backend work, not this slice).
+
+Still unresolved and explicitly out of scope for this slice: vault/credential
 broker product and OAuth callback ownership; canonical tenant/agent identity
 propagation through the agent gateway; exact Gmail OAuth scopes for read vs.
-compose vs. send; whether full message body access is in the first pilot or
-metadata/snippet only; whether attachment download is needed for the pilot;
-which reviewed MCP server (if any) is eligible after the first-party
-adapter; approval-UI ownership and audit retention policy; pilot cohort and
-rollback owner.
+compose vs. send; the final attachment byte cap value for production
+(current value is a conservative placeholder); which reviewed MCP server (if
+any) is eligible after the first-party adapter; approval-UI ownership and
+audit retention policy; pilot cohort and rollback owner.

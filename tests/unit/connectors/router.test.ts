@@ -12,6 +12,7 @@ import { ApprovalRequestsRepo } from '../../../src/connectors/policy/approval-re
 import { ConnectorAuditLog } from '../../../src/connectors/audit/audit-log.js';
 import { ConnectorRouter } from '../../../src/connectors/runtime/router.js';
 import { OAuthApiBackend } from '../../../src/connectors/backends/oauth-api-backend.js';
+import type { ConnectorBackend } from '../../../src/connectors/backends/connector-backend.js';
 import { FakeVaultCredentialBroker } from '../../../src/connectors/credentials/credential-broker.js';
 import { bootstrapGmailConnector } from '../../../src/connectors/providers/gmail/bootstrap.js';
 import { GMAIL_CONNECTOR_ID, GMAIL_MANIFEST_VERSION } from '../../../src/connectors/providers/gmail/gmail-manifest.js';
@@ -25,7 +26,7 @@ import type { ConnectionRecord, ConnectorInvocation } from '../../../src/connect
 const AGENT_ID = 'agent-a';
 const TENANT_ID = 'tenant-a';
 
-async function setup(flagOverrides: Partial<ConnectorFeatureFlags> = {}) {
+async function setup(flagOverrides: Partial<ConnectorFeatureFlags> = {}, backendOverride?: ConnectorBackend) {
   const db = new SqliteAdapter(':memory:');
   await migrateConnectorsSqlite(db);
 
@@ -55,7 +56,7 @@ async function setup(flagOverrides: Partial<ConnectorFeatureFlags> = {}) {
     approvalPolicies,
     approvalRequests,
     auditLog,
-    backends: { oauth_api: oauthBackend },
+    backends: { oauth_api: backendOverride ?? oauthBackend },
     featureFlags,
     connectorFlagGate: { [GMAIL_CONNECTOR_ID]: 'gmailConnectorEnabled' },
     capabilityFlagGate: CONNECTOR_CAPABILITY_FLAG_GATE,
@@ -354,7 +355,40 @@ describe('ConnectorRouter', () => {
     // auto-approval capability reaches the backend; FakeVaultCredentialBroker
     // guarantees no live Gmail API call is possible.
     expect(result.status).toBe('provider_error');
-    expect(result.errorMessage).toMatch(/no credential is available/);
+    expect(result.errorMessage).toBe('Connector backend request failed');
+  });
+
+  it('does not expose provider diagnostic text in caller results or audit events', async () => {
+    const providerDiagnostic = 'privacy-probe-secret-4b07a3';
+    const backend: ConnectorBackend = {
+      async validateBinding() {},
+      async health() {
+        return { healthy: true };
+      },
+      async invoke() {
+        return { ok: false, errorKind: 'provider', errorMessage: providerDiagnostic };
+      },
+    };
+    const { router, grants, connection, auditLog } = await setup({}, backend);
+    await grants.issueGrant({
+      agentId: AGENT_ID,
+      tenantId: TENANT_ID,
+      connectionId: connection.id,
+      capabilityId: 'gmail.messages.search',
+      connectorVersion: GMAIL_MANIFEST_VERSION,
+      effect: 'allow',
+      issuedBy: 'operator-1',
+      reason: 'test',
+    });
+
+    const result = await router.route(
+      invocation({ capabilityId: 'gmail.messages.search', connection, args: { query: 'is:unread' } }),
+    );
+
+    expect(result.status).toBe('provider_error');
+    expect(result.errorMessage).toBe('Connector backend request failed');
+    expect(JSON.stringify(result)).not.toContain(providerDiagnostic);
+    expect(JSON.stringify(await auditLog.listAll())).not.toContain(providerDiagnostic);
   });
 
   it('a deny grant on drafts.send wins even without reaching approval', async () => {
@@ -515,6 +549,248 @@ describe('ConnectorRouter', () => {
 
     expect(conflict.status).toBe('denied');
     expect(conflict.denyCode).toBe('idempotency_conflict');
+  });
+
+  it('denies gmail.drafts.send under a recipient-domain-scoped grant when the requested recipients are outside scope', async () => {
+    const { router, grants, connection } = await setup();
+    await grants.issueGrant({
+      agentId: AGENT_ID,
+      tenantId: TENANT_ID,
+      connectionId: connection.id,
+      capabilityId: 'gmail.drafts.send',
+      connectorVersion: GMAIL_MANIFEST_VERSION,
+      effect: 'allow',
+      resourceScope: { recipientDomainsAllow: ['example.com'] },
+      issuedBy: 'operator-1',
+      reason: 'test',
+    });
+    const result = await router.route(
+      invocation({ capabilityId: 'gmail.drafts.send', connection, args: { draftId: 'd1', to: ['blocked@outside.test'] } }),
+    );
+    expect(result.status).toBe('denied');
+    expect(result.denyCode).toBe('resource_scope_violation');
+  });
+
+  it('fails closed on gmail.drafts.send under a recipient-domain-scoped grant when `to` is omitted', async () => {
+    const { router, grants, connection } = await setup();
+    await grants.issueGrant({
+      agentId: AGENT_ID,
+      tenantId: TENANT_ID,
+      connectionId: connection.id,
+      capabilityId: 'gmail.drafts.send',
+      connectorVersion: GMAIL_MANIFEST_VERSION,
+      effect: 'allow',
+      resourceScope: { recipientDomainsAllow: ['example.com'] },
+      issuedBy: 'operator-1',
+      reason: 'test',
+    });
+    const result = await router.route(invocation({ capabilityId: 'gmail.drafts.send', connection, args: { draftId: 'd1' } }));
+    expect(result.status).toBe('denied');
+    expect(result.denyCode).toBe('resource_scope_violation');
+  });
+
+  it('allows gmail.drafts.send under a recipient-domain-scoped grant when the requested recipients are in scope', async () => {
+    const { router, grants, connection } = await setup();
+    await grants.issueGrant({
+      agentId: AGENT_ID,
+      tenantId: TENANT_ID,
+      connectionId: connection.id,
+      capabilityId: 'gmail.drafts.send',
+      connectorVersion: GMAIL_MANIFEST_VERSION,
+      effect: 'allow',
+      resourceScope: { recipientDomainsAllow: ['example.com'] },
+      issuedBy: 'operator-1',
+      reason: 'test',
+    });
+    const result = await router.route(
+      invocation({
+        capabilityId: 'gmail.drafts.send',
+        connection,
+        idempotencyKey: 'draft-send-in-scope',
+        args: { draftId: 'd1', to: ['person@example.com'] },
+      }),
+    );
+    // Manifest floor is "always" approval so this still round-trips through
+    // approval, but it must not be denied for scope — no live send happens.
+    expect(result.status).toBe('approval_required');
+  });
+
+  it('denies gmail.drafts.reply when requested recipients exceed the grant recipient-domain scope', async () => {
+    const { router, grants, connection } = await setup();
+    await grants.issueGrant({
+      agentId: AGENT_ID,
+      tenantId: TENANT_ID,
+      connectionId: connection.id,
+      capabilityId: 'gmail.drafts.reply',
+      connectorVersion: GMAIL_MANIFEST_VERSION,
+      effect: 'allow',
+      resourceScope: { recipientDomainsAllow: ['example.com'] },
+      issuedBy: 'operator-1',
+      reason: 'test',
+    });
+    const result = await router.route(
+      invocation({
+        capabilityId: 'gmail.drafts.reply',
+        connection,
+        args: { threadId: 't1', messageId: 'm1', to: ['blocked@outside.test'], body: 'b' },
+      }),
+    );
+    expect(result.status).toBe('denied');
+    expect(result.denyCode).toBe('resource_scope_violation');
+  });
+
+  it('requires an idempotency key before gmail.drafts.reply can reach approval or backend dispatch', async () => {
+    const { router, grants, connection } = await setup();
+    await grants.issueGrant({
+      agentId: AGENT_ID,
+      tenantId: TENANT_ID,
+      connectionId: connection.id,
+      capabilityId: 'gmail.drafts.reply',
+      connectorVersion: GMAIL_MANIFEST_VERSION,
+      effect: 'allow',
+      issuedBy: 'operator-1',
+      reason: 'test',
+    });
+    const result = await router.route(
+      invocation({
+        capabilityId: 'gmail.drafts.reply',
+        connection,
+        args: { threadId: 't1', messageId: 'm1', to: ['person@example.com'], body: 'b' },
+      }),
+    );
+    expect(result.status).toBe('denied');
+    expect(result.denyCode).toBe('idempotency_required');
+  });
+
+  it('denies gmail.attachments.download above the manifest hard cap regardless of any grant', async () => {
+    const { router, grants, connection } = await setup();
+    await grants.issueGrant({
+      agentId: AGENT_ID,
+      tenantId: TENANT_ID,
+      connectionId: connection.id,
+      capabilityId: 'gmail.attachments.download',
+      connectorVersion: GMAIL_MANIFEST_VERSION,
+      effect: 'allow',
+      issuedBy: 'operator-1',
+      reason: 'test',
+    });
+    const result = await router.route(
+      invocation({
+        capabilityId: 'gmail.attachments.download',
+        connection,
+        args: { messageId: 'm1', attachmentId: 'a1', maxBytes: 50_000_000 },
+      }),
+    );
+    expect(result.status).toBe('denied');
+    expect(result.denyCode).toBe('attachment_cap_exceeded');
+  });
+
+  it('lets a grant narrow the attachment byte cap below the manifest hard cap', async () => {
+    const { router, grants, connection } = await setup();
+    await grants.issueGrant({
+      agentId: AGENT_ID,
+      tenantId: TENANT_ID,
+      connectionId: connection.id,
+      capabilityId: 'gmail.attachments.download',
+      connectorVersion: GMAIL_MANIFEST_VERSION,
+      effect: 'allow',
+      resourceScope: { maxAttachmentBytes: 1_000 },
+      issuedBy: 'operator-1',
+      reason: 'test',
+    });
+
+    const withinGrantScope = await router.route(
+      invocation({
+        capabilityId: 'gmail.attachments.download',
+        connection,
+        args: { messageId: 'm1', attachmentId: 'a1', maxBytes: 500 },
+      }),
+    );
+    expect(withinGrantScope.status).toBe('provider_error');
+
+    const overGrantScope = await router.route(
+      invocation({
+        capabilityId: 'gmail.attachments.download',
+        connection,
+        args: { messageId: 'm1', attachmentId: 'a1', maxBytes: 2_000 },
+      }),
+    );
+    expect(overGrantScope.status).toBe('denied');
+    expect(overGrantScope.denyCode).toBe('resource_scope_violation');
+  });
+
+  it('denies gmail.messages.get_full when gmailFullBodyReadEnabled is off even with an allow grant', async () => {
+    const { router, grants, connection } = await setup({ gmailFullBodyReadEnabled: false });
+    await grants.issueGrant({
+      agentId: AGENT_ID,
+      tenantId: TENANT_ID,
+      connectionId: connection.id,
+      capabilityId: 'gmail.messages.get_full',
+      connectorVersion: GMAIL_MANIFEST_VERSION,
+      effect: 'allow',
+      issuedBy: 'operator-1',
+      reason: 'test',
+    });
+    const result = await router.route(
+      invocation({ capabilityId: 'gmail.messages.get_full', connection, args: { messageId: 'm1' } }),
+    );
+    expect(result.status).toBe('denied');
+    expect(result.denyCode).toBe('feature_disabled');
+  });
+
+  it('does not gate metadata/snippet gmail.messages.get on gmailFullBodyReadEnabled', async () => {
+    const { router, grants, connection } = await setup({ gmailFullBodyReadEnabled: false });
+    await grants.issueGrant({
+      agentId: AGENT_ID,
+      tenantId: TENANT_ID,
+      connectionId: connection.id,
+      capabilityId: 'gmail.messages.get',
+      connectorVersion: GMAIL_MANIFEST_VERSION,
+      effect: 'allow',
+      issuedBy: 'operator-1',
+      reason: 'test',
+    });
+    const result = await router.route(
+      invocation({ capabilityId: 'gmail.messages.get', connection, args: { messageId: 'm1', format: 'snippet' } }),
+    );
+    expect(result.status).not.toBe('denied');
+  });
+
+  it('requires per-invocation confirmation for gmail.messages.get_full once its flag is on', async () => {
+    const { router, grants, connection } = await setup({ gmailFullBodyReadEnabled: true });
+    await grants.issueGrant({
+      agentId: AGENT_ID,
+      tenantId: TENANT_ID,
+      connectionId: connection.id,
+      capabilityId: 'gmail.messages.get_full',
+      connectorVersion: GMAIL_MANIFEST_VERSION,
+      effect: 'allow',
+      issuedBy: 'operator-1',
+      reason: 'test',
+    });
+    const result = await router.route(
+      invocation({ capabilityId: 'gmail.messages.get_full', connection, args: { messageId: 'm1' } }),
+    );
+    expect(result.status).toBe('approval_required');
+  });
+
+  it('rejects format "full" on gmail.messages.get now that full body is its own capability', async () => {
+    const { router, grants, connection } = await setup();
+    await grants.issueGrant({
+      agentId: AGENT_ID,
+      tenantId: TENANT_ID,
+      connectionId: connection.id,
+      capabilityId: 'gmail.messages.get',
+      connectorVersion: GMAIL_MANIFEST_VERSION,
+      effect: 'allow',
+      issuedBy: 'operator-1',
+      reason: 'test',
+    });
+    const result = await router.route(
+      invocation({ capabilityId: 'gmail.messages.get', connection, args: { messageId: 'm1', format: 'full' } }),
+    );
+    expect(result.status).toBe('denied');
+    expect(result.denyCode).toBe('invalid_args');
   });
 
   it('writes an audit event for every terminal decision, in order', async () => {
