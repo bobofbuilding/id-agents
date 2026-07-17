@@ -10,6 +10,9 @@
  *   4. connection binding + status check
  *   5. argument shape validation
  *   5b. attachment byte hard cap (manifest-declared, grant-independent)
+ *   5c. draft-recipient verification (provider-declared flag; binds send
+ *       authorization to the draft's actual recipients, not only the
+ *       caller-declared `to`, once wired — see RouterDeps.recipientVerificationGate)
  *   6. grant evaluation (deny-overrides-allow)
  *   6b. side-effect idempotency-key requirement
  *   7. approval policy (may short-circuit with approval_required)
@@ -34,6 +37,7 @@ import { resolveApprovalMode, type ApprovalContext } from '../policy/approval-po
 import { ConnectorAuditLog, hashSanitizedArgs } from '../audit/audit-log.js';
 import type { DbAdapter } from '../../db/db-adapter.js';
 import type { CapabilityManifestEntry, ConnectionRecord, ConnectorInvocation, ConnectorResult, DenyCode } from '../types.js';
+import { NullDraftRecipientsLookup, type DraftRecipientsLookup } from './draft-recipients-lookup.js';
 
 export interface RouterDeps {
   db: DbAdapter;
@@ -49,6 +53,18 @@ export interface RouterDeps {
   connectorFlagGate: Record<string, keyof ConnectorFeatureFlags>;
   /** capabilityId -> flag name that must be true for that specific capability, beyond its connector's flag. See CONNECTOR_CAPABILITY_FLAG_GATE. */
   capabilityFlagGate?: Record<string, keyof ConnectorFeatureFlags>;
+  /**
+   * capabilityId -> flag name that, when true, turns on step 5c draft-recipient
+   * verification for that capability. See CONNECTOR_RECIPIENT_VERIFICATION_GATE.
+   */
+  recipientVerificationGate?: Record<string, keyof ConnectorFeatureFlags>;
+  /**
+   * Resolves a draft's actual recipients for step 5c. Defaults to
+   * NullDraftRecipientsLookup (always "unavailable") when omitted, so
+   * turning on a recipientVerificationGate flag without wiring a real
+   * lookup fails closed rather than silently trusting caller-declared `to`.
+   */
+  draftRecipientsLookup?: DraftRecipientsLookup;
 }
 
 function isOptionalField(schemaValue: unknown): boolean {
@@ -100,21 +116,44 @@ function stringArrayField(args: Record<string, unknown>, key: string): string[] 
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
 }
 
-function extractDomain(recipient: string): string | null {
+/** Strips a `Display Name <addr>` wrapper down to the bare address; never throws on malformed input. */
+function bareAddress(recipient: string): string {
   const trimmed = recipient.trim();
   const angleAddress = /<([^<>@\s]+@[^<>\s]+)>$/.exec(trimmed);
-  const address = angleAddress?.[1] ?? trimmed;
-  const match = /@([^@\s>]+)$/.exec(address);
+  return angleAddress?.[1] ?? trimmed;
+}
+
+function extractDomain(recipient: string): string | null {
+  const match = /@([^@\s>]+)$/.exec(bareAddress(recipient));
   return match ? match[1].toLowerCase() : null;
 }
 
-function recipientDomainsFromArgs(args: Record<string, unknown>): string[] {
+function normalizeRecipientAddress(recipient: string): string {
+  return bareAddress(recipient).toLowerCase();
+}
+
+function recipientDomainsFromList(recipients: string[]): string[] {
   const domains = new Set<string>();
-  for (const recipient of stringArrayField(args, 'to')) {
+  for (const recipient of recipients) {
     const domain = extractDomain(recipient);
     if (domain) domains.add(domain);
   }
   return [...domains];
+}
+
+function recipientDomainsFromArgs(args: Record<string, unknown>): string[] {
+  return recipientDomainsFromList(stringArrayField(args, 'to'));
+}
+
+/** Order-independent, case-insensitive comparison of two recipient address lists. */
+function sameRecipientSet(declared: string[], actual: string[]): boolean {
+  const declaredSet = new Set(declared.map(normalizeRecipientAddress));
+  const actualSet = new Set(actual.map(normalizeRecipientAddress));
+  if (declaredSet.size !== actualSet.size) return false;
+  for (const address of declaredSet) {
+    if (!actualSet.has(address)) return false;
+  }
+  return true;
 }
 
 function attachmentBytesFromArgs(args: Record<string, unknown>): number | undefined {
@@ -135,9 +174,13 @@ function hasAttachmentContext(args: Record<string, unknown>): boolean {
 function deriveRequestedResource(
   connection: ConnectionRecord,
   args: unknown,
+  /** When set (step 5c resolved the draft's actual recipients), authorization binds to these, not the caller-declared `to`. */
+  verifiedRecipients?: string[],
 ): RequestedResource {
   const argsRecord = asArgsRecord(args);
-  const recipientDomains = recipientDomainsFromArgs(argsRecord);
+  const recipientDomains = verifiedRecipients
+    ? recipientDomainsFromList(verifiedRecipients)
+    : recipientDomainsFromArgs(argsRecord);
   const requested: RequestedResource = {
     accountRef: connection.vaultCredentialRef ?? connection.id,
   };
@@ -151,10 +194,13 @@ function deriveRequestedResource(
   return requested;
 }
 
-function deriveApprovalContext(args: unknown): ApprovalContext {
+function deriveApprovalContext(args: unknown, verifiedRecipients?: string[]): ApprovalContext {
   const argsRecord = asArgsRecord(args);
+  const recipientDomains = verifiedRecipients
+    ? recipientDomainsFromList(verifiedRecipients)
+    : recipientDomainsFromArgs(argsRecord);
   return {
-    externalRecipient: recipientDomainsFromArgs(argsRecord).length > 0,
+    externalRecipient: recipientDomains.length > 0,
     hasAttachment: hasAttachmentContext(argsRecord),
   };
 }
@@ -173,6 +219,8 @@ function publicBackendErrorMessage(errorKind: 'retryable' | 'provider' | 'not_co
 function requiresIdempotency(capability: CapabilityManifestEntry): boolean {
   return capability.sideEffect !== 'none';
 }
+
+const DEFAULT_DRAFT_RECIPIENTS_LOOKUP = new NullDraftRecipientsLookup();
 
 export class ConnectorRouter {
   constructor(private readonly deps: RouterDeps) {}
@@ -269,6 +317,37 @@ export class ConnectorRouter {
       }
     }
 
+    // 5c. Draft-recipient verification. Provider-declared per capability
+    // (RouterDeps.recipientVerificationGate); off unless that capability's
+    // gate flag is true. When on, authorization for the rest of this
+    // invocation binds to the draft's actual recipients — resolved by
+    // querying draftRecipientsLookup with the already-validated `connection`
+    // identity (never invocation.agentId/tenantId) — instead of only the
+    // caller-declared `to`. A caller-declared `to` that disagrees with the
+    // actual recipients is denied; omitting `to` falls back entirely to the
+    // looked-up recipients for grant-scope and approval-context purposes.
+    let verifiedRecipients: string[] | undefined;
+    const verificationFlag = this.deps.recipientVerificationGate?.[capability.id];
+    if (verificationFlag && this.deps.featureFlags[verificationFlag]) {
+      const argsRecord = asArgsRecord(invocation.args);
+      const draftId = typeof argsRecord.draftId === 'string' ? argsRecord.draftId : undefined;
+      if (!draftId) return deny('invalid_args', version, capability.id);
+      const lookup = this.deps.draftRecipientsLookup ?? DEFAULT_DRAFT_RECIPIENTS_LOOKUP;
+      const actualRecipients = await lookup.getRecipients({
+        connectorId: connection.connectorId,
+        connectionId: connection.id,
+        agentId: connection.agentId,
+        tenantId: connection.tenantId,
+        draftId,
+      });
+      if (!actualRecipients) return deny('draft_lookup_unavailable', version, capability.id);
+      const declaredRecipients = stringArrayField(argsRecord, 'to');
+      if (declaredRecipients.length > 0 && !sameRecipientSet(declaredRecipients, actualRecipients)) {
+        return deny('recipient_mismatch', version, capability.id);
+      }
+      verifiedRecipients = actualRecipients;
+    }
+
     // 6. Grant evaluation.
     const candidates = await this.deps.grants.listCandidates(invocation.agentId, invocation.tenantId, capability.id);
     const grantResult = evaluateGrant({
@@ -278,7 +357,7 @@ export class ConnectorRouter {
       connectionId: invocation.connectionId,
       candidateGrants: candidates,
       now,
-      requestedResource: deriveRequestedResource(connection, invocation.args),
+      requestedResource: deriveRequestedResource(connection, invocation.args, verifiedRecipients),
     });
     if (!grantResult.allowed) return deny(grantResult.denyCode ?? 'no_grant', version, capability.id);
 
@@ -293,7 +372,7 @@ export class ConnectorRouter {
 
     // 7. Approval policy.
     const policies = await this.deps.approvalPolicies.listForCapability(capability.id);
-    const approvalContext = deriveApprovalContext(invocation.args);
+    const approvalContext = deriveApprovalContext(invocation.args, verifiedRecipients);
     const approval = resolveApprovalMode(capability, invocation.agentId, invocation.tenantId, policies, approvalContext);
 
     if (approval.mode === 'deny') return deny('approval_denied', version, capability.id);

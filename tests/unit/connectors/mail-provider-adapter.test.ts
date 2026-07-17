@@ -6,12 +6,14 @@ import {
   GMAIL_CONNECTOR_ID,
   GMAIL_GRANTABLE_CAPABILITY_IDS,
   GMAIL_MANIFEST_VERSION,
+  GMAIL_RECIPIENT_VERIFICATION_GATE,
   GMAIL_V1_MANIFEST,
 } from '../../../src/connectors/providers/gmail/gmail-manifest.js';
 import {
   buildCapabilityFlagGate,
   buildConnectorFlagGate,
   buildMailManifest,
+  buildRecipientVerificationGate,
   grantableCapabilityIds,
   type MailProviderDefinition,
 } from '../../../src/connectors/providers/mail/mail-provider-adapter.js';
@@ -218,6 +220,12 @@ describe('gmail manifest built through the universal mail provider adapter', () 
     expect(GMAIL_V1_MANIFEST.connectorId).toEqual(GMAIL_CONNECTOR_ID);
     expect(GMAIL_V1_MANIFEST.version).toEqual(GMAIL_MANIFEST_VERSION);
   });
+
+  it('declares send recipient-verification only for gmail.drafts.send, resolved from the same manifest aliasing', () => {
+    expect(GMAIL_RECIPIENT_VERIFICATION_GATE).toEqual({
+      'gmail.drafts.send': 'gmailSendRecipientVerificationEnabled',
+    });
+  });
 });
 
 describe('a second, hypothetical mail provider built on the same adapter', () => {
@@ -235,6 +243,9 @@ describe('a second, hypothetical mail provider built on the same adapter', () =>
     flagGate: {
       'messages.get_full': 'acmeFullBodyReadEnabled',
       'drafts.send': 'acmeSendEnabled',
+    },
+    recipientVerificationFlag: {
+      'drafts.send': 'acmeSendRecipientVerificationEnabled',
     },
   };
   const ACME_MANIFEST = buildMailManifest(ACME_DEF);
@@ -300,5 +311,16 @@ describe('a second, hypothetical mail provider built on the same adapter', () =>
   it("is isolated from Gmail's flag gate — a second provider never widens or narrows Gmail's own flags", () => {
     expect(buildCapabilityFlagGate(ACME_DEF)).not.toHaveProperty('gmail.drafts.send');
     expect(buildCapabilityFlagGate(ACME_DEF)).not.toHaveProperty('gmail.messages.get_full');
+  });
+
+  it('declares its own send recipient-verification gate with no shared code changes', () => {
+    expect(buildRecipientVerificationGate(ACME_DEF)).toEqual({
+      'acmemail.drafts.send': 'acmeSendRecipientVerificationEnabled',
+    });
+  });
+
+  it("is isolated from Gmail's recipient-verification gate — a second provider never widens or narrows Gmail's own flag", () => {
+    expect(buildRecipientVerificationGate(ACME_DEF)).not.toHaveProperty('gmail.drafts.send');
+    expect(GMAIL_RECIPIENT_VERIFICATION_GATE).not.toHaveProperty('acmemail.drafts.send');
   });
 });

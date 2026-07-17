@@ -9,7 +9,7 @@
 
 import fs from 'fs';
 import path from 'path';
-import { GMAIL_CAPABILITY_FLAG_GATE } from '../providers/gmail/gmail-manifest.js';
+import { GMAIL_CAPABILITY_FLAG_GATE, GMAIL_RECIPIENT_VERIFICATION_GATE } from '../providers/gmail/gmail-manifest.js';
 
 export interface ConnectorFeatureFlags {
   /** Master switch; when false, the router denies every invocation before any other check. */
@@ -24,6 +24,18 @@ export interface ConnectorFeatureFlags {
    * materially more sensitive. Requires gmailConnectorEnabled.
    */
   gmailFullBodyReadEnabled: boolean;
+  /**
+   * Send-time recipient verification for gmail.drafts.send. Requires
+   * gmailSendEnabled. When true, the router binds send authorization to the
+   * draft's actual recipients (resolved via an injected
+   * DraftRecipientsLookup keyed on canonical connection identity — see
+   * runtime/draft-recipients-lookup.ts) instead of only the caller-declared
+   * `to`, and fails closed (denies) if no lookup is wired or the draft is
+   * unknown. Off by default; flipping it on without a real lookup wired
+   * denies every send rather than silently trusting caller-declared
+   * recipients.
+   */
+  gmailSendRecipientVerificationEnabled: boolean;
   /** Reviewed MCP backend transport. Off until a specific server is pinned and reviewed. */
   mcpBackendEnabled: boolean;
   /**
@@ -43,6 +55,7 @@ export const DEFAULT_CONNECTOR_FEATURE_FLAGS: ConnectorFeatureFlags = {
   gmailConnectorEnabled: false,
   gmailSendEnabled: false,
   gmailFullBodyReadEnabled: false,
+  gmailSendRecipientVerificationEnabled: false,
   mcpBackendEnabled: false,
   connectorsMigrationsEnabled: false,
 };
@@ -88,6 +101,10 @@ export function loadConnectorFeatureFlags(
       fromFile.gmailFullBodyReadEnabled,
       DEFAULT_CONNECTOR_FEATURE_FLAGS.gmailFullBodyReadEnabled,
     ),
+    gmailSendRecipientVerificationEnabled: coerceBool(
+      fromFile.gmailSendRecipientVerificationEnabled,
+      DEFAULT_CONNECTOR_FEATURE_FLAGS.gmailSendRecipientVerificationEnabled,
+    ),
     mcpBackendEnabled: coerceBool(fromFile.mcpBackendEnabled, DEFAULT_CONNECTOR_FEATURE_FLAGS.mcpBackendEnabled),
     connectorsMigrationsEnabled: coerceBool(
       fromFile.connectorsMigrationsEnabled,
@@ -102,6 +119,10 @@ export function loadConnectorFeatureFlags(
     gmailFullBodyReadEnabled: coerceBool(
       env.ID_CONNECTORS_GMAIL_FULL_BODY_ENABLED,
       merged.gmailFullBodyReadEnabled,
+    ),
+    gmailSendRecipientVerificationEnabled: coerceBool(
+      env.ID_CONNECTORS_GMAIL_SEND_RECIPIENT_VERIFICATION_ENABLED,
+      merged.gmailSendRecipientVerificationEnabled,
     ),
     mcpBackendEnabled: coerceBool(env.ID_CONNECTORS_MCP_ENABLED, merged.mcpBackendEnabled),
     connectorsMigrationsEnabled: coerceBool(
@@ -132,4 +153,19 @@ export function loadConnectorFeatureFlags(
  */
 export const CONNECTOR_CAPABILITY_FLAG_GATE: Record<string, keyof ConnectorFeatureFlags> = {
   ...GMAIL_CAPABILITY_FLAG_GATE,
+};
+
+/**
+ * Send recipient-verification gate: capability id -> flag name that, when
+ * true, turns on send-time recipient verification for that capability (see
+ * ConnectorRouter step 5c, runtime/router.ts). Distinct from
+ * CONNECTOR_CAPABILITY_FLAG_GATE — that gate decides whether a capability
+ * can be invoked at all; this one layers an additional check onto a
+ * capability that is already invocable. Provider-extensible the same way:
+ * each provider declares its own gate against its own manifest (see
+ * MailProviderDefinition.recipientVerificationFlag /
+ * buildRecipientVerificationGate) and is merged in here.
+ */
+export const CONNECTOR_RECIPIENT_VERIFICATION_GATE: Record<string, keyof ConnectorFeatureFlags> = {
+  ...GMAIL_RECIPIENT_VERIFICATION_GATE,
 };

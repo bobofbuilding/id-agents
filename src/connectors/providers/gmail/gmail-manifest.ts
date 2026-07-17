@@ -18,6 +18,7 @@ import {
   buildCapabilityFlagGate,
   buildConnectorFlagGate,
   buildMailManifest,
+  buildRecipientVerificationGate,
   grantableCapabilityIds,
   type MailProviderDefinition,
 } from '../mail/mail-provider-adapter.js';
@@ -56,6 +57,14 @@ export const GMAIL_PROVIDER_DEFINITION: MailProviderDefinition<keyof ConnectorFe
   flagGate: {
     'messages.get_full': 'gmailFullBodyReadEnabled',
     'drafts.send': 'gmailSendEnabled',
+  },
+  // Beyond gmailSendEnabled: when gmailSendRecipientVerificationEnabled is
+  // also on, gmail.drafts.send binds authorization to the draft's actual
+  // recipients (via a DraftRecipientsLookup keyed on canonical connection
+  // identity) rather than only the caller-declared `to`. Off by default; see
+  // runtime/router.ts step 5c and runtime/draft-recipients-lookup.ts.
+  recipientVerificationFlag: {
+    'drafts.send': 'gmailSendRecipientVerificationEnabled',
   },
   capabilityOverrides: {
     'messages.get': {
@@ -103,3 +112,12 @@ export const GMAIL_CONNECTOR_FLAG_GATE = buildConnectorFlagGate(GMAIL_PROVIDER_D
  * export like this one.
  */
 export const GMAIL_CAPABILITY_FLAG_GATE = buildCapabilityFlagGate(GMAIL_PROVIDER_DEFINITION);
+
+/**
+ * Gmail's contribution to the send recipient-verification gate, derived from
+ * GMAIL_PROVIDER_DEFINITION.recipientVerificationFlag — see
+ * config/feature-flags.ts CONNECTOR_RECIPIENT_VERIFICATION_GATE, which
+ * merges every registered provider's export like this one, and
+ * runtime/router.ts step 5c for where this is enforced.
+ */
+export const GMAIL_RECIPIENT_VERIFICATION_GATE = buildRecipientVerificationGate(GMAIL_PROVIDER_DEFINITION);

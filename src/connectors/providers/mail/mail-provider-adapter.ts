@@ -69,6 +69,19 @@ export interface MailProviderDefinition<FlagKey extends string = string> {
    * capability it describes.
    */
   flagGate?: Partial<Record<string, FlagKey>>;
+  /**
+   * Per-schema-key flag that, when true, turns on send-time recipient
+   * verification for that capability (e.g. Gmail's `drafts.send` binding
+   * authorization to the draft's actual recipients via a
+   * DraftRecipientsLookup, not just caller-declared `to` — see
+   * runtime/router.ts step 5c). Resolved to full capability ids by
+   * buildRecipientVerificationGate() the same way buildCapabilityFlagGate
+   * resolves flagGate, so an entry here can never drift from the capability
+   * it describes. Distinct from flagGate: a flagGate entry gates whether the
+   * capability can be invoked at all; this gates an additional check layered
+   * on top of an already-invocable capability.
+   */
+  recipientVerificationFlag?: Partial<Record<string, FlagKey>>;
 }
 
 function capabilityId(entry: MailCapabilitySchemaEntry, def: MailProviderDefinition<string>): string {
@@ -138,6 +151,25 @@ export function buildCapabilityFlagGate<FlagKey extends string>(
   def: MailProviderDefinition<FlagKey>,
 ): Record<string, FlagKey> {
   const gate = def.flagGate ?? {};
+  const result: Record<string, FlagKey> = {};
+  for (const entry of MAIL_CAPABILITY_SCHEMA) {
+    const flag = gate[entry.key];
+    if (flag) result[capabilityId(entry, def)] = flag;
+  }
+  return result;
+}
+
+/**
+ * Resolve MailProviderDefinition.recipientVerificationFlag (schema-key
+ * keyed) into capability-id keyed entries for RouterDeps.recipientVerificationGate
+ * (router.ts step 5c), reusing the exact same resource/idSuffix aliasing
+ * capabilityId() uses to build the manifest — see buildCapabilityFlagGate,
+ * which this mirrors for the separate recipient-verification gate.
+ */
+export function buildRecipientVerificationGate<FlagKey extends string>(
+  def: MailProviderDefinition<FlagKey>,
+): Record<string, FlagKey> {
+  const gate = def.recipientVerificationFlag ?? {};
   const result: Record<string, FlagKey> = {};
   for (const entry of MAIL_CAPABILITY_SCHEMA) {
     const flag = gate[entry.key];

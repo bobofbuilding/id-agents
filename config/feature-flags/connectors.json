@@ -4,6 +4,7 @@
   "gmailConnectorEnabled": false,
   "gmailSendEnabled": false,
   "gmailFullBodyReadEnabled": false,
+  "gmailSendRecipientVerificationEnabled": false,
   "mcpBackendEnabled": false,
   "connectorsMigrationsEnabled": false
 }

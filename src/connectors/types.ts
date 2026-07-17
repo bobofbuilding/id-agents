@@ -180,7 +180,9 @@ export type DenyCode =
   | 'idempotency_required'
   | 'idempotency_conflict'
   | 'approval_denied'
-  | 'approval_expired';
+  | 'approval_expired'
+  | 'draft_lookup_unavailable'
+  | 'recipient_mismatch';
 
 export interface ConnectorResult<T = unknown> {
   status: ConnectorResultStatus;
