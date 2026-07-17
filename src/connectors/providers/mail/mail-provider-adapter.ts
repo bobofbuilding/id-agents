@@ -33,7 +33,15 @@ export interface MailProviderBackend {
   binding: string;
 }
 
-export interface MailProviderDefinition {
+/**
+ * A provider definition is parameterized over its own flag-key vocabulary
+ * (FlagKey) rather than importing ConnectorFeatureFlags directly, so this
+ * adapter module has no dependency on config/feature-flags.ts — a provider
+ * binds the concrete type (see gmail-manifest.ts using
+ * `MailProviderDefinition<keyof ConnectorFeatureFlags>`), keeping this file
+ * usable for any future flags shape.
+ */
+export interface MailProviderDefinition<FlagKey extends string = string> {
   connectorId: string;
   version: string;
   displayName: string;
@@ -49,15 +57,33 @@ export interface MailProviderDefinition {
   capabilityOverrides?: Partial<Record<string, Partial<Omit<MailCapabilitySchemaEntry, 'key'>>>>;
   /** Restrict the manifest to a subset of schema keys; defaults to the full universal set. */
   includeKeys?: string[];
+  /** Flag that must be true for this provider's connector-level gate, beyond the master switch. See buildConnectorFlagGate. */
+  connectorFlag?: FlagKey;
+  /**
+   * Per-schema-key feature flag that must be true for that specific
+   * capability, beyond the provider's connectorFlag — e.g. Gmail's
+   * `messages.get_full` and `drafts.send` each require their own flag on top
+   * of `gmailConnectorEnabled`. Resolved to full capability ids by
+   * buildCapabilityFlagGate() using the same resource/idSuffix aliasing as
+   * the manifest itself, so a gate entry can never silently drift from the
+   * capability it describes.
+   */
+  flagGate?: Partial<Record<string, FlagKey>>;
 }
 
-function buildCapability(entry: MailCapabilitySchemaEntry, def: MailProviderDefinition): CapabilityManifestEntry {
+function capabilityId(entry: MailCapabilitySchemaEntry, def: MailProviderDefinition<string>): string {
   const override = def.capabilityOverrides?.[entry.key] ?? {};
   const resource = def.resourceAliases?.[entry.key] ?? override.resource ?? entry.resource;
   const idSuffix = def.idSuffixAliases?.[entry.key] ?? override.idSuffix ?? entry.idSuffix ?? entry.operation;
+  return `${def.connectorId}.${resource}.${idSuffix}`;
+}
+
+function buildCapability(entry: MailCapabilitySchemaEntry, def: MailProviderDefinition<string>): CapabilityManifestEntry {
+  const override = def.capabilityOverrides?.[entry.key] ?? {};
+  const resource = def.resourceAliases?.[entry.key] ?? override.resource ?? entry.resource;
   const merged: Omit<MailCapabilitySchemaEntry, 'key'> = { ...entry, ...override, resource };
   return {
-    id: `${def.connectorId}.${resource}.${idSuffix}`,
+    id: capabilityId(entry, def),
     operation: merged.operation,
     resource: merged.resource,
     risk: merged.risk,
@@ -88,6 +114,36 @@ export function buildMailManifest(def: MailProviderDefinition): ConnectorManifes
 /** Capability ids a grant may reference (excludes hard-denied entries). */
 export function grantableCapabilityIds(manifest: ConnectorManifest): string[] {
   return manifest.capabilities.filter((c) => !c.hardDeny).map((c) => c.id);
+}
+
+/**
+ * `{ connectorId: def.connectorFlag }`, or empty if the provider declares no
+ * connector-level flag. Feeds RouterDeps.connectorFlagGate (router.ts step
+ * 1) the same way buildCapabilityFlagGate feeds capabilityFlagGate.
+ */
+export function buildConnectorFlagGate<FlagKey extends string>(
+  def: MailProviderDefinition<FlagKey>,
+): Record<string, FlagKey> {
+  return def.connectorFlag ? { [def.connectorId]: def.connectorFlag } : {};
+}
+
+/**
+ * Resolve MailProviderDefinition.flagGate (schema-key keyed) into
+ * capability-id keyed entries for RouterDeps.capabilityFlagGate
+ * (router.ts step 3b), reusing the exact same resource/idSuffix aliasing
+ * capabilityId() uses to build the manifest — so this can never list a
+ * capability id that doesn't match what the manifest actually published.
+ */
+export function buildCapabilityFlagGate<FlagKey extends string>(
+  def: MailProviderDefinition<FlagKey>,
+): Record<string, FlagKey> {
+  const gate = def.flagGate ?? {};
+  const result: Record<string, FlagKey> = {};
+  for (const entry of MAIL_CAPABILITY_SCHEMA) {
+    const flag = gate[entry.key];
+    if (flag) result[capabilityId(entry, def)] = flag;
+  }
+  return result;
 }
 
 /**

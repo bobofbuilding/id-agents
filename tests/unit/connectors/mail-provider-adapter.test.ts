@@ -8,7 +8,13 @@ import {
   GMAIL_MANIFEST_VERSION,
   GMAIL_V1_MANIFEST,
 } from '../../../src/connectors/providers/gmail/gmail-manifest.js';
-import { buildMailManifest, grantableCapabilityIds } from '../../../src/connectors/providers/mail/mail-provider-adapter.js';
+import {
+  buildCapabilityFlagGate,
+  buildConnectorFlagGate,
+  buildMailManifest,
+  grantableCapabilityIds,
+  type MailProviderDefinition,
+} from '../../../src/connectors/providers/mail/mail-provider-adapter.js';
 import type { ConnectorManifest } from '../../../src/connectors/types.js';
 
 /**
@@ -215,7 +221,7 @@ describe('gmail manifest built through the universal mail provider adapter', () 
 });
 
 describe('a second, hypothetical mail provider built on the same adapter', () => {
-  const ACME_MANIFEST = buildMailManifest({
+  const ACME_DEF: MailProviderDefinition<string> = {
     connectorId: 'acmemail',
     version: '1.0.0',
     displayName: 'Acme Mail',
@@ -225,7 +231,13 @@ describe('a second, hypothetical mail provider built on the same adapter', () =>
     backend: { kind: 'api_key', provider: 'acme', binding: 'acme-mail-v1' },
     resourceAliases: { 'folders.list': 'mailboxes' },
     idSuffixAliases: { 'settings.accountControl': 'auto_forward' },
-  });
+    connectorFlag: 'acmeConnectorEnabled',
+    flagGate: {
+      'messages.get_full': 'acmeFullBodyReadEnabled',
+      'drafts.send': 'acmeSendEnabled',
+    },
+  };
+  const ACME_MANIFEST = buildMailManifest(ACME_DEF);
 
   it('produces a manifest that passes structural validation with no router/grants/policy code changes', () => {
     const result = validateConnectorManifest(ACME_MANIFEST);
@@ -267,5 +279,26 @@ describe('a second, hypothetical mail provider built on the same adapter', () =>
     expect(grantable).not.toContain('acmemail.messages.send');
     expect(grantable).not.toContain('acmemail.settings.auto_forward');
     expect(grantable.length).toEqual(ACME_MANIFEST.capabilities.length - ACME_MANIFEST.capabilities.filter((c) => c.hardDeny).length);
+  });
+
+  it('declares its own connector-level and capability-level flag gate with no shared code changes', () => {
+    expect(buildConnectorFlagGate(ACME_DEF)).toEqual({ acmemail: 'acmeConnectorEnabled' });
+    expect(buildCapabilityFlagGate(ACME_DEF)).toEqual({
+      'acmemail.messages.get_full': 'acmeFullBodyReadEnabled',
+      'acmemail.drafts.send': 'acmeSendEnabled',
+    });
+  });
+
+  it('resolves flag-gate entries through the same resource/id-suffix aliasing as the manifest, never a stale id', () => {
+    const gate = buildCapabilityFlagGate({
+      ...ACME_DEF,
+      flagGate: { 'settings.accountControl': 'acmeAccountControlEnabled' },
+    });
+    expect(gate).toEqual({ 'acmemail.settings.auto_forward': 'acmeAccountControlEnabled' });
+  });
+
+  it("is isolated from Gmail's flag gate — a second provider never widens or narrows Gmail's own flags", () => {
+    expect(buildCapabilityFlagGate(ACME_DEF)).not.toHaveProperty('gmail.drafts.send');
+    expect(buildCapabilityFlagGate(ACME_DEF)).not.toHaveProperty('gmail.messages.get_full');
   });
 });

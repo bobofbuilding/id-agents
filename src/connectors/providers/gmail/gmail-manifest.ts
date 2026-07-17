@@ -13,7 +13,14 @@
  */
 
 import type { ConnectorManifest } from '../../types.js';
-import { buildMailManifest, grantableCapabilityIds, type MailProviderDefinition } from '../mail/mail-provider-adapter.js';
+import type { ConnectorFeatureFlags } from '../../config/feature-flags.js';
+import {
+  buildCapabilityFlagGate,
+  buildConnectorFlagGate,
+  buildMailManifest,
+  grantableCapabilityIds,
+  type MailProviderDefinition,
+} from '../mail/mail-provider-adapter.js';
 
 export const GMAIL_CONNECTOR_ID = 'gmail';
 export const GMAIL_MANIFEST_VERSION = '1.0.0';
@@ -29,7 +36,7 @@ export const GMAIL_MANIFEST_VERSION = '1.0.0';
  */
 export const GMAIL_ATTACHMENT_DOWNLOAD_HARD_CAP_BYTES = 10_000_000;
 
-export const GMAIL_PROVIDER_DEFINITION: MailProviderDefinition = {
+export const GMAIL_PROVIDER_DEFINITION: MailProviderDefinition<keyof ConnectorFeatureFlags> = {
   connectorId: GMAIL_CONNECTOR_ID,
   version: GMAIL_MANIFEST_VERSION,
   displayName: 'Gmail',
@@ -41,6 +48,15 @@ export const GMAIL_PROVIDER_DEFINITION: MailProviderDefinition = {
   // account-control settings surface is specifically mail forwarding rules.
   resourceAliases: { 'folders.list': 'labels' },
   idSuffixAliases: { 'settings.accountControl': 'forwarding' },
+  connectorFlag: 'gmailConnectorEnabled',
+  // Beyond gmailConnectorEnabled: full-body reads and send each require
+  // their own additional flag (see docs/connectors/gmail-first-connector-
+  // architecture.md#feature-flags). Resolved into capability-id form by
+  // GMAIL_CAPABILITY_FLAG_GATE below.
+  flagGate: {
+    'messages.get_full': 'gmailFullBodyReadEnabled',
+    'drafts.send': 'gmailSendEnabled',
+  },
   capabilityOverrides: {
     'messages.get': {
       notes: 'Metadata/snippet only. Full body is a separate, stricter capability — see gmail.messages.get_full.',
@@ -75,3 +91,15 @@ export const GMAIL_V1_MANIFEST: ConnectorManifest = buildMailManifest(GMAIL_PROV
 
 /** Capability ids that a grant may reference at launch (excludes hard-denied entries). */
 export const GMAIL_GRANTABLE_CAPABILITY_IDS = grantableCapabilityIds(GMAIL_V1_MANIFEST);
+
+/** `{ gmail: 'gmailConnectorEnabled' }` — feeds RouterDeps.connectorFlagGate. Derived from GMAIL_PROVIDER_DEFINITION.connectorFlag, not hand-duplicated. */
+export const GMAIL_CONNECTOR_FLAG_GATE = buildConnectorFlagGate(GMAIL_PROVIDER_DEFINITION);
+
+/**
+ * Gmail's contribution to the capability-specific flag gate, derived from
+ * GMAIL_PROVIDER_DEFINITION.flagGate rather than a hand-duplicated map of
+ * capability-id strings — see config/feature-flags.ts
+ * CONNECTOR_CAPABILITY_FLAG_GATE, which merges every registered provider's
+ * export like this one.
+ */
+export const GMAIL_CAPABILITY_FLAG_GATE = buildCapabilityFlagGate(GMAIL_PROVIDER_DEFINITION);

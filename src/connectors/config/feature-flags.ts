@@ -9,6 +9,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { GMAIL_CAPABILITY_FLAG_GATE } from '../providers/gmail/gmail-manifest.js';
 
 export interface ConnectorFeatureFlags {
   /** Master switch; when false, the router denies every invocation before any other check. */
@@ -119,8 +120,16 @@ export function loadConnectorFeatureFlags(
  * (runtime/router.ts) for where this is enforced, and
  * docs/connectors/gmail-first-connector-architecture.md#staged-rollout
  * stage 4 for the rollout sequencing this exists to support.
+ *
+ * Provider-extensible by construction: each provider declares its own gate
+ * against its own manifest (see MailProviderDefinition.flagGate /
+ * buildCapabilityFlagGate in providers/mail/mail-provider-adapter.ts) and is
+ * merged in here — this file never hand-transcribes a capability id string,
+ * so a gate entry can't silently drift from the manifest capability it
+ * describes. Gmail is the only provider registered today; adding another
+ * mail provider means importing its own `*_CAPABILITY_FLAG_GATE` export and
+ * spreading it into this merge, not editing capability ids by hand.
  */
 export const CONNECTOR_CAPABILITY_FLAG_GATE: Record<string, keyof ConnectorFeatureFlags> = {
-  'gmail.drafts.send': 'gmailSendEnabled',
-  'gmail.messages.get_full': 'gmailFullBodyReadEnabled',
+  ...GMAIL_CAPABILITY_FLAG_GATE,
 };
