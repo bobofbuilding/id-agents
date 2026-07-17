@@ -17,6 +17,12 @@ export interface ConnectorFeatureFlags {
   gmailConnectorEnabled: boolean;
   /** Approval-gated gmail.drafts.send. Requires gmailConnectorEnabled. */
   gmailSendEnabled: boolean;
+  /**
+   * Full-body message reads (gmail.messages.get_full), split out from the
+   * metadata/snippet tier of gmail.messages.get because full body content is
+   * materially more sensitive. Requires gmailConnectorEnabled.
+   */
+  gmailFullBodyReadEnabled: boolean;
   /** Reviewed MCP backend transport. Off until a specific server is pinned and reviewed. */
   mcpBackendEnabled: boolean;
 }
@@ -25,6 +31,7 @@ export const DEFAULT_CONNECTOR_FEATURE_FLAGS: ConnectorFeatureFlags = {
   connectorsEnabled: false,
   gmailConnectorEnabled: false,
   gmailSendEnabled: false,
+  gmailFullBodyReadEnabled: false,
   mcpBackendEnabled: false,
 };
 
@@ -65,6 +72,10 @@ export function loadConnectorFeatureFlags(
       DEFAULT_CONNECTOR_FEATURE_FLAGS.gmailConnectorEnabled,
     ),
     gmailSendEnabled: coerceBool(fromFile.gmailSendEnabled, DEFAULT_CONNECTOR_FEATURE_FLAGS.gmailSendEnabled),
+    gmailFullBodyReadEnabled: coerceBool(
+      fromFile.gmailFullBodyReadEnabled,
+      DEFAULT_CONNECTOR_FEATURE_FLAGS.gmailFullBodyReadEnabled,
+    ),
     mcpBackendEnabled: coerceBool(fromFile.mcpBackendEnabled, DEFAULT_CONNECTOR_FEATURE_FLAGS.mcpBackendEnabled),
   };
 
@@ -72,6 +83,10 @@ export function loadConnectorFeatureFlags(
     connectorsEnabled: coerceBool(env.ID_CONNECTORS_ENABLED, merged.connectorsEnabled),
     gmailConnectorEnabled: coerceBool(env.ID_CONNECTORS_GMAIL_ENABLED, merged.gmailConnectorEnabled),
     gmailSendEnabled: coerceBool(env.ID_CONNECTORS_GMAIL_SEND_ENABLED, merged.gmailSendEnabled),
+    gmailFullBodyReadEnabled: coerceBool(
+      env.ID_CONNECTORS_GMAIL_FULL_BODY_ENABLED,
+      merged.gmailFullBodyReadEnabled,
+    ),
     mcpBackendEnabled: coerceBool(env.ID_CONNECTORS_MCP_ENABLED, merged.mcpBackendEnabled),
   };
 }
@@ -88,4 +103,5 @@ export function loadConnectorFeatureFlags(
  */
 export const CONNECTOR_CAPABILITY_FLAG_GATE: Record<string, keyof ConnectorFeatureFlags> = {
   'gmail.drafts.send': 'gmailSendEnabled',
+  'gmail.messages.get_full': 'gmailFullBodyReadEnabled',
 };

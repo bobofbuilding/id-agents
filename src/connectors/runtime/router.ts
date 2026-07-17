@@ -9,6 +9,7 @@
  *   3b. capability-specific feature-flag gate (e.g. gmailSendEnabled)
  *   4. connection binding + status check
  *   5. argument shape validation
+ *   5b. attachment byte hard cap (manifest-declared, grant-independent)
  *   6. grant evaluation (deny-overrides-allow)
  *   6b. side-effect idempotency-key requirement
  *   7. approval policy (may short-circuit with approval_required)
@@ -116,6 +117,11 @@ function recipientDomainsFromArgs(args: Record<string, unknown>): string[] {
   return [...domains];
 }
 
+function attachmentBytesFromArgs(args: Record<string, unknown>): number | undefined {
+  const value = args.maxBytes;
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
 function hasAttachmentContext(args: Record<string, unknown>): boolean {
   if (args.hasAttachment === true) return true;
   if (typeof args.attachmentId === 'string' && args.attachmentId.trim().length > 0) return true;
@@ -140,6 +146,8 @@ function deriveRequestedResource(
   if (typeof argsRecord.label === 'string') requested.label = argsRecord.label;
   if (typeof argsRecord.maxResults === 'number') requested.maxResults = argsRecord.maxResults;
   if (typeof argsRecord.maxMessages === 'number') requested.maxResults = argsRecord.maxMessages;
+  const attachmentBytes = attachmentBytesFromArgs(argsRecord);
+  if (attachmentBytes !== undefined) requested.attachmentBytes = attachmentBytes;
   return requested;
 }
 
@@ -149,6 +157,17 @@ function deriveApprovalContext(args: unknown): ApprovalContext {
     externalRecipient: recipientDomainsFromArgs(argsRecord).length > 0,
     hasAttachment: hasAttachmentContext(argsRecord),
   };
+}
+
+/**
+ * Backend errors can include provider diagnostics, credential metadata, or
+ * request-derived values. The router is a caller-facing boundary, so expose
+ * only the already-classified result status and never the backend text.
+ */
+function publicBackendErrorMessage(errorKind: 'retryable' | 'provider' | 'not_connected' | undefined): string {
+  return errorKind === 'retryable'
+    ? 'Connector backend is temporarily unavailable'
+    : 'Connector backend request failed';
 }
 
 function requiresIdempotency(capability: CapabilityManifestEntry): boolean {
@@ -239,6 +258,16 @@ export class ConnectorRouter {
 
     // 5. Argument shape.
     if (!validateArgs(capability, invocation.args)) return deny('invalid_args', version, capability.id);
+
+    // 5b. Attachment byte hard cap. Manifest-declared, so it applies even
+    // with no grant at all — a grant's maxAttachmentBytes may narrow this
+    // further in step 6, but never widen past it.
+    if (capability.hardCapAttachmentBytes != null) {
+      const requestedBytes = attachmentBytesFromArgs(asArgsRecord(invocation.args));
+      if (requestedBytes == null || requestedBytes > capability.hardCapAttachmentBytes) {
+        return deny('attachment_cap_exceeded', version, capability.id);
+      }
+    }
 
     // 6. Grant evaluation.
     const candidates = await this.deps.grants.listCandidates(invocation.agentId, invocation.tenantId, capability.id);
@@ -402,7 +431,7 @@ export class ConnectorRouter {
       return {
         status: result.errorKind === 'retryable' ? 'retryable_error' : 'provider_error',
         requestId: invocation.requestId,
-        errorMessage: result.errorMessage,
+        errorMessage: publicBackendErrorMessage(result.errorKind),
       };
     }
     return { status: 'ok', requestId: invocation.requestId, data: result.data };
