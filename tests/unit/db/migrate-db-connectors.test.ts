@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { SqliteAdapter } from '../../../src/db/sqlite-adapter.js';
 import { migrateDb } from '../../../src/db/index.js';
 import type { Db } from '../../../src/db/db-service.js';
@@ -29,6 +29,7 @@ describe('migrateDb connector migration boot wiring', () => {
   it('creates the connector tables once ID_CONNECTORS_MIGRATIONS_ENABLED is set, without touching core tables', async () => {
     process.env.ID_CONNECTORS_MIGRATIONS_ENABLED = 'true';
     const adapter = new SqliteAdapter(':memory:');
+    const execSpy = vi.spyOn(adapter, 'exec');
     await migrateDb({ adapter } as unknown as Db);
 
     const names = await connectorTableNames(adapter);
@@ -39,6 +40,16 @@ describe('migrateDb connector migration boot wiring', () => {
       `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'teams'`,
     );
     expect(teamRows).toHaveLength(1);
+
+    const connectorDdl = execSpy.mock.calls
+      .map(([sql]) => sql)
+      .flatMap((sql) => sql.split(';'))
+      .map((statement) => statement.replace(/^\s*--.*$/gm, '').trim())
+      .filter((statement) => /\bconnector(?:s|_)/i.test(statement));
+    expect(connectorDdl.length).toBeGreaterThan(0);
+    expect(
+      connectorDdl.every((statement) => /^CREATE (?:TABLE|(?:UNIQUE )?INDEX) IF NOT EXISTS\b/i.test(statement)),
+    ).toBe(true);
     await adapter.close();
   });
 });
