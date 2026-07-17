@@ -30,6 +30,19 @@ describe('ConnectorOperatorConsentRepo', () => {
     expect(active?.id).toEqual(record.id);
     expect(active?.operator).toEqual('bobofbuilding');
     expect(active?.flagKey).toEqual('connectorsMigrationsEnabled');
+
+    const { rows: columns } = await adapter.query<{ name: string }>(
+      `PRAGMA table_info(connector_operator_consents)`,
+    );
+    const persistedColumnNames = columns.map((column) => column.name);
+    expect(persistedColumnNames.some((name) => /credential|token|secret/i.test(name))).toBe(false);
+
+    const { rows: persistedRows } = await adapter.query<Record<string, unknown>>(
+      `SELECT * FROM connector_operator_consents WHERE id = $1`,
+      [record.id],
+    );
+    expect(persistedRows).toHaveLength(1);
+    expect(Object.keys(persistedRows[0]).some((name) => /credential|token|secret/i.test(name))).toBe(false);
     await adapter.close();
   });
 
