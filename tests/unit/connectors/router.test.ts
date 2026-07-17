@@ -11,6 +11,7 @@ import { ApprovalPolicyRepo } from '../../../src/connectors/policy/approval-poli
 import { ApprovalRequestsRepo } from '../../../src/connectors/policy/approval-requests-repo.js';
 import { ConnectorAuditLog } from '../../../src/connectors/audit/audit-log.js';
 import { ConnectorRouter } from '../../../src/connectors/runtime/router.js';
+import type { DraftRecipientsLookup, DraftRecipientsQuery } from '../../../src/connectors/runtime/draft-recipients-lookup.js';
 import { OAuthApiBackend } from '../../../src/connectors/backends/oauth-api-backend.js';
 import type { ConnectorBackend } from '../../../src/connectors/backends/connector-backend.js';
 import { FakeVaultCredentialBroker } from '../../../src/connectors/credentials/credential-broker.js';
@@ -20,9 +21,11 @@ import {
   GMAIL_CONNECTOR_FLAG_GATE,
   GMAIL_CONNECTOR_ID,
   GMAIL_MANIFEST_VERSION,
+  GMAIL_RECIPIENT_VERIFICATION_GATE,
 } from '../../../src/connectors/providers/gmail/gmail-manifest.js';
 import {
   CONNECTOR_CAPABILITY_FLAG_GATE,
+  CONNECTOR_RECIPIENT_VERIFICATION_GATE,
   DEFAULT_CONNECTOR_FEATURE_FLAGS,
   type ConnectorFeatureFlags,
 } from '../../../src/connectors/config/feature-flags.js';
@@ -31,7 +34,11 @@ import type { ConnectionRecord, ConnectorInvocation } from '../../../src/connect
 const AGENT_ID = 'agent-a';
 const TENANT_ID = 'tenant-a';
 
-async function setup(flagOverrides: Partial<ConnectorFeatureFlags> = {}, backendOverride?: ConnectorBackend) {
+async function setup(
+  flagOverrides: Partial<ConnectorFeatureFlags> = {},
+  backendOverride?: ConnectorBackend,
+  draftRecipientsLookup?: DraftRecipientsLookup,
+) {
   const db = new SqliteAdapter(':memory:');
   await migrateConnectorsSqlite(db);
 
@@ -65,6 +72,8 @@ async function setup(flagOverrides: Partial<ConnectorFeatureFlags> = {}, backend
     featureFlags,
     connectorFlagGate: GMAIL_CONNECTOR_FLAG_GATE,
     capabilityFlagGate: CONNECTOR_CAPABILITY_FLAG_GATE,
+    recipientVerificationGate: CONNECTOR_RECIPIENT_VERIFICATION_GATE,
+    draftRecipientsLookup,
   });
 
   const connection = await connections.create({
@@ -620,6 +629,210 @@ describe('ConnectorRouter', () => {
     expect(result.status).toBe('approval_required');
   });
 
+  it('gmailSendRecipientVerificationEnabled defaults to false, so drafts.send behaves exactly as before with no lookup wired', async () => {
+    const { router, grants, connection } = await setup();
+    await grants.issueGrant({
+      agentId: AGENT_ID,
+      tenantId: TENANT_ID,
+      connectionId: connection.id,
+      capabilityId: 'gmail.drafts.send',
+      connectorVersion: GMAIL_MANIFEST_VERSION,
+      effect: 'allow',
+      issuedBy: 'operator-1',
+      reason: 'test',
+    });
+    const result = await router.route(
+      invocation({
+        capabilityId: 'gmail.drafts.send',
+        connection,
+        idempotencyKey: 'recipient-verification-off',
+        args: { draftId: 'd1', to: ['person@example.com'] },
+      }),
+    );
+    // Unchanged from pre-slice behavior: reaches the manifest's `always`
+    // approval floor without ever consulting a draft lookup.
+    expect(result.status).toBe('approval_required');
+  });
+
+  it('fails closed with draft_lookup_unavailable when recipient verification is on but no lookup resolves the draft', async () => {
+    const { router, grants, connection } = await setup({ gmailSendRecipientVerificationEnabled: true });
+    await grants.issueGrant({
+      agentId: AGENT_ID,
+      tenantId: TENANT_ID,
+      connectionId: connection.id,
+      capabilityId: 'gmail.drafts.send',
+      connectorVersion: GMAIL_MANIFEST_VERSION,
+      effect: 'allow',
+      issuedBy: 'operator-1',
+      reason: 'test',
+    });
+    // No draftRecipientsLookup passed to setup(): the default
+    // NullDraftRecipientsLookup always reports "unavailable".
+    const result = await router.route(
+      invocation({
+        capabilityId: 'gmail.drafts.send',
+        connection,
+        idempotencyKey: 'recipient-verification-unavailable',
+        args: { draftId: 'd1', to: ['person@example.com'] },
+      }),
+    );
+    expect(result.status).toBe('denied');
+    expect(result.denyCode).toBe('draft_lookup_unavailable');
+  });
+
+  it('denies with recipient_mismatch when the caller-declared `to` disagrees with the draft\'s actual recipients', async () => {
+    const lookup: DraftRecipientsLookup = {
+      async getRecipients() {
+        return ['actual@example.com'];
+      },
+    };
+    const { router, grants, connection } = await setup({ gmailSendRecipientVerificationEnabled: true }, undefined, lookup);
+    await grants.issueGrant({
+      agentId: AGENT_ID,
+      tenantId: TENANT_ID,
+      connectionId: connection.id,
+      capabilityId: 'gmail.drafts.send',
+      connectorVersion: GMAIL_MANIFEST_VERSION,
+      effect: 'allow',
+      issuedBy: 'operator-1',
+      reason: 'test',
+    });
+    const result = await router.route(
+      invocation({
+        capabilityId: 'gmail.drafts.send',
+        connection,
+        idempotencyKey: 'recipient-verification-mismatch',
+        args: { draftId: 'd1', to: ['claimed@example.com'] },
+      }),
+    );
+    expect(result.status).toBe('denied');
+    expect(result.denyCode).toBe('recipient_mismatch');
+  });
+
+  it('allows drafts.send once caller-declared `to` matches the actual draft recipients (case/display-name insensitive)', async () => {
+    const lookup: DraftRecipientsLookup = {
+      async getRecipients() {
+        return ['Person@Example.com'];
+      },
+    };
+    const { router, grants, connection } = await setup({ gmailSendRecipientVerificationEnabled: true }, undefined, lookup);
+    await grants.issueGrant({
+      agentId: AGENT_ID,
+      tenantId: TENANT_ID,
+      connectionId: connection.id,
+      capabilityId: 'gmail.drafts.send',
+      connectorVersion: GMAIL_MANIFEST_VERSION,
+      effect: 'allow',
+      issuedBy: 'operator-1',
+      reason: 'test',
+    });
+    const result = await router.route(
+      invocation({
+        capabilityId: 'gmail.drafts.send',
+        connection,
+        idempotencyKey: 'recipient-verification-match',
+        args: { draftId: 'd1', to: ['Someone <person@example.com>'] },
+      }),
+    );
+    expect(result.status).toBe('approval_required');
+  });
+
+  it('binds recipient-domain grant scope to the actual draft recipients even when the caller omits `to` entirely', async () => {
+    const lookup: DraftRecipientsLookup = {
+      async getRecipients() {
+        return ['actual@outside.test'];
+      },
+    };
+    const { router, grants, connection } = await setup({ gmailSendRecipientVerificationEnabled: true }, undefined, lookup);
+    await grants.issueGrant({
+      agentId: AGENT_ID,
+      tenantId: TENANT_ID,
+      connectionId: connection.id,
+      capabilityId: 'gmail.drafts.send',
+      connectorVersion: GMAIL_MANIFEST_VERSION,
+      effect: 'allow',
+      resourceScope: { recipientDomainsAllow: ['example.com'] },
+      issuedBy: 'operator-1',
+      reason: 'test',
+    });
+    // Caller declares no `to` at all — under the pre-slice behavior this
+    // still fails closed (resource_scope_violation) for the same reason;
+    // the point of this test is that the *actual* looked-up domain
+    // (outside.test) is what gets checked, not merely "to was omitted".
+    const result = await router.route(
+      invocation({ capabilityId: 'gmail.drafts.send', connection, args: { draftId: 'd1' } }),
+    );
+    expect(result.status).toBe('denied');
+    expect(result.denyCode).toBe('resource_scope_violation');
+  });
+
+  it('allows a recipient-domain-scoped grant against the actual draft recipients when `to` is omitted and the real recipients are in scope', async () => {
+    const lookup: DraftRecipientsLookup = {
+      async getRecipients() {
+        return ['actual@example.com'];
+      },
+    };
+    const { router, grants, connection } = await setup({ gmailSendRecipientVerificationEnabled: true }, undefined, lookup);
+    await grants.issueGrant({
+      agentId: AGENT_ID,
+      tenantId: TENANT_ID,
+      connectionId: connection.id,
+      capabilityId: 'gmail.drafts.send',
+      connectorVersion: GMAIL_MANIFEST_VERSION,
+      effect: 'allow',
+      resourceScope: { recipientDomainsAllow: ['example.com'] },
+      issuedBy: 'operator-1',
+      reason: 'test',
+    });
+    const result = await router.route(
+      invocation({
+        capabilityId: 'gmail.drafts.send',
+        connection,
+        idempotencyKey: 'recipient-verification-omitted-in-scope',
+        args: { draftId: 'd1' },
+      }),
+    );
+    expect(result.status).toBe('approval_required');
+  });
+
+  it('queries the draft-recipients lookup with the canonical connection identity, never the raw invocation fields', async () => {
+    const queries: DraftRecipientsQuery[] = [];
+    const lookup: DraftRecipientsLookup = {
+      async getRecipients(query) {
+        queries.push(query);
+        return ['person@example.com'];
+      },
+    };
+    const { router, grants, connection } = await setup({ gmailSendRecipientVerificationEnabled: true }, undefined, lookup);
+    await grants.issueGrant({
+      agentId: AGENT_ID,
+      tenantId: TENANT_ID,
+      connectionId: connection.id,
+      capabilityId: 'gmail.drafts.send',
+      connectorVersion: GMAIL_MANIFEST_VERSION,
+      effect: 'allow',
+      issuedBy: 'operator-1',
+      reason: 'test',
+    });
+    await router.route(
+      invocation({
+        capabilityId: 'gmail.drafts.send',
+        connection,
+        idempotencyKey: 'recipient-verification-canonical-identity',
+        args: { draftId: 'd1', to: ['person@example.com'] },
+      }),
+    );
+    expect(queries).toEqual([
+      {
+        connectorId: connection.connectorId,
+        connectionId: connection.id,
+        agentId: connection.agentId,
+        tenantId: connection.tenantId,
+        draftId: 'd1',
+      },
+    ]);
+  });
+
   it('denies gmail.drafts.reply when requested recipients exceed the grant recipient-domain scope', async () => {
     const { router, grants, connection } = await setup();
     await grants.issueGrant({
@@ -837,5 +1050,18 @@ describe('connector flag-gate assembly stays Gmail-only at runtime', () => {
       expect(DEFAULT_CONNECTOR_FEATURE_FLAGS[flag]).toBe(false);
     }
     expect(DEFAULT_CONNECTOR_FEATURE_FLAGS[GMAIL_CONNECTOR_FLAG_GATE[GMAIL_CONNECTOR_ID]]).toBe(false);
+  });
+
+  it('CONNECTOR_RECIPIENT_VERIFICATION_GATE is assembled entirely from GMAIL_RECIPIENT_VERIFICATION_GATE, gmail.drafts.send only', () => {
+    expect(CONNECTOR_RECIPIENT_VERIFICATION_GATE).toEqual(GMAIL_RECIPIENT_VERIFICATION_GATE);
+    expect(CONNECTOR_RECIPIENT_VERIFICATION_GATE).toEqual({
+      'gmail.drafts.send': 'gmailSendRecipientVerificationEnabled',
+    });
+  });
+
+  it('the recipient-verification gate value defaults to false, so assembly alone cannot turn on verification', () => {
+    for (const flag of Object.values(CONNECTOR_RECIPIENT_VERIFICATION_GATE)) {
+      expect(DEFAULT_CONNECTOR_FEATURE_FLAGS[flag]).toBe(false);
+    }
   });
 });

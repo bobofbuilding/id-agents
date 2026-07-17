@@ -69,6 +69,24 @@ Implemented in `src/connectors/runtime/router.ts` (`ConnectorRouter.route`):
    a manifest-declared floor, not something a grant can widen. A grant's
    `resourceScope.maxAttachmentBytes` (step 6) may narrow the effective cap
    further per agent/tenant.
+5c. **Draft-recipient verification** — a capability may declare a
+   `RouterDeps.recipientVerificationGate` flag (currently `gmail.drafts.send`
+   → `gmailSendRecipientVerificationEnabled`, off by default). When that flag
+   is true, the router resolves the draft's actual recipients via an
+   injected `DraftRecipientsLookup` (`runtime/draft-recipients-lookup.ts`),
+   queried with the already-validated `connection.agentId/tenantId/id` —
+   never the raw `invocation.agentId/tenantId` — plus the capability's
+   `draftId` argument. A caller-declared `to` that disagrees with those
+   actual recipients denies with `recipient_mismatch`; an unresolvable draft
+   (including the default `NullDraftRecipientsLookup`, which always reports
+   unavailable) denies with `draft_lookup_unavailable`. When the lookup
+   succeeds, the resolved recipients — not the caller-declared `to` — feed
+   step 6's recipient-domain grant scope and step 7's external-recipient
+   approval-context signal, even if `to` is omitted entirely. This is the
+   slice that starts resolving the "verifying `to` against the underlying
+   draft's actual recipients" item from
+   [Open decisions](#open-decisions); the real Gmail-backed lookup
+   implementation remains Stage 3/Slice 5 work.
 6. **Grant evaluation** — `grants/grant-evaluator.ts#evaluateGrant`.
    Deny-overrides-allow; absence of any grant is deny; expired/revoked grants
    are ignored for allow purposes. The router derives invocation resource
@@ -210,14 +228,31 @@ separate from the metadata/snippet tier; attachment download is modeled as
 operator sign-off on a larger value once real traffic is observed; a
 draft-first reply path (`gmail.drafts.reply`) exists alongside `.create`;
 and `gmail.drafts.send` carries an optional `to` so recipient-domain grant
-scope applies at send time, not only at draft-create time (verifying `to`
-against the underlying draft's actual recipients is Stage 3/Slice 5 live
-backend work, not this slice).
+scope applies at send time, not only at draft-create time.
+
+Resolved by this slice (policy-plane only — still no live Gmail wiring):
+`gmail.drafts.send` authorization now optionally binds to the draft's actual
+recipients rather than only the caller-declared `to`, via the injected
+`DraftRecipientsLookup` port and `gmailSendRecipientVerificationEnabled` flag
+(step 5c above), keyed on canonical `connection.agentId/tenantId/id` — not
+raw invocation fields — so a lookup can never be pointed at another agent's
+or tenant's draft. Off by default, and fails closed (denies) if the flag is
+ever turned on without a real lookup wired, since the shipped
+`NullDraftRecipientsLookup` always reports "unavailable." The real
+Gmail-backed lookup — actually fetching a draft's recipients over the
+network — is still Stage 3/Slice 5 live-backend work, same as before; this
+slice only establishes the seam and the fail-closed default. This also
+narrows (but does not fully close) the "canonical tenant/agent identity
+propagation" item below: this one call site is now demonstrably scoped to
+the resolved connection's identity, not caller-supplied fields, but the
+broader agent-gateway-wide propagation question remains open.
 
 Still unresolved and explicitly out of scope for this slice: vault/credential
 broker product and OAuth callback ownership; canonical tenant/agent identity
-propagation through the agent gateway; exact Gmail OAuth scopes for read vs.
-compose vs. send; the final attachment byte cap value for production
-(current value is a conservative placeholder); which reviewed MCP server (if
-any) is eligible after the first-party adapter; approval-UI ownership and
-audit retention policy; pilot cohort and rollback owner.
+propagation through the agent gateway more broadly (beyond the one call site
+above); exact Gmail OAuth scopes for read vs. compose vs. send; the final
+attachment byte cap value for production (current value is a conservative
+placeholder); which reviewed MCP server (if any) is eligible after the
+first-party adapter; approval-UI ownership and audit retention policy; pilot
+cohort and rollback owner; the real Gmail-backed `DraftRecipientsLookup`
+implementation and its own OAuth scope/quota implications.
