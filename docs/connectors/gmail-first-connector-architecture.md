@@ -144,24 +144,33 @@ bootstrapped via `providers/gmail/bootstrap.ts`:
 
 `config/feature-flags/connectors.json`, loaded by
 `src/connectors/config/feature-flags.ts` with `ID_CONNECTORS_*` env
-overrides. All five flags default to `false`:
+overrides. All six flags default to `false`:
 `connectorsEnabled`, `gmailConnectorEnabled`, `gmailSendEnabled`,
-`gmailFullBodyReadEnabled`, `mcpBackendEnabled`.
+`gmailFullBodyReadEnabled`, `mcpBackendEnabled`, `connectorsMigrationsEnabled`.
 
 ## Staged rollout
 
-The migrations in `src/connectors/catalog/migrations.ts` are **not** wired
-into `src/db/migrations/{sqlite,postgres}.ts`'s boot chain yet — they must be
-called explicitly (tests do this today). Wiring them into the boot chain,
-enabling any feature flag, registering a real `CredentialBroker`, or pinning
-a real MCP server are each a separate, operator-approved stage:
+The migrations in `src/connectors/catalog/migrations.ts` are wired into the
+live boot chain (`src/db/index.ts` `migrateDb`, called after the core
+`migrateSqlite`/`migratePostgres` chain) but gated behind
+`connectorsMigrationsEnabled` (default `false`) — on every boot today this
+is a no-op. Flipping that flag, enabling any other feature flag, registering
+a real `CredentialBroker`, or pinning a real MCP server are each a separate,
+operator-approved stage:
 
-1. **Stage 0 (done, this slice)** — catalog/grants/policy/router/backends/
-   audit code + tests, all flags off, no DB wiring into the live boot chain.
-2. **Stage 1** — wire `migrateConnectorsSqlite`/`migrateConnectorsPostgres`
-   into the boot migration chain (additive `CREATE TABLE IF NOT EXISTS`
-   only). Requires operator sign-off since it starts applying to the live
-   manager DB on next restart.
+1. **Stage 0 (done)** — catalog/grants/policy/router/backends/audit code +
+   tests, all flags off, no DB wiring into the live boot chain.
+2. **Stage 1 (done, off by default)** — `migrateConnectorsSqlite`/
+   `migrateConnectorsPostgres` are wired into `migrateDb`
+   (`src/db/index.ts`) behind `connectorsMigrationsEnabled`. Flipping that
+   flag to `true` is the operator-approved action that starts applying the
+   additive `CREATE TABLE/INDEX IF NOT EXISTS` statements to the live
+   manager DB on next restart — nothing else in this stage requires a code
+   change. A durable operator-consent record for that sign-off (and future
+   stage sign-offs) is captured by `connector_operator_consents`
+   (`src/connectors/catalog/migrations.ts`,
+   `src/connectors/catalog/operator-consent.ts`); recording consent does
+   not itself flip any flag.
 3. **Stage 2** — accept a vault/credential-broker choice and OAuth callback
    owner (see [Open decisions](#open-decisions)); implement a real
    `CredentialBroker` and register it in place of `FakeVaultCredentialBroker`.

@@ -7,17 +7,9 @@
  */
 
 import type { ConnectorRegistry } from '../../catalog/connector-registry.js';
-import { GMAIL_CONNECTOR_ID, GMAIL_MANIFEST_VERSION, GMAIL_V1_MANIFEST } from './gmail-manifest.js';
+import { bootstrapMailConnector } from '../mail/mail-provider-adapter.js';
+import { GMAIL_PROVIDER_DEFINITION, GMAIL_V1_MANIFEST } from './gmail-manifest.js';
 
 export async function bootstrapGmailConnector(registry: ConnectorRegistry, now = Date.now()): Promise<void> {
-  await registry.registerConnector({
-    id: GMAIL_CONNECTOR_ID,
-    displayName: 'Gmail',
-    description: 'First-party Gmail OAuth/API connector. Read + draft-first at launch; send is approval-gated.',
-    owner: 'idacc-connectors',
-    trustTier: 'first-party',
-    now,
-  });
-  await registry.draftVersion(GMAIL_V1_MANIFEST, 'oauth_api', now);
-  await registry.publishVersion(GMAIL_CONNECTOR_ID, GMAIL_MANIFEST_VERSION, now);
+  await bootstrapMailConnector(registry, GMAIL_PROVIDER_DEFINITION, GMAIL_V1_MANIFEST, now);
 }

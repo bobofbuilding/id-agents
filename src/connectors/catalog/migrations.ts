@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: MIT
 /**
  * Additive, standalone migrations for the connector registry/grants/policy/
- * audit tables. Deliberately NOT wired into src/db/migrations/{sqlite,postgres}.ts
- * yet — see docs/connectors/gmail-first-connector-architecture.md#staged-rollout
- * stage 1. Call migrateConnectors{Sqlite,Postgres} explicitly (tests do this
- * today; wiring it into the boot migration chain is a later, operator-approved
- * stage since it would start applying to the live manager DB on next restart).
+ * audit/consent tables. Wired into the live boot chain via
+ * src/db/index.ts migrateDb, but gated behind the connectorsMigrationsEnabled
+ * feature flag (default false) — see
+ * docs/connectors/gmail-first-connector-architecture.md#staged-rollout
+ * stage 1. Tests call migrateConnectors{Sqlite,Postgres} directly; flipping
+ * the flag is the operator-approved action that makes migrateDb call them
+ * on the live manager DB.
  *
  * Every statement is CREATE TABLE/INDEX IF NOT EXISTS, so re-running is a
  * no-op and there is no destructive rollback needed — dropping the tables
  * (see downMigrateConnectors*) is the only rollback action, and only the
- * registry/grant/audit rows are affected; no other subsystem's tables are
- * touched.
+ * registry/grant/audit/consent rows are affected; no other subsystem's
+ * tables are touched.
  */
 
 import type { DbAdapter } from '../../db/db-adapter.js';
@@ -139,6 +141,20 @@ const SQLITE_DDL = `
     prev_integrity_hash TEXT
   );
   CREATE INDEX IF NOT EXISTS connector_audit_events_actor_idx ON connector_audit_events(actor_agent_id, timestamp);
+
+  CREATE TABLE IF NOT EXISTS connector_operator_consents (
+    id TEXT PRIMARY KEY,
+    stage TEXT NOT NULL,
+    flag_key TEXT,
+    operator TEXT NOT NULL,
+    scope TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    consented_at INTEGER NOT NULL,
+    revoked_at INTEGER,
+    revoked_reason TEXT
+  );
+  CREATE INDEX IF NOT EXISTS connector_operator_consents_stage_idx
+    ON connector_operator_consents(stage, revoked_at);
 `;
 
 export async function migrateConnectorsSqlite(adapter: SqliteAdapter): Promise<void> {
@@ -148,6 +164,7 @@ export async function migrateConnectorsSqlite(adapter: SqliteAdapter): Promise<v
 /** Drops every connector table. Rollback path for the staged rollout; test-only today. */
 export async function downMigrateConnectorsSqlite(adapter: SqliteAdapter): Promise<void> {
   adapter.exec(`
+    DROP TABLE IF EXISTS connector_operator_consents;
     DROP TABLE IF EXISTS connector_audit_events;
     DROP TABLE IF EXISTS connector_invocations;
     DROP TABLE IF EXISTS connector_approval_requests;
@@ -281,6 +298,20 @@ const POSTGRES_DDL = `
     prev_integrity_hash TEXT
   );
   CREATE INDEX IF NOT EXISTS connector_audit_events_actor_idx ON connector_audit_events(actor_agent_id, timestamp);
+
+  CREATE TABLE IF NOT EXISTS connector_operator_consents (
+    id TEXT PRIMARY KEY,
+    stage TEXT NOT NULL,
+    flag_key TEXT,
+    operator TEXT NOT NULL,
+    scope TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    consented_at BIGINT NOT NULL,
+    revoked_at BIGINT,
+    revoked_reason TEXT
+  );
+  CREATE INDEX IF NOT EXISTS connector_operator_consents_stage_idx
+    ON connector_operator_consents(stage, revoked_at);
 `;
 
 export async function migrateConnectorsPostgres(adapter: DbAdapter): Promise<void> {
@@ -291,6 +322,7 @@ export async function migrateConnectorsPostgres(adapter: DbAdapter): Promise<voi
 
 export async function downMigrateConnectorsPostgres(adapter: DbAdapter): Promise<void> {
   const statements = [
+    'DROP TABLE IF EXISTS connector_operator_consents',
     'DROP TABLE IF EXISTS connector_audit_events',
     'DROP TABLE IF EXISTS connector_invocations',
     'DROP TABLE IF EXISTS connector_approval_requests',

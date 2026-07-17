@@ -25,6 +25,16 @@ export interface ConnectorFeatureFlags {
   gmailFullBodyReadEnabled: boolean;
   /** Reviewed MCP backend transport. Off until a specific server is pinned and reviewed. */
   mcpBackendEnabled: boolean;
+  /**
+   * Wires the additive connector registry/grants/policy/audit migrations
+   * (src/connectors/catalog/migrations.ts) into the live boot chain
+   * (src/db/index.ts migrateDb). Every statement is CREATE TABLE/INDEX IF
+   * NOT EXISTS, so flipping this on only adds empty tables — it does not by
+   * itself enable any connector, capability, or credential path. See
+   * docs/connectors/gmail-first-connector-architecture.md#staged-rollout
+   * stage 1.
+   */
+  connectorsMigrationsEnabled: boolean;
 }
 
 export const DEFAULT_CONNECTOR_FEATURE_FLAGS: ConnectorFeatureFlags = {
@@ -33,6 +43,7 @@ export const DEFAULT_CONNECTOR_FEATURE_FLAGS: ConnectorFeatureFlags = {
   gmailSendEnabled: false,
   gmailFullBodyReadEnabled: false,
   mcpBackendEnabled: false,
+  connectorsMigrationsEnabled: false,
 };
 
 const CONFIG_RELATIVE_PATH = path.join('config', 'feature-flags', 'connectors.json');
@@ -77,6 +88,10 @@ export function loadConnectorFeatureFlags(
       DEFAULT_CONNECTOR_FEATURE_FLAGS.gmailFullBodyReadEnabled,
     ),
     mcpBackendEnabled: coerceBool(fromFile.mcpBackendEnabled, DEFAULT_CONNECTOR_FEATURE_FLAGS.mcpBackendEnabled),
+    connectorsMigrationsEnabled: coerceBool(
+      fromFile.connectorsMigrationsEnabled,
+      DEFAULT_CONNECTOR_FEATURE_FLAGS.connectorsMigrationsEnabled,
+    ),
   };
 
   return {
@@ -88,6 +103,10 @@ export function loadConnectorFeatureFlags(
       merged.gmailFullBodyReadEnabled,
     ),
     mcpBackendEnabled: coerceBool(env.ID_CONNECTORS_MCP_ENABLED, merged.mcpBackendEnabled),
+    connectorsMigrationsEnabled: coerceBool(
+      env.ID_CONNECTORS_MIGRATIONS_ENABLED,
+      merged.connectorsMigrationsEnabled,
+    ),
   };
 }
 
