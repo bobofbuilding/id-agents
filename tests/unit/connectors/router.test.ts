@@ -15,7 +15,12 @@ import { OAuthApiBackend } from '../../../src/connectors/backends/oauth-api-back
 import type { ConnectorBackend } from '../../../src/connectors/backends/connector-backend.js';
 import { FakeVaultCredentialBroker } from '../../../src/connectors/credentials/credential-broker.js';
 import { bootstrapGmailConnector } from '../../../src/connectors/providers/gmail/bootstrap.js';
-import { GMAIL_CONNECTOR_ID, GMAIL_MANIFEST_VERSION } from '../../../src/connectors/providers/gmail/gmail-manifest.js';
+import {
+  GMAIL_CAPABILITY_FLAG_GATE,
+  GMAIL_CONNECTOR_FLAG_GATE,
+  GMAIL_CONNECTOR_ID,
+  GMAIL_MANIFEST_VERSION,
+} from '../../../src/connectors/providers/gmail/gmail-manifest.js';
 import {
   CONNECTOR_CAPABILITY_FLAG_GATE,
   DEFAULT_CONNECTOR_FEATURE_FLAGS,
@@ -58,7 +63,7 @@ async function setup(flagOverrides: Partial<ConnectorFeatureFlags> = {}, backend
     auditLog,
     backends: { oauth_api: backendOverride ?? oauthBackend },
     featureFlags,
-    connectorFlagGate: { [GMAIL_CONNECTOR_ID]: 'gmailConnectorEnabled' },
+    connectorFlagGate: GMAIL_CONNECTOR_FLAG_GATE,
     capabilityFlagGate: CONNECTOR_CAPABILITY_FLAG_GATE,
   });
 
@@ -815,5 +820,22 @@ describe('ConnectorRouter', () => {
     expect(events[1].decision).toBe('provider_error');
     const chain = await auditLog.verifyChain();
     expect(chain.ok).toBe(true);
+  });
+});
+
+describe('connector flag-gate assembly stays Gmail-only at runtime', () => {
+  it('CONNECTOR_CAPABILITY_FLAG_GATE is assembled entirely from GMAIL_CAPABILITY_FLAG_GATE — no other provider is wired', () => {
+    expect(CONNECTOR_CAPABILITY_FLAG_GATE).toEqual(GMAIL_CAPABILITY_FLAG_GATE);
+    expect(CONNECTOR_CAPABILITY_FLAG_GATE).toEqual({
+      'gmail.messages.get_full': 'gmailFullBodyReadEnabled',
+      'gmail.drafts.send': 'gmailSendEnabled',
+    });
+  });
+
+  it('every gate value defaults to false, so assembly alone cannot enable a capability', () => {
+    for (const flag of Object.values(CONNECTOR_CAPABILITY_FLAG_GATE)) {
+      expect(DEFAULT_CONNECTOR_FEATURE_FLAGS[flag]).toBe(false);
+    }
+    expect(DEFAULT_CONNECTOR_FEATURE_FLAGS[GMAIL_CONNECTOR_FLAG_GATE[GMAIL_CONNECTOR_ID]]).toBe(false);
   });
 });
