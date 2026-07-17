@@ -89,6 +89,30 @@ export async function migrateDb(db: Db): Promise<void> {
     const { migrateSqlite } = await import('./migrations/sqlite.js');
     await migrateSqlite(db.adapter as SqliteAdapter);
   }
+  await migrateConnectorsIfEnabled(db.adapter);
+}
+
+/**
+ * Stage 1 of the connector staged rollout: wires the additive connector
+ * registry/grants/policy/audit migrations into the live boot chain, gated
+ * behind `connectorsMigrationsEnabled` (default false — see
+ * src/connectors/config/feature-flags.ts). Off by default, this is a no-op
+ * on every boot; flipping the flag only ever runs CREATE TABLE/INDEX IF NOT
+ * EXISTS statements (src/connectors/catalog/migrations.ts), so it cannot
+ * fail destructively even on a live manager DB. See
+ * docs/connectors/gmail-first-connector-architecture.md#staged-rollout.
+ */
+async function migrateConnectorsIfEnabled(adapter: DbAdapter): Promise<void> {
+  const { loadConnectorFeatureFlags } = await import('../connectors/config/feature-flags.js');
+  const flags = loadConnectorFeatureFlags();
+  if (!flags.connectorsMigrationsEnabled) return;
+
+  const { migrateConnectorsPostgres, migrateConnectorsSqlite } = await import('../connectors/catalog/migrations.js');
+  if (adapter.dialect === 'postgres') {
+    await migrateConnectorsPostgres(adapter);
+  } else {
+    await migrateConnectorsSqlite(adapter as SqliteAdapter);
+  }
 }
 
 // Re-export types for convenience

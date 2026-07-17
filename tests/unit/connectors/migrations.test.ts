@@ -21,6 +21,7 @@ describe('connector registry migrations (sqlite)', () => {
         'connector_capability_grants',
         'connector_connections',
         'connector_invocations',
+        'connector_operator_consents',
         'connector_versions',
         'connectors',
       ].sort(),
