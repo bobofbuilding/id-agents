@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.104-beta
+
+### Added — agent profiles (bio + handles)
+
+- **Agent config** accepts optional `bio` and `handles` on an agent entry (backward-compatible).
+- **Manager** loads `bio`/`handles` into the agent record, surfaces them in `/agents` metadata, and adds `POST /agents/by-name/:name/profile` to set them, writing back to the agent config when one is deployed.
+- **dashboard-core** exposes `bio`/`handles` on the `Agent`/`AgentMetadata` types and validates them in `parseAgent`.
+- **Discovery symmetry** — each agent publishes its profile in both its `GET /catalog` and its standard `/.well-known/restap.json`, sourced from one shared helper (`src/lib/restap-profile.ts`), so the manager directory, `/catalog`, and `restap.json` all agree.
+- Also carries the additive `Schedule.message` field (calendar prompt) from the prior `schedule-message` work.
+
 ## 0.1.103-beta
 
 ### Added — reusable dashboard-core library + package exports
