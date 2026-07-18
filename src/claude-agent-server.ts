@@ -16,6 +16,7 @@ import fs from 'fs';
 import type http from 'http';
 import type { Db } from './db/db-service.js';
 import { resolveNewsTrigger } from './core/messaging-service.js';
+import { createSelfProfileSource } from './lib/restap-profile.js';
 import {
   getRuntimeAuthProvider,
   getDefaultModelForRuntime,
@@ -488,7 +489,7 @@ export class AgentRestServer {
     }
     
     // REST-AP discovery
-    this.app.get('/.well-known/restap.json', (req, res) => {
+    this.app.get('/.well-known/restap.json', async (req, res) => {
       const allowSessionResume = supportsSessionResume(this.harnessType);
       const talkDescription = allowSessionResume
         ? `Ask ${getRuntimeDisplayName(this.harnessType)} to perform tasks with full tool access (Read, Write, Edit, Bash, Glob, Grep, WebSearch, WebFetch). Supports optional session_id for context continuity.`
@@ -509,6 +510,14 @@ export class AgentRestServer {
       // Add tokenId if available
       if (this.agentIdentity?.tokenId) {
         agentInfo.tokenId = this.agentIdentity.tokenId;
+      }
+
+      // Published profile (bio + handles) — one source of truth (the manager
+      // record). Prefers identity metadata pushed via setIdentity/PATCH
+      // /identity; falls back to a TTL-cached manager self-lookup.
+      const profile = await this.profileSource();
+      if (profile) {
+        agentInfo.profile = profile;
       }
 
       res.json({
@@ -1457,6 +1466,11 @@ export class AgentRestServer {
       }
     });
   }
+
+  private profileSource = createSelfProfileSource({
+    agentName: () => this.agentIdentity?.name || this.agentName,
+    getLocal: () => this.agentIdentity?.metadata,
+  });
 
   public setIdentity(identity: { name?: string; team?: string; metadata?: any; tokenId?: string; domain?: string }) {
     this.agentIdentity = identity;

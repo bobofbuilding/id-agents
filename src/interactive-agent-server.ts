@@ -4,6 +4,7 @@ import express from 'express';
 import { EventEmitter } from 'events';
 import { NewsItem } from './agent-rest-server.js';
 import type { Db } from './db/db-service.js';
+import { createSelfProfileSource, type PublishedAgentProfile } from './lib/restap-profile.js';
 
 export interface IncomingReply {
   type: string;
@@ -35,8 +36,20 @@ export class InteractiveAgentServer extends EventEmitter {
   private dbTeamId: string | undefined;
   private dbAgentId: string | undefined;
 
-  constructor(private name: string, private port: number = 4000) {
+  private profileSource: () => Promise<PublishedAgentProfile | null>;
+
+  constructor(
+    private name: string,
+    private port: number = 4000,
+    opts: { managerUrl?: string; team?: string; profileTtlMs?: number } = {},
+  ) {
     super();
+    this.profileSource = createSelfProfileSource({
+      agentName: () => this.name,
+      managerUrl: opts.managerUrl,
+      team: opts.team,
+      ttlMs: opts.profileTtlMs,
+    });
     this.app = express();
     // Configure JSON parser with error handling
     this.app.use(express.json({ 
@@ -110,13 +123,17 @@ export class InteractiveAgentServer extends EventEmitter {
   
   private setupRoutes() {
     // REST-AP discovery
-    this.app.get('/.well-known/restap.json', (req, res) => {
+    this.app.get('/.well-known/restap.json', async (req, res) => {
+      // Published profile (bio + handles): TTL-cached self-lookup from the
+      // manager record — the same source the dashboard reads and edits.
+      const profile = await this.profileSource();
       res.json({
         restap_version: '1.0',
         agent: {
           name: this.name,
           description: `Agent ${this.name} - responses provided interactively`,
-          contact: `${this.name}@localhost`
+          contact: `${this.name}@localhost`,
+          ...(profile ? { profile } : {})
         },
         endpoints: [
           {

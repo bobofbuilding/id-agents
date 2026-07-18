@@ -23,6 +23,7 @@ import path from 'path';
 import * as net from 'net';
 
 import { AgentManagerDb } from '../../src/agent-manager-db.js';
+import { InteractiveAgentServer } from '../../src/interactive-agent-server.js';
 import { writeProfileToConfig } from '../../src/lib/profile-config-write.js';
 import { SqliteAdapter } from '../../src/db/sqlite-adapter.js';
 import { migrateSqlite } from '../../src/db/migrations/sqlite.js';
@@ -221,6 +222,40 @@ describe('agent profile bio/handles integration', () => {
     const meta = (await readAgentRow()).metadata as Record<string, unknown>;
     expect(meta.bio).toBe('Original YAML bio.');
     expect(meta.handles).toEqual({ x: '@profiledev' });
+  });
+
+  it('publishes bio/handles in /.well-known/restap.json after a profile edit', async () => {
+    await deploy();
+
+    // A real agent-side server doing TTL-cached self-lookup against this
+    // REAL manager (the same publication path human/interactive agents use;
+    // claude-agent-server additionally prefers pushed identity metadata).
+    const agentPort = await findFreePort();
+    const agentServer = new InteractiveAgentServer(AGENT, agentPort, {
+      managerUrl: baseUrl,
+      team: TEST_TEAM,
+      profileTtlMs: 50,
+    });
+    await agentServer.start();
+    try {
+      const catalog1 = await (await fetch(`http://127.0.0.1:${agentPort}/.well-known/restap.json`)).json() as any;
+      expect(catalog1.agent.profile).toEqual({
+        bio: 'Original YAML bio.',
+        handles: { x: '@profiledev' },
+      });
+
+      const resp = await postProfile({ bio: 'Edited for restap.', handles: { x: '@edited' } });
+      expect(resp.ok).toBe(true);
+      await new Promise((r) => setTimeout(r, 120)); // pass the profile TTL
+
+      const catalog2 = await (await fetch(`http://127.0.0.1:${agentPort}/.well-known/restap.json`)).json() as any;
+      expect(catalog2.agent.profile).toEqual({
+        bio: 'Edited for restap.',
+        handles: { x: '@edited' },
+      });
+    } finally {
+      await agentServer.close();
+    }
   });
 });
 
