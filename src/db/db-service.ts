@@ -49,6 +49,13 @@ export interface TeamsRepository {
   /** Return the parsed config JSON for a team (empty object if none). */
   getConfig(teamId: string): Promise<Record<string, unknown>>;
 
+  /**
+   * Shallow-merge a patch into the team's config JSON (read-modify-write).
+   * Keys set to undefined are ignored; existing keys not in the patch are
+   * preserved.
+   */
+  updateConfig(teamId: string, patch: Record<string, unknown>): Promise<void>;
+
   /** List all teams ordered by created_at descending. */
   listTeams(): Promise<TeamRow[]>;
 

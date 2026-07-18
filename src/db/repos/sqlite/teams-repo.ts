@@ -47,6 +47,15 @@ export class SqliteTeamsRepo implements TeamsRepository {
     return parseJsonObject(rows[0]?.config);
   }
 
+  async updateConfig(teamId: string, patch: Record<string, unknown>): Promise<void> {
+    const current = await this.getConfig(teamId);
+    const next = { ...current, ...patch };
+    await this.db.query(`UPDATE teams SET config = ? WHERE id = ?`, [
+      JSON.stringify(next),
+      teamId,
+    ]);
+  }
+
   async listTeams(): Promise<TeamRow[]> {
     const { rows } = await this.db.query<TeamRow>(
       `SELECT id, name, config, port_start, port_end, created_at FROM teams ORDER BY created_at DESC`,

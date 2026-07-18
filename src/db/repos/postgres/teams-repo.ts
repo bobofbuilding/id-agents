@@ -33,6 +33,15 @@ export class PgTeamsRepo implements TeamsRepository {
     return r.rows[0] || null;
   }
 
+  async updateConfig(teamId: string, patch: Record<string, unknown>): Promise<void> {
+    const current = await this.getConfig(teamId);
+    const next = { ...current, ...patch };
+    await this.db.query('UPDATE teams SET config = $1 WHERE id = $2', [
+      JSON.stringify(next),
+      teamId,
+    ]);
+  }
+
   async getConfig(teamId: string): Promise<Record<string, unknown>> {
     const r = await this.db.query<{ config: Record<string, unknown> | null }>(
       'SELECT config FROM teams WHERE id = $1',

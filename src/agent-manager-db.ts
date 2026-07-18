@@ -26,7 +26,9 @@ import { filterClaudeEnvVars } from './lib/env-hygiene.js';
 import { type Db } from './db/db-service.js';
 import type { AgentRow, ScheduleDefinitionRow, TaskRow } from './db/types.js';
 import fetch from 'node-fetch';
-import type { PluginConfig, DeployConfig, HeartbeatConfig, CalendarSpec, ScheduleDeliveryMode } from './config-parser.js';
+import type { AgentHandles, PluginConfig, DeployConfig, HeartbeatConfig, CalendarSpec, ScheduleDeliveryMode } from './config-parser.js';
+import { PROFILE_BIO_MAX_LENGTH, validateAgentHandles } from './config-parser.js';
+import { writeProfileToConfig } from './lib/profile-config-write.js';
 import {
   processConfig,
   copyAgentDirOverlay,
@@ -3278,6 +3280,84 @@ export class AgentManagerDb {
       res.json({ id: agent.id, name: agent.name, metadata: nextMetadata });
     });
 
+    // Runtime profile editor: update bio/handles on the agent record and
+    // persist them back to the team's last-deployed config YAML so they
+    // survive restart and /sync (which re-applies the YAML floor).
+    this.managementApp.post('/agents/by-name/:name/profile', async (req, res) => {
+      const { id: teamId } = await this.getTeam(req);
+      const agent = await this.dbQueryAgentByNameMostRecent(teamId, req.params.name);
+      if (!agent) return res.status(404).json({ error: 'Agent not found' });
+
+      const body = (req.body || {}) as { bio?: unknown; handles?: unknown };
+      if (body.bio === undefined && body.handles === undefined) {
+        return res.status(400).json({ error: 'Provide bio and/or handles (null clears a field)' });
+      }
+      if (body.bio !== undefined && body.bio !== null) {
+        if (typeof body.bio !== 'string') {
+          return res.status(400).json({ error: 'bio must be a string (or null to clear)' });
+        }
+        if (body.bio.length > PROFILE_BIO_MAX_LENGTH) {
+          return res
+            .status(400)
+            .json({ error: `bio must be at most ${PROFILE_BIO_MAX_LENGTH} characters` });
+        }
+      }
+      if (body.handles !== undefined && body.handles !== null) {
+        const handleErrors = validateAgentHandles(body.handles);
+        if (handleErrors.length > 0) {
+          return res.status(400).json({ error: handleErrors.join('; ') });
+        }
+      }
+
+      const nextMetadata = { ...(agent.metadata || {}) } as Record<string, unknown>;
+      if (body.bio !== undefined) {
+        if (body.bio === null) delete nextMetadata.bio;
+        else nextMetadata.bio = body.bio;
+      }
+      if (body.handles !== undefined) {
+        if (body.handles === null) delete nextMetadata.handles;
+        else nextMetadata.handles = body.handles;
+      }
+      await this.db.agents.updateMetadata(agent.id, nextMetadata);
+
+      const server = this.runningServers.get(this.key(teamId, agent.id));
+      if (server && agent.type === 'claude') {
+        server.setIdentity({
+          name: agent.name,
+          metadata: nextMetadata,
+          tokenId: agent.token_id || undefined,
+          domain: agent.domain || undefined,
+        });
+      }
+
+      // Persist to the last-deployed config YAML when the manager knows it.
+      // The path comes only from recorded team state, never from the caller.
+      let persistedToConfig = false;
+      let configNote: string | undefined;
+      const teamConfig = await this.db.teams.getConfig(teamId);
+      const configPath =
+        typeof teamConfig.last_config_path === 'string' ? teamConfig.last_config_path : undefined;
+      if (configPath) {
+        const writeResult = writeProfileToConfig(configPath, agent.name, {
+          bio: body.bio as string | null | undefined,
+          handles: body.handles as AgentHandles | null | undefined,
+        });
+        persistedToConfig = writeResult.ok;
+        if (!writeResult.ok) configNote = writeResult.reason;
+      } else {
+        configNote = 'no deployed config recorded for this team; profile stored on the agent record only';
+      }
+
+      res.json({
+        id: agent.id,
+        name: agent.name,
+        bio: (nextMetadata.bio as string | undefined) ?? null,
+        handles: (nextMetadata.handles as AgentHandles | undefined) ?? null,
+        persistedToConfig,
+        ...(configNote && { configNote }),
+      });
+    });
+
     // Note: Agent catalogs are managed by agents themselves via their /catalog endpoint
     // This follows REST-AP where each agent owns its own /.well-known/restap.json
     // To view an agent's catalog, fetch their restap.json: GET {agent.url}/.well-known/restap.json
@@ -5466,6 +5546,12 @@ export class AgentManagerDb {
           return { ok: false, error: 'No agents defined in config' };
         }
 
+        // Remember the config file for this team so runtime profile edits
+        // (POST /agents/by-name/:name/profile) can persist back to YAML.
+        if (!syncDryRun) {
+          await this.db.teams.updateConfig(syncTeamId, { last_config_path: syncAbsolutePath });
+        }
+
         // Get running agents for this team (include automators)
         const runningAgents = await this.db.agents.list(syncTeamId, true);
         // Filter to claude/automator types only — skip interactive agents
@@ -5583,6 +5669,9 @@ export class AgentManagerDb {
             // Catalog seed from YAML — overwrites any runtime PATCH on redeploy.
             // This is intentional: YAML is the redeploy floor.
             ...(spec.catalog && { catalog: spec.catalog }),
+            // Profile floor from YAML — absent fields keep any runtime edits.
+            ...(spec.bio && { bio: spec.bio }),
+            ...(spec.handles && { handles: spec.handles }),
           }, spec.wallet);
 
           this.deploySkillsToAgent(workingDirectory, agentSkills, {
@@ -5693,6 +5782,9 @@ export class AgentManagerDb {
               ...(spec.dangerouslySkipPermissions !== undefined && { dangerouslySkipPermissions: spec.dangerouslySkipPermissions }),
               // Catalog seed from YAML — see notes on the sync-update site above.
               ...(spec.catalog && { catalog: spec.catalog }),
+              // Profile floor from YAML — see notes on the sync-update site above.
+              ...(spec.bio && { bio: spec.bio }),
+              ...(spec.handles && { handles: spec.handles }),
             }, spec.wallet);
 
             // 1. Deploy library-backed agent overlay into the runtime overlay target, if configured
@@ -5910,6 +6002,10 @@ export class AgentManagerDb {
           return { ok: false, error: 'No agents defined in config' };
         }
 
+        // Remember the config file for this team so runtime profile edits
+        // (POST /agents/by-name/:name/profile) can persist back to YAML.
+        await this.db.teams.updateConfig(effectiveTeamId, { last_config_path: absolutePath });
+
         for (const agentConfig of agents) {
           const effectiveRuntime = resolveRuntime(agentConfig.runtime) as HarnessType;
           const effectiveModel = agentConfig.model || getDefaultModelForRuntime(effectiveRuntime, this.defaultConfig?.model);
@@ -6008,7 +6104,10 @@ export class AgentManagerDb {
               // Catalog seed from YAML — lands in metadata.catalog and surfaces
               // via the agent's /catalog endpoint. Runtime PATCH /catalog still
               // works; the next /deploy or /sync re-applies this YAML floor.
-              ...(agentConfig.catalog && { catalog: agentConfig.catalog })
+              ...(agentConfig.catalog && { catalog: agentConfig.catalog }),
+              // Profile floor from YAML (bio/handles) — same semantics as catalog.
+              ...(agentConfig.bio && { bio: agentConfig.bio }),
+              ...(agentConfig.handles && { handles: agentConfig.handles })
             };
 
             // Wallet opt-in (default off). Record the explicit choice in
