@@ -119,6 +119,8 @@ export interface Schedule {
   daysOfWeek: string | null;
   createdAt: number;
   teamName?: string;
+  /** The prompt/message delivered when this schedule fires (calendar events). */
+  message?: string;
 }
 
 export interface RemoteSchedulesResponse {

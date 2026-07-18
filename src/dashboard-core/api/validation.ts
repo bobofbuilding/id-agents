@@ -212,6 +212,7 @@ export function parseSchedule(value: unknown, context = 'schedule'): Schedule {
       deliveryMode: [gString, 'a string'],
       sourceType: [gString, 'a string'],
       teamName: [gString, 'a string'],
+      message: [gString, 'a string'],
     },
   ) as unknown as Schedule;
 }
