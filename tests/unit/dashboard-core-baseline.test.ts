@@ -42,6 +42,7 @@ import {
 } from '../../src/tui/commands/registry.js';
 import type { CommandSpec } from '../../src/tui/commands/registry.js';
 import type { Schedule, Team } from '../../src/tui/api/types.js';
+import { parseAgent } from '../../src/dashboard-core/api/validation.js';
 
 import { humanizeUptime, humanizeLastSeen, truncate, padRight } from '../../src/tui/util/format.js';
 import { detectTabularResult, isPlainObject } from '../../src/tui/util/tabular.js';
@@ -563,5 +564,32 @@ describe('dashboard-core baseline: schedule calculations', () => {
     const soon = formatNextFire(now + 120, now);
     expect(soon.length).toBe(11);
     expect(soon.startsWith('   2m ')).toBe(true);
+  });
+});
+
+describe('dashboard-core baseline: agent bio + handles (additive, Phase 2)', () => {
+  it('parseAgent preserves optional bio and handles when present', () => {
+    const agent = parseAgent({
+      id: 'a1',
+      name: 'seniordev',
+      bio: 'Lead engineer for the desktop app.',
+      handles: { github: 'https://github.com/nxt3d', site: 'https://example.com' },
+    });
+    expect(agent.bio).toBe('Lead engineer for the desktop app.');
+    expect(agent.handles).toEqual({
+      github: 'https://github.com/nxt3d',
+      site: 'https://example.com',
+    });
+  });
+
+  it('parseAgent tolerates identity-only rows (bio/handles absent)', () => {
+    const agent = parseAgent({ id: 'a2', name: 'x-ray' });
+    expect(agent.bio).toBeUndefined();
+    expect(agent.handles).toBeUndefined();
+  });
+
+  it('parseAgent rejects a present bio/handles of the wrong type', () => {
+    expect(() => parseAgent({ id: 'a3', name: 'z', bio: 123 })).toThrow();
+    expect(() => parseAgent({ id: 'a4', name: 'z', handles: 'not-an-object' })).toThrow();
   });
 });

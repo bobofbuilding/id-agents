@@ -41,6 +41,10 @@ export interface Agent {
   lastHealthCheck?: number;
   metadata?: AgentMetadata;
   teamName?: string;
+  /** Optional profile bio, from the agent config (surfaced by the manager). */
+  bio?: string;
+  /** Optional named profile links, e.g. `{ x?, github?, site? }`, from the config. */
+  handles?: Record<string, string>;
   // Remote-endpoint fields (public-agent-remote runtime)
   deploymentShape?: 'local-process' | 'remote-endpoint';
   pid?: number | null;

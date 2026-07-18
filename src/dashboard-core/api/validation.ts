@@ -144,6 +144,8 @@ export function parseAgent(value: unknown, context = 'agent'): Agent {
       lastHealthCheck: [gNumber, 'a number'],
       metadata: [gRecord, 'an object'],
       teamName: [gString, 'a string'],
+      bio: [gString, 'a string'],
+      handles: [gRecord, 'an object'],
       deploymentShape: [gOneOf('local-process', 'remote-endpoint'), 'local-process|remote-endpoint'],
       pid: [gNumberOrNull, 'a number or null'],
       customer_domain: [gStringOrNull, 'a string or null'],
