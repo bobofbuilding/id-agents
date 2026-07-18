@@ -6,7 +6,10 @@ import os from 'os';
 import path from 'path';
 
 import {
+  PROFILE_BIO_MAX_LENGTH,
+  PROFILE_HANDLE_VALUE_MAX_LENGTH,
   parseCatalogMarkdown,
+  validateAgentHandles,
   parseTeamConfig,
   processConfig,
   resolveCatalogFile,
@@ -425,5 +428,90 @@ agents:
       expect(messages).toContain('agents[0].catalog.costTier: catalog.costTier must be one of: low, medium, high');
       expect(messages).toContain('agents[0].catalog.status: catalog.status must be a string');
     });
+  });
+});
+
+describe('agent profile bio + handles', () => {
+  const base = { version: '1' } as const;
+  let tmpDir = '';
+
+  afterEach(() => {
+    if (tmpDir) {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      tmpDir = '';
+    }
+  });
+
+  it('accepts an agent with valid bio and handles (backward-compatible optional fields)', () => {
+    const result = validateConfig({
+      ...base,
+      agents: [
+        {
+          name: 'dev',
+          bio: 'Senior engineer. Ships the manager.',
+          handles: { x: '@dev', github: 'dev-gh', site: 'https://example.com' },
+        },
+        { name: 'plain' }, // entries without bio/handles remain valid
+      ],
+    } as never);
+    expect(result.valid).toBe(true);
+    expect(result.errors).toEqual([]);
+  });
+
+  it('rejects a non-string bio and an over-long bio', () => {
+    const bad = validateConfig({
+      ...base,
+      agents: [{ name: 'dev', bio: 42 }],
+    } as never);
+    expect(bad.valid).toBe(false);
+    expect(bad.errors.some((e) => e.path === 'agents[0].bio' && /string/.test(e.message))).toBe(true);
+
+    const long = validateConfig({
+      ...base,
+      agents: [{ name: 'dev', bio: 'x'.repeat(PROFILE_BIO_MAX_LENGTH + 1) }],
+    } as never);
+    expect(long.valid).toBe(false);
+    expect(long.errors.some((e) => e.path === 'agents[0].bio' && /2000/.test(e.message))).toBe(true);
+  });
+
+  it('rejects malformed handles shapes via validateConfig', () => {
+    for (const handles of [['x'], 'x', 42, { 'bad key!': 'v' }, { x: 7 }, { x: '' }]) {
+      const result = validateConfig({ ...base, agents: [{ name: 'dev', handles }] } as never);
+      expect(result.valid).toBe(false);
+      expect(result.errors.some((e) => e.path === 'agents[0].handles')).toBe(true);
+    }
+  });
+
+  it('validateAgentHandles enforces key pattern, value length, and entry cap', () => {
+    expect(validateAgentHandles({ x: '@me', github: 'octocat' })).toEqual([]);
+    expect(validateAgentHandles(null).length).toBe(1);
+    expect(validateAgentHandles([]).length).toBe(1);
+    expect(validateAgentHandles({ 'no spaces': 'v' })[0]).toMatch(/no spaces/);
+    expect(validateAgentHandles({ k: 'v'.repeat(PROFILE_HANDLE_VALUE_MAX_LENGTH + 1) })[0]).toMatch(/300/);
+    const many = Object.fromEntries(Array.from({ length: 21 }, (_, i) => [`k${i}`, 'v']));
+    expect(validateAgentHandles(many).some((m) => /at most 20/.test(m))).toBe(true);
+  });
+
+  it('parses bio + handles through processConfig from a real YAML file', () => {
+    tmpDir = mkTmp();
+    const configPath = path.join(tmpDir, 'configs', 'profile-team.yaml');
+    fs.mkdirSync(path.dirname(configPath), { recursive: true });
+    fs.writeFileSync(
+      configPath,
+      [
+        'version: "1"',
+        'name: profile-team',
+        'agents:',
+        '  - name: fronted',
+        '    bio: Builds the dashboard.',
+        '    handles:',
+        '      x: "@fronted"',
+        '      github: fronted-gh',
+      ].join('\n'),
+    );
+    const { agents, errors } = processConfig(configPath, tmpDir, []);
+    expect(errors).toEqual([]);
+    expect(agents[0]?.bio).toBe('Builds the dashboard.');
+    expect(agents[0]?.handles).toEqual({ x: '@fronted', github: 'fronted-gh' });
   });
 });

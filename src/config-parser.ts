@@ -65,6 +65,15 @@ export interface AgentCatalog {
   [key: string]: unknown;              // Allow custom fields without breaking parsing
 }
 
+/**
+ * Named profile links for an agent (e.g. { x: '@handle', github: 'octocat',
+ * site: 'https://example.com' }). Free-form string values — display surfaces
+ * decide whether a value is a URL or a plain handle.
+ */
+export interface AgentHandles {
+  [name: string]: string;
+}
+
 export interface AgentSpec {
   name: string;
   agent?: string;                     // Library agent overlay name (resolves to <library-root>/agents/<agent>/)
@@ -105,6 +114,12 @@ export interface AgentSpec {
                                       // resolved relative to the config file (like heartbeatFile).
                                       // Mutually exclusive with `catalog:`. Resolved at
                                       // processConfig time into `catalog` and cleared.
+  bio?: string;                       // Profile bio shown in dashboard profile surfaces.
+                                      // Lands in metadata.bio at deploy/sync (YAML floor,
+                                      // like catalog); editable at runtime via
+                                      // POST /agents/by-name/<name>/profile.
+  handles?: AgentHandles;             // Named profile links/handles — lands in
+                                      // metadata.handles at deploy/sync (YAML floor).
 }
 
 export interface CalendarSpec {
@@ -381,6 +396,44 @@ export function resolveLibraryAgentPath(filePath: string, agentName: string, lib
 /**
  * Validate a deploy config
  */
+// Profile (bio/handles) limits — shared by config validation and the
+// manager's runtime profile write path so both accept the same shapes.
+export const PROFILE_BIO_MAX_LENGTH = 2000;
+export const PROFILE_HANDLE_KEY_PATTERN = /^[a-zA-Z0-9_-]{1,32}$/;
+export const PROFILE_HANDLE_VALUE_MAX_LENGTH = 300;
+export const PROFILE_HANDLES_MAX_ENTRIES = 20;
+
+/**
+ * Validate a `handles` value. Returns human-readable error messages
+ * (empty array = valid). Accepts only a plain object of short string values
+ * keyed by simple identifiers (x, github, site, ...).
+ */
+export function validateAgentHandles(handles: unknown): string[] {
+  if (typeof handles !== 'object' || handles === null || Array.isArray(handles)) {
+    return ['handles must be an object of { name: string } entries'];
+  }
+  const errors: string[] = [];
+  const entries = Object.entries(handles as Record<string, unknown>);
+  if (entries.length > PROFILE_HANDLES_MAX_ENTRIES) {
+    errors.push(`handles must have at most ${PROFILE_HANDLES_MAX_ENTRIES} entries`);
+  }
+  for (const [key, value] of entries) {
+    if (!PROFILE_HANDLE_KEY_PATTERN.test(key)) {
+      errors.push(
+        `handles key "${key}" must be 1-32 alphanumeric/hyphen/underscore characters`,
+      );
+    }
+    if (typeof value !== 'string' || value.length === 0) {
+      errors.push(`handles.${key} must be a non-empty string`);
+    } else if (value.length > PROFILE_HANDLE_VALUE_MAX_LENGTH) {
+      errors.push(
+        `handles.${key} must be at most ${PROFILE_HANDLE_VALUE_MAX_LENGTH} characters`,
+      );
+    }
+  }
+  return errors;
+}
+
 export function validateConfig(config: DeployConfig): ValidationResult {
   const validDays = new Set(['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']);
   const errors: ValidationError[] = [];
@@ -506,6 +559,24 @@ export function validateConfig(config: DeployConfig): ValidationResult {
         if (cat.status !== undefined && typeof cat.status !== 'string') {
           errors.push({ path: `${agentPath}.catalog.status`, message: 'catalog.status must be a string' });
         }
+      }
+    }
+
+    if (agent.bio !== undefined) {
+      if (typeof agent.bio !== 'string') {
+        errors.push({ path: `${agentPath}.bio`, message: 'bio must be a string' });
+      } else if (agent.bio.length > PROFILE_BIO_MAX_LENGTH) {
+        errors.push({
+          path: `${agentPath}.bio`,
+          message: `bio must be at most ${PROFILE_BIO_MAX_LENGTH} characters`,
+        });
+      }
+    }
+
+    if (agent.handles !== undefined) {
+      const handleErrors = validateAgentHandles(agent.handles);
+      for (const message of handleErrors) {
+        errors.push({ path: `${agentPath}.handles`, message });
       }
     }
 
