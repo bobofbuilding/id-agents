@@ -300,6 +300,23 @@ describe('a second, hypothetical mail provider built on the same adapter', () =>
     });
   });
 
+  it('rejects gate entries that cannot resolve to a capability in the generated provider manifest', () => {
+    expect(() =>
+      buildCapabilityFlagGate({
+        ...ACME_DEF,
+        flagGate: { 'not.in.schema': 'acmeSendEnabled' },
+      }),
+    ).toThrow('flagGate references unknown mail schema capability: not.in.schema');
+
+    expect(() =>
+      buildRecipientVerificationGate({
+        ...ACME_DEF,
+        includeKeys: ['messages.search'],
+        recipientVerificationFlag: { 'drafts.send': 'acmeSendRecipientVerificationEnabled' },
+      }),
+    ).toThrow('recipientVerificationFlag references capability excluded from acmemail manifest: drafts.send');
+  });
+
   it('resolves flag-gate entries through the same resource/id-suffix aliasing as the manifest, never a stale id', () => {
     const gate = buildCapabilityFlagGate({
       ...ACME_DEF,

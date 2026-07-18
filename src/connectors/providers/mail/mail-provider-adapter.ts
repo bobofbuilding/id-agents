@@ -91,6 +91,21 @@ function capabilityId(entry: MailCapabilitySchemaEntry, def: MailProviderDefinit
   return `${def.connectorId}.${resource}.${idSuffix}`;
 }
 
+function schemaEntryForGate(
+  def: MailProviderDefinition<string>,
+  schemaKey: string,
+  gateName: 'flagGate' | 'recipientVerificationFlag',
+): MailCapabilitySchemaEntry {
+  const entry = MAIL_CAPABILITY_SCHEMA.find((candidate) => candidate.key === schemaKey);
+  if (!entry) {
+    throw new Error(`${gateName} references unknown mail schema capability: ${schemaKey}`);
+  }
+  if (def.includeKeys && !def.includeKeys.includes(schemaKey)) {
+    throw new Error(`${gateName} references capability excluded from ${def.connectorId} manifest: ${schemaKey}`);
+  }
+  return entry;
+}
+
 function buildCapability(entry: MailCapabilitySchemaEntry, def: MailProviderDefinition<string>): CapabilityManifestEntry {
   const override = def.capabilityOverrides?.[entry.key] ?? {};
   const resource = def.resourceAliases?.[entry.key] ?? override.resource ?? entry.resource;
@@ -152,9 +167,10 @@ export function buildCapabilityFlagGate<FlagKey extends string>(
 ): Record<string, FlagKey> {
   const gate = def.flagGate ?? {};
   const result: Record<string, FlagKey> = {};
-  for (const entry of MAIL_CAPABILITY_SCHEMA) {
-    const flag = gate[entry.key];
-    if (flag) result[capabilityId(entry, def)] = flag;
+  for (const [schemaKey, flag] of Object.entries(gate) as Array<[string, FlagKey | undefined]>) {
+    if (!flag) continue;
+    const entry = schemaEntryForGate(def, schemaKey, 'flagGate');
+    result[capabilityId(entry, def)] = flag;
   }
   return result;
 }
@@ -171,9 +187,10 @@ export function buildRecipientVerificationGate<FlagKey extends string>(
 ): Record<string, FlagKey> {
   const gate = def.recipientVerificationFlag ?? {};
   const result: Record<string, FlagKey> = {};
-  for (const entry of MAIL_CAPABILITY_SCHEMA) {
-    const flag = gate[entry.key];
-    if (flag) result[capabilityId(entry, def)] = flag;
+  for (const [schemaKey, flag] of Object.entries(gate) as Array<[string, FlagKey | undefined]>) {
+    if (!flag) continue;
+    const entry = schemaEntryForGate(def, schemaKey, 'recipientVerificationFlag');
+    result[capabilityId(entry, def)] = flag;
   }
   return result;
 }
