@@ -14,6 +14,10 @@ export interface AgentMetadata {
   effort?: string;
   heartbeat?: boolean;
   pid?: number;
+  /** Profile bio from the manager catalog (config YAML floor; runtime-editable). */
+  bio?: string;
+  /** Named profile links/handles, e.g. { x: '@name', github: 'name', site: 'https://…' }. */
+  handles?: Record<string, string>;
   [key: string]: unknown;
 }
 

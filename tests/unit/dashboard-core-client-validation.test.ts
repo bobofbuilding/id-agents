@@ -110,6 +110,19 @@ describe('ManagerClient boundary validation — agents', () => {
     await expect(c.fetchAgentsByTeam('idchain', signal)).rejects.toBeInstanceOf(ManagerError);
   });
 
+  it('preserves profile bio/handles inside metadata (typed on AgentMetadata)', async () => {
+    const c = clientReturning({
+      agents: [{
+        id: 'a1',
+        name: 'dev',
+        metadata: { bio: 'Builds the dashboard.', handles: { x: '@dev', github: 'dev-gh' } },
+      }],
+    });
+    const [agent] = await c.fetchAgentsByTeam('idchain', signal);
+    expect(agent!.metadata?.bio).toBe('Builds the dashboard.');
+    expect(agent!.metadata?.handles).toEqual({ x: '@dev', github: 'dev-gh' });
+  });
+
   it('accepts explicit null for nullable fields (remote-endpoint agents)', async () => {
     // Live remote-endpoint agents carry port/url/workingDirectory/pid as null.
     const c = clientReturning({
