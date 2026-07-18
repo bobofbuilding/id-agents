@@ -23,6 +23,7 @@ import path from 'path';
 import * as net from 'net';
 
 import { AgentManagerDb } from '../../src/agent-manager-db.js';
+import { AgentRestServer } from '../../src/agent-rest-server.js';
 import { InteractiveAgentServer } from '../../src/interactive-agent-server.js';
 import { writeProfileToConfig } from '../../src/lib/profile-config-write.js';
 import { SqliteAdapter } from '../../src/db/sqlite-adapter.js';
@@ -222,6 +223,47 @@ describe('agent profile bio/handles integration', () => {
     const meta = (await readAgentRow()).metadata as Record<string, unknown>;
     expect(meta.bio).toBe('Original YAML bio.');
     expect(meta.handles).toEqual({ x: '@profiledev' });
+  });
+
+  it('keeps /agents metadata, /catalog, and restap.json consistent after a profile edit', async () => {
+    await deploy();
+    const edited = { bio: 'Consistency bio.', handles: { ENS: 'profiledev.eth', x: '@edited' } };
+    expect((await postProfile(edited)).ok).toBe(true);
+
+    // Boot a REAL AgentRestServer (the /catalog + restap server every claude/
+    // local agent runs) pointed at this manager via env, AFTER the edit so the
+    // first self-lookup already sees the new values (no TTL wait).
+    const prevManagerUrl = process.env.MANAGER_URL;
+    const prevTeam = process.env.ID_TEAM;
+    process.env.MANAGER_URL = baseUrl;
+    process.env.ID_TEAM = TEST_TEAM;
+    const agentServer = new AgentRestServer({
+      agentName: AGENT,
+      workingDirectory: process.cwd(),
+      sharedDirectory: process.cwd(),
+    } as never);
+    try {
+      await agentServer.start(0);
+      const port = ((agentServer as never as { httpServer: { address(): { port: number } } }).httpServer.address()).port;
+      const agentUrl = `http://127.0.0.1:${port}`;
+
+      const managerView = await (await fetch(`${baseUrl}/agents`, { headers: adminHeaders(TEST_TEAM) })).json() as any;
+      const managerMeta = (managerView.agents as Array<{ name: string; metadata: Record<string, unknown> }>)
+        .find((a) => a.name === AGENT)!.metadata;
+      const catalogView = await (await fetch(`${agentUrl}/catalog`)).json() as any;
+      const restapView = await (await fetch(`${agentUrl}/.well-known/restap.json`)).json() as any;
+
+      // All three views agree on the same source of truth.
+      expect(managerMeta.bio).toEqual(edited.bio);
+      expect(managerMeta.handles).toEqual(edited.handles);
+      expect(catalogView.bio).toEqual(edited.bio);
+      expect(catalogView.handles).toEqual(edited.handles);
+      expect(restapView.agent.profile).toEqual(edited);
+    } finally {
+      await agentServer.stop();
+      if (prevManagerUrl === undefined) delete process.env.MANAGER_URL; else process.env.MANAGER_URL = prevManagerUrl;
+      if (prevTeam === undefined) delete process.env.ID_TEAM; else process.env.ID_TEAM = prevTeam;
+    }
   });
 
   it('publishes bio/handles in /.well-known/restap.json after a profile edit', async () => {

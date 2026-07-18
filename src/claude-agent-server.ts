@@ -647,11 +647,18 @@ export class AgentRestServer {
     });
 
     // GET /catalog - read current catalog
-    this.app.get('/catalog', (req, res) => {
+    this.app.get('/catalog', async (req, res) => {
+      // Bio/handles come from the SAME shared profile source that restap.json
+      // publishes (manager record / pushed identity) so /catalog, restap.json,
+      // and the manager /agents metadata always agree. They are read-only here
+      // and win over any catalog drift; omitted entirely when unset.
+      const profile = await this.profileSource();
       res.json({
         name: this.agentIdentity?.name || this.agentName,
         tokenId: this.agentIdentity?.tokenId,
-        ...this.catalog
+        ...this.catalog,
+        ...(profile?.bio !== undefined ? { bio: profile.bio } : {}),
+        ...(profile?.handles !== undefined ? { handles: profile.handles } : {})
       });
     });
 
