@@ -45,6 +45,13 @@ router's default-deny sequence.
   `folders` resource to `labels`, and its account-control settings surface to
   `forwarding`). The generated capability id is always
   `${connectorId}.${resource}.${idSuffix}`.
+- The same provider definition owns `connectorFlag`, `flagGate`, and optional
+  `recipientVerificationFlag` declarations. `buildConnectorFlagGate`,
+  `buildCapabilityFlagGate`, and `buildRecipientVerificationGate` resolve
+  those schema keys to the provider's generated connector/capability ids and
+  reject references to absent schema capabilities. Central configuration
+  merges each provider's generated exports; it does not hand-transcribe the
+  provider's capability ids.
 - `grantableCapabilityIds(manifest)` — same "exclude hard-denied" helper
   Gmail's `GMAIL_GRANTABLE_CAPABILITY_IDS` used, now shared.
 - `bootstrapMailConnector(registry, def, manifest, now?)` — thin wrapper
@@ -80,11 +87,23 @@ discipline in gmail-first-connector-architecture.md:
    live network path, no mailbox access for any provider, same as the
    Gmail slice at launch.
 4. Feature flags gating the new connector/capabilities off by default,
-   following the `connectorFlagGate` / `capabilityFlagGate` pattern already
-   wired through `RouterDeps` (see `runtime/router.ts`).
+   declared on that provider definition and exported through the generated
+   `connectorFlagGate` / `capabilityFlagGate` pattern already wired through
+   `RouterDeps` (see `runtime/router.ts`). Promotion evidence must show that
+   every generated capability id exists in the provider manifest, every flag
+   name exists in the loaded `ConnectorFeatureFlags` shape, and all new
+   persisted defaults are `false`.
 
 None of steps 2–4 are implied or started by this change — it only
 generalizes the manifest-shape half of the Gmail slice.
+
+The provider-extensible gate implementation landed in `3a44275` and was
+independently validated in manager Brain completion `memory:8989`: TypeScript,
+the full unit suite, connector tests, default-false inventory, generated gate
+resolution, and existing consent-key compatibility passed. This is mechanism
+evidence only. A second provider remains backlog and still requires its own
+operator-approved rollout record, credentials/scopes decision, backend and
+negative tests; no provider is enabled by adding a definition or gate map.
 
 ## Reconciliation with the Gmail send-scope/read-tier/reply/attachment-cap slice
 
