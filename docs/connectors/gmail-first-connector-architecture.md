@@ -52,8 +52,13 @@ Implemented in `src/connectors/runtime/router.ts` (`ConnectorRouter.route`):
    `gmailConnectorEnabled` gating the rest of the connector — this is what
    makes stage 3 (read/draft live, send still off) and stage 4 (send flipped
    for the pilot cohort) distinct, enforceable states rather than a single
-   flag covering both. Whoever instantiates `ConnectorRouter` for a real
-   deployment must pass this map; it is not wired automatically.
+   flag covering both. The map is generated from each provider's
+   `MailProviderDefinition.flagGate` by `buildCapabilityFlagGate`; capability
+   ids are therefore resolved from the same provider definition that builds
+   the manifest, rather than being hand-copied into central configuration.
+   Whoever instantiates `ConnectorRouter` for a real deployment must pass
+   this map; it is not wired automatically. A missing map is a rollout
+   blocker, not permission to invoke a gated capability.
 4. **Connection binding + status** — the connection must belong to the same
    agent/tenant/connector/version and be `active`.
 5. **Argument shape validation** — runtime check against the manifest's
@@ -162,9 +167,35 @@ bootstrapped via `providers/gmail/bootstrap.ts`:
 
 `config/feature-flags/connectors.json`, loaded by
 `src/connectors/config/feature-flags.ts` with `ID_CONNECTORS_*` env
-overrides. All six flags default to `false`:
+overrides. All seven flags default to `false`:
 `connectorsEnabled`, `gmailConnectorEnabled`, `gmailSendEnabled`,
-`gmailFullBodyReadEnabled`, `mcpBackendEnabled`, `connectorsMigrationsEnabled`.
+`gmailFullBodyReadEnabled`, `gmailSendRecipientVerificationEnabled`,
+`mcpBackendEnabled`, `connectorsMigrationsEnabled`.
+
+The capability gate landed in `3a44275`. Its enforcement evidence is:
+
+- `GMAIL_PROVIDER_DEFINITION.flagGate` declares `messages.get_full` →
+  `gmailFullBodyReadEnabled` and `drafts.send` → `gmailSendEnabled`;
+  `GMAIL_CAPABILITY_FLAG_GATE` derives the full capability ids and
+  `CONNECTOR_CAPABILITY_FLAG_GATE` merges provider contributions.
+- `ConnectorRouter.route` evaluates the resulting capability-keyed map at
+  step 3b, before connection, grant, approval, credential, or backend work.
+- `tests/unit/connectors/mail-provider-adapter.test.ts` proves a synthetic
+  second provider derives gates in its own namespace, applies resource/id
+  aliases consistently, and does not alter Gmail's gates;
+  `tests/unit/connectors/router.test.ts` proves a gated capability denies
+  while its flag is false and proceeds to later policy checks only when true.
+- Independent QA at the exact implementation commit passed TypeScript, all
+  984 unit tests, all 98 connector tests, and checks that persisted/runtime
+  flag keys match, every default remains false, generated Gmail gate keys
+  resolve to manifest capabilities, and the existing
+  `connectorsMigrationsEnabled` consent reference remains valid. Evidence:
+  `output/verify-provider-extensible-flag-gate.md` in the
+  `architecture-engineer` task workspace; manager Brain completion
+  `memory:8989`.
+
+This evidence validates the gate mechanism, not production readiness and not
+permission to change a flag.
 
 ## Staged rollout
 
@@ -195,14 +226,73 @@ operator-approved stage:
    Still `gmailConnectorEnabled: false`.
 4. **Stage 3** — flip `connectorsEnabled` + `gmailConnectorEnabled` for a
    named pilot agent/tenant only (via an explicit grant, not a global flag
-   flip), with `gmailSendEnabled` still `false`. Implement the real Gmail API
-   calls inside `OAuthApiBackend.invoke`.
+   flip), with `gmailSendEnabled`, `gmailFullBodyReadEnabled`, and
+   `gmailSendRecipientVerificationEnabled` still `false` unless each is
+   separately named in the approved stage record. Implement the real Gmail
+   API calls inside `OAuthApiBackend.invoke`.
 5. **Stage 4** — pilot evidence review, then `gmailSendEnabled: true` for the
-   same pilot cohort. `gmail.drafts.send` remains `always`-approval; direct
+   same pilot cohort. Do not enable
+   `gmailSendRecipientVerificationEnabled` until a real Gmail-backed
+   `DraftRecipientsLookup` is wired and its fail-closed behavior is
+   evidenced; the shipped null lookup denies every verified send.
+   `gmail.drafts.send` remains `always`-approval; direct
    send/trash/delete/settings remain hard-denied.
 6. **Stage 5 (conditional)** — a specific, reviewed MCP server may be pinned
    into `mcp-backend.ts`'s `reviewedServers` and `mcpBackendEnabled` flipped,
    only after its manifest digest and tool mapping are reviewed.
+
+### Operator promotion record and evidence accounting
+
+Every transition remains off by default and requires a named operator. Before
+changing any JSON/env flag, connection, grant, credential-broker binding, or
+reviewed-server pin, attach one durable rollout record that includes:
+
+- stage, named operator, timestamp, named agent/tenant cohort, and exact
+  controls to change (including previous and proposed values);
+- the preceding stage's acceptance artifact and command results, with commit
+  SHA, file references, and test counts, plus a default-false inventory
+  matched to `ConnectorFeatureFlags` and `connectors.json`;
+- the generated connector/capability gate maps and proof that every flag key
+  and capability id resolves to the loaded runtime shape and published
+  manifest;
+- the corresponding `connector_operator_consents` row and rollout-log/audit
+  references; consent is evidence of authorization and never flips a flag;
+- rollback owner, numeric disable SLO, timed kill-switch drill evidence, and
+  denied post-disable invocation evidence; and
+- Brain `used_source_ids` and `used_instruction_ids`, with any volunteered
+  but unused or unsafe instructions reported as `ignored_instruction_ids` or
+  `harmful_instruction_ids`.
+
+For this documentation update, `used_source_ids` are `memory:8989`,
+`entity:task:83350edb-947d-4d86-971b-34672f454851`,
+`entity:tracking:contribution:2026-W29:f0d7bba30eb4`,
+`entity:plan:plan_mrpjbgw4_n78dd`, `entity:agent:default:lead`, `fact:3438`,
+`fact:6726`, `fact:6727`, `fact:6728`, `fact:6729`, `text:42921`,
+`text:36970`, and `text:26673`; `used_instruction_ids` are `memory:4` and
+`memory:2148`. The upstream QA completion `memory:8989` separately accounts
+for its own used instructions (`memory:6`, `memory:2144`, `memory:2148`). No
+instruction was ignored or harmful. These identifiers are accounting
+metadata, not rollout authority.
+
+### Remaining rollout blockers
+
+No production stage may advance until its applicable blockers have closure
+evidence:
+
+- a timed kill-switch drill and operator-approved numeric disable SLO;
+- an operator-controlled dependency policy that pins any external/MCP source
+  commit and artifact/manifest digest and forbids runtime self-install/update;
+- vault/credential-broker and OAuth callback ownership, exact least-privilege
+  Gmail scopes, canonical identity propagation, approval UI and audit
+  retention ownership, named pilot/rollback owners, and real Gmail backend
+  implementations;
+- a real Gmail-backed `DraftRecipientsLookup` before recipient verification
+  can be enabled; and
+- zero unresolved provenance/tag/domain defects for any catalog entry proposed
+  for promotion or routing.
+
+Non-Gmail provider activation, optional rollout refinements, and unresolved
+operator choices stay in backlog. They do not expand this rollout slice.
 
 ### Rollback
 
