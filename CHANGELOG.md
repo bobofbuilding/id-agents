@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.113]
+
+- Preserve Brain data, memory, reports, source trees, uploads, and agent task artifacts during routine workspace cleanup; whole-output and publish-snapshot deletion now require explicit opt-in flags.
+- Reclaim only old rebuildable agent dependency trees and project build caches by default, with guarded root containment, age checks, and deduplicated candidates.
+- Include the workspace collector in the published package and add a smoke test proving cleanup removes stale dependencies without deleting durable task results.
+
 ## [0.1.112]
 
 - Treat byte-identical control-state writes as no-ops in SQLite and Postgres so polling and repeated work passes do not increment versions or flood the durable event log.

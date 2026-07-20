@@ -4,6 +4,7 @@
 import { rm, stat, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
+import { fileURLToPath } from 'node:url';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -70,29 +71,76 @@ async function listDirs(root) {
   return entries.filter((entry) => entry.isDirectory()).map((entry) => path.join(root, entry.name));
 }
 
+function isWithin(root, candidate) {
+  const relative = path.relative(root, candidate);
+  return relative !== '' && !relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative);
+}
+
+async function collectRebuildableDirs(root, olderThanMs, now) {
+  const found = [];
+
+  async function walk(current) {
+    const entries = await readdir(current, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+      const target = path.join(current, entry.name);
+      const relative = path.relative(root, target);
+      const parent = path.dirname(target);
+      const rebuildable =
+        entry.name === 'node_modules' ||
+        entry.name === '.parcel-cache' ||
+        entry.name === '.turbo' ||
+        relative.endsWith(path.join('.next', 'cache')) ||
+        relative.endsWith(path.join('.vercel', 'output')) ||
+        (entry.name === 'target' && await exists(path.join(parent, 'Cargo.toml'))) ||
+        (entry.name === 'release' && await exists(path.join(parent, 'package.json')));
+
+      if (rebuildable) {
+        const targetStat = await stat(target).catch(() => null);
+        if (targetStat && now - targetStat.mtimeMs >= olderThanMs) found.push(target);
+        continue;
+      }
+      await walk(target);
+    }
+  }
+
+  await walk(root);
+  return found;
+}
+
 async function main() {
-  const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
   const workspaceRoot = path.resolve(argValue('--workspace', path.join(repoRoot, 'workspace')));
   const publishRoot = path.resolve(argValue('--publish-root', path.join(repoRoot, '..', '.iacc-publish')));
   const olderThanDays = Math.max(1, Number.parseInt(argValue('--older-than-days', '7'), 10) || 7);
   const keepPublish = Math.max(0, Number.parseInt(argValue('--keep-publish', '1'), 10) || 1);
   const apply = hasArg('--apply');
   const includeNodeModules = hasArg('--include-node-modules');
+  const includeAgentOutputs = hasArg('--include-agent-outputs');
+  const includePublishSnapshots = hasArg('--include-publish-snapshots');
   const now = Date.now();
   const olderThanMs = olderThanDays * DAY_MS;
   const candidates = [];
 
   for (const agentDir of await listDirs(path.join(workspaceRoot, 'agents'))) {
     for (const outputDir of await listDirs(path.join(agentDir, 'output'))) {
-      await addCandidate(candidates, outputDir, `agent output older than ${olderThanDays}d`, now, olderThanMs);
+      if (includeAgentOutputs) {
+        await addCandidate(candidates, outputDir, `agent output older than ${olderThanDays}d`, now, olderThanMs);
+        continue;
+      }
+      for (const rebuildable of await collectRebuildableDirs(outputDir, olderThanMs, now)) {
+        await addCandidate(candidates, rebuildable, `old rebuildable agent artifact`, now, 0);
+      }
     }
   }
 
-  const publishDirs = await Promise.all((await listDirs(publishRoot)).map(async (p) => ({ path: p, stat: await stat(p) })));
-  publishDirs
-    .sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs)
-    .slice(keepPublish)
-    .forEach((entry) => candidates.push({ path: entry.path, reason: `old publish staging snapshot; keeping newest ${keepPublish}`, mtimeMs: entry.stat.mtimeMs, bytes: 0 }));
+  if (includePublishSnapshots) {
+    const publishDirs = await Promise.all((await listDirs(publishRoot)).map(async (p) => ({ path: p, stat: await stat(p) })));
+    publishDirs
+      .sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs)
+      .slice(keepPublish)
+      .forEach((entry) => candidates.push({ path: entry.path, reason: `old publish staging snapshot; keeping newest ${keepPublish}`, mtimeMs: entry.stat.mtimeMs, bytes: 0 }));
+  }
 
   for (const projectDir of await listDirs(path.join(workspaceRoot, 'projects'))) {
     const rebuildable = [
@@ -105,9 +153,19 @@ async function main() {
     ];
     if (includeNodeModules) rebuildable.push('node_modules');
     for (const rel of rebuildable) {
-      await addCandidate(candidates, path.join(projectDir, rel), `rebuildable project artifact: ${rel}`, now, 0);
+      await addCandidate(candidates, path.join(projectDir, rel), `rebuildable project artifact older than ${olderThanDays}d: ${rel}`, now, olderThanMs);
     }
   }
+
+  const unique = new Map();
+  for (const candidate of candidates) {
+    if (!isWithin(workspaceRoot, candidate.path) && !isWithin(publishRoot, candidate.path)) {
+      throw new Error(`refusing candidate outside guarded roots: ${candidate.path}`);
+    }
+    unique.set(candidate.path, candidate);
+  }
+  candidates.length = 0;
+  candidates.push(...unique.values());
 
   let total = 0;
   for (const candidate of candidates) {
@@ -123,6 +181,9 @@ async function main() {
 
   if (!apply) {
     console.log('\nNo files deleted. Re-run with --apply to remove these candidates.');
+    if (!includeAgentOutputs) {
+      console.log('Whole agent outputs are retained. Use --include-agent-outputs only for an intentional archival purge.');
+    }
     return;
   }
 

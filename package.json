@@ -1,6 +1,6 @@
 {
   "name": "id-agents",
-  "version": "0.1.112",
+  "version": "0.1.113",
   "description": "Multi-agent orchestration platform with REST-AP interfaces",
   "type": "module",
   "main": "dist/index.js",
@@ -26,6 +26,7 @@
     "build": "npm run build:core && npm run build:tui",
     "verify:release-schema": "tsx src/release-schema-cli.ts",
     "workspace:gc": "node scripts/workspace-gc.mjs",
+    "test:workspace-gc": "node scripts/workspace-gc-smoke.mjs",
     "prepublishOnly": "npm run verify:release-schema && npm run build",
     "dev": "tsc --watch",
     "lint": "npm run typecheck",
@@ -52,6 +53,7 @@
   },
   "files": [
     "dist/**/*",
+    "scripts/workspace-gc.mjs",
     "docs/**/*",
     "skills/**/*",
     "plugins/**/*",
