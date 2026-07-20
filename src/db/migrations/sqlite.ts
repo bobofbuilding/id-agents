@@ -419,6 +419,18 @@ export async function migrateSqlite(adapter: SqliteAdapter): Promise<void> {
     CREATE INDEX IF NOT EXISTS event_log_team_topic_seq_idx ON event_log(team_id, topic, seq);
     CREATE INDEX IF NOT EXISTS event_log_team_subject_idx ON event_log(team_id, subject_kind, subject_id, seq);
 
+    CREATE TABLE IF NOT EXISTS control_state (
+      team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+      scope TEXT NOT NULL CHECK(scope IN ('global','team','project')),
+      state_key TEXT NOT NULL,
+      value TEXT NOT NULL,
+      version INTEGER NOT NULL DEFAULT 1,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY(team_id, scope, state_key)
+    );
+    CREATE INDEX IF NOT EXISTS control_state_team_scope_idx ON control_state(team_id, scope, updated_at);
+
     CREATE TABLE IF NOT EXISTS subscriptions (
       id TEXT PRIMARY KEY,
       team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
@@ -630,6 +642,18 @@ export async function migrateSqlite(adapter: SqliteAdapter): Promise<void> {
   // guarded by a PRAGMA check to detect whether the old global uniqueness is still present.
   await migrateTasks_TeamNameUnique(adapter);
   await migrateTaskEventLinks_TasksReference(adapter);
+  try {
+    adapter.exec(`ALTER TABLE tasks ADD COLUMN project_id TEXT`);
+  } catch {
+    // Column already exists in upgraded databases.
+  }
+  try {
+    adapter.exec(`ALTER TABLE tasks ADD COLUMN plan_id TEXT`);
+  } catch {
+    // Column already exists in upgraded databases.
+  }
+  adapter.exec(`CREATE INDEX IF NOT EXISTS tasks_project_idx ON tasks(team_id, project_id, status, updated_at)`);
+  adapter.exec(`CREATE INDEX IF NOT EXISTS tasks_plan_idx ON tasks(team_id, plan_id, status, updated_at)`);
 }
 
 /**

@@ -12,7 +12,7 @@
  * subsequent passes; this manifest is the single source of truth for the contract today.
  */
 
-export const CC_API_VERSION = 1;
+export const CC_API_VERSION = 4;
 
 export interface CcRoute {
   method: string;
@@ -23,6 +23,13 @@ export interface CcRoute {
 /** Manager routes the Control Center relies on that do NOT exist in upstream id-agents. */
 export const CC_ROUTES: CcRoute[] = [
   { method: 'GET', path: '/capabilities', group: 'core' },
+  { method: 'POST', path: '/control/brain', group: 'brain-control' },
+  { method: 'POST', path: '/control-event', group: 'control-events' },
+  { method: 'GET', path: '/control/state/:scope', group: 'control-state' },
+  { method: 'GET', path: '/control/state/:scope/:key', group: 'control-state' },
+  { method: 'POST', path: '/control/state/:scope/:key', group: 'control-state' },
+  { method: 'DELETE', path: '/control/state/:scope/:key', group: 'control-state' },
+  { method: 'POST', path: '/control/memory', group: 'brain-control' },
   // observability (live display)
   { method: 'GET', path: '/activity', group: 'observability' },
   { method: 'POST', path: '/activity/record', group: 'observability' },
@@ -57,6 +64,9 @@ export const CC_FEATURES = [
   'team-config', // per-team relay config
   'library', // skills/plugins install
   'brain-context', // brain volunteer hook on dispatch
+  'brain-control', // manager-mediated, acknowledged Brain reads and writes
+  'control-events', // durable control/config events consumed by Brain
+  'control-state', // manager-authoritative Dashboard state with optimistic versions
   'stalled-sweep', // always-on supervision sweeper
 ] as const;
 

@@ -10,8 +10,8 @@ export class PgTasksRepo implements TasksRepository {
   async create(task: TaskRow, eventScheduleIds?: string[]): Promise<void> {
     await this.db.query(
       `INSERT INTO tasks
-         (id, name, uuid, team_id, title, description, status, created_by, owner, created_at, updated_at, completed_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+         (id, name, uuid, team_id, title, description, status, created_by, owner, created_at, updated_at, completed_at, project_id, plan_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
       [
         task.id,
         task.name,
@@ -25,6 +25,8 @@ export class PgTasksRepo implements TasksRepository {
         task.created_at,
         task.updated_at,
         task.completed_at,
+        task.project_id ?? null,
+        task.plan_id ?? null,
       ],
     );
 

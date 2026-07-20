@@ -164,6 +164,9 @@ export interface TaskRow {
   created_at: number;
   updated_at: number;
   completed_at: number | null;
+  /** Dashboard lineage. These are opaque control-plane IDs, not foreign keys. */
+  project_id?: string | null;
+  plan_id?: string | null;
 }
 
 /** task_event_links table row */
@@ -171,6 +174,17 @@ export interface TaskEventLinkRow {
   task_id: string;
   schedule_id: string;
   created_at: number;
+}
+
+/** Manager-owned Dashboard control state; app config is only a cache mirror. */
+export interface ControlStateRow {
+  team_id: string;
+  scope: 'global' | 'team' | 'project';
+  state_key: string;
+  value: Record<string, unknown>;
+  version: number;
+  created_at: number;
+  updated_at: number;
 }
 
 // ---------------------------------------------------------------------------

@@ -24,6 +24,7 @@ import type {
   TaskRow,
   TaskEventLinkRow,
   EventLogRow,
+  ControlStateRow,
   SubscriptionRow,
   CheckinRow,
   CheckinStatus,
@@ -794,6 +795,20 @@ export interface RuntimeLaneCooldownsRepository {
   pruneExpired(nowMs: number): Promise<number>;
 }
 
+export interface ControlStateRepository {
+  get(teamId: string, scope: ControlStateRow['scope'], key: string): Promise<ControlStateRow | null>;
+  list(teamId: string, scope: ControlStateRow['scope']): Promise<ControlStateRow[]>;
+  upsert(input: {
+    teamId: string;
+    scope: ControlStateRow['scope'];
+    key: string;
+    value: Record<string, unknown>;
+    expectedVersion?: number;
+    now: number;
+  }): Promise<ControlStateRow | null>;
+  delete(teamId: string, scope: ControlStateRow['scope'], key: string): Promise<boolean>;
+}
+
 // ---------------------------------------------------------------------------
 // Db — composite service
 // ---------------------------------------------------------------------------
@@ -821,6 +836,7 @@ export interface Db {
   subscriptions: SubscriptionsRepository;
   checkins: CheckinsRepository;
   runtimeLaneCooldowns: RuntimeLaneCooldownsRepository;
+  controlState: ControlStateRepository;
 
   /** Close the database connection / file handle. */
   close(): Promise<void>;

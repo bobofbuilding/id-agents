@@ -10,8 +10,8 @@ export class SqliteTasksRepo implements TasksRepository {
   async create(task: TaskRow, eventScheduleIds?: string[]): Promise<void> {
     await this.db.query(
       `INSERT INTO tasks
-         (id, name, uuid, team_id, title, description, status, created_by, owner, created_at, updated_at, completed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, name, uuid, team_id, title, description, status, created_by, owner, created_at, updated_at, completed_at, project_id, plan_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         task.id,
         task.name,
@@ -25,6 +25,8 @@ export class SqliteTasksRepo implements TasksRepository {
         task.created_at,
         task.updated_at,
         task.completed_at,
+        task.project_id ?? null,
+        task.plan_id ?? null,
       ],
     );
 

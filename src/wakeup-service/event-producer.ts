@@ -17,6 +17,7 @@ import type { CheckinPriority } from '../db/types.js';
 import type { LearningLoopCapture } from '../core/learning-loop-capture.js';
 
 export const TASK_CLAIMED = 'task:claimed';
+export const TASK_CREATED = 'task:created';
 export const TASK_COMPLETED = 'task:completed';
 export const TASK_REFRESHED = 'task:refreshed';
 export const TASK_TRIAGED = 'task:triaged';
@@ -30,6 +31,58 @@ export const CHECKIN_DUE = 'checkin:due';
 export const CHECKIN_EXPIRED = 'checkin:expired';
 
 const PREVIEW_MAX = 280;
+
+export interface ControlEventInput {
+  teamId: string;
+  topic: string;
+  actorAgentId?: string | null;
+  subjectKind?: string | null;
+  subjectId?: string | null;
+  occurredAt?: number;
+  data?: Record<string, unknown>;
+}
+
+export async function emitControlEvent(events: EventsRepository, input: ControlEventInput): Promise<{ seq: number }> {
+  return events.insert({
+    team_id: input.teamId,
+    topic: input.topic,
+    actor_agent_id: input.actorAgentId ?? null,
+    subject_kind: input.subjectKind ?? null,
+    subject_id: input.subjectId ?? null,
+    occurred_at: input.occurredAt ?? Date.now(),
+    data: input.data ?? {},
+  });
+}
+
+export async function emitTaskCreated(events: EventsRepository, input: {
+  teamId: string;
+  taskUuid: string;
+  taskName: string;
+  title?: string | null;
+  ownerAgentId?: string | null;
+  actorAgentId?: string | null;
+  occurredAt?: number;
+  projectId?: string | null;
+  planId?: string | null;
+}): Promise<{ seq: number }> {
+  return emitControlEvent(events, {
+    teamId: input.teamId,
+    topic: TASK_CREATED,
+    actorAgentId: input.actorAgentId,
+    subjectKind: 'task',
+    subjectId: input.taskUuid,
+    occurredAt: input.occurredAt,
+    data: {
+      task_name: input.taskName,
+      task_uuid: input.taskUuid,
+      title: input.title ?? input.taskName,
+      status: input.ownerAgentId ? 'doing' : 'todo',
+      assignee: input.ownerAgentId ?? null,
+      ...(input.projectId ? { project_id: input.projectId } : {}),
+      ...(input.planId ? { plan_id: input.planId } : {}),
+    },
+  });
+}
 
 export interface TaskClaimedInput {
   teamId: string;

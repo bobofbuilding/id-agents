@@ -30,6 +30,12 @@ import { filterClaudeEnvVars } from './lib/env-hygiene.js';
 import { LocalModelGate, isLocalModelRuntime } from './lib/local-model-gate.js';
 import { withDesktopResourceLimits } from './lib/resource-limits.js';
 import { ccCapabilities } from './control-center/manifest.js';
+import {
+  CONTROL_BRAIN_DELIVERED,
+  CONTROL_BRAIN_REQUESTED,
+  parseControlBrainRequest,
+  redactControlBrainValue,
+} from './control-center/brain-relay.js';
 import { loadMasterKey, deriveKeyAtIndex } from './lib/skillmesh-key-manager.js';
 import { type Db } from './db/db-service.js';
 import type { AgentRow, CheckinPriority, QueryRow, ScheduleDefinitionRow, TaskRow, TeamRow } from './db/types.js';
@@ -86,6 +92,8 @@ import {
   emitQueryDelivered,
   emitQueryExpired,
   emitQueryFailed,
+  emitControlEvent,
+  emitTaskCreated,
   emitTaskClaimed,
   emitTaskCompleted,
   emitTaskRefreshed,
@@ -274,6 +282,8 @@ const TOPIC_ALIASES: Record<string, readonly string[]> = {
   'query:terminal': ['query:delivered', 'query:failed', 'query:expired'],
   'task:status': ['task:created', 'task:claimed', 'task:completed', 'task:refreshed', 'task:triaged'],
   'agent:lifecycle': ['agent:started', 'agent:stopped', 'agent:rebuild'],
+  'control:all': ['control:action', 'control:project', 'control:org', 'control:work'],
+  'config:all': ['config:agent-updated', 'config:team-updated', 'config:manager-updated', 'config:capability-updated'],
 };
 
 const DEFAULT_LEAD_DELEGATION_KICKOFF_GRACE_MS = 0;
@@ -320,6 +330,51 @@ function expandTopicAliases(topics: readonly string[]): string[] {
     }
   }
   return Array.from(out);
+}
+
+export function configEventForRequest(req: express.Request): { topic: string; kind: string; subject: string } | null {
+  const method = req.method.toUpperCase();
+  if (method !== 'POST' && method !== 'DELETE') return null;
+  const route = req.path;
+  const removedNamedAgent = method === 'DELETE' ? route.match(/^\/agents\/by-name\/([^/]+)$/) : null;
+  const removedAgent = method === 'DELETE' ? route.match(/^\/agents\/([^/]+)$/) : null;
+  if (removedNamedAgent || removedAgent) {
+    return { topic: 'config:agent-removed', kind: 'agent', subject: decodeURIComponent((removedNamedAgent ?? removedAgent)![1]) };
+  }
+  const agentRoute = route.match(/^\/agents\/([^/]+)\/(?:mcp|instructions|delegates|metadata|model|runtime|team|onchain\/(?:register|redeliver-identity))$/);
+  if (agentRoute) {
+    return { topic: 'config:agent-updated', kind: 'agent', subject: decodeURIComponent(agentRoute[1]) };
+  }
+  const namedAgentRoute = route.match(/^\/agents\/by-name\/([^/]+)\/metadata$/);
+  if (namedAgentRoute) {
+    return { topic: 'config:agent-updated', kind: 'agent', subject: decodeURIComponent(namedAgentRoute[1]) };
+  }
+  if (route === '/agents/spawn' || route === '/agents/register') {
+    return { topic: 'config:agent-updated', kind: 'agent', subject: String(req.body?.name || 'agent') };
+  }
+  const removedTeam = method === 'DELETE' ? route.match(/^\/teams\/([^/]+)$/) : null;
+  if (removedTeam) {
+    return { topic: 'config:team-removed', kind: 'team', subject: decodeURIComponent(removedTeam[1]) };
+  }
+  const teamRoute = route.match(/^\/teams\/([^/]+)\/(?:delegates|validator-recommendation-loop)$/);
+  if (teamRoute || route === '/teams') {
+    return { topic: 'config:team-updated', kind: 'team', subject: teamRoute ? decodeURIComponent(teamRoute[1]) : String(req.body?.name || 'team') };
+  }
+  if (route === '/manager/local-concurrency') {
+    return { topic: 'config:manager-updated', kind: 'manager', subject: 'local-concurrency' };
+  }
+  if (/^\/library\//.test(route)) {
+    return { topic: 'config:capability-updated', kind: 'capability', subject: String(req.body?.skill || req.body?.name || route.split('/').pop() || 'library') };
+  }
+  if (route === '/deploy' || route === '/sync') {
+    return { topic: `config:team-${route.slice(1)}`, kind: 'team', subject: String(req.body?.team || req.headers['x-id-team'] || 'team') };
+  }
+  return null;
+}
+
+function boundedLineageId(value: unknown): string | null {
+  const id = typeof value === 'string' ? value.trim() : '';
+  return id && id.length <= 240 && !/[\r\n]/.test(id) ? id : null;
 }
 
 /**
@@ -7375,16 +7430,17 @@ Return this JSON shape:
     return brainContext;
   }
 
-  private async postBrain(pathname: string, body: Record<string, unknown>): Promise<void> {
-    if (process.env.BRAIN_CONTEXT_DISABLED === 'true') return;
+  private async postBrain(pathname: string, body: Record<string, unknown>): Promise<boolean> {
+    if (process.env.BRAIN_CONTEXT_DISABLED === 'true') return false;
     try {
-      await fetch(`${this.brainUrl()}${pathname}`, {
+      const response = await fetch(`${this.brainUrl()}${pathname}`, {
         method: 'POST',
         headers: this.brainHeaders(),
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(Number(process.env.BRAIN_CONTEXT_TIMEOUT_MS || 1200)),
       });
-    } catch {}
+      return response.ok;
+    } catch { return false; }
   }
 
   private compactJsonForBrain(value: unknown, maxChars: number): string {
@@ -8594,6 +8650,33 @@ Return this JSON shape:
     // Install team/principal context middleware for all remaining routes
     this.managementApp.use(this.teamContextMiddleware());
 
+    // Existing config routes become Brain-visible without duplicating event calls in every
+    // handler. Only successful, allowlisted mutations are journaled; request data is redacted
+    // and bounded before it enters the durable event stream.
+    this.managementApp.use((req, res, next) => {
+      const descriptor = configEventForRequest(req);
+      if (!descriptor) return next();
+      res.once('finish', () => {
+        if (res.statusCode < 200 || res.statusCode >= 300) return;
+        const ctx = (req as any).ctx as { teamId?: string; principal?: string } | undefined;
+        if (!ctx?.teamId) return;
+        const data = redactControlBrainValue(req.body ?? {});
+        void emitControlEvent(this.db.events, {
+          teamId: ctx.teamId,
+          topic: descriptor.topic,
+          actorAgentId: ctx.principal === 'agent' ? String(req.headers['x-id-agent'] || '') : null,
+          subjectKind: descriptor.kind,
+          subjectId: descriptor.subject,
+          data: {
+            method: req.method,
+            path: req.path,
+            change: data && typeof data === 'object' && !Array.isArray(data) ? data as Record<string, unknown> : {},
+          },
+        }).catch((error) => console.error('[Manager] Failed to emit config event:', error));
+      });
+      next();
+    });
+
     this.managementApp.get('/health', async (req, res) => {
       const { id: teamId, name: teamName } = await this.getTeam(req);
       const count = await this.db.agents.count(teamId);
@@ -8883,6 +8966,238 @@ Return this JSON shape:
     // manager supports (vs stock upstream) and degrade gracefully. See src/control-center/manifest.ts.
     this.managementApp.get('/capabilities', (_req, res) => {
       res.json(ccCapabilities());
+    });
+
+    // IDACC is not allowed to bypass the manager when it reads or writes Brain state.
+    // Writes are first journaled in the manager event log and use a caller-provided
+    // idempotency key, so a desktop retry cannot create duplicate learning records.
+    this.managementApp.post('/control/brain', async (req, res) => {
+      if (!this.isAdminRequest(req)) return res.status(403).json({ error: 'admin_required' });
+      if (process.env.BRAIN_CONTEXT_DISABLED === 'true') {
+        return res.status(503).json({ error: 'brain_disabled', message: 'Manager Brain integration is disabled.' });
+      }
+
+      try {
+        const operation = parseControlBrainRequest(req.body);
+        const { id: teamId } = await this.getTeam(req);
+        let requestSeq: number | null = null;
+
+        if (operation.method === 'POST') {
+          const latestSeq = await this.db.events.latestSeq(teamId) ?? 0;
+          const delivered = await this.db.events.query({
+            teamId,
+            sinceSeq: Math.max(0, latestSeq - 2_000),
+            topics: [CONTROL_BRAIN_DELIVERED],
+            limit: 2_000,
+          });
+          const prior = delivered.find((event) => event.data?.idempotency_key === operation.idempotency_key);
+          if (prior) {
+            return res.json({
+              ok: true,
+              duplicate: true,
+              event_seq: prior.seq,
+              body: prior.data?.response_body ?? null,
+              cacheControl: null,
+              noStore: false,
+            });
+          }
+
+          const inserted = await this.db.events.insert({
+            team_id: teamId,
+            topic: CONTROL_BRAIN_REQUESTED,
+            actor_agent_id: null,
+            subject_kind: 'brain-route',
+            subject_id: operation.path,
+            occurred_at: Date.now(),
+            data: {
+              idempotency_key: operation.idempotency_key!,
+              method: operation.method,
+              path: operation.path,
+              body: operation.body ?? {},
+            },
+          });
+          requestSeq = inserted.seq;
+        }
+
+        const response = await fetch(`${this.brainUrl()}${operation.path}`, {
+          method: operation.method,
+          headers: this.brainHeaders(),
+          ...(operation.method === 'POST' ? { body: JSON.stringify(operation.body ?? {}) } : {}),
+          signal: AbortSignal.timeout(Number(process.env.BRAIN_CONTROL_TIMEOUT_MS || 5_000)),
+        });
+        const responseText = await response.text();
+        let responseBody: unknown = null;
+        if (responseText) {
+          try { responseBody = JSON.parse(responseText); } catch { responseBody = null; }
+        }
+        const cacheControl = response.headers.get('cache-control');
+        const noStore = cacheControl?.toLowerCase().split(',').map((part) => part.trim()).includes('no-store') ?? false;
+        if (!response.ok) {
+          return res.status(502).json({
+            error: 'brain_request_failed',
+            brain_status: response.status,
+            event_seq: requestSeq,
+          });
+        }
+
+        let deliveredSeq = requestSeq;
+        if (operation.method === 'POST') {
+          const inserted = await this.db.events.insert({
+            team_id: teamId,
+            topic: CONTROL_BRAIN_DELIVERED,
+            actor_agent_id: null,
+            subject_kind: 'brain-route',
+            subject_id: operation.path,
+            occurred_at: Date.now(),
+            data: {
+              idempotency_key: operation.idempotency_key!,
+              request_seq: requestSeq,
+              method: operation.method,
+              path: operation.path,
+              response_body: responseBody,
+            },
+          });
+          deliveredSeq = inserted.seq;
+        }
+
+        return res.json({
+          ok: true,
+          duplicate: false,
+          event_seq: deliveredSeq,
+          body: responseBody,
+          cacheControl,
+          noStore,
+        });
+      } catch (error: any) {
+        const message = error?.message || String(error);
+        const clientError = /^(?:request_body_required|invalid_|brain_path_not_allowed|brain_body_too_large)/.test(message);
+        return res.status(clientError ? 400 : 502).json({
+          error: clientError ? message : 'brain_unavailable',
+          ...(clientError ? {} : { message }),
+        });
+      }
+    });
+
+    this.managementApp.post('/control-event', async (req, res) => {
+      if (!this.isAdminRequest(req)) return res.status(403).json({ error: 'admin_required' });
+      try {
+        const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+        const topic = String(body.topic || '').trim().toLowerCase();
+        if (!/^(?:control|config|project|plan):[a-z0-9][a-z0-9._-]{0,80}$/.test(topic)) {
+          return res.status(400).json({ error: 'invalid_control_topic' });
+        }
+        const idempotencyKey = String(body.idempotency_key || '').trim();
+        if (!/^[a-zA-Z0-9:._-]{8,160}$/.test(idempotencyKey)) {
+          return res.status(400).json({ error: 'invalid_idempotency_key' });
+        }
+        const subjectInput = body.subject && typeof body.subject === 'object' && !Array.isArray(body.subject)
+          ? body.subject as Record<string, unknown>
+          : {};
+        const subjectKind = String(subjectInput.kind || body.subject_kind || 'control').slice(0, 64);
+        const subjectId = String(subjectInput.id || body.subject || topic).slice(0, 240);
+        const dataValue = redactControlBrainValue(body.data ?? {});
+        const data = dataValue && typeof dataValue === 'object' && !Array.isArray(dataValue)
+          ? dataValue as Record<string, unknown>
+          : {};
+        if (Buffer.byteLength(JSON.stringify(data), 'utf8') > 128 * 1024) {
+          return res.status(413).json({ error: 'control_event_too_large' });
+        }
+        const { id: teamId } = await this.getTeam(req);
+        const latestSeq = await this.db.events.latestSeq(teamId) ?? 0;
+        const recent = await this.db.events.query({ teamId, sinceSeq: Math.max(0, latestSeq - 2_000), topics: [topic], limit: 2_000 });
+        const duplicate = recent.find((event) => event.data?.idempotency_key === idempotencyKey);
+        if (duplicate) return res.json({ ok: true, duplicate: true, seq: duplicate.seq });
+        const inserted = await emitControlEvent(this.db.events, {
+          teamId,
+          topic,
+          actorAgentId: typeof body.actor === 'string' ? body.actor.slice(0, 160) : null,
+          subjectKind,
+          subjectId,
+          data: { ...data, idempotency_key: idempotencyKey },
+        });
+        return res.status(202).json({ ok: true, duplicate: false, seq: inserted.seq });
+      } catch (error: any) {
+        return res.status(500).json({ error: error?.message || String(error) });
+      }
+    });
+
+    const controlScope = (value: unknown): 'global' | 'team' | 'project' | null => {
+      const scope = String(value || '');
+      return scope === 'global' || scope === 'team' || scope === 'project' ? scope : null;
+    };
+    const controlKey = (value: unknown): string | null => {
+      const key = String(value || '').trim();
+      return key && key.length <= 240 && !/[\r\n]/.test(key) ? key : null;
+    };
+
+    this.managementApp.get('/control/state/:scope', async (req, res) => {
+      if (!this.isAdminRequest(req)) return res.status(403).json({ error: 'admin_required' });
+      const scope = controlScope(req.params.scope);
+      if (!scope) return res.status(400).json({ error: 'invalid_control_scope' });
+      const { id: teamId } = await this.getTeam(req);
+      return res.json({ items: await this.db.controlState.list(teamId, scope) });
+    });
+
+    this.managementApp.get('/control/state/:scope/:key', async (req, res) => {
+      if (!this.isAdminRequest(req)) return res.status(403).json({ error: 'admin_required' });
+      const scope = controlScope(req.params.scope);
+      const key = controlKey(req.params.key);
+      if (!scope || !key) return res.status(400).json({ error: !scope ? 'invalid_control_scope' : 'invalid_control_key' });
+      const { id: teamId } = await this.getTeam(req);
+      const item = await this.db.controlState.get(teamId, scope, key);
+      return item ? res.json({ item }) : res.status(404).json({ error: 'control_state_not_found' });
+    });
+
+    this.managementApp.post('/control/state/:scope/:key', async (req, res) => {
+      if (!this.isAdminRequest(req)) return res.status(403).json({ error: 'admin_required' });
+      const scope = controlScope(req.params.scope);
+      const key = controlKey(req.params.key);
+      if (!scope || !key) return res.status(400).json({ error: !scope ? 'invalid_control_scope' : 'invalid_control_key' });
+      const value = redactControlBrainValue(req.body?.value);
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return res.status(400).json({ error: 'invalid_control_value' });
+      if (Buffer.byteLength(JSON.stringify(value), 'utf8') > 256 * 1024) return res.status(413).json({ error: 'control_value_too_large' });
+      const expectedVersion = req.body?.expected_version;
+      if (expectedVersion !== undefined && (!Number.isInteger(expectedVersion) || expectedVersion < 0)) {
+        return res.status(400).json({ error: 'invalid_expected_version' });
+      }
+      const { id: teamId } = await this.getTeam(req);
+      const item = await this.db.controlState.upsert({
+        teamId,
+        scope,
+        key,
+        value: value as Record<string, unknown>,
+        ...(expectedVersion === undefined ? {} : { expectedVersion }),
+        now: Date.now(),
+      });
+      if (!item) return res.status(409).json({ error: 'control_state_version_conflict' });
+      const event = await emitControlEvent(this.db.events, {
+        teamId,
+        topic: scope === 'project' ? 'project:updated' : 'control:state-updated',
+        subjectKind: scope,
+        subjectId: key,
+        data: { scope, key, version: item.version, data: item.value },
+      });
+      return res.json({ item, event_seq: event.seq });
+    });
+
+    this.managementApp.delete('/control/state/:scope/:key', async (req, res) => {
+      if (!this.isAdminRequest(req)) return res.status(403).json({ error: 'admin_required' });
+      const scope = controlScope(req.params.scope);
+      const key = controlKey(req.params.key);
+      if (!scope || !key) return res.status(400).json({ error: !scope ? 'invalid_control_scope' : 'invalid_control_key' });
+      const { id: teamId } = await this.getTeam(req);
+      const deleted = await this.db.controlState.delete(teamId, scope, key);
+      if (deleted) await emitControlEvent(this.db.events, { teamId, topic: scope === 'project' ? 'project:removed' : 'control:state-removed', subjectKind: scope, subjectId: key, data: { scope, key } });
+      return res.json({ ok: true, deleted });
+    });
+
+    this.managementApp.post('/control/memory', async (req, res) => {
+      if (!this.isAdminRequest(req)) return res.status(403).json({ error: 'admin_required' });
+      const agentId = controlKey(req.body?.agent_id || req.body?.agentId);
+      const input = redactControlBrainValue(req.body?.input);
+      if (!agentId || !input || typeof input !== 'object' || Array.isArray(input)) return res.status(400).json({ error: 'invalid_control_memory' });
+      const delivered = await this.postBrain(`/memory/${encodeURIComponent(agentId)}`, input as Record<string, unknown>);
+      return res.status(delivered ? 200 : 502).json({ ok: delivered });
     });
 
     this.managementApp.get('/manager/local-concurrency', (_req, res) => {
@@ -12336,6 +12651,8 @@ Return this JSON shape:
         }
 
         const now = Math.floor(Date.now() / 1000);
+        const projectId = boundedLineageId(body.project_id ?? body.project);
+        const planId = boundedLineageId(body.plan_id ?? body.plan);
         const taskRow: TaskRow = {
           id: `task_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
           name,
@@ -12349,9 +12666,22 @@ Return this JSON shape:
           created_at: now,
           updated_at: now,
           completed_at: null,
+          project_id: projectId,
+          plan_id: planId,
         };
 
         await this.db.tasks.create(taskRow);
+        await emitTaskCreated(this.db.events, {
+          teamId: taskTeamId,
+          taskUuid: taskRow.uuid,
+          taskName: taskRow.name,
+          title: taskRow.title,
+          ownerAgentId: taskRow.owner,
+          actorAgentId: createdBy,
+          occurredAt: Date.now(),
+          projectId,
+          planId,
+        });
         let ownerWake: Awaited<ReturnType<typeof this.wakeAssignedTaskOwner>> | undefined;
         let brainContext: BrainVolunteerContext | null = null;
         if (defaultOwner.owner) {
@@ -16213,6 +16543,8 @@ Return this JSON shape:
           let bittreesRelevance: string | undefined;
           let target: string | undefined;
           let parentTask: string | undefined;
+          let projectId: string | undefined;
+          let planId: string | undefined;
           let validationPurpose: string | undefined;
           let leadCoordination = false;
           const eventIds: string[] = [];
@@ -16248,6 +16580,8 @@ Return this JSON shape:
               || token === '--url'
             ) { target = rawArgs[++i]; continue; }
             if (token === '--parent-task' || token === '--parent-ref') { parentTask = rawArgs[++i]; continue; }
+            if (token === '--project' || token === '--project-id') { projectId = rawArgs[++i]; continue; }
+            if (token === '--plan' || token === '--plan-id') { planId = rawArgs[++i]; continue; }
             if (token === '--validation-purpose') { validationPurpose = rawArgs[++i]; continue; }
             if (token === '--lead-coordination' || token === '--coordination-parent') { leadCoordination = true; continue; }
             if (!title) { title = token; continue; }
@@ -16470,9 +16804,22 @@ Return this JSON shape:
             created_at: now,
             updated_at: now,
             completed_at: null,
+            project_id: boundedLineageId(projectId),
+            plan_id: boundedLineageId(planId),
           };
 
           await this.db.tasks.create(taskRow, eventIds.length > 0 ? eventIds : undefined);
+          await emitTaskCreated(this.db.events, {
+            teamId: taskTeamId,
+            taskUuid: taskRow.uuid,
+            taskName: taskRow.name,
+            title: taskRow.title,
+            ownerAgentId: taskRow.owner,
+            actorAgentId: createdBy,
+            occurredAt: Date.now(),
+            projectId: taskRow.project_id,
+            planId: taskRow.plan_id,
+          });
           let ownerWake: Awaited<ReturnType<typeof this.wakeAssignedTaskOwner>> | undefined;
           let brainContext: BrainVolunteerContext | null = null;
           if (ownerId && ownerAgentForGuard) {

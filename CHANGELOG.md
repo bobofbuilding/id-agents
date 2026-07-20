@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.111]
+
+- Add an authenticated, allowlisted, idempotent Manager relay for all IDACC Brain reads and writes, with secret redaction and bounded payloads.
+- Persist versioned Dashboard control state in SQLite or Postgres with atomic optimistic concurrency, keeping IDACC project, organization, and task-overlay state recoverable.
+- Emit durable control/config and task-created events for agent, team, deployment, identity, and capability mutations.
+- Preserve project and plan lineage on task rows so Brain can learn project-to-plan-to-task-to-agent relationships.
+
 ## [0.1.110]
 
 - Route confirmed subscription session, daily, weekly, and monthly caps to the next healthy authenticated subscription runtime before considering metered or local fallback.

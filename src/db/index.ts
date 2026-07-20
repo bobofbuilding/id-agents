@@ -38,6 +38,7 @@ async function createPostgresDb(adapter: DbAdapter): Promise<Db> {
   const { PgSubscriptionsRepo } = await import('./repos/postgres/subscriptions-repo.js');
   const { PgCheckinsRepo } = await import('./repos/postgres/checkins-repo.js');
   const { PgRuntimeLaneCooldownsRepo } = await import('./repos/postgres/runtime-lane-cooldowns-repo.js');
+  const { PgControlStateRepo } = await import('./repos/postgres/control-state-repo.js');
   return {
     adapter,
     teams: new PgTeamsRepo(adapter),
@@ -50,6 +51,7 @@ async function createPostgresDb(adapter: DbAdapter): Promise<Db> {
     subscriptions: new PgSubscriptionsRepo(adapter),
     checkins: new PgCheckinsRepo(adapter),
     runtimeLaneCooldowns: new PgRuntimeLaneCooldownsRepo(adapter),
+    controlState: new PgControlStateRepo(adapter),
     async close() { await adapter.close(); },
   };
 }
@@ -65,6 +67,7 @@ async function createSqliteDb(adapter: SqliteAdapter): Promise<Db> {
   const { SqliteSubscriptionsRepo } = await import('./repos/sqlite/subscriptions-repo.js');
   const { SqliteCheckinsRepo } = await import('./repos/sqlite/checkins-repo.js');
   const { SqliteRuntimeLaneCooldownsRepo } = await import('./repos/sqlite/runtime-lane-cooldowns-repo.js');
+  const { SqliteControlStateRepo } = await import('./repos/sqlite/control-state-repo.js');
   return {
     adapter,
     teams: new SqliteTeamsRepo(adapter),
@@ -77,6 +80,7 @@ async function createSqliteDb(adapter: SqliteAdapter): Promise<Db> {
     subscriptions: new SqliteSubscriptionsRepo(adapter),
     checkins: new SqliteCheckinsRepo(adapter),
     runtimeLaneCooldowns: new SqliteRuntimeLaneCooldownsRepo(adapter),
+    controlState: new SqliteControlStateRepo(adapter),
     async close() { await adapter.close(); },
   };
 }

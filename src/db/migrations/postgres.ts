@@ -568,6 +568,8 @@ export async function migratePostgres(adapter: DbAdapter): Promise<void> {
   // Tasks: ensure uuid column exists for upgraded databases, then backfill
   // and enforce uniqueness. pgcrypto provides gen_random_uuid().
   await adapter.query(`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS uuid text;`);
+  await adapter.query(`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS project_id text;`);
+  await adapter.query(`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS plan_id text;`);
   await adapter.query(`UPDATE tasks SET uuid = gen_random_uuid()::text WHERE uuid IS NULL OR uuid = '';`);
   await adapter.query(`CREATE UNIQUE INDEX IF NOT EXISTS tasks_uuid_idx ON tasks(uuid);`);
 
@@ -583,6 +585,8 @@ export async function migratePostgres(adapter: DbAdapter): Promise<void> {
   await adapter.query(`CREATE INDEX IF NOT EXISTS tasks_status_idx ON tasks(status, updated_at);`);
   await adapter.query(`CREATE INDEX IF NOT EXISTS tasks_owner_idx ON tasks(owner, status, updated_at);`);
   await adapter.query(`CREATE INDEX IF NOT EXISTS tasks_team_idx ON tasks(team_id, status, updated_at);`);
+  await adapter.query(`CREATE INDEX IF NOT EXISTS tasks_project_idx ON tasks(team_id, project_id, status, updated_at);`);
+  await adapter.query(`CREATE INDEX IF NOT EXISTS tasks_plan_idx ON tasks(team_id, plan_id, status, updated_at);`);
   await adapter.query(`CREATE INDEX IF NOT EXISTS task_event_links_schedule_idx ON task_event_links(schedule_id, task_id);`);
 
   // 16) Wakeup service tables: durable event bus, durable subscriptions, webhook delivery bookkeeping.
@@ -601,6 +605,20 @@ export async function migratePostgres(adapter: DbAdapter): Promise<void> {
   await adapter.query(`CREATE INDEX IF NOT EXISTS event_log_team_seq_idx ON event_log(team_id, seq);`);
   await adapter.query(`CREATE INDEX IF NOT EXISTS event_log_team_topic_seq_idx ON event_log(team_id, topic, seq);`);
   await adapter.query(`CREATE INDEX IF NOT EXISTS event_log_team_subject_idx ON event_log(team_id, subject_kind, subject_id, seq);`);
+
+  await adapter.query(`
+    CREATE TABLE IF NOT EXISTS control_state (
+      team_id uuid NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+      scope text NOT NULL CHECK(scope IN ('global','team','project')),
+      state_key text NOT NULL,
+      value jsonb NOT NULL,
+      version integer NOT NULL DEFAULT 1,
+      created_at bigint NOT NULL,
+      updated_at bigint NOT NULL,
+      PRIMARY KEY(team_id, scope, state_key)
+    );
+  `);
+  await adapter.query(`CREATE INDEX IF NOT EXISTS control_state_team_scope_idx ON control_state(team_id, scope, updated_at);`);
 
   await adapter.query(`
     CREATE TABLE IF NOT EXISTS subscriptions (
