@@ -242,6 +242,9 @@ export interface AgentsRepository {
 // ---------------------------------------------------------------------------
 
 export interface QueriesRepository {
+  /** Count all live pending/processing queries across every managed team. */
+  countActive(): Promise<number>;
+
   /** Insert a new query row. */
   create(
     teamId: string,

@@ -24,6 +24,15 @@ function resolveQueryOwnership(
 export class PgQueriesRepo implements QueriesRepository {
   constructor(private db: DbAdapter) {}
 
+  async countActive(): Promise<number> {
+    const { rows } = await this.db.query<{ c: string }>(
+      `SELECT COUNT(*)::text AS c
+       FROM queries
+       WHERE status IN ('pending', 'processing')`,
+    );
+    return Number(rows[0]?.c ?? 0);
+  }
+
   async getById(agentId: string, queryId: string): Promise<QueryRow | null> {
     const { rows } = await this.db.query<QueryRow>(
       `SELECT team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id, metadata

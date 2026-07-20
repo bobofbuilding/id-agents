@@ -8679,8 +8679,17 @@ Return this JSON shape:
 
     this.managementApp.get('/health', async (req, res) => {
       const { id: teamId, name: teamName } = await this.getTeam(req);
-      const count = await this.db.agents.count(teamId);
-      res.json({ status: 'ok', team: teamName, agents: parseInt(count || '0'), timestamp: Date.now() });
+      const [count, activeQueries] = await Promise.all([
+        this.db.agents.count(teamId),
+        this.db.queries.countActive(),
+      ]);
+      res.json({
+        status: 'ok',
+        team: teamName,
+        agents: parseInt(count || '0'),
+        activeQueries,
+        timestamp: Date.now(),
+      });
     });
 
     // Slice 7: read-only library inventory. Library root is captured at

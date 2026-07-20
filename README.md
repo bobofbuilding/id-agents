@@ -118,6 +118,21 @@ Then paste the prompt above into Claude Code.
 
 See [QUICKSTART.md](./QUICKSTART.md) for the full step-by-step.
 
+### Managed updates with IDACC
+
+The supported IDACC stack installer installs this manager as a per-user macOS
+service and adds a separate release updater. The updater checks `main` every 30
+minutes, accepts only fast-forward commits that satisfy the tagged release
+schema, rebuilds before activation, and waits for active manager queries to
+drain before restarting. Tracked local edits or divergent history block the
+update; untracked local files are preserved.
+
+Run the same guarded check manually from this checkout with:
+
+```bash
+npm run manager:update -- --dry-run
+```
+
 ### Manual install
 
 Prefer to run the steps yourself? Skip the skill and use the interactive CLI directly.

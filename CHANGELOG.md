@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.115]
+
+- Add a guarded manager release updater that accepts only tagged release-schema commits, preserves untracked local files, refuses tracked edits or divergent history, and builds before activation.
+- Defer automatic manager service restarts while any team has pending or processing queries, then activate the staged release once work drains.
+- Report aggregate active-query count from manager health so IDACC can coordinate updates without interrupting committed work.
+
 ## [0.1.114]
 
 - Keep the manager HTTP event loop responsive during SQLite write contention by limiting each synchronous busy wait to 250 ms while preserving the existing bounded asynchronous retry window.

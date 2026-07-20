@@ -1,6 +1,6 @@
 {
   "name": "id-agents",
-  "version": "0.1.114",
+  "version": "0.1.115",
   "description": "Multi-agent orchestration platform with REST-AP interfaces",
   "type": "module",
   "main": "dist/index.js",
@@ -27,6 +27,8 @@
     "verify:release-schema": "tsx src/release-schema-cli.ts",
     "workspace:gc": "node scripts/workspace-gc.mjs",
     "test:workspace-gc": "node scripts/workspace-gc-smoke.mjs",
+    "manager:update": "node scripts/manager-auto-update.mjs",
+    "test:manager-update": "node scripts/manager-auto-update-smoke.mjs",
     "prepublishOnly": "npm run verify:release-schema && npm run build",
     "dev": "tsc --watch",
     "lint": "npm run typecheck",
@@ -54,6 +56,7 @@
   "files": [
     "dist/**/*",
     "scripts/workspace-gc.mjs",
+    "scripts/manager-auto-update.mjs",
     "docs/**/*",
     "skills/**/*",
     "plugins/**/*",

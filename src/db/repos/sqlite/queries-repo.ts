@@ -26,6 +26,15 @@ function resolveQueryOwnership(
 export class SqliteQueriesRepo implements QueriesRepository {
   constructor(private readonly db: DbAdapter) {}
 
+  async countActive(): Promise<number> {
+    const r = await this.db.query<{ c: number }>(
+      `SELECT COUNT(*) AS c
+       FROM queries
+       WHERE status IN ('pending', 'processing')`,
+    );
+    return Number(r.rows[0]?.c ?? 0);
+  }
+
   private parseQueryRow(row: any): QueryRow | null {
     if (!row) return null;
     const agent_id =
