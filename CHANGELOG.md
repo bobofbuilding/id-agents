@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.114]
+
+- Keep the manager HTTP event loop responsive during SQLite write contention by limiting each synchronous busy wait to 250 ms while preserving the existing bounded asynchronous retry window.
+- Add status/time indexes for stale-query expiry and recent-completion supervision scans so manager maintenance no longer performs full query-table scans every 30 seconds.
+- Cover the live query-sweep index migration and SQLite busy-timeout guard with regression tests.
+
 ## [0.1.113]
 
 - Preserve Brain data, memory, reports, source trees, uploads, and agent task artifacts during routine workspace cleanup; whole-output and publish-snapshot deletion now require explicit opt-in flags.

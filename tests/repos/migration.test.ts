@@ -198,6 +198,19 @@ describe('SQLite migration — tasks uniqueness upgrade', () => {
   });
 });
 
+describe('SQLite migration — query sweep indexes', () => {
+  it('indexes status/time query sweeps without requiring a team or agent prefix', async () => {
+    const adapter = await freshDb();
+    const { rows } = await adapter.query<{ name: string }>(
+      `SELECT name FROM pragma_index_list('queries')`,
+    );
+    const names = rows.map((row) => row.name);
+    expect(names).toContain('queries_status_created_idx');
+    expect(names).toContain('queries_status_completed_idx');
+    await adapter.close();
+  });
+});
+
 // =====================================================================
 // Phase 2: remote endpoint column idempotency
 // =====================================================================

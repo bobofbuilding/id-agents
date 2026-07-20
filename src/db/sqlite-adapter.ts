@@ -3,7 +3,10 @@
 import Database from 'better-sqlite3';
 import { DbAdapter, QueryResult } from './db-adapter.js';
 
-const DEFAULT_BUSY_TIMEOUT_MS = 30_000;
+// better-sqlite3 waits synchronously inside SQLite. A long busy timeout blocks
+// the Node event loop, including /health and read-only HTTP routes. Keep each
+// lock attempt short and use the asynchronous retry loop below for resilience.
+const DEFAULT_BUSY_TIMEOUT_MS = 250;
 const DEFAULT_LOCK_RETRY_WINDOW_MS = 30_000;
 const MAX_LOCK_RETRY_DELAY_MS = 750;
 const DEFAULT_SLOW_QUERY_MS = 500;
