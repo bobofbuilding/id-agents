@@ -180,6 +180,28 @@ async function health(managerUrl) {
   }
 }
 
+export async function localActiveQueryCount(env = process.env) {
+  if (env.DATABASE_URL) return undefined;
+  const databasePath = resolve(env.SQLITE_PATH || join(env.HOME || homedir(), '.id-agents', 'id-agents.db'));
+  if (!existsSync(databasePath)) return undefined;
+  let database;
+  try {
+    const { default: Database } = await import('better-sqlite3');
+    database = new Database(databasePath, { readonly: true, fileMustExist: true });
+    database.pragma('busy_timeout = 100');
+    const row = database.prepare(
+      `SELECT COUNT(*) AS count
+       FROM queries
+       WHERE status IN ('pending', 'processing')`,
+    ).get();
+    return Number(row?.count ?? 0);
+  } catch {
+    return undefined;
+  } finally {
+    try { database?.close(); } catch { /* read-only fallback cleanup is best-effort */ }
+  }
+}
+
 async function waitForHealth(managerUrl, timeoutMs = 45_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -249,6 +271,9 @@ export async function updateManager(opts) {
 
   if (!opts.restart) return { status: 'restart-pending', version, commit: targetCommit };
   const readiness = await health(opts.managerUrl);
+  if (readiness.activeQueries === undefined) {
+    readiness.activeQueries = await localActiveQueryCount();
+  }
   if (readiness.activeQueries === undefined) {
     writeState(opts.state, {
       status: 'restart-pending',

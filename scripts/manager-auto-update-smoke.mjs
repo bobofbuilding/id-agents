@@ -5,8 +5,9 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import Database from 'better-sqlite3';
 
-import { parseArgs, validateReleaseSnapshot } from './manager-auto-update.mjs';
+import { localActiveQueryCount, parseArgs, validateReleaseSnapshot } from './manager-auto-update.mjs';
 
 const root = mkdtempSync(join(tmpdir(), 'id-agents-manager-update-'));
 try {
@@ -45,6 +46,16 @@ try {
     changelog: '## [1.2.3]',
     tags: [],
   }), /tagged/);
+
+  const databasePath = join(root, 'manager.db');
+  const database = new Database(databasePath);
+  database.exec(`
+    CREATE TABLE queries (status TEXT NOT NULL);
+    INSERT INTO queries (status) VALUES ('pending'), ('processing'), ('completed');
+  `);
+  database.close();
+  assert.equal(await localActiveQueryCount({ HOME: root, SQLITE_PATH: databasePath }), 2);
+  assert.equal(await localActiveQueryCount({ HOME: root, SQLITE_PATH: databasePath, DATABASE_URL: 'postgres://example' }), undefined);
   console.log('manager-auto-update smoke test passed');
 } finally {
   rmSync(root, { recursive: true, force: true });

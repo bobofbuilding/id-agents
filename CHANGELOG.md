@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.117]
+
+- Let the updater read the default SQLite queue in read-only mode when upgrading a manager too old to report active-query count, completing the automatic migration without treating unknown state as idle.
+- Keep PostgreSQL and unavailable queue state fail-closed, and cover the compatibility query count with a smoke test.
+
 ## [0.1.116]
 
 - Defer manager update activation when the running service is unavailable or does not expose an aggregate active-query count, preventing a first-upgrade compatibility gap from being mistaken for an idle manager.
