@@ -269,7 +269,9 @@ export async function updateManager(opts) {
     return { status: 'current', version, commit: targetCommit };
   }
 
-  if (!opts.restart) return { status: 'restart-pending', version, commit: targetCommit };
+  if (opts.dryRun || !opts.restart) {
+    return { status: 'restart-pending', version, commit: targetCommit };
+  }
   const readiness = await health(opts.managerUrl);
   if (readiness.activeQueries === undefined) {
     readiness.activeQueries = await localActiveQueryCount();

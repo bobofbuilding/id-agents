@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.1.118]
+
+- Keep `manager:update -- --dry-run` side-effect free when a release is already built and awaiting activation, so preview mode can never restart the manager service.
+
 ## [0.1.117]
 
 - Let the updater read the default SQLite queue in read-only mode when upgrading a manager too old to report active-query count, completing the automatic migration without treating unknown state as idle.
