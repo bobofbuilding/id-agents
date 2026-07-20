@@ -3,6 +3,7 @@ import type { DbAdapter } from '../../db-adapter.js';
 import type { ControlStateRepository } from '../../db-service.js';
 import type { ControlStateRow } from '../../types.js';
 import { parseJsonObject, stringifyJson } from '../../db-json.js';
+import { isDeepStrictEqual } from 'node:util';
 
 function row(value: any): ControlStateRow {
   return { ...value, version: Number(value.version), created_at: Number(value.created_at), updated_at: Number(value.updated_at), value: parseJsonObject(value.value) };
@@ -20,6 +21,11 @@ export class PgControlStateRepo implements ControlStateRepository {
   }
   async upsert(input: { teamId: string; scope: ControlStateRow['scope']; key: string; value: Record<string, unknown>; expectedVersion?: number; now: number }): Promise<ControlStateRow | null> {
     const value = stringifyJson(input.value);
+    const current = await this.get(input.teamId, input.scope, input.key);
+    if (current) {
+      if (input.expectedVersion !== undefined && input.expectedVersion !== current.version) return null;
+      if (isDeepStrictEqual(current.value, input.value)) return current;
+    }
     if (input.expectedVersion === 0) {
       const inserted = await this.db.query(
         `INSERT INTO control_state(team_id,scope,state_key,value,version,created_at,updated_at) VALUES($1,$2,$3,$4::jsonb,1,$5,$5)
@@ -38,7 +44,8 @@ export class PgControlStateRepo implements ControlStateRepository {
     }
     await this.db.query(
       `INSERT INTO control_state(team_id,scope,state_key,value,version,created_at,updated_at) VALUES($1,$2,$3,$4::jsonb,1,$5,$5)
-       ON CONFLICT(team_id,scope,state_key) DO UPDATE SET value=EXCLUDED.value,version=control_state.version+1,updated_at=EXCLUDED.updated_at`,
+       ON CONFLICT(team_id,scope,state_key) DO UPDATE SET value=EXCLUDED.value,version=control_state.version+1,updated_at=EXCLUDED.updated_at
+       WHERE control_state.value IS DISTINCT FROM EXCLUDED.value`,
       [input.teamId, input.scope, input.key, value, input.now],
     );
     return this.get(input.teamId, input.scope, input.key);

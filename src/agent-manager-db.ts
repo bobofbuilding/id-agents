@@ -9161,6 +9161,7 @@ Return this JSON shape:
         return res.status(400).json({ error: 'invalid_expected_version' });
       }
       const { id: teamId } = await this.getTeam(req);
+      const previous = await this.db.controlState.get(teamId, scope, key);
       const item = await this.db.controlState.upsert({
         teamId,
         scope,
@@ -9170,6 +9171,9 @@ Return this JSON shape:
         now: Date.now(),
       });
       if (!item) return res.status(409).json({ error: 'control_state_version_conflict' });
+      if (previous && item.version === previous.version) {
+        return res.json({ item, event_seq: null, unchanged: true });
+      }
       const event = await emitControlEvent(this.db.events, {
         teamId,
         topic: scope === 'project' ? 'project:updated' : 'control:state-updated',

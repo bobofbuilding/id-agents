@@ -21,6 +21,8 @@ describe('manager control state and task lineage', () => {
     const first = await repo.upsert({ teamId: 'team-1', scope: 'project', key: 'alpha', value: { name: 'Alpha' }, now: 10 });
     expect(first?.version).toBe(1);
     expect((await repo.get('team-1', 'project', 'alpha'))?.value).toEqual({ name: 'Alpha' });
+    const unchanged = await repo.upsert({ teamId: 'team-1', scope: 'project', key: 'alpha', value: { name: 'Alpha' }, now: 11 });
+    expect(unchanged).toMatchObject({ version: 1, updated_at: 10 });
     expect(await repo.upsert({ teamId: 'team-1', scope: 'project', key: 'alpha', value: { name: 'stale' }, expectedVersion: 0, now: 11 })).toBeNull();
     const second = await repo.upsert({ teamId: 'team-1', scope: 'project', key: 'alpha', value: { name: 'Alpha 2' }, expectedVersion: 1, now: 12 });
     expect(second?.version).toBe(2);

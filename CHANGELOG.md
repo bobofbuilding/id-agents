@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.112]
+
+- Treat byte-identical control-state writes as no-ops in SQLite and Postgres so polling and repeated work passes do not increment versions or flood the durable event log.
+- Return unchanged control-state writes without emitting `control:state-updated`, while preserving optimistic concurrency conflicts for stale writers.
+
 ## [0.1.111]
 
 - Add an authenticated, allowlisted, idempotent Manager relay for all IDACC Brain reads and writes, with secret redaction and bounded payloads.
