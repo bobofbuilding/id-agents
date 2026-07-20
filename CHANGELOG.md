@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.1.116]
+
+- Defer manager update activation when the running service is unavailable or does not expose an aggregate active-query count, preventing a first-upgrade compatibility gap from being mistaken for an idle manager.
+
 ## [0.1.115]
 
 - Add a guarded manager release updater that accepts only tagged release-schema commits, preserves untracked local files, refuses tracked edits or divergent history, and builds before activation.

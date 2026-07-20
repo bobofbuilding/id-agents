@@ -249,9 +249,22 @@ export async function updateManager(opts) {
 
   if (!opts.restart) return { status: 'restart-pending', version, commit: targetCommit };
   const readiness = await health(opts.managerUrl);
-  // Older managers do not report activeQueries. This one-time compatibility
-  // activation is allowed; every subsequent release uses the explicit count.
-  if (readiness.activeQueries !== undefined && readiness.activeQueries > 0) {
+  if (readiness.activeQueries === undefined) {
+    writeState(opts.state, {
+      status: 'restart-pending',
+      version,
+      commit: targetCommit,
+      reason: readiness.healthy ? 'active-query-count-unavailable' : 'manager-unavailable',
+      deferredAt: new Date().toISOString(),
+    });
+    return {
+      status: 'deferred',
+      version,
+      commit: targetCommit,
+      reason: readiness.healthy ? 'active-query-count-unavailable' : 'manager-unavailable',
+    };
+  }
+  if (readiness.activeQueries > 0) {
     writeState(opts.state, {
       status: 'restart-pending',
       version,
