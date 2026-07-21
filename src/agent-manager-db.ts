@@ -9164,6 +9164,38 @@ Return this JSON shape:
       res.json(ccCapabilities());
     });
 
+    // Resolve and verify the exact runtime/model pair that POST /agents/spawn will
+    // use. IDACC calls this before creating any agents so an unavailable runtime or
+    // a stale manager default cannot produce a partially-created team.
+    this.managementApp.post('/runtime/preflight', (req, res) => {
+      const runtime = typeof req.body?.runtime === 'string' ? req.body.runtime.trim() : undefined;
+      const model = typeof req.body?.model === 'string' ? req.body.model.trim() : undefined;
+
+      if (runtime && !isRuntimeId(runtime)) {
+        return res.status(400).json({
+          ok: false,
+          error: `Unknown runtime "${runtime}". Expected one of: ${getAvailableRuntimes().join(', ')}`,
+        });
+      }
+      if (runtime && isRemoteEndpointRuntime(runtime)) {
+        return res.status(400).json({
+          ok: false,
+          error: 'runtime_not_spawnable',
+          message: 'public-agent-remote cannot be spawned locally.',
+        });
+      }
+
+      const selection = resolveSpawnRuntimeModel(runtime, model, this.defaultConfig);
+      const issues = validateRuntimePreflight(selection.runtime, selection.model);
+      return res.json({
+        ok: issues.length === 0,
+        runtime: selection.runtime,
+        model: selection.model,
+        issues,
+        detail: issues.map((issue) => runtimeIssueHint(issue.code) || issue.message).join('; '),
+      });
+    });
+
     // IDACC is not allowed to bypass the manager when it reads or writes Brain state.
     // Writes are first journaled in the manager event log and use a caller-provided
     // idempotency key, so a desktop retry cannot create duplicate learning records.

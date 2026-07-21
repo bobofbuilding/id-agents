@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.121]
+
+- Add a side-effect-free runtime preflight endpoint that resolves the exact runtime/model pair used by agent spawn and validates it on the manager host.
+- Advertise the runtime preflight contract through Control Center API v5 so compatible clients can block outdated managers before partial team creation.
+- Cover the versioned capability contract while retaining the runtime/default pairing regression coverage from v0.1.120.
+
 ## [0.1.120]
 
 - Keep configured default models paired with their configured runtime so an explicit alternate runtime never inherits an incompatible provider model during agent creation.
