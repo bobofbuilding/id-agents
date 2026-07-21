@@ -111,6 +111,7 @@ function fakeDb(overrides: Record<string, any> = {}): any {
       getByNameForTeam: vi.fn(async () => task()),
       getByUuidPrefix: vi.fn(async () => [task()]),
       claim: vi.fn(async () => true),
+      releaseClaim: vi.fn(async () => true),
       updateFields: vi.fn(async () => {}),
       listEventLinksForTask: vi.fn(async () => []),
       ...overrides.tasks,
@@ -180,6 +181,23 @@ describe('stalled task sweeper', () => {
     delete process.env.LEAD_DELEGATION_KICKOFF_GRACE_MS;
     delete process.env.ID_LEAD_BACKLOG_AUTO_KEEP_ACTIVE;
     delete process.env.ID_LEAD_BACKLOG_AUTO_DISABLED;
+  });
+
+  it('restores a missing task team from its recorded owner without refreshing staleness', async () => {
+    const orphan = task({ id: 'legacy-task', team_id: null, updated_at: 1_799_999_100 });
+    const db = fakeDb({
+      tasks: {
+        list: vi.fn(async ({ status, teamId }: { status?: string; teamId?: string | null } = {}) =>
+          teamId === null && status === 'doing' ? [orphan] : []),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-task-team-repair-test', db, { libraryRoot: null }) as any;
+
+    await expect(manager.repairMissingTaskTeams(25)).resolves.toBe(1);
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(orphan.id, {
+      team_id: TEAM_ID,
+      updated_at: orphan.updated_at,
+    });
   });
 
   it('defaults automatic stalled-task sweeps to a responsive assignment cadence', () => {
@@ -2123,6 +2141,49 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('marks direct assignment prompts done when their completed reply names the task', async () => {
+    const staleTask = task({
+      name: 'draft-rollout-sequence',
+      title: 'Draft rollout sequence',
+      uuid: '9718379f-9eef-4f35-bbe4-3d3ceaa4163d',
+    });
+    const db = fakeDb({
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [staleTask]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-direct-assignment-completion-test', db, { libraryRoot: null }) as any;
+
+    await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery(staleTask.owner!, {
+        query_id: 'direct-assignment-completion',
+        prompt: [
+          "You've been assigned task #9718379f: Draft rollout sequence",
+          'Do this task now. When finished, mark it done with: /task done #9718379f --acceptance "completed the assigned scope; evidence is in my reply"',
+        ].join('\n'),
+        status: 'completed',
+      }),
+      {
+        result: [
+          'Task #9718379f is complete.',
+          'Output: [rollout.md](/tmp/rollout.md)',
+          '/task done #9718379f --acceptance "completed the assigned scope; evidence is in my reply"',
+        ].join('\n'),
+      },
+      NOW_MS,
+    );
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(staleTask.id, {
+      status: 'done',
+      completed_at: Math.floor(NOW_MS / 1000),
+      updated_at: Math.floor(NOW_MS / 1000),
+    });
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:completed',
+      subject_id: staleTask.uuid,
+    }));
+  });
+
   it('compacts Brain context before returning dispatch responses', () => {
     const manager = new AgentManagerDb('/tmp/id-agents-brain-context-response-test', fakeDb(), { libraryRoot: null }) as any;
 
@@ -3397,6 +3458,44 @@ describe('stalled task sweeper', () => {
       'coder',
       expect.stringContaining('TASK DELEGATION from manager'),
     );
+  });
+
+  it('returns an auto-assigned task to todo when delivery is rejected', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const worker = agent({ id: 'agent-worker', name: 'worker' });
+    const queued = task({
+      id: 'queued-task',
+      name: 'queued-task',
+      uuid: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+      title: 'Queued task',
+      status: 'todo',
+      owner: null,
+      updated_at: nowSec - 900,
+    });
+    const db = fakeDb({
+      agents: {
+        list: vi.fn(async () => [worker]),
+        getById: vi.fn(async () => worker),
+      },
+      tasks: {
+        list: vi.fn(async () => []),
+        getByNameForTeam: vi.fn(async () => queued),
+        claim: vi.fn(async () => true),
+        releaseClaim: vi.fn(async () => true),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-rejected-autoassign-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => false);
+
+    const result = await manager.assignUnownedTodoTask(queued, team(), NOW_MS);
+
+    expect(result).toEqual({ assigned: false, reason: 'dispatch_rejected', dispatched: false });
+    expect(db.tasks.releaseClaim).toHaveBeenCalledWith('queued-task', worker.id, nowSec, nowSec);
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:triaged',
+      subject_id: queued.uuid,
+      data: expect.objectContaining({ reason: 'dispatch_rejected' }),
+    }));
   });
 
   it('wakes a stopped local teammate before auto-assigning stale unowned work', async () => {

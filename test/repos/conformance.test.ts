@@ -273,6 +273,52 @@ describe('QueriesRepository', () => {
     assert.ok(q);
     assert.equal(q.status, 'pending');
     assert.equal(q.prompt, 'Hello?');
+    assert.equal((q.metadata as any)?.context?.kind, 'non_task');
+    assert.equal((q.metadata as any)?.context?.reason, 'legacy_unspecified_non_task_query');
+  });
+
+  it('redacts stored prompts and records versioned HMAC fingerprints without keys', async () => {
+    const { teamId, agentId } = await seedAgent(db);
+    const queryId = randomUUID();
+    const now = Date.now();
+
+    await db.queries.create(teamId, queryId, agentId, 'token=sk-secret1234567890 cwd: /Users/alice/private/repo', now);
+
+    const q = await db.queries.getById(agentId, queryId);
+    assert.ok(q);
+    assert.equal(q.prompt?.includes('sk-secret1234567890'), false);
+    assert.equal(q.prompt?.includes('/Users/alice/private/repo'), false);
+    assert.equal((q.metadata as any).prompt_fingerprint.alg, 'HMAC-SHA256');
+    assert.equal(typeof (q.metadata as any).prompt_fingerprint.digest, 'string');
+    assert.equal((q.metadata as any).prompt_fingerprint.key, undefined);
+    assert.equal((q.metadata as any).policy_version, 'remote-query-context.v1');
+  });
+
+  it('rejects task-scoped queries that omit durable task or assignment linkage', async () => {
+    const { teamId, agentId } = await seedAgent(db);
+    await assert.rejects(
+      () => db.queries.create(teamId, randomUUID(), agentId, 'task probe', Date.now(), undefined, undefined, {
+        context: { kind: 'task', task_id: 'task:abc' },
+      }),
+      /query_context_task_linkage_required/,
+    );
+  });
+
+  it('persists task linkage and chains audit hashes', async () => {
+    const { teamId, agentId } = await seedAgent(db);
+    const firstId = randomUUID();
+    const secondId = randomUUID();
+    await db.queries.create(teamId, firstId, agentId, 'first', Date.now(), undefined, undefined, {
+      context: { kind: 'task', reason: 'delegated', task_id: 'task:t1', assignment_id: 'assignment:t1:a1' },
+    });
+    await db.queries.create(teamId, secondId, agentId, 'second', Date.now() + 1, undefined, undefined, {
+      context: { kind: 'task', reason: 'delegated', task_id: 'task:t2', assignment_id: 'assignment:t2:a1' },
+    });
+    const first = await db.queries.getById(agentId, firstId);
+    const second = await db.queries.getById(agentId, secondId);
+    assert.equal((first?.metadata as any).context.task_id, 'task:t1');
+    assert.equal((second?.metadata as any).context.assignment_id, 'assignment:t2:a1');
+    assert.equal((second?.metadata as any).audit_chain.previous_hash, (first?.metadata as any).audit_chain.hash);
   });
 
   it('upsert creates then updates same record', async () => {

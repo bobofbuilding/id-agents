@@ -45,3 +45,70 @@ describe('QueriesRepo.countActive', () => {
     }
   });
 });
+
+describe('QueriesRepo context hardening', () => {
+  async function setup() {
+    const adapter = new SqliteAdapter(':memory:');
+    await migrateSqlite(adapter);
+    const agents = new SqliteAgentsRepo(adapter);
+    const queries = new SqliteQueriesRepo(adapter);
+    const teams = new SqliteTeamsRepo(adapter);
+    const teamId = await teams.getOrCreateTeamId('context-team');
+    await agents.create({
+      team_id: teamId,
+      id: 'agent-context',
+      name: 'agent-context',
+      type: 'claude',
+      model: 'test',
+      status: 'running',
+      created_at: 1,
+    });
+    return { adapter, queries, teamId, agentId: 'agent-context' };
+  }
+
+  it('redacts prompt storage and records versioned fingerprints without keys', async () => {
+    const { adapter, queries, teamId, agentId } = await setup();
+    try {
+      await queries.create(teamId, 'qid-redact', agentId, 'token=sk-secret1234567890 cwd: /Users/alice/private/repo', 10);
+      const row = await queries.getById(agentId, 'qid-redact');
+      expect(row?.prompt).not.toContain('sk-secret1234567890');
+      expect(row?.prompt).not.toContain('/Users/alice/private/repo');
+      expect(row?.metadata?.policy_version).toBe('remote-query-context.v1');
+      expect((row?.metadata as any).prompt_fingerprint.alg).toBe('HMAC-SHA256');
+      expect((row?.metadata as any).prompt_fingerprint.version).toBeTruthy();
+      expect((row?.metadata as any).prompt_fingerprint.key).toBeUndefined();
+    } finally {
+      await adapter.close();
+    }
+  });
+
+  it('rejects task-scoped rows without task_id and assignment_id', async () => {
+    const { adapter, queries, teamId, agentId } = await setup();
+    try {
+      await expect(queries.create(teamId, 'qid-bad-task', agentId, 'task probe', 10, undefined, undefined, {
+        context: { kind: 'task', task_id: 'task:missing-assignment' },
+      })).rejects.toThrow(/query_context_task_linkage_required/);
+    } finally {
+      await adapter.close();
+    }
+  });
+
+  it('chains task-scoped query audit hashes', async () => {
+    const { adapter, queries, teamId, agentId } = await setup();
+    try {
+      await queries.create(teamId, 'qid-task-1', agentId, 'first', 10, undefined, undefined, {
+        context: { kind: 'task', reason: 'delegated', task_id: 'task:t1', assignment_id: 'assignment:t1:a1' },
+      });
+      await queries.create(teamId, 'qid-task-2', agentId, 'second', 11, undefined, undefined, {
+        context: { kind: 'task', reason: 'delegated', task_id: 'task:t2', assignment_id: 'assignment:t2:a1' },
+      });
+      const first = await queries.getById(agentId, 'qid-task-1');
+      const second = await queries.getById(agentId, 'qid-task-2');
+      expect((first?.metadata as any).context.task_id).toBe('task:t1');
+      expect((second?.metadata as any).context.assignment_id).toBe('assignment:t2:a1');
+      expect((second?.metadata as any).audit_chain.previous_hash).toBe((first?.metadata as any).audit_chain.hash);
+    } finally {
+      await adapter.close();
+    }
+  });
+});

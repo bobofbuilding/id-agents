@@ -583,6 +583,14 @@ export interface TasksRepository {
       title?: string;
       description?: string | null;
       completed_at?: number | null;
+      workflow_state?: TaskRow['workflow_state'];
+      workflow_contract?: TaskRow['workflow_contract'];
+      assignment_id?: string | null;
+      delegation_lineage?: TaskRow['delegation_lineage'];
+      blocked_detail?: TaskRow['blocked_detail'];
+      validation_detail?: TaskRow['validation_detail'];
+      outcome_detail?: TaskRow['outcome_detail'];
+      lifecycle_updated_at?: number | null;
       updated_at: number;
     },
   ): Promise<void>;
@@ -598,7 +606,25 @@ export interface TasksRepository {
     taskId: string,
     ownerId: string,
     updatedAt: number,
-    options?: { maxDoingForTeam?: number },
+    options?: {
+      maxDoingForTeam?: number;
+      workflow?: {
+        assignmentId: string;
+        lineage: Record<string, unknown>;
+      };
+    },
+  ): Promise<boolean>;
+
+  /**
+   * Release a claim only when the task is still owned by the same agent and
+   * has not changed since it was claimed. Used when dispatch is rejected so a
+   * task cannot remain in `doing` without an executing query.
+   */
+  releaseClaim(
+    taskId: string,
+    ownerId: string,
+    claimedAt: number,
+    updatedAt: number,
   ): Promise<boolean>;
 
   /** Delete a task by id (task_event_links cascade). */

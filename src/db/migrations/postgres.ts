@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 import type { DbAdapter } from '../db-adapter.js';
+import { hardenQueryContext } from '../query-context-hardening.js';
 
 export async function migratePostgres(adapter: DbAdapter): Promise<void> {
   // Minimal "migrations" run on startup (idempotent).
@@ -311,6 +312,37 @@ export async function migratePostgres(adapter: DbAdapter): Promise<void> {
       owner_id = CASE WHEN agent_id LIKE 'manager-%' THEN team_id::text ELSE agent_id END
     WHERE owner_id = ''
   `);
+  const legacyQueries = await adapter.query<{
+    team_id: string;
+    agent_id: string | null;
+    query_id: string;
+    prompt: string | null;
+    created: number;
+    metadata: Record<string, unknown> | null;
+  }>(`
+    SELECT team_id::text AS team_id, agent_id, query_id, prompt, created, metadata
+    FROM queries
+    WHERE metadata IS NULL
+       OR metadata #>> '{audit_chain,hash}' IS NULL
+    ORDER BY created ASC, query_id ASC
+  `);
+  let previousAuditHash: string | null = null;
+  for (const row of legacyQueries.rows) {
+    const hardened = hardenQueryContext({
+      teamId: row.team_id,
+      queryId: row.query_id,
+      agentId: row.agent_id,
+      prompt: row.prompt,
+      created: Number(row.created),
+      metadata: row.metadata,
+      previousAuditHash,
+    });
+    previousAuditHash = (hardened.metadata.audit_chain as any).hash;
+    await adapter.query(
+      `UPDATE queries SET prompt = $1, metadata = $2 WHERE team_id = $3 AND query_id = $4`,
+      [hardened.prompt, hardened.metadata, row.team_id, row.query_id],
+    );
+  }
 
   await adapter.query(`CREATE INDEX IF NOT EXISTS queries_team_owner_idx ON queries(team_id, owner_kind, owner_id);`);
   await adapter.query(`CREATE INDEX IF NOT EXISTS queries_retention_idx ON queries(team_id, status, completed, created, query_id);`);
@@ -518,6 +550,14 @@ export async function migratePostgres(adapter: DbAdapter): Promise<void> {
       created_at bigint NOT NULL,
       updated_at bigint NOT NULL,
       completed_at bigint,
+      workflow_state text,
+      workflow_contract jsonb,
+      assignment_id text,
+      delegation_lineage jsonb,
+      blocked_detail jsonb,
+      validation_detail jsonb,
+      outcome_detail jsonb,
+      lifecycle_updated_at bigint,
       UNIQUE(team_id, name)
     );
   `);
@@ -572,6 +612,14 @@ export async function migratePostgres(adapter: DbAdapter): Promise<void> {
   await adapter.query(`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS uuid text;`);
   await adapter.query(`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS project_id text;`);
   await adapter.query(`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS plan_id text;`);
+  await adapter.query(`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS workflow_state text;`);
+  await adapter.query(`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS workflow_contract jsonb;`);
+  await adapter.query(`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS assignment_id text;`);
+  await adapter.query(`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS delegation_lineage jsonb;`);
+  await adapter.query(`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS blocked_detail jsonb;`);
+  await adapter.query(`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS validation_detail jsonb;`);
+  await adapter.query(`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS outcome_detail jsonb;`);
+  await adapter.query(`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS lifecycle_updated_at bigint;`);
   await adapter.query(`UPDATE tasks SET uuid = gen_random_uuid()::text WHERE uuid IS NULL OR uuid = '';`);
   await adapter.query(`CREATE UNIQUE INDEX IF NOT EXISTS tasks_uuid_idx ON tasks(uuid);`);
 
@@ -589,6 +637,8 @@ export async function migratePostgres(adapter: DbAdapter): Promise<void> {
   await adapter.query(`CREATE INDEX IF NOT EXISTS tasks_team_idx ON tasks(team_id, status, updated_at);`);
   await adapter.query(`CREATE INDEX IF NOT EXISTS tasks_project_idx ON tasks(team_id, project_id, status, updated_at);`);
   await adapter.query(`CREATE INDEX IF NOT EXISTS tasks_plan_idx ON tasks(team_id, plan_id, status, updated_at);`);
+  await adapter.query(`CREATE INDEX IF NOT EXISTS tasks_workflow_idx ON tasks(team_id, workflow_state, lifecycle_updated_at);`);
+  await adapter.query(`CREATE INDEX IF NOT EXISTS tasks_assignment_idx ON tasks(assignment_id);`);
   await adapter.query(`CREATE INDEX IF NOT EXISTS task_event_links_schedule_idx ON task_event_links(schedule_id, task_id);`);
 
   // 16) Wakeup service tables: durable event bus, durable subscriptions, webhook delivery bookkeeping.

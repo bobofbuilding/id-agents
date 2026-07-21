@@ -414,6 +414,14 @@ The Manager exposes dedicated `/tasks` REST endpoints for agent task coordinatio
 | `/tasks/:name/claim` | POST | Claim a task (`{ agent_id }`) |
 | `/tasks/:name/done` | POST | Mark task complete (`{ agent_id }`) |
 | `/tasks/:name` | DELETE | Remove a task |
+| `/tasks/:name/workflow` | POST | Repair the versioned dispatch contract |
+| `/tasks/:name/block` | POST | Block with reason, recovery owner, retry, and fallback |
+| `/tasks/:name/recover` | POST | Retry, reassign, park, or retire blocked work |
+| `/tasks/:name/validate` | POST | Record verdict, evidence IDs, and artifacts |
+| `/tasks/:name/lifecycle` | POST | Supersede or retire a task |
+| `/tasks-workflow/metrics` | GET | Workflow throughput, validation, recovery, and reuse metrics |
+
+New tasks carry a durable `task-workflow.v1` contract and atomic assignment lineage. Incomplete dispatches enter `triage_required` instead of executing without measurable completion conditions. See [Task Workflow Contract](./docs/guides/task-workflow-contract.md).
 
 **Create and claim a task:**
 

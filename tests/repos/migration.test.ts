@@ -113,6 +113,23 @@ describe('Tasks (team_id, name) uniqueness', () => {
 });
 
 describe('SQLite migration — tasks uniqueness upgrade', () => {
+  it('adds durable workflow, lineage, recovery, validation, and outcome fields', async () => {
+    const adapter = await freshDb();
+    const { rows } = await adapter.query<{ name: string }>(`SELECT name FROM pragma_table_info('tasks')`);
+    const columns = rows.map((row) => row.name);
+    expect(columns).toEqual(expect.arrayContaining([
+      'workflow_state',
+      'workflow_contract',
+      'assignment_id',
+      'delegation_lineage',
+      'blocked_detail',
+      'validation_detail',
+      'outcome_detail',
+      'lifecycle_updated_at',
+    ]));
+    await adapter.close();
+  });
+
   it('fresh DB has (team_id, name) constraint not global name UNIQUE', async () => {
     const adapter = await freshDb();
 
@@ -207,6 +224,41 @@ describe('SQLite migration — query sweep indexes', () => {
     const names = rows.map((row) => row.name);
     expect(names).toContain('queries_status_created_idx');
     expect(names).toContain('queries_status_completed_idx');
+    await adapter.close();
+  });
+});
+
+describe('SQLite migration — query context hardening', () => {
+  it('backfills legacy query rows with redaction, classification, fingerprint, and audit hash', async () => {
+    const adapter = await freshDb();
+    const teamsRepo = new SqliteTeamsRepo(adapter);
+    const teamId = await teamsRepo.getOrCreateTeamId('legacy-query-team');
+    await adapter.query(
+      `INSERT INTO agents (team_id, id, name, type, model, status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [teamId, 'legacy-agent', 'legacy-agent', 'claude', 'test', 'running', 1],
+    );
+    await adapter.query(
+      `INSERT INTO queries (team_id, agent_id, query_id, status, prompt, created, owner_kind, owner_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [teamId, 'legacy-agent', 'legacy-qid', 'pending', 'secret=ghp_abcdefghijklmnopqrstuvwxyz cwd: /Users/alice/repo', 10, 'agent', 'legacy-agent'],
+    );
+
+    await adapter.query(`DELETE FROM id_agents_migration_markers WHERE name = 'sqlite-query-context-hardening-v1'`);
+    await migrateSqlite(adapter);
+
+    const { rows } = await adapter.query<{ prompt: string; metadata: string }>(
+      `SELECT prompt, metadata FROM queries WHERE team_id = ? AND query_id = ?`,
+      [teamId, 'legacy-qid'],
+    );
+    expect(rows[0].prompt).not.toContain('ghp_abcdefghijklmnopqrstuvwxyz');
+    expect(rows[0].prompt).not.toContain('/Users/alice/repo');
+    const metadata = JSON.parse(rows[0].metadata);
+    expect(metadata.context.kind).toBe('non_task');
+    expect(metadata.context.reason).toBe('legacy_unspecified_non_task_query');
+    expect(metadata.prompt_fingerprint.alg).toBe('HMAC-SHA256');
+    expect(metadata.audit_chain.hash).toMatch(/^[a-f0-9]{64}$/);
+
     await adapter.close();
   });
 });

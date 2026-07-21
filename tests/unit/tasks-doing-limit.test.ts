@@ -100,6 +100,90 @@ describe('TasksRepository claim doing limit', () => {
     expect(after?.owner).toBe('agent-b');
   });
 
+  it('persists assignment lineage atomically with a successful claim', async () => {
+    const teamId = await teams.getOrCreateTeamId('lineage-team');
+    await agents.create({
+      team_id: teamId,
+      id: 'agent-lineage',
+      name: 'agent-lineage',
+      type: 'claude',
+      model: 'sonnet',
+      status: 'running',
+      created_at: 1,
+    });
+    await tasks.create(task({
+      team_id: teamId,
+      name: 'lineage-task',
+      workflow_state: 'queued',
+      workflow_contract: { version: 'task-workflow.v1', goal_id: 'goal-1' },
+    }));
+
+    const row = await tasks.getByNameForTeam('lineage-task', teamId);
+    const claimed = await tasks.claim(row!.id, 'agent-lineage', 100, {
+      maxDoingForTeam: 2,
+      workflow: {
+        assignmentId: 'assignment-1',
+        lineage: { version: 'delegation-lineage.v1', route: 'test' },
+      },
+    });
+
+    expect(claimed).toBe(true);
+    const persisted = await tasks.getByNameForTeam('lineage-task', teamId);
+    expect(persisted?.status).toBe('doing');
+    expect(persisted?.workflow_state).toBe('executing');
+    expect(persisted?.assignment_id).toBe('assignment-1');
+    expect(persisted?.delegation_lineage).toEqual({ version: 'delegation-lineage.v1', route: 'test' });
+    expect(persisted?.workflow_contract).toEqual({ version: 'task-workflow.v1', goal_id: 'goal-1' });
+  });
+
+  it('releases an unchanged claim after dispatch rejection', async () => {
+    const teamId = await teams.getOrCreateTeamId('release-team');
+    await agents.create({
+      team_id: teamId,
+      id: 'agent-release',
+      name: 'agent-release',
+      type: 'claude',
+      model: 'sonnet',
+      status: 'running',
+      created_at: Math.floor(Date.now() / 1000),
+    });
+    await tasks.create(task({ team_id: teamId, name: 'release-me' }));
+
+    const row = await tasks.getByNameForTeam('release-me', teamId);
+    expect(await tasks.claim(row!.id, 'agent-release', 100)).toBe(true);
+    expect(await tasks.releaseClaim(row!.id, 'agent-release', 100, 101)).toBe(true);
+
+    const released = await tasks.getByNameForTeam('release-me', teamId);
+    expect(released?.status).toBe('todo');
+    expect(released?.owner).toBeNull();
+    expect(released?.updated_at).toBe(101);
+    expect(released?.workflow_state).toBe('queued');
+    expect(released?.assignment_id).toBeNull();
+  });
+
+  it('does not release a claim that changed after dispatch', async () => {
+    const teamId = await teams.getOrCreateTeamId('changed-release-team');
+    await agents.create({
+      team_id: teamId,
+      id: 'agent-release',
+      name: 'agent-release',
+      type: 'claude',
+      model: 'sonnet',
+      status: 'running',
+      created_at: Math.floor(Date.now() / 1000),
+    });
+    await tasks.create(task({ team_id: teamId, name: 'keep-claim' }));
+
+    const row = await tasks.getByNameForTeam('keep-claim', teamId);
+    expect(await tasks.claim(row!.id, 'agent-release', 100)).toBe(true);
+    await tasks.updateFields(row!.id, { updated_at: 101 });
+
+    expect(await tasks.releaseClaim(row!.id, 'agent-release', 100, 102)).toBe(false);
+    const retained = await tasks.getByNameForTeam('keep-claim', teamId);
+    expect(retained?.status).toBe('doing');
+    expect(retained?.owner).toBe('agent-release');
+  });
+
   it('can list the oldest updated tasks first with a limit', async () => {
     const teamId = await teams.getOrCreateTeamId('scan-team');
     await tasks.create(task({ team_id: teamId, name: 'newest', updated_at: 30 }));

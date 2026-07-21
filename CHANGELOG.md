@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.119]
+
+- Enforce versioned task dispatch contracts with atomic owner, assignment, team, and delegation lineage so incomplete work enters triage instead of execution.
+- Add first-class blocked, stalled, validation, supersession, retirement, and recovery transitions with validator deadlines, bounded fallback, capacity-aware routing, and workflow telemetry.
+- Promote task learning to reusable Brain knowledge only after evidence-backed validation, confidence checks, provenance preservation, and lifecycle governance.
+- Gate skill intake on provenance, permissions, compatibility, health, ownership, rollback, and re-evaluation metadata; harden persisted query context with redaction and tamper-evident audit lineage.
+- Document the workflow contract and cover migrations, repository behavior, lifecycle recovery, capacity limits, knowledge promotion, capability intake, and query context with regression tests.
+
 ## [0.1.118]
 
 - Keep `manager:update -- --dry-run` side-effect free when a release is already built and awaiting activation, so preview mode can never restart the manager service.

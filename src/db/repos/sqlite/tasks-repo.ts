@@ -3,6 +3,20 @@
 import type { DbAdapter } from '../../db-adapter.js';
 import type { TasksRepository } from '../../db-service.js';
 import type { TaskRow } from '../../types.js';
+import { parseJsonObject, stringifyJson } from '../../db-json.js';
+
+function taskRow(row: TaskRow): TaskRow {
+  const optionalJson = (value: unknown): Record<string, unknown> | null =>
+    value === null || value === undefined || value === '' ? null : parseJsonObject(value);
+  return {
+    ...row,
+    workflow_contract: optionalJson(row.workflow_contract),
+    delegation_lineage: optionalJson(row.delegation_lineage),
+    blocked_detail: optionalJson(row.blocked_detail),
+    validation_detail: optionalJson(row.validation_detail),
+    outcome_detail: optionalJson(row.outcome_detail),
+  };
+}
 
 export class SqliteTasksRepo implements TasksRepository {
   constructor(private readonly db: DbAdapter) {}
@@ -10,8 +24,9 @@ export class SqliteTasksRepo implements TasksRepository {
   async create(task: TaskRow, eventScheduleIds?: string[]): Promise<void> {
     await this.db.query(
       `INSERT INTO tasks
-         (id, name, uuid, team_id, title, description, status, created_by, owner, created_at, updated_at, completed_at, project_id, plan_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, name, uuid, team_id, title, description, status, created_by, owner, created_at, updated_at, completed_at, project_id, plan_id,
+          workflow_state, workflow_contract, assignment_id, delegation_lineage, blocked_detail, validation_detail, outcome_detail, lifecycle_updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         task.id,
         task.name,
@@ -27,6 +42,14 @@ export class SqliteTasksRepo implements TasksRepository {
         task.completed_at,
         task.project_id ?? null,
         task.plan_id ?? null,
+        task.workflow_state ?? null,
+        task.workflow_contract ? stringifyJson(task.workflow_contract) : null,
+        task.assignment_id ?? null,
+        task.delegation_lineage ? stringifyJson(task.delegation_lineage) : null,
+        task.blocked_detail ? stringifyJson(task.blocked_detail) : null,
+        task.validation_detail ? stringifyJson(task.validation_detail) : null,
+        task.outcome_detail ? stringifyJson(task.outcome_detail) : null,
+        task.lifecycle_updated_at ?? null,
       ],
     );
 
@@ -46,7 +69,7 @@ export class SqliteTasksRepo implements TasksRepository {
       `SELECT * FROM tasks WHERE name = ?`,
       [name],
     );
-    return rows[0] || null;
+    return rows[0] ? taskRow(rows[0]) : null;
   }
 
   async getByNameForTeam(name: string, teamId: string): Promise<TaskRow | null> {
@@ -54,7 +77,7 @@ export class SqliteTasksRepo implements TasksRepository {
       `SELECT * FROM tasks WHERE name = ? AND team_id = ?`,
       [name, teamId],
     );
-    return rows[0] || null;
+    return rows[0] ? taskRow(rows[0]) : null;
   }
 
   async getByUuidPrefix(prefix: string): Promise<TaskRow[]> {
@@ -62,7 +85,7 @@ export class SqliteTasksRepo implements TasksRepository {
       `SELECT * FROM tasks WHERE uuid LIKE ? ORDER BY updated_at DESC`,
       [`${prefix}%`],
     );
-    return rows;
+    return rows.map(taskRow);
   }
 
   async list(filters?: {
@@ -101,7 +124,7 @@ export class SqliteTasksRepo implements TasksRepository {
       `SELECT * FROM tasks ${where} ORDER BY updated_at ${order}${limit ? ' LIMIT ?' : ''}`,
       limit ? [...params, limit] : params,
     );
-    return rows;
+    return rows.map(taskRow);
   }
 
   async updateFields(
@@ -113,6 +136,14 @@ export class SqliteTasksRepo implements TasksRepository {
       title?: string;
       description?: string | null;
       completed_at?: number | null;
+      workflow_state?: TaskRow['workflow_state'];
+      workflow_contract?: TaskRow['workflow_contract'];
+      assignment_id?: string | null;
+      delegation_lineage?: TaskRow['delegation_lineage'];
+      blocked_detail?: TaskRow['blocked_detail'];
+      validation_detail?: TaskRow['validation_detail'];
+      outcome_detail?: TaskRow['outcome_detail'];
+      lifecycle_updated_at?: number | null;
       updated_at: number;
     },
   ): Promise<void> {
@@ -125,6 +156,14 @@ export class SqliteTasksRepo implements TasksRepository {
     if (fields.title !== undefined) { sets.push('title = ?'); params.push(fields.title); }
     if (fields.description !== undefined) { sets.push('description = ?'); params.push(fields.description); }
     if (fields.completed_at !== undefined) { sets.push('completed_at = ?'); params.push(fields.completed_at); }
+    if (fields.workflow_state !== undefined) { sets.push('workflow_state = ?'); params.push(fields.workflow_state); }
+    if (fields.workflow_contract !== undefined) { sets.push('workflow_contract = ?'); params.push(fields.workflow_contract ? stringifyJson(fields.workflow_contract) : null); }
+    if (fields.assignment_id !== undefined) { sets.push('assignment_id = ?'); params.push(fields.assignment_id); }
+    if (fields.delegation_lineage !== undefined) { sets.push('delegation_lineage = ?'); params.push(fields.delegation_lineage ? stringifyJson(fields.delegation_lineage) : null); }
+    if (fields.blocked_detail !== undefined) { sets.push('blocked_detail = ?'); params.push(fields.blocked_detail ? stringifyJson(fields.blocked_detail) : null); }
+    if (fields.validation_detail !== undefined) { sets.push('validation_detail = ?'); params.push(fields.validation_detail ? stringifyJson(fields.validation_detail) : null); }
+    if (fields.outcome_detail !== undefined) { sets.push('outcome_detail = ?'); params.push(fields.outcome_detail ? stringifyJson(fields.outcome_detail) : null); }
+    if (fields.lifecycle_updated_at !== undefined) { sets.push('lifecycle_updated_at = ?'); params.push(fields.lifecycle_updated_at); }
 
     params.push(taskId);
     await this.db.query(
@@ -137,17 +176,27 @@ export class SqliteTasksRepo implements TasksRepository {
     taskId: string,
     ownerId: string,
     updatedAt: number,
-    options?: { maxDoingForTeam?: number },
+    options?: {
+      maxDoingForTeam?: number;
+      workflow?: { assignmentId: string; lineage: Record<string, unknown> };
+    },
   ): Promise<boolean> {
     // A pre-assigned todo row (owner set by auto-routing, status still
     // 'todo') must be claimable by that same owner — otherwise it's a dead
     // state nobody can flip to 'doing'. Only a *different* owner is
     // rejected by the `owner IS NULL OR owner = ?` condition below.
     const limit = options?.maxDoingForTeam;
+    const workflow = options?.workflow;
+    const workflowSet = workflow
+      ? ", workflow_state = 'executing', assignment_id = ?, delegation_lineage = ?, lifecycle_updated_at = ?"
+      : '';
+    const workflowParams = workflow
+      ? [workflow.assignmentId, stringifyJson(workflow.lineage), updatedAt]
+      : [];
     if (limit !== undefined) {
       const { rowCount } = await this.db.query(
         `UPDATE tasks
-         SET owner = ?, status = 'doing', updated_at = ?
+         SET owner = ?, status = 'doing', updated_at = ?${workflowSet}
          WHERE id = ? AND (owner IS NULL OR owner = ?) AND status = 'todo'
            AND (
              SELECT COUNT(*)
@@ -158,16 +207,32 @@ export class SqliteTasksRepo implements TasksRepository {
                  OR (active.team_id IS NULL AND tasks.team_id IS NULL)
                )
            ) < ?`,
-        [ownerId, updatedAt, taskId, ownerId, limit],
+        [ownerId, updatedAt, ...workflowParams, taskId, ownerId, limit],
       );
       return rowCount > 0;
     }
 
     const { rowCount } = await this.db.query(
       `UPDATE tasks
-       SET owner = ?, status = 'doing', updated_at = ?
+       SET owner = ?, status = 'doing', updated_at = ?${workflowSet}
        WHERE id = ? AND (owner IS NULL OR owner = ?) AND status = 'todo'`,
-      [ownerId, updatedAt, taskId, ownerId],
+      [ownerId, updatedAt, ...workflowParams, taskId, ownerId],
+    );
+    return rowCount > 0;
+  }
+
+  async releaseClaim(
+    taskId: string,
+    ownerId: string,
+    claimedAt: number,
+    updatedAt: number,
+  ): Promise<boolean> {
+    const { rowCount } = await this.db.query(
+      `UPDATE tasks
+       SET owner = NULL, status = 'todo', completed_at = NULL,
+           workflow_state = 'queued', assignment_id = NULL, lifecycle_updated_at = ?, updated_at = ?
+       WHERE id = ? AND owner = ? AND status = 'doing' AND updated_at = ?`,
+      [updatedAt, updatedAt, taskId, ownerId, claimedAt],
     );
     return rowCount > 0;
   }
@@ -206,6 +271,6 @@ export class SqliteTasksRepo implements TasksRepository {
        ORDER BY t.updated_at DESC`,
       [scheduleId],
     );
-    return rows;
+    return rows.map(taskRow);
   }
 }

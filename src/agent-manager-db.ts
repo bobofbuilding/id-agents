@@ -89,6 +89,12 @@ import {
   type TaskCompletionValidationResult,
 } from './task-brief-validation.js';
 import {
+  buildTaskWorkflowContract,
+  canTransitionTaskWorkflow,
+  knowledgePromotionEnvelope,
+  taskWorkflowStateForLegacyStatus,
+} from './task-workflow.js';
+import {
   emitQueryDelivered,
   emitQueryExpired,
   emitQueryFailed,
@@ -142,6 +148,7 @@ import {
   validateRuntimePreflight,
 } from './runtime/registry.js';
 import { resolveModelAlias } from './core/model-aliases.js';
+import { buildCapabilityIntakeRecord } from './capability-intake.js';
 export { MODEL_ALIASES, resolveModelAlias } from './core/model-aliases.js';
 
 // ES module equivalent of __dirname
@@ -4160,6 +4167,8 @@ Return this JSON shape:
     const lower = String(prompt ?? '').trim().toLowerCase();
     if (!lower) return false;
     return lower.startsWith('task delegation')
+      || lower.startsWith("you've been assigned task")
+      || lower.startsWith('you’ve been assigned task')
       || (lower.startsWith('team objective:') && /\byour assigned task\s*\(#?[a-z0-9][a-z0-9_-]{3,}\)/i.test(lower))
       || lower.startsWith('backlog guard:')
       || lower.startsWith('backlog guard alert:')
@@ -4477,7 +4486,12 @@ Return this JSON shape:
     task: TaskRow,
     marker: string,
   ): { action: 'done'; note: string; target: null } | null {
-    if (!String(prompt ?? '').trim().toLowerCase().startsWith('task delegation')) return null;
+    const lowerPrompt = String(prompt ?? '').trim().toLowerCase();
+    if (
+      !lowerPrompt.startsWith('task delegation')
+      && !lowerPrompt.startsWith("you've been assigned task")
+      && !lowerPrompt.startsWith('you’ve been assigned task')
+    ) return null;
 
     const text = String(message || '').trim();
     if (!text) return null;
@@ -4867,6 +4881,17 @@ Return this JSON shape:
       await this.db.tasks.updateFields(task.id, {
         status: 'done',
         completed_at: nowSec,
+        ...(task.workflow_contract ? {
+          workflow_state: 'validation_pending' as const,
+          validation_detail: {
+            version: 'task-validation.v1',
+            verdict: 'pending',
+            reason: 'completion_inferred_from_control_reply',
+            validator_deadline_at: occurredAt + 15 * 60_000,
+            fallback_validators: (task.workflow_contract as any)?.validation?.fallback_validators || ['owning-team/lead', 'operations-team/task-master'],
+          },
+          lifecycle_updated_at: nowSec,
+        } : {}),
         updated_at: nowSec,
       });
       await emitTaskCompleted(this.db.events, {
@@ -4934,6 +4959,15 @@ Return this JSON shape:
           status: parkedTask.status,
           completed_at: parkedTask.completed_at,
           description: parkedTask.description,
+          ...(task.workflow_contract ? { workflow_state: 'blocked' as const, blocked_detail: {
+            version: 'blocked-work.v1',
+            reason: 'repeated_attempt_without_changed_approach',
+            recovery_owner_id: 'operations-team/task-master',
+            retry_at: occurredAt + 15 * 60_000,
+            fallback_route: 'operations-team/task-master',
+            attempts: Number((task.blocked_detail as any)?.attempts || 0) + 1,
+            created_at: occurredAt,
+          }, lifecycle_updated_at: nowSec } : {}),
           updated_at: parkedTask.updated_at,
         });
         await this.recordTaskAttemptApproach({
@@ -4972,7 +5006,9 @@ Return this JSON shape:
         this.managerLog(`Blocked repeated ${effectiveParsed.action} control reply for task ${task.name} from query ${queryRow.query_id}`);
         return { applied: true, action: 'repeat_attempt_blocked', task: task.name, reason: 'repeated_attempt_without_changed_approach' };
       }
-      await this.db.tasks.updateFields(task.id, { updated_at: nowSec });
+      await this.db.tasks.updateFields(task.id, task.workflow_contract ? {
+        workflow_state: 'executing', blocked_detail: null, lifecycle_updated_at: nowSec, updated_at: nowSec,
+      } : { updated_at: nowSec });
       await this.recordTaskAttemptApproach({
         teamId: queryRow.team_id,
         task,
@@ -4997,10 +5033,22 @@ Return this JSON shape:
 
     if (effectiveParsed.action === 'claim') {
       if (task.status === 'todo' && !task.owner && actorAgentId) {
+        const assignmentId = task.workflow_contract ? crypto.randomUUID() : null;
         await this.db.tasks.updateFields(task.id, {
           owner: actorAgentId,
           status: 'doing',
           completed_at: null,
+          ...(task.workflow_contract ? { workflow_state: 'executing' as const, assignment_id: assignmentId, delegation_lineage: {
+            version: 'delegation-lineage.v1',
+            assignment_id: assignmentId,
+            task_id: task.id,
+            from_agent_id: task.created_by,
+            to_agent_id: actorAgentId,
+            team_id: queryRow.team_id,
+            route: 'control_reply_claim',
+            reason: 'owner_confirmed_claim',
+            occurred_at: occurredAt,
+          }, blocked_detail: null, lifecycle_updated_at: nowSec } : {}),
           updated_at: nowSec,
         });
         const ownerAgent = await this.db.agents.getById(actorAgentId).catch(() => null);
@@ -5106,11 +5154,23 @@ Return this JSON shape:
               assignmentCapacity: true,
             }));
           } else {
+            const assignmentId = task.workflow_contract ? crypto.randomUUID() : null;
             await this.db.tasks.updateFields(task.id, {
               ...(route.team.id !== taskTeamId ? { team_id: route.team.id } : {}),
               owner: route.agent.id,
               status: 'doing',
               completed_at: null,
+              ...(task.workflow_contract ? { workflow_state: 'executing' as const, assignment_id: assignmentId, delegation_lineage: {
+                version: 'delegation-lineage.v1',
+                assignment_id: assignmentId,
+                task_id: task.id,
+                from_agent_id: actorAgentId,
+                to_agent_id: route.agent.id,
+                team_id: route.team.id,
+                route: 'control_reply_reassignment',
+                reason: effectiveParsed.note,
+                occurred_at: occurredAt,
+              }, blocked_detail: null, lifecycle_updated_at: nowSec } : {}),
               updated_at: nowSec,
             });
             const routedTask = await this.db.tasks.getByNameForTeam(task.name, route.team.id).catch(() => null) ?? {
@@ -5169,6 +5229,15 @@ Return this JSON shape:
       status: parkedTask.status,
       completed_at: parkedTask.completed_at,
       description: parkedTask.description,
+      ...(task.workflow_contract ? { workflow_state: effectiveParsed.action === 'blocked' ? 'blocked' as const : 'queued' as const, assignment_id: null, blocked_detail: {
+        version: 'blocked-work.v1',
+        reason: fallbackNote || effectiveParsed.action,
+        recovery_owner_id: 'operations-team/task-master',
+        retry_at: occurredAt + 15 * 60_000,
+        fallback_route: 'operations-team/task-master',
+        attempts: Number((task.blocked_detail as any)?.attempts || 0) + 1,
+        created_at: occurredAt,
+      }, lifecycle_updated_at: nowSec } : {}),
       updated_at: parkedTask.updated_at,
     });
     await this.recordTaskSupervision(
@@ -7514,6 +7583,12 @@ Return this JSON shape:
     const used = (input.usedSourceIds || []).slice(0, 40);
     const volunteered = (input.volunteeredSourceIds || []).slice(0, 40);
     const summary = this.completionPayloadSummary(input.payload || {});
+    const promotion = knowledgePromotionEnvelope(input.payload || {}, {
+      taskId: input.taskId || input.queryId || input.key,
+      sourceIds: [...used, ...volunteered],
+      reviewerId: input.agentId,
+      nowMs: input.occurredAt,
+    });
     const content = [
       `# Completed ${input.kind}: ${this.redactBrainMemoryText(input.title || input.key)}`,
       `Kind: ${input.kind}`,
@@ -7530,6 +7605,7 @@ Return this JSON shape:
       summary ? `## Result summary\n${summary}` : '',
       learnedArtifact ? `## Learned artifact\n${this.compactJsonForBrain(learnedArtifact, 1600)}` : '',
       learningLoop ? `## Learning loop capture\n${this.compactJsonForBrain(learningLoop, 1600)}` : '',
+      `## Knowledge promotion\n${this.compactJsonForBrain(promotion, 1600)}`,
     ].filter(Boolean).join('\n');
     await this.postBrain('/memory/manager', {
       key: `completion:${input.key}`,
@@ -7540,9 +7616,10 @@ Return this JSON shape:
         'persistent-memory',
         'agent-output',
         'manager-captured',
+        promotion.reusable === true ? 'validated-reusable' : 'promotion-candidate',
         ...(agentName ? [`agent:${agentName}`] : []),
       ],
-      shared: true,
+      shared: promotion.reusable === true,
       project: input.project || 'default',
     });
   }
@@ -8155,7 +8232,7 @@ Return this JSON shape:
 
       const messageForDispatch = learnRoutingDedupKey ? this.withRecursiveLearningGuard(String(message)) : String(message);
       this.managerLog(`${shouldWait ? 'Forwarding' : 'Sending async'} message to ${targetDisplayId} at ${targetUrl}`);
-      const autoAttach = (req as any)._autoAttach as { task?: TaskRow } | undefined;
+      const autoAttach = (req as any)._autoAttach as { task?: TaskRow; checkin?: CheckinRow | null } | undefined;
       const taskIdForBrain = autoAttach?.task?.uuid ? `task:${autoAttach.task.uuid}` : null;
       const brainRequiredIntent = this.brainContextRequiredIntent(messageForDispatch);
       const brainContext = this.shouldAttachBrainContext(messageForDispatch)
@@ -8189,7 +8266,17 @@ Return this JSON shape:
       if (!result.ok) {
         this.bindLocalGate(lmgToken); // dispatch failed → release the slot now
         console.error(`[Manager] Failed to deliver message to ${targetDisplayId}: ${result.status}`);
-        return res.status(result.status).json({ error: result.error });
+        const taskQueued = autoAttach
+          ? await this.releaseRejectedAutoAttach(autoAttach, Date.now())
+          : false;
+        return res.status(result.status).json({
+          error: result.error,
+          ...(taskQueued ? {
+            task_queued: true,
+            task_ref: autoAttach?.task ? this.taskShortRef(autoAttach.task) : undefined,
+            message: 'Agent delivery was rejected; the task was returned to todo for retry.',
+          } : {}),
+        });
       }
 
       const queryId = result.data.query_id;
@@ -8197,6 +8284,43 @@ Return this JSON shape:
 
       // Store the query so replies can be routed correctly
       if (queryId) {
+        const queryMetadata: Record<string, unknown> = {
+          ...(brainContext ? { brain_context: brainContext } : {}),
+          ...(autoAttach?.task ? {
+            context: {
+              kind: 'task',
+              reason: 'talk_to_auto_attach_dispatch',
+              task_id: `task:${autoAttach.task.uuid}`,
+              assignment_id: `assignment:${autoAttach.task.uuid}:${targetAgent.id}`,
+            },
+            actor: {
+              agent_id: from || null,
+              team_id: teamId,
+            },
+            decision: {
+              action: shouldWait ? 'talk_to_dispatch' : 'async_dispatch',
+              reason: 'manager_auto_attached_task_query',
+            },
+            scope: {
+              capability: 'inter-agent-dispatch',
+              resource: `agent:${targetAgent.id}`,
+            },
+            task_probe: {
+              task_ref: this.taskShortRef(autoAttach.task),
+              claim_url: `http://127.0.0.1:${this.managementPort}/tasks/${autoAttach.task.name}/claim`,
+              done_url: `http://127.0.0.1:${this.managementPort}/tasks/${autoAttach.task.name}/done`,
+              expected_output: 'Completion packet with task name, summary, evidence, goal fit, risks, and source/instruction accounting.',
+              acceptance_criteria: 'Assigned scope handled, verified, and reported without unrelated mutation.',
+              authority_limits: 'No deploy, production DB mutation, secret changes, destructive git, or unrelated refactor unless explicitly authorized.',
+              repo_root: process.cwd(),
+            },
+          } : {
+            context: {
+              kind: 'non_task',
+              reason: shouldWait ? 'direct_talk_query_without_task' : 'async_notify_query_without_task',
+            },
+          }),
+        };
         await this.db.queries.create(
           teamId,
           queryId,
@@ -8205,7 +8329,7 @@ Return this JSON shape:
           Date.now(),
           undefined,
           undefined,
-          brainContext ? { brain_context: brainContext } : null,
+          queryMetadata,
         );
         if (brainContext) this.queryBrainContext.set(queryId, brainContext);
       }
@@ -8475,6 +8599,46 @@ Return this JSON shape:
     }
 
     return { task: taskRow, checkin: checkinRow };
+  }
+
+  private async releaseRejectedAutoAttach(
+    autoAttach: { task?: TaskRow; checkin?: CheckinRow | null },
+    occurredAt: number,
+  ): Promise<boolean> {
+    const task = autoAttach.task;
+    if (!task?.id || !task.owner || !task.team_id || task.status !== 'doing') return false;
+    const releasedAt = Math.floor(occurredAt / 1000);
+    const released = await this.db.tasks.releaseClaim(
+      task.id,
+      task.owner,
+      task.updated_at,
+      releasedAt,
+    );
+    if (!released) return false;
+
+    if (autoAttach.checkin?.id) {
+      await this.db.checkins.close(
+        autoAttach.checkin.id,
+        task.team_id,
+        occurredAt,
+        'dispatch_rejected',
+      ).catch(() => false);
+    }
+    await this.recordTaskSupervision(
+      {
+        ...task,
+        owner: null,
+        status: 'todo',
+        completed_at: null,
+        updated_at: releasedAt,
+      },
+      task.team_id,
+      task.owner,
+      'dispatch_rejected',
+      0,
+      occurredAt,
+    );
+    return true;
   }
 
   /**
@@ -8833,8 +8997,22 @@ Return this JSON shape:
         const skillsRoot = this.libraryRoot
           ? getLibraryPaths(this.libraryRoot).skills
           : path.resolve(__dirname, '..', 'skills');
-        if (!existsSync(path.join(skillsRoot, skill, 'SKILL.md'))) {
+        const skillFile = path.join(skillsRoot, skill, 'SKILL.md');
+        if (!existsSync(skillFile)) {
           return res.status(404).json({ error: 'not_found', resource: 'library-skill', name: skill });
+        }
+        const intake = buildCapabilityIntakeRecord({
+          kind: 'skill',
+          name: skill,
+          source: skillFile,
+          content: readFileSync(skillFile, 'utf8'),
+          owner: String(req.body?.owner || agent.name),
+          runtime: String(agent.runtime || agent.type || 'unknown'),
+          permissions: this.stringArray(req.body?.permissions),
+          cost: typeof req.body?.cost === 'string' ? req.body.cost : undefined,
+        });
+        if (intake.status !== 'approved') {
+          return res.status(422).json({ error: 'capability_intake_blocked', intake });
         }
 
         const workingDirectory = agent.working_directory
@@ -8852,9 +9030,13 @@ Return this JSON shape:
         const cur = (agent.metadata as Record<string, unknown>) || {};
         const existing = Array.isArray((cur as any).skills) ? ((cur as any).skills as string[]) : [];
         const skills = existing.includes(skill) ? existing : [...existing, skill];
-        await this.db.agents.updateMetadata(agent.id, { ...cur, skills });
+        const capabilityIntake = {
+          ...(((cur as any).capability_intake && typeof (cur as any).capability_intake === 'object') ? (cur as any).capability_intake : {}),
+          [`skill:${skill}`]: intake,
+        };
+        await this.db.agents.updateMetadata(agent.id, { ...cur, skills, capability_intake: capabilityIntake });
 
-        res.json({ installed: skill, agent: agent.name, skills });
+        res.json({ installed: skill, agent: agent.name, skills, intake });
       } catch (e: any) {
         res.status(500).json({ error: e?.message || String(e) });
       }
@@ -8927,7 +9109,11 @@ Return this JSON shape:
         const cur = (agent.metadata as Record<string, unknown>) || {};
         const existing = Array.isArray((cur as any).skills) ? ((cur as any).skills as string[]) : [];
         const skills = existing.filter((s) => s !== skill);
-        await this.db.agents.updateMetadata(agent.id, { ...cur, skills });
+        const capabilityIntake = {
+          ...(((cur as any).capability_intake && typeof (cur as any).capability_intake === 'object') ? (cur as any).capability_intake : {}),
+        };
+        delete (capabilityIntake as any)[`skill:${skill}`];
+        await this.db.agents.updateMetadata(agent.id, { ...cur, skills, capability_intake: capabilityIntake });
 
         res.json({ uninstalled: skill, agent: agent.name, skills });
       } catch (e: any) {
@@ -12663,17 +12849,47 @@ Return this JSON shape:
           name = candidate;
         }
 
-        const now = Math.floor(Date.now() / 1000);
+        const nowMs = Date.now();
+        const now = Math.floor(nowMs / 1000);
         const projectId = boundedLineageId(body.project_id ?? body.project);
         const planId = boundedLineageId(body.plan_id ?? body.plan);
+        const taskId = `task_${nowMs}_${Math.random().toString(36).substring(2, 9)}`;
+        const taskUuid = crypto.randomUUID();
+        const workflow = buildTaskWorkflowContract({
+          ...body,
+          title,
+          description: taskDescription,
+        }, {
+          taskId,
+          taskUuid,
+          teamId: taskTeamId,
+          teamName: taskTeamName,
+          ownerId: defaultOwner.owner?.id ?? null,
+          ownerName: defaultOwner.owner?.name ?? null,
+          actorId: createdBy,
+          nowMs,
+        });
+        const dispatchReady = workflow.missing.length === 0;
+        const assignmentId = dispatchReady && defaultOwner.owner ? crypto.randomUUID() : null;
+        const delegationLineage = defaultOwner.owner ? {
+          version: 'delegation-lineage.v1',
+          assignment_id: assignmentId,
+          task_id: taskId,
+          from_agent_id: createdBy,
+          to_agent_id: defaultOwner.owner.id,
+          team_id: taskTeamId,
+          route: 'configured_team_lead',
+          reason: dispatchReady ? 'dispatch_contract_complete' : 'triage_owner_for_incomplete_contract',
+          occurred_at: nowMs,
+        } : null;
         const taskRow: TaskRow = {
-          id: `task_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
+          id: taskId,
           name,
-          uuid: crypto.randomUUID(),
+          uuid: taskUuid,
           team_id: taskTeamId,
           title,
           description: taskDescription,
-          status: defaultOwner.owner ? 'doing' : 'todo',
+          status: dispatchReady && defaultOwner.owner ? 'doing' : 'todo',
           created_by: createdBy,
           owner: defaultOwner.owner?.id ?? null,
           created_at: now,
@@ -12681,6 +12897,22 @@ Return this JSON shape:
           completed_at: null,
           project_id: projectId,
           plan_id: planId,
+          workflow_state: dispatchReady ? workflow.state : 'triage_required',
+          workflow_contract: workflow.contract,
+          assignment_id: assignmentId,
+          delegation_lineage: delegationLineage,
+          blocked_detail: dispatchReady ? null : {
+            version: 'blocked-work.v1',
+            reason: 'dispatch_contract_incomplete',
+            missing: workflow.missing,
+            recovery_owner_id: defaultOwner.owner?.id ?? createdBy,
+            retry_at: nowMs,
+            fallback_route: 'operations-team/task-master',
+            created_at: nowMs,
+          },
+          validation_detail: null,
+          outcome_detail: null,
+          lifecycle_updated_at: now,
         };
 
         await this.db.tasks.create(taskRow);
@@ -12697,7 +12929,7 @@ Return this JSON shape:
         });
         let ownerWake: Awaited<ReturnType<typeof this.wakeAssignedTaskOwner>> | undefined;
         let brainContext: BrainVolunteerContext | null = null;
-        if (defaultOwner.owner) {
+        if (defaultOwner.owner && dispatchReady) {
           brainContext = await this.emitTaskClaimedWithBrainContext({
             teamId: taskTeamId,
             teamName: taskTeamName,
@@ -12732,6 +12964,11 @@ Return this JSON shape:
               : undefined,
           specialist_routing: specialistRouting || undefined,
           brief_validation: brief.validation,
+          workflow_validation: {
+            state: taskRow.workflow_state,
+            missing: workflow.missing,
+            dispatch_ready: dispatchReady,
+          },
         });
       } catch (err: any) {
         console.error('[Manager] Error in POST /tasks:', err);
@@ -12800,6 +13037,55 @@ Return this JSON shape:
       }
     });
 
+    this.managementApp.get('/tasks-workflow/metrics', async (req, res) => {
+      try {
+        const { id: teamId, name: teamName } = await this.getTeam(req);
+        const tasks = await this.db.tasks.list({ teamId, limit: 500 });
+        const states: Record<string, number> = {};
+        let completed = 0;
+        let validated = 0;
+        let blocked = 0;
+        let recovered = 0;
+        let reusable = 0;
+        let cycleTimeMs = 0;
+        for (const task of tasks) {
+          const state = task.workflow_state || taskWorkflowStateForLegacyStatus(task.status);
+          states[state] = (states[state] || 0) + 1;
+          if (task.status === 'done') {
+            completed++;
+            cycleTimeMs += Math.max(0, ((task.completed_at || task.updated_at) - task.created_at) * 1000);
+          }
+          if (state === 'validated') validated++;
+          if (state === 'blocked' || state === 'stalled' || state === 'triage_required') blocked++;
+          if (Number((task.outcome_detail as any)?.recovery_attempts || 0) > 0) recovered++;
+          if ((task.outcome_detail as any)?.knowledge_promotion?.reusable === true) reusable++;
+        }
+        res.json({
+          ok: true,
+          team: teamName,
+          sample_size: tasks.length,
+          states,
+          throughput: {
+            completed,
+            validated,
+            validation_pass_rate: completed ? validated / completed : null,
+            mean_cycle_time_ms: completed ? Math.round(cycleTimeMs / completed) : null,
+          },
+          reliability: {
+            blocked,
+            recovered,
+            recovery_rate: blocked + recovered ? recovered / (blocked + recovered) : null,
+          },
+          knowledge: {
+            reusable,
+            reuse_rate: completed ? reusable / completed : null,
+          },
+        });
+      } catch (err: any) {
+        res.status(500).json({ error: err?.message || 'Internal server error' });
+      }
+    });
+
     this.managementApp.get('/tasks/:ref', async (req, res) => {
       try {
         const { id: teamId } = await this.getTeam(req);
@@ -12808,6 +13094,168 @@ Return this JSON shape:
         res.json({ ok: true, task: await this.buildTaskResult(task, teamId) });
       } catch (err: any) {
         console.error('[Manager] Error in GET /tasks/:ref:', err);
+        res.status(500).json({ error: err?.message || 'Internal server error' });
+      }
+    });
+
+    this.managementApp.post('/tasks/:ref/workflow', async (req, res) => {
+      try {
+        const { id: teamId, name: teamName } = await this.getTeam(req);
+        const { task, error } = await this.resolveTaskRef(req.params.ref, teamId);
+        if (!task) return res.status(404).json({ error: error || `Task "${req.params.ref}" not found` });
+        const owner = task.owner ? await this.db.agents.getById(task.owner) : null;
+        const nowMs = Date.now();
+        const workflow = buildTaskWorkflowContract({
+          ...(req.body || {}),
+          title: task.title,
+          description: req.body?.description || task.description,
+        }, {
+          taskId: task.id,
+          taskUuid: task.uuid,
+          teamId,
+          teamName,
+          ownerId: task.owner,
+          ownerName: owner?.name,
+          actorId: (req as any).ctx?.principal || null,
+          nowMs,
+        });
+        const nextState = workflow.missing.length ? 'triage_required' : task.status === 'doing' ? 'executing' : 'ready';
+        await this.db.tasks.updateFields(task.id, {
+          workflow_state: nextState,
+          workflow_contract: workflow.contract,
+          blocked_detail: workflow.missing.length ? {
+            version: 'blocked-work.v1',
+            reason: 'dispatch_contract_incomplete',
+            missing: workflow.missing,
+            recovery_owner_id: task.owner || task.created_by,
+            retry_at: nowMs,
+            fallback_route: 'operations-team/task-master',
+            created_at: nowMs,
+          } : null,
+          lifecycle_updated_at: Math.floor(nowMs / 1000),
+          updated_at: Math.floor(nowMs / 1000),
+        });
+        const updated = await this.db.tasks.getByNameForTeam(task.name, teamId);
+        res.json({ ok: true, dispatch_ready: workflow.missing.length === 0, missing: workflow.missing, task: await this.buildTaskResult(updated!, teamId) });
+      } catch (err: any) {
+        res.status(500).json({ error: err?.message || 'Internal server error' });
+      }
+    });
+
+    this.managementApp.post('/tasks/:ref/block', async (req, res) => {
+      try {
+        const { id: teamId } = await this.getTeam(req);
+        const { task, error } = await this.resolveTaskRef(req.params.ref, teamId);
+        if (!task) return res.status(404).json({ error: error || `Task "${req.params.ref}" not found` });
+        const reason = String(req.body?.reason || '').trim();
+        const recoveryOwner = String(req.body?.recovery_owner || req.body?.recoveryOwner || task.owner || task.created_by || '').trim();
+        if (!reason || !recoveryOwner) return res.status(422).json({ error: 'reason and recovery_owner are required' });
+        const from = task.workflow_state || taskWorkflowStateForLegacyStatus(task.status);
+        if (!canTransitionTaskWorkflow(from, 'blocked')) return res.status(409).json({ error: `Cannot transition ${from} to blocked` });
+        const nowMs = Date.now();
+        const retryAt = Number(req.body?.retry_at || req.body?.retryAt) || nowMs + 5 * 60_000;
+        await this.db.tasks.updateFields(task.id, {
+          status: 'todo',
+          owner: null,
+          assignment_id: null,
+          workflow_state: 'blocked',
+          blocked_detail: {
+            version: 'blocked-work.v1',
+            reason,
+            recovery_owner_id: recoveryOwner,
+            retry_at: retryAt,
+            deadline_at: Number(req.body?.deadline_at || req.body?.deadlineAt) || nowMs + 24 * 60 * 60_000,
+            fallback_route: String(req.body?.fallback_route || req.body?.fallbackRoute || 'operations-team/task-master'),
+            attempts: Number((task.blocked_detail as any)?.attempts || 0),
+            created_at: nowMs,
+          },
+          lifecycle_updated_at: Math.floor(nowMs / 1000),
+          updated_at: Math.floor(nowMs / 1000),
+        });
+        const updated = await this.db.tasks.getByNameForTeam(task.name, teamId);
+        res.json({ ok: true, task: await this.buildTaskResult(updated!, teamId) });
+      } catch (err: any) {
+        res.status(500).json({ error: err?.message || 'Internal server error' });
+      }
+    });
+
+    this.managementApp.post('/tasks/:ref/recover', async (req, res) => {
+      try {
+        const { id: teamId } = await this.getTeam(req);
+        const { task, error } = await this.resolveTaskRef(req.params.ref, teamId);
+        if (!task) return res.status(404).json({ error: error || `Task "${req.params.ref}" not found` });
+        const from = task.workflow_state || taskWorkflowStateForLegacyStatus(task.status);
+        const action = String(req.body?.action || 'retry');
+        const nextState = action === 'park' ? 'blocked' : action === 'retire' ? 'retired' : 'queued';
+        if (!canTransitionTaskWorkflow(from, nextState)) return res.status(409).json({ error: `Cannot transition ${from} to ${nextState}` });
+        const nowMs = Date.now();
+        const priorAttempts = Number((task.blocked_detail as any)?.attempts || 0);
+        const outcome = { ...(task.outcome_detail || {}), recovery_attempts: priorAttempts + 1, last_recovery_action: action, last_recovery_at: nowMs };
+        await this.db.tasks.updateFields(task.id, {
+          status: nextState === 'retired' ? 'done' : 'todo',
+          owner: action === 'retry' ? task.owner : null,
+          assignment_id: null,
+          workflow_state: nextState,
+          blocked_detail: nextState === 'blocked' ? { ...(task.blocked_detail || {}), attempts: priorAttempts + 1, retry_at: nowMs + 15 * 60_000 } : null,
+          outcome_detail: outcome,
+          completed_at: nextState === 'retired' ? Math.floor(nowMs / 1000) : null,
+          lifecycle_updated_at: Math.floor(nowMs / 1000),
+          updated_at: Math.floor(nowMs / 1000),
+        });
+        const updated = await this.db.tasks.getByNameForTeam(task.name, teamId);
+        res.json({ ok: true, action, task: await this.buildTaskResult(updated!, teamId) });
+      } catch (err: any) {
+        res.status(500).json({ error: err?.message || 'Internal server error' });
+      }
+    });
+
+    this.managementApp.post('/tasks/:ref/validate', async (req, res) => {
+      try {
+        const { id: teamId } = await this.getTeam(req);
+        const { task, error } = await this.resolveTaskRef(req.params.ref, teamId);
+        if (!task) return res.status(404).json({ error: error || `Task "${req.params.ref}" not found` });
+        const verdict = String(req.body?.verdict || '').toLowerCase();
+        const evidenceIds = this.stringArray(req.body?.evidence_ids || req.body?.evidenceIds);
+        const validatorId = String(req.body?.validator_id || req.body?.validatorId || '').trim();
+        if (!['approved', 'revise', 'rejected'].includes(verdict) || !validatorId || !evidenceIds.length) {
+          return res.status(422).json({ error: 'verdict (approved|revise|rejected), validator_id, and evidence_ids are required' });
+        }
+        const nowMs = Date.now();
+        const nextState = verdict === 'approved' ? 'validated' : verdict === 'revise' ? 'executing' : 'failed';
+        const from = task.workflow_state || taskWorkflowStateForLegacyStatus(task.status);
+        if (!canTransitionTaskWorkflow(from, nextState)) return res.status(409).json({ error: `Cannot transition ${from} to ${nextState}` });
+        const promotion = knowledgePromotionEnvelope({ ...req.body, validation_status: verdict === 'approved' ? 'validated' : verdict }, { taskId: `task:${task.uuid}`, sourceIds: evidenceIds, reviewerId: validatorId, nowMs });
+        await this.db.tasks.updateFields(task.id, {
+          status: verdict === 'approved' ? 'done' : verdict === 'revise' ? 'doing' : 'todo',
+          workflow_state: nextState,
+          validation_detail: { version: 'task-validation.v1', verdict, validator_id: validatorId, evidence_ids: evidenceIds, artifacts: this.stringArray(req.body?.artifacts), validated_at: nowMs },
+          outcome_detail: { ...(task.outcome_detail || {}), knowledge_promotion: promotion, validation_passed: verdict === 'approved' },
+          completed_at: verdict === 'approved' ? Math.floor(nowMs / 1000) : null,
+          lifecycle_updated_at: Math.floor(nowMs / 1000),
+          updated_at: Math.floor(nowMs / 1000),
+        });
+        const updated = await this.db.tasks.getByNameForTeam(task.name, teamId);
+        res.json({ ok: true, task: await this.buildTaskResult(updated!, teamId), promotion });
+      } catch (err: any) {
+        res.status(500).json({ error: err?.message || 'Internal server error' });
+      }
+    });
+
+    this.managementApp.post('/tasks/:ref/lifecycle', async (req, res) => {
+      try {
+        const { id: teamId } = await this.getTeam(req);
+        const { task, error } = await this.resolveTaskRef(req.params.ref, teamId);
+        if (!task) return res.status(404).json({ error: error || `Task "${req.params.ref}" not found` });
+        const action = String(req.body?.action || '').toLowerCase();
+        const nextState = action === 'supersede' ? 'superseded' : action === 'retire' ? 'retired' : null;
+        if (!nextState) return res.status(422).json({ error: 'action must be supersede or retire' });
+        const from = task.workflow_state || taskWorkflowStateForLegacyStatus(task.status);
+        if (!canTransitionTaskWorkflow(from, nextState)) return res.status(409).json({ error: `Cannot transition ${from} to ${nextState}` });
+        const now = Math.floor(Date.now() / 1000);
+        await this.db.tasks.updateFields(task.id, { status: 'done', workflow_state: nextState, completed_at: task.completed_at || now, outcome_detail: { ...(task.outcome_detail || {}), lifecycle_reason: String(req.body?.reason || action), superseded_by: req.body?.superseded_by || null }, lifecycle_updated_at: now, updated_at: now });
+        const updated = await this.db.tasks.getByNameForTeam(task.name, teamId);
+        res.json({ ok: true, task: await this.buildTaskResult(updated!, teamId) });
+      } catch (err: any) {
         res.status(500).json({ error: err?.message || 'Internal server error' });
       }
     });
@@ -12872,9 +13320,25 @@ Return this JSON shape:
           });
         }
 
-        const now = Math.floor(Date.now() / 1000);
+        const claimedAtMs = Date.now();
+        const now = Math.floor(claimedAtMs / 1000);
+        const assignmentId = crypto.randomUUID();
         const claimed = await this.db.tasks.claim(task.id, agent.id, now, {
           maxDoingForTeam: this.getMaxDoingTasks(),
+          workflow: {
+            assignmentId,
+            lineage: {
+              version: 'delegation-lineage.v1',
+              assignment_id: assignmentId,
+              task_id: task.id,
+              from_agent_id: task.created_by,
+              to_agent_id: agent.id,
+              team_id: teamId,
+              route: 'explicit_claim',
+              reason: 'agent_claimed_dispatch_ready_task',
+              occurred_at: claimedAtMs,
+            },
+          },
         });
         if (!claimed) {
           const current = await this.db.tasks.getByNameForTeam(task.name, teamId);
@@ -12990,14 +13454,47 @@ Return this JSON shape:
         }
 
         const now = Math.floor(Date.now() / 1000);
+        const completedAt = Date.now();
+        const validationEvidence = [
+          ...this.stringArray(req.body?.evidence_ids || req.body?.evidenceIds),
+          `task:${task.uuid}:completion-packet`,
+        ];
+        const promotion = knowledgePromotionEnvelope({
+          ...(req.body || {}),
+          validation_status: 'validated',
+          confidence: req.body?.confidence ?? 1,
+          evidence_ids: validationEvidence,
+        }, {
+          taskId: `task:${task.uuid}`,
+          reviewerId: callerAgent?.id ?? task.owner ?? null,
+          nowMs: completedAt,
+        });
         await this.db.tasks.updateFields(task.id, {
           status: 'done',
           completed_at: now,
+          workflow_state: 'validated',
+          validation_detail: {
+            version: 'task-validation.v1',
+            verdict: 'validated',
+            validator_id: callerAgent?.id ?? task.owner ?? null,
+            acceptance_coverage: completion.validation,
+            evidence_ids: validationEvidence,
+            validated_at: completedAt,
+          },
+          outcome_detail: {
+            version: 'task-outcome.v1',
+            result: this.completionPayloadSummary(req.body || {}),
+            knowledge_promotion: promotion,
+            cycle_time_ms: Math.max(0, completedAt - task.created_at * 1000),
+            validation_passed: true,
+            completed_at: completedAt,
+          },
+          blocked_detail: null,
+          lifecycle_updated_at: now,
           updated_at: now,
         });
 
         const updated = await this.db.tasks.getByNameForTeam(task.name, teamId);
-        const completedAt = Date.now();
         const bodyBrainContext = req.body?.brain_context || req.body?.brainContext || null;
         const claimedBrainContext = bodyBrainContext ? null : await this.latestTaskClaimBrainContext(teamId, updated!.uuid);
         const effectiveBrainContext = bodyBrainContext || claimedBrainContext;
@@ -13014,7 +13511,16 @@ Return this JSON shape:
               ? effectiveBrainContext.cited.canonical_source_ids.map(String)
               : [];
         const learningLoop = normalizeLearningLoopCapture({
-          payload: req.body || {},
+          payload: {
+            ...(req.body || {}),
+            validation_status: 'validated',
+            confidence: req.body?.confidence ?? 1,
+            evidence_ids: validationEvidence,
+            measured_outcome: {
+              cycle_time_ms: Math.max(0, completedAt - task.created_at * 1000),
+              validation_passed: true,
+            },
+          },
           subject: {
             kind: 'task',
             ref: `task:${updated!.uuid}`,
@@ -13907,6 +14413,14 @@ Return this JSON shape:
       createdAt: task.created_at,
       updatedAt: task.updated_at,
       completedAt: task.completed_at,
+      workflowState: task.workflow_state || taskWorkflowStateForLegacyStatus(task.status),
+      workflowContract: task.workflow_contract || null,
+      assignmentId: task.assignment_id || null,
+      delegationLineage: task.delegation_lineage || null,
+      blockedDetail: task.blocked_detail || null,
+      validationDetail: task.validation_detail || null,
+      outcomeDetail: task.outcome_detail || null,
+      lifecycleUpdatedAt: task.lifecycle_updated_at || task.updated_at,
       ...(delegationAudit ? { delegationAudit } : {}),
     };
   }
@@ -16793,7 +17307,9 @@ Return this JSON shape:
             if (sDef.kind !== 'calendar') return { ok: false, error: `Schedule "${eid}" is not a calendar event (kind: ${sDef.kind})` };
           }
 
-          const now = Math.floor(Date.now() / 1000);
+          const assignedAtMs = Date.now();
+          const now = Math.floor(assignedAtMs / 1000);
+          const assignmentId = crypto.randomUUID();
           const status = ownerId ? 'doing' : 'todo';
           const queuedByDoingLimit = Boolean(ownerRef && !ownerId);
           // Resolve created_by from callerFrom if present
@@ -16804,14 +17320,37 @@ Return this JSON shape:
             if (callerAgent) createdBy = callerAgent.id;
           }
 
+          const taskId = `task_${assignedAtMs}_${Math.random().toString(36).substring(2, 9)}`;
+          const taskUuid = crypto.randomUUID();
+          const taskTeamForWorkflow = await this.db.teams.getTeam(taskTeamId).catch(() => null);
+          const workflow = buildTaskWorkflowContract({
+            title,
+            description: taskDescription,
+            goal_id: goalId,
+            target,
+            parent_task: parentTask,
+            project_id: projectId,
+            plan_id: planId,
+          }, {
+            taskId,
+            taskUuid,
+            teamId: taskTeamId,
+            teamName: taskTeamForWorkflow?.name || taskTeamName,
+            ownerId,
+            ownerName: ownerAgentForGuard?.name,
+            actorId: createdBy,
+            nowMs: assignedAtMs,
+          });
+          const dispatchReady = workflow.missing.length === 0;
+
           const taskRow: TaskRow = {
-            id: `task_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
+            id: taskId,
             name,
-            uuid: crypto.randomUUID(),
+            uuid: taskUuid,
             team_id: taskTeamId,
             title,
             description: taskDescription,
-            status,
+            status: dispatchReady ? status : 'todo',
             created_by: createdBy,
             owner: ownerId,
             created_at: now,
@@ -16819,6 +17358,30 @@ Return this JSON shape:
             completed_at: null,
             project_id: boundedLineageId(projectId),
             plan_id: boundedLineageId(planId),
+            workflow_state: dispatchReady ? workflow.state : 'triage_required',
+            workflow_contract: workflow.contract,
+            assignment_id: dispatchReady && ownerId ? assignmentId : null,
+            delegation_lineage: ownerId ? {
+              version: 'delegation-lineage.v1',
+              assignment_id: dispatchReady ? assignmentId : null,
+              task_id: taskId,
+              from_agent_id: createdBy,
+              to_agent_id: ownerId,
+              team_id: taskTeamId,
+              route: ownerRef ? 'explicit_owner' : 'configured_team_lead',
+              reason: dispatchReady ? 'dispatch_contract_complete' : 'triage_owner_for_incomplete_contract',
+              occurred_at: assignedAtMs,
+            } : null,
+            blocked_detail: dispatchReady ? null : {
+              version: 'blocked-work.v1',
+              reason: 'dispatch_contract_incomplete',
+              missing: workflow.missing,
+              recovery_owner_id: ownerId || createdBy,
+              retry_at: assignedAtMs,
+              fallback_route: 'operations-team/task-master',
+              created_at: assignedAtMs,
+            },
+            lifecycle_updated_at: now,
           };
 
           await this.db.tasks.create(taskRow, eventIds.length > 0 ? eventIds : undefined);
@@ -16835,7 +17398,7 @@ Return this JSON shape:
           });
           let ownerWake: Awaited<ReturnType<typeof this.wakeAssignedTaskOwner>> | undefined;
           let brainContext: BrainVolunteerContext | null = null;
-          if (ownerId && ownerAgentForGuard) {
+          if (dispatchReady && ownerId && ownerAgentForGuard) {
             const taskTeamRow = await this.db.teams.getTeam(taskTeamId).catch(() => null);
             brainContext = await this.emitTaskClaimedWithBrainContext({
               teamId: taskTeamId,
@@ -16876,6 +17439,7 @@ Return this JSON shape:
 	              specialist_routing: specialistRouting || undefined,
 	              warning: warnings.length ? warnings.join(' ') : undefined,
 	              brief_validation: brief.validation,
+	              workflow_validation: { state: taskRow.workflow_state, missing: workflow.missing, dispatch_ready: dispatchReady },
             },
           };
         }
@@ -17275,13 +17839,29 @@ Return this JSON shape:
             };
           }
 
-          const now = Math.floor(Date.now() / 1000);
+          const assignedAtMs = Date.now();
+          const now = Math.floor(assignedAtMs / 1000);
+          const assignmentId = crypto.randomUUID();
           if (task.status !== 'doing' && !(await this.hasDoingTaskRoom(task.team_id || teamId))) {
             return { ok: false, error: await this.doingTaskLimitMessage(task.team_id || teamId) };
           }
           await this.db.tasks.updateFields(task.id, {
             owner: agent.id,
             status: 'doing',
+            workflow_state: 'executing',
+            assignment_id: assignmentId,
+            delegation_lineage: {
+              version: 'delegation-lineage.v1',
+              assignment_id: assignmentId,
+              task_id: task.id,
+              from_agent_id: task.created_by,
+              to_agent_id: agent.id,
+              team_id: taskTeamIdForGuard,
+              route: 'manager_command_assign',
+              reason: 'explicit_owner_selection',
+              occurred_at: assignedAtMs,
+            },
+            lifecycle_updated_at: now,
             updated_at: now,
           });
 
@@ -17365,9 +17945,25 @@ Return this JSON shape:
             };
           }
 
-          const now = Math.floor(Date.now() / 1000);
+          const claimedAtMs = Date.now();
+          const now = Math.floor(claimedAtMs / 1000);
+          const assignmentId = crypto.randomUUID();
           const claimed = await this.db.tasks.claim(task.id, callerAgent.id, now, {
             maxDoingForTeam: this.getMaxDoingTasks(),
+            workflow: {
+              assignmentId,
+              lineage: {
+                version: 'delegation-lineage.v1',
+                assignment_id: assignmentId,
+                task_id: task.id,
+                from_agent_id: task.created_by,
+                to_agent_id: callerAgent.id,
+                team_id: teamId,
+                route: 'remote_command_claim',
+                reason: 'agent_claimed_dispatch_ready_task',
+                occurred_at: claimedAtMs,
+              },
+            },
           });
           if (!claimed) {
             const current = await this.db.tasks.getByNameForTeam(task.name, teamId);
@@ -18196,6 +18792,60 @@ Return this JSON shape:
     return out;
   }
 
+  private async routeExpiredValidationFallback(task: TaskRow, nowMs: number): Promise<'routed' | 'failed' | 'waiting'> {
+    if (task.workflow_state !== 'validation_pending') return 'waiting';
+    const validation = (task.validation_detail || {}) as Record<string, unknown>;
+    const deadlineAt = Number(validation.validator_deadline_at || (task.workflow_contract as any)?.validation?.deadline_at || 0);
+    if (deadlineAt > nowMs) return 'waiting';
+    const attempts = Number(validation.fallback_attempts || 0);
+    const maxAttempts = Math.max(1, Math.min(3, Number((task.workflow_contract as any)?.validation?.max_revision_cycles || 2)));
+    if (attempts >= maxAttempts) {
+      const nowSec = Math.floor(nowMs / 1000);
+      await this.db.tasks.updateFields(task.id, {
+        workflow_state: 'failed',
+        validation_detail: { ...validation, verdict: 'failed', failure_reason: 'validator_fallback_exhausted', failed_at: nowMs },
+        outcome_detail: { ...(task.outcome_detail || {}), validation_passed: false, validator_fallback_exhausted: true },
+        lifecycle_updated_at: nowSec,
+        updated_at: task.updated_at,
+      });
+      return 'failed';
+    }
+
+    const teamId = task.team_id;
+    if (!teamId) return 'waiting';
+    const team = await this.db.teams.getTeam(teamId).catch(() => null);
+    if (!team) return 'waiting';
+    const lead = await this.findSupervisionLead(teamId).catch(() => null);
+    const managers = await this.findTaskManagerFallbacks().catch(() => []);
+    const candidates = [
+      ...(lead ? [{ team, agent: lead }] : []),
+      ...managers,
+    ].filter((candidate, index, all) => all.findIndex((item) => item.agent.id === candidate.agent.id) === index);
+    const validator = candidates.find((candidate) =>
+      candidate.agent.id !== task.owner
+      && this.isLiveForSupervision(candidate.agent),
+    );
+    if (!validator) return 'waiting';
+    const marker = this.taskShortRef(task);
+    if (await this.hasActiveSupervisionAskForMarker(validator.team.id, validator.agent, marker)) return 'waiting';
+    const message = `Validation fallback for task ${marker} ("${task.title}"). Review the completion evidence and POST /tasks/${task.name}/validate with verdict, validator_id, evidence_ids, and artifacts. Use approved only with reproducible evidence; otherwise use revise or rejected. This is fallback attempt ${attempts + 1}/${maxAttempts}.`;
+    const sent = await this.sendSupervisionAsk(validator.team.name, validator.agent.name, message);
+    if (!sent) return 'waiting';
+    await this.db.tasks.updateFields(task.id, {
+      validation_detail: {
+        ...validation,
+        fallback_attempts: attempts + 1,
+        active_validator_id: validator.agent.id,
+        active_validator_team_id: validator.team.id,
+        validator_deadline_at: nowMs + 15 * 60_000,
+        last_fallback_at: nowMs,
+      },
+      lifecycle_updated_at: Math.floor(nowMs / 1000),
+      updated_at: task.updated_at,
+    });
+    return 'routed';
+  }
+
   private async sendSupervisionAsk(teamName: string, agentName: string, message: string): Promise<boolean> {
     const quoted = `"${message.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
     try {
@@ -18272,6 +18922,8 @@ Return this JSON shape:
     const text = String(prompt ?? '').trim();
     const lower = text.toLowerCase();
     const managedTaskAsk = lower.startsWith('task delegation')
+      || lower.startsWith("you've been assigned task")
+      || lower.startsWith('you’ve been assigned task')
       || (lower.startsWith('team objective:') && /\byour assigned task\s*\(#?[a-z0-9][a-z0-9_-]{3,}\)/i.test(lower))
       || lower.startsWith('task-manager triage assigned existing')
       || lower.startsWith('supervision:')
@@ -18435,6 +19087,7 @@ Return this JSON shape:
            OR LOWER(prompt) LIKE 'team objective:%'
            OR LOWER(prompt) LIKE 'urgent delegation probe:%'
            OR LOWER(prompt) LIKE 'task delegation%'
+           OR LOWER(prompt) LIKE 'you''ve been assigned task #%'
            OR LOWER(prompt) LIKE 'task-manager triage assigned existing%'
            OR LOWER(prompt) LIKE 'resume and complete task #%'
            OR LOWER(prompt) LIKE 'backlog guard:%'
@@ -18724,7 +19377,7 @@ Return this JSON shape:
     task: TaskRow,
     teamId: string,
     actorAgentId: string | null,
-    reason: 'owner_refresh' | 'owner_unavailable' | 'owner_busy' | 'unclaimed' | 'owned_todo_dead_state' | 'ownerless_doing_repaired' | 'checkin_heartbeat_probe' | 'probe_limit_reached' | 'validator_stalled_terminal' | 'lead_delegation_required' | 'lead_owner_unavailable' | 'delegated_children_complete' | 'control_reply_done' | 'control_reply_in_progress' | 'control_reply_delegated' | 'control_reply_claimed' | 'control_reply_blocked' | 'control_reply_reassign' | 'control_reply_route_assigned' | 'control_reply_repeated_attempt',
+    reason: 'owner_refresh' | 'owner_unavailable' | 'owner_busy' | 'unclaimed' | 'owned_todo_dead_state' | 'ownerless_doing_repaired' | 'dispatch_rejected' | 'checkin_heartbeat_probe' | 'probe_limit_reached' | 'validator_stalled_terminal' | 'lead_delegation_required' | 'lead_owner_unavailable' | 'delegated_children_complete' | 'control_reply_done' | 'control_reply_in_progress' | 'control_reply_delegated' | 'control_reply_claimed' | 'control_reply_blocked' | 'control_reply_reassign' | 'control_reply_route_assigned' | 'control_reply_repeated_attempt',
     stalledMinutes: number,
     nowMs: number,
   ): Promise<void> {
@@ -18938,6 +19591,9 @@ Return this JSON shape:
     opts: { dispatch?: boolean } = {},
   ): Promise<{ assigned: boolean; reason: string; owner?: AgentRow; dispatched?: boolean }> {
     if (task.owner || task.status !== 'todo') return { assigned: false, reason: 'not_unowned_todo' };
+    if (task.workflow_state === 'triage_required' || task.workflow_state === 'blocked' || task.workflow_state === 'retired' || task.workflow_state === 'superseded') {
+      return { assigned: false, reason: `workflow_${task.workflow_state}` };
+    }
     const leadCoordinationTask = this.isLeadCoordinationParentTask(task);
     const assignmentHoldReason = await this.recentAssignmentHoldTriageReason(teamRow.id, task, nowMs);
     if (assignmentHoldReason && !leadCoordinationTask) {
@@ -18952,6 +19608,13 @@ Return this JSON shape:
       if (active.owner) activeByOwner.set(active.owner, (activeByOwner.get(active.owner) ?? 0) + 1);
     }
 
+    const taskTerms = new Set(`${task.title} ${task.description || ''}`.toLowerCase().match(/[a-z][a-z0-9-]{3,}/g) || []);
+    const affinity = (agent: AgentRow): number => {
+      const searchable = `${agent.name} ${JSON.stringify(agent.metadata || {})}`.toLowerCase();
+      let score = 0;
+      for (const term of taskTerms) if (searchable.includes(term)) score++;
+      return score;
+    };
     const candidates = agents
       .filter((agent) =>
         this.isLiveForSupervision(agent)
@@ -18960,7 +19623,8 @@ Return this JSON shape:
         && Boolean(agent.endpoint),
       )
       .sort((a, b) =>
-        (activeByOwner.get(a.id) ?? 0) - (activeByOwner.get(b.id) ?? 0)
+        affinity(b) - affinity(a)
+        || (activeByOwner.get(a.id) ?? 0) - (activeByOwner.get(b.id) ?? 0)
         || a.name.localeCompare(b.name),
       );
     const wakeCandidates = agents
@@ -18970,7 +19634,8 @@ Return this JSON shape:
         && this.canWakeAssignedTaskOwner(agent),
       )
       .sort((a, b) =>
-        (activeByOwner.get(a.id) ?? 0) - (activeByOwner.get(b.id) ?? 0)
+        affinity(b) - affinity(a)
+        || (activeByOwner.get(a.id) ?? 0) - (activeByOwner.get(b.id) ?? 0)
         || a.name.localeCompare(b.name),
       );
 
@@ -19015,8 +19680,23 @@ Return this JSON shape:
       }
 
       const nowSec = Math.floor(nowMs / 1000);
+      const assignmentId = crypto.randomUUID();
       const claimed = await this.db.tasks.claim(current.id, owner.id, nowSec, {
         maxDoingForTeam: this.getMaxDoingTasks(),
+        ...(current.workflow_contract ? { workflow: {
+          assignmentId,
+          lineage: {
+            version: 'delegation-lineage.v1',
+            assignment_id: assignmentId,
+            task_id: current.id,
+            from_agent_id: current.created_by,
+            to_agent_id: owner.id,
+            team_id: teamRow.id,
+            route: 'capacity_aware_auto_assignment',
+            reason: `specialization_affinity=${affinity(owner)};active_tasks=${activeByOwner.get(owner.id) ?? 0}`,
+            occurred_at: nowMs,
+          },
+        } } : {}),
       });
       if (!claimed) return { assigned: false, reason: 'claim_race_or_limit' };
 
@@ -19040,7 +19720,30 @@ Return this JSON shape:
         const msg = this.taskDelegationPrompt(updated, ref);
         const sent = await this.sendSupervisionAsk(teamRow.name, owner.name, msg);
         dispatched = sent;
-        if (!sent) this.managerLog(`Auto-assigned task ${updated.name} to ${owner.name}, but the delegation prompt could not be delivered`);
+        if (!sent) {
+          const releasedAt = Math.floor(Date.now() / 1000);
+          const released = await this.db.tasks.releaseClaim(updated.id, owner.id, nowSec, releasedAt);
+          if (released) {
+            const parkedTask: TaskRow = {
+              ...updated,
+              owner: null,
+              status: 'todo',
+              completed_at: null,
+              updated_at: releasedAt,
+            };
+            await this.recordTaskSupervision(
+              parkedTask,
+              teamRow.id,
+              owner.id,
+              'dispatch_rejected',
+              0,
+              releasedAt * 1000,
+            );
+            this.managerLog(`Released task ${updated.name} back to todo after ${owner.name} rejected the delegation prompt`);
+            return { assigned: false, reason: 'dispatch_rejected', dispatched: false };
+          }
+          this.managerLog(`Auto-assigned task ${updated.name} to ${owner.name}, but the delegation prompt could not be delivered and the claim changed before release`);
+        }
       }
       return { assigned: true, reason: 'assigned', owner, dispatched };
     };
@@ -19065,12 +19768,12 @@ Return this JSON shape:
 
     for (const owner of candidates) {
       const assignment = await tryAssign(owner);
-      if (assignment.assigned) return assignment;
+      if (assignment.assigned || assignment.reason === 'dispatch_rejected') return assignment;
     }
 
     for (const owner of wakeCandidates) {
       const assignment = await tryAssign(owner, { wakeBeforeClaim: true });
-      if (assignment.assigned) return assignment;
+      if (assignment.assigned || assignment.reason === 'dispatch_rejected') return assignment;
     }
 
     return { assigned: false, reason: leadRecoveryReason ? `lead_recovery_${leadRecoveryReason}` : 'no_idle_live_member' };
@@ -19330,6 +20033,29 @@ Return this JSON shape:
     }
   }
 
+  private async repairMissingTaskTeams(scanLimit: number): Promise<number> {
+    const [todo, doing] = await Promise.all([
+      this.db.tasks.list({ status: 'todo', teamId: null, order: 'updated_asc', limit: scanLimit }).catch(() => [] as TaskRow[]),
+      this.db.tasks.list({ status: 'doing', teamId: null, order: 'updated_asc', limit: scanLimit }).catch(() => [] as TaskRow[]),
+    ]);
+    const candidates = new Map([...todo, ...doing].map((task) => [task.id, task]));
+    let repaired = 0;
+
+    for (const task of candidates.values()) {
+      if (task.team_id || !task.owner) continue;
+      const owner = await this.db.agents.getById(task.owner).catch(() => null);
+      if (!owner?.team_id) continue;
+      await this.db.tasks.updateFields(task.id, {
+        team_id: owner.team_id,
+        // Preserve staleness so this sweep can triage the task immediately.
+        updated_at: task.updated_at,
+      });
+      repaired++;
+    }
+
+    return repaired;
+  }
+
   private async sweepStalledTasksImpl(): Promise<void> {
     const STALL_MS = this.getStallSweepMs();       // 'doing' this long with no update
     const RENUDGE_MS = this.getStallRenudgeMs();   // don't re-nudge a task within this
@@ -19347,6 +20073,21 @@ Return this JSON shape:
     let nudged = 0;
     let unownedAssigned = 0;
     const assignedTodoTaskIds = new Set<string>();
+
+    const validationPending = await this.db.tasks.list({ status: 'done', order: 'updated_asc', limit: SCAN_LIMIT }).catch(() => [] as TaskRow[]);
+    for (const task of validationPending.filter((item) => item.workflow_state === 'validation_pending').slice(0, MAX_PER_SWEEP)) {
+      await this.routeExpiredValidationFallback(task, now).catch((err) => {
+        console.warn(`[Workflow] Validator fallback failed for ${task.name}: ${err?.message || err}`);
+      });
+    }
+
+    const repairedTaskTeams = await this.repairMissingTaskTeams(SCAN_LIMIT).catch((err) => {
+      console.warn('[Manager] Missing task team repair failed:', err?.message || err);
+      return 0;
+    });
+    if (repairedTaskTeams > 0) {
+      console.warn(`[Manager] Restored team ownership for ${repairedTaskTeams} legacy task(s).`);
+    }
 
     await this.autoCompactLeadDelegationBacklog().catch((err) => {
       console.warn('[Manager] Lead delegation backlog auto-guard failed:', err?.message || err);
@@ -19654,6 +20395,27 @@ Return this JSON shape:
       }
 
       if (ageMs < STALL_MS) continue;
+
+      if (t.workflow_contract && t.workflow_state !== 'stalled') {
+        await this.db.tasks.updateFields(t.id, {
+          workflow_state: 'stalled',
+          blocked_detail: {
+            version: 'blocked-work.v1',
+            reason: 'no_progress_before_timeout',
+            recovery_owner_id: t.owner,
+            retry_at: now + RENUDGE_MS,
+            deadline_at: Number((t.workflow_contract as any)?.timing?.deadline_at || now + 24 * 60 * 60_000),
+            fallback_route: String((t.workflow_contract as any)?.timing?.fallback_route || 'operations-team/task-master'),
+            attempts: Number((t.blocked_detail as any)?.attempts || 0),
+            created_at: now,
+          },
+          lifecycle_updated_at: Math.floor(now / 1000),
+          // Preserve the task activity timestamp; lifecycle bookkeeping must
+          // not make stalled work look active again.
+          updated_at: t.updated_at,
+        }).catch((err) => console.warn(`[Workflow] Failed to mark ${t.name} stalled: ${err?.message || err}`));
+        t.workflow_state = 'stalled';
+      }
 
       const [hasRecentSupervision, ownerPendingQueries] = await Promise.all([
         this.hasRecentTaskSupervisionEvent(teamRow.id, t, now - RENUDGE_MS),

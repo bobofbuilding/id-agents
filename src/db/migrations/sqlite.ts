@@ -2,9 +2,11 @@
 
 import crypto from 'crypto';
 import type { SqliteAdapter } from '../sqlite-adapter.js';
+import { hardenQueryContext } from '../query-context-hardening.js';
 
 const OWNER_BACKFILL_MARKER = 'sqlite-owner-kind-owner-id-backfill-v1';
 const MANAGER_SHADOW_CLEANUP_MARKER = 'sqlite-manager-shadow-agent-cleanup-v1';
+const QUERY_CONTEXT_HARDENING_MARKER = 'sqlite-query-context-hardening-v1';
 const MIGRATION_MARKERS_TABLE = 'id_agents_migration_markers';
 
 async function ensureSqliteMigrationMarkers(adapter: SqliteAdapter): Promise<void> {
@@ -388,6 +390,14 @@ export async function migrateSqlite(adapter: SqliteAdapter): Promise<void> {
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       completed_at INTEGER,
+      workflow_state TEXT,
+      workflow_contract TEXT,
+      assignment_id TEXT,
+      delegation_lineage TEXT,
+      blocked_detail TEXT,
+      validation_detail TEXT,
+      outcome_detail TEXT,
+      lifecycle_updated_at INTEGER,
       UNIQUE(team_id, name)
     );
 
@@ -579,6 +589,41 @@ export async function migrateSqlite(adapter: SqliteAdapter): Promise<void> {
     `);
     await setSqliteMigrationMarker(adapter, OWNER_BACKFILL_MARKER);
   }
+  if (!(await hasSqliteMigrationMarker(adapter, QUERY_CONTEXT_HARDENING_MARKER))) {
+    const legacy = await adapter.query<{
+      team_id: string;
+      agent_id: string | null;
+      query_id: string;
+      prompt: string | null;
+      created: number;
+      metadata: string | null;
+    }>(`
+      SELECT team_id, agent_id, query_id, prompt, created, metadata
+      FROM queries
+      WHERE metadata IS NULL
+         OR json_extract(metadata, '$.audit_chain.hash') IS NULL
+      ORDER BY created ASC, query_id ASC
+    `);
+    let previousAuditHash: string | null = null;
+    for (const row of legacy.rows) {
+      const existing = row.metadata ? JSON.parse(row.metadata) : null;
+      const hardened = hardenQueryContext({
+        teamId: row.team_id,
+        queryId: row.query_id,
+        agentId: row.agent_id,
+        prompt: row.prompt,
+        created: Number(row.created),
+        metadata: existing && typeof existing === 'object' ? existing : null,
+        previousAuditHash,
+      });
+      previousAuditHash = (hardened.metadata.audit_chain as any).hash;
+      await adapter.query(
+        `UPDATE queries SET prompt = ?, metadata = ? WHERE team_id = ? AND query_id = ?`,
+        [hardened.prompt, JSON.stringify(hardened.metadata), row.team_id, row.query_id],
+      );
+    }
+    await setSqliteMigrationMarker(adapter, QUERY_CONTEXT_HARDENING_MARKER);
+  }
 
   // Remote endpoint columns for public-agent-remote registry entries (Phase 2).
   // All four columns are nullable so existing rows stay intact (backfill-safe).
@@ -654,8 +699,26 @@ export async function migrateSqlite(adapter: SqliteAdapter): Promise<void> {
   } catch {
     // Column already exists in upgraded databases.
   }
+  for (const [column, type] of [
+    ['workflow_state', 'TEXT'],
+    ['workflow_contract', 'TEXT'],
+    ['assignment_id', 'TEXT'],
+    ['delegation_lineage', 'TEXT'],
+    ['blocked_detail', 'TEXT'],
+    ['validation_detail', 'TEXT'],
+    ['outcome_detail', 'TEXT'],
+    ['lifecycle_updated_at', 'INTEGER'],
+  ] as const) {
+    try {
+      adapter.exec(`ALTER TABLE tasks ADD COLUMN ${column} ${type}`);
+    } catch {
+      // Column already exists in upgraded databases.
+    }
+  }
   adapter.exec(`CREATE INDEX IF NOT EXISTS tasks_project_idx ON tasks(team_id, project_id, status, updated_at)`);
   adapter.exec(`CREATE INDEX IF NOT EXISTS tasks_plan_idx ON tasks(team_id, plan_id, status, updated_at)`);
+  adapter.exec(`CREATE INDEX IF NOT EXISTS tasks_workflow_idx ON tasks(team_id, workflow_state, lifecycle_updated_at)`);
+  adapter.exec(`CREATE INDEX IF NOT EXISTS tasks_assignment_idx ON tasks(assignment_id)`);
 }
 
 /**

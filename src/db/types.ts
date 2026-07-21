@@ -151,6 +151,19 @@ export interface ScheduleRunRow {
 }
 
 /** tasks table row */
+export type TaskWorkflowState =
+  | 'triage_required'
+  | 'ready'
+  | 'queued'
+  | 'executing'
+  | 'blocked'
+  | 'stalled'
+  | 'validation_pending'
+  | 'validated'
+  | 'superseded'
+  | 'retired'
+  | 'failed';
+
 export interface TaskRow {
   id: string;
   name: string;
@@ -167,6 +180,15 @@ export interface TaskRow {
   /** Dashboard lineage. These are opaque control-plane IDs, not foreign keys. */
   project_id?: string | null;
   plan_id?: string | null;
+  /** Versioned Discover -> Qualify -> Execute -> Validate -> Promote envelope. */
+  workflow_state?: TaskWorkflowState | null;
+  workflow_contract?: Record<string, unknown> | null;
+  assignment_id?: string | null;
+  delegation_lineage?: Record<string, unknown> | null;
+  blocked_detail?: Record<string, unknown> | null;
+  validation_detail?: Record<string, unknown> | null;
+  outcome_detail?: Record<string, unknown> | null;
+  lifecycle_updated_at?: number | null;
 }
 
 /** task_event_links table row */

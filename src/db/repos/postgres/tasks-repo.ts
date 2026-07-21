@@ -10,8 +10,9 @@ export class PgTasksRepo implements TasksRepository {
   async create(task: TaskRow, eventScheduleIds?: string[]): Promise<void> {
     await this.db.query(
       `INSERT INTO tasks
-         (id, name, uuid, team_id, title, description, status, created_by, owner, created_at, updated_at, completed_at, project_id, plan_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+         (id, name, uuid, team_id, title, description, status, created_by, owner, created_at, updated_at, completed_at, project_id, plan_id,
+          workflow_state, workflow_contract, assignment_id, delegation_lineage, blocked_detail, validation_detail, outcome_detail, lifecycle_updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)`,
       [
         task.id,
         task.name,
@@ -27,6 +28,14 @@ export class PgTasksRepo implements TasksRepository {
         task.completed_at,
         task.project_id ?? null,
         task.plan_id ?? null,
+        task.workflow_state ?? null,
+        task.workflow_contract ?? null,
+        task.assignment_id ?? null,
+        task.delegation_lineage ?? null,
+        task.blocked_detail ?? null,
+        task.validation_detail ?? null,
+        task.outcome_detail ?? null,
+        task.lifecycle_updated_at ?? null,
       ],
     );
 
@@ -115,6 +124,14 @@ export class PgTasksRepo implements TasksRepository {
       title?: string;
       description?: string | null;
       completed_at?: number | null;
+      workflow_state?: TaskRow['workflow_state'];
+      workflow_contract?: TaskRow['workflow_contract'];
+      assignment_id?: string | null;
+      delegation_lineage?: TaskRow['delegation_lineage'];
+      blocked_detail?: TaskRow['blocked_detail'];
+      validation_detail?: TaskRow['validation_detail'];
+      outcome_detail?: TaskRow['outcome_detail'];
+      lifecycle_updated_at?: number | null;
       updated_at: number;
     },
   ): Promise<void> {
@@ -131,6 +148,14 @@ export class PgTasksRepo implements TasksRepository {
     if (fields.title !== undefined) { sets.push(`title = $${idx++}`); params.push(fields.title); }
     if (fields.description !== undefined) { sets.push(`description = $${idx++}`); params.push(fields.description); }
     if (fields.completed_at !== undefined) { sets.push(`completed_at = $${idx++}`); params.push(fields.completed_at); }
+    if (fields.workflow_state !== undefined) { sets.push(`workflow_state = $${idx++}`); params.push(fields.workflow_state); }
+    if (fields.workflow_contract !== undefined) { sets.push(`workflow_contract = $${idx++}`); params.push(fields.workflow_contract); }
+    if (fields.assignment_id !== undefined) { sets.push(`assignment_id = $${idx++}`); params.push(fields.assignment_id); }
+    if (fields.delegation_lineage !== undefined) { sets.push(`delegation_lineage = $${idx++}`); params.push(fields.delegation_lineage); }
+    if (fields.blocked_detail !== undefined) { sets.push(`blocked_detail = $${idx++}`); params.push(fields.blocked_detail); }
+    if (fields.validation_detail !== undefined) { sets.push(`validation_detail = $${idx++}`); params.push(fields.validation_detail); }
+    if (fields.outcome_detail !== undefined) { sets.push(`outcome_detail = $${idx++}`); params.push(fields.outcome_detail); }
+    if (fields.lifecycle_updated_at !== undefined) { sets.push(`lifecycle_updated_at = $${idx++}`); params.push(fields.lifecycle_updated_at); }
 
     params.push(taskId);
     await this.db.query(
@@ -143,17 +168,25 @@ export class PgTasksRepo implements TasksRepository {
     taskId: string,
     ownerId: string,
     updatedAt: number,
-    options?: { maxDoingForTeam?: number },
+    options?: {
+      maxDoingForTeam?: number;
+      workflow?: { assignmentId: string; lineage: Record<string, unknown> };
+    },
   ): Promise<boolean> {
     // A pre-assigned todo row (owner set by auto-routing, status still
     // 'todo') must be claimable by that same owner — otherwise it's a dead
     // state nobody can flip to 'doing'. Only a *different* owner is
     // rejected by the `owner IS NULL OR owner = $2` condition below.
     const limit = options?.maxDoingForTeam;
+    const workflow = options?.workflow;
     if (limit !== undefined) {
       const r = await this.db.query(
         `UPDATE tasks AS target
-         SET owner = $2, status = 'doing', updated_at = $3
+         SET owner = $2, status = 'doing', updated_at = $3,
+             workflow_state = CASE WHEN $5::text IS NULL THEN workflow_state ELSE 'executing' END,
+             assignment_id = COALESCE($5, assignment_id),
+             delegation_lineage = COALESCE($6::jsonb, delegation_lineage),
+             lifecycle_updated_at = CASE WHEN $5::text IS NULL THEN lifecycle_updated_at ELSE $3 END
          WHERE target.id = $1 AND (target.owner IS NULL OR target.owner = $2) AND target.status = 'todo'
            AND (
              SELECT COUNT(*)
@@ -164,16 +197,36 @@ export class PgTasksRepo implements TasksRepository {
                  OR (active.team_id IS NULL AND target.team_id IS NULL)
                )
            ) < $4`,
-        [taskId, ownerId, updatedAt, limit],
+        [taskId, ownerId, updatedAt, limit, workflow?.assignmentId ?? null, workflow?.lineage ?? null],
       );
       return r.rowCount > 0;
     }
 
     const r = await this.db.query(
       `UPDATE tasks
-       SET owner = $2, status = 'doing', updated_at = $3
+       SET owner = $2, status = 'doing', updated_at = $3,
+           workflow_state = CASE WHEN $4::text IS NULL THEN workflow_state ELSE 'executing' END,
+           assignment_id = COALESCE($4, assignment_id),
+           delegation_lineage = COALESCE($5::jsonb, delegation_lineage),
+           lifecycle_updated_at = CASE WHEN $4::text IS NULL THEN lifecycle_updated_at ELSE $3 END
        WHERE id = $1 AND (owner IS NULL OR owner = $2) AND status = 'todo'`,
-      [taskId, ownerId, updatedAt],
+      [taskId, ownerId, updatedAt, workflow?.assignmentId ?? null, workflow?.lineage ?? null],
+    );
+    return r.rowCount > 0;
+  }
+
+  async releaseClaim(
+    taskId: string,
+    ownerId: string,
+    claimedAt: number,
+    updatedAt: number,
+  ): Promise<boolean> {
+    const r = await this.db.query(
+      `UPDATE tasks
+       SET owner = NULL, status = 'todo', completed_at = NULL,
+           workflow_state = 'queued', assignment_id = NULL, lifecycle_updated_at = $4, updated_at = $4
+       WHERE id = $1 AND owner = $2 AND status = 'doing' AND updated_at = $3`,
+      [taskId, ownerId, claimedAt, updatedAt],
     );
     return r.rowCount > 0;
   }

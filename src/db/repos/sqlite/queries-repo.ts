@@ -4,6 +4,7 @@ import type { QueriesRepository } from '../../db-service.js';
 import type { InboxOwnerKind, QueryRow } from '../../types.js';
 import type { DbAdapter } from '../../db-adapter.js';
 import { parseJsonObject, stringifyJson } from '../../db-json.js';
+import { hardenQueryContext } from '../../query-context-hardening.js';
 
 const TERMINAL_STATUSES = ['completed', 'failed', 'cancelled', 'expired'] as const;
 const RETENTION_DELETE_BATCH = 500;
@@ -25,6 +26,28 @@ function resolveQueryOwnership(
 
 export class SqliteQueriesRepo implements QueriesRepository {
   constructor(private readonly db: DbAdapter) {}
+
+  private async latestAuditHash(teamId: string, queryId?: string): Promise<string | null> {
+    const params: unknown[] = [teamId];
+    let exclude = '';
+    if (queryId) {
+      exclude = 'AND query_id <> ?';
+      params.push(queryId);
+    }
+    const r = await this.db.query<{ metadata: string | null }>(
+      `SELECT metadata
+       FROM queries
+       WHERE team_id = ? ${exclude}
+       ORDER BY created DESC, query_id DESC
+       LIMIT 1`,
+      params,
+    );
+    const metadata = parseJsonObject(r.rows[0]?.metadata);
+    const chain = metadata?.audit_chain;
+    return chain && typeof chain === 'object' && typeof (chain as any).hash === 'string'
+      ? (chain as any).hash
+      : null;
+  }
 
   async countActive(): Promise<number> {
     const r = await this.db.query<{ c: number }>(
@@ -183,11 +206,20 @@ export class SqliteQueriesRepo implements QueriesRepository {
     metadata?: Record<string, unknown> | null,
   ): Promise<void> {
     const own = resolveQueryOwnership(teamId, agentId, ownership);
+    const hardened = hardenQueryContext({
+      teamId,
+      queryId,
+      agentId,
+      prompt,
+      created,
+      metadata,
+      previousAuditHash: await this.latestAuditHash(teamId),
+    });
     await this.db.query(
       `INSERT INTO queries (team_id, query_id, agent_id, prompt, status, created, session_id, owner_kind, owner_id, metadata)
        VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)
        ON CONFLICT (team_id, query_id) DO NOTHING`,
-      [teamId, queryId, agentId, prompt, created, sessionId ?? null, own.owner_kind, own.owner_id, metadata ? stringifyJson(metadata) : null],
+      [teamId, queryId, agentId, hardened.prompt, created, sessionId ?? null, own.owner_kind, own.owner_id, stringifyJson(hardened.metadata)],
     );
   }
 
@@ -200,6 +232,16 @@ export class SqliteQueriesRepo implements QueriesRepository {
       query.owner_kind != null && query.owner_id != null
         ? { owner_kind: query.owner_kind, owner_id: query.owner_id }
         : resolveQueryOwnership(teamId, agentId);
+    const created = query.created ?? Date.now();
+    const hardened = hardenQueryContext({
+      teamId,
+      queryId: query.query_id,
+      agentId,
+      prompt: query.prompt ?? null,
+      created,
+      metadata: query.metadata ?? null,
+      previousAuditHash: await this.latestAuditHash(teamId, query.query_id),
+    });
     await this.db.query(
       `INSERT INTO queries (team_id, agent_id, query_id, status, prompt, created, completed, result, error, session_id, owner_kind, owner_id, metadata)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -218,15 +260,15 @@ export class SqliteQueriesRepo implements QueriesRepository {
         agentId,
         query.query_id,
         query.status ?? 'pending',
-        query.prompt ?? null,
-        query.created ?? Date.now(),
+        hardened.prompt,
+        created,
         query.completed ?? null,
         query.result ? stringifyJson(query.result) : null,
         query.error ?? null,
         query.session_id ?? null,
         own.owner_kind,
         own.owner_id,
-        query.metadata ? stringifyJson(query.metadata) : null,
+        stringifyJson(hardened.metadata),
       ],
     );
   }
