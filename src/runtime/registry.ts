@@ -59,7 +59,10 @@ const PROFILES: Record<RuntimeId, RuntimeProfile> = {
     canonicalId: 'claude-code-cli',
     displayName: 'Claude Code',
     providerName: 'Claude Code CLI',
-    defaultModel: 'claude-opus-4-20250514',
+    // A blank model lets the signed-in Claude Code subscription choose its
+    // current default. Pinning a dated model here causes fresh installs to
+    // inherit stale or unavailable model ids.
+    defaultModel: '',
     sessionPolicy: 'persistent',
     deploymentShape: 'local-process',
     auth: {
@@ -80,7 +83,7 @@ const PROFILES: Record<RuntimeId, RuntimeProfile> = {
     canonicalId: 'claude-code-cli',
     displayName: 'Claude Code',
     providerName: 'Claude Code CLI',
-    defaultModel: 'claude-opus-4-20250514',
+    defaultModel: '',
     sessionPolicy: 'persistent',
     deploymentShape: 'local-process',
     auth: {
@@ -347,6 +350,29 @@ export function getDefaultModelForRuntime(
   configuredDefault?: string
 ): string {
   return configuredDefault || getRuntimeProfile(runtime).defaultModel;
+}
+
+/**
+ * Resolve the runtime/model pair for an ad-hoc spawn request.
+ *
+ * A configured default model belongs to its configured default runtime. When
+ * a caller explicitly selects another runtime and leaves model blank, inherit
+ * that runtime's own default instead of leaking the configured model across
+ * provider families.
+ */
+export function resolveSpawnRuntimeModel(
+  runtime: HarnessType | string | undefined,
+  model: string | undefined,
+  configuredDefaults: { runtime?: HarnessType | string; model?: string } | null | undefined,
+): { runtime: RuntimeId; model: string } {
+  const requestedRuntime = typeof runtime === 'string' && runtime.trim() ? runtime.trim() : undefined;
+  const requestedModel = typeof model === 'string' && model.trim() ? model.trim() : undefined;
+  const effectiveRuntime = resolveRuntime(requestedRuntime || configuredDefaults?.runtime);
+  const inheritedModel = requestedRuntime ? undefined : configuredDefaults?.model;
+  return {
+    runtime: effectiveRuntime,
+    model: requestedModel || getDefaultModelForRuntime(effectiveRuntime, inheritedModel),
+  };
 }
 
 export function usesCliLogin(runtime: HarnessType | string | undefined): boolean {

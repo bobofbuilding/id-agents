@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.120]
+
+- Keep configured default models paired with their configured runtime so an explicit alternate runtime never inherits an incompatible provider model during agent creation.
+- Let blank Claude Code model selections use the signed-in subscription's current default instead of pinning a dated model identifier.
+- Return actionable `400 runtime_preflight_failed` responses for invalid spawn selections before creating any agent workspace or database state.
+- Cover fresh default-team runtime/model selection and explicit model overrides with regression tests.
+
 ## [0.1.119]
 
 - Enforce versioned task dispatch contracts with atomic owner, assignment, team, and delegation lineage so incomplete work enters triage instead of execution.

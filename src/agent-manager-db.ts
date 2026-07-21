@@ -143,6 +143,7 @@ import {
   isRuntimeId,
   isSupportedRuntimeSpecifier,
   resolveRuntime,
+  resolveSpawnRuntimeModel,
   runtimeIssueHint,
   supportsMcpTools,
   validateRuntimePreflight,
@@ -11339,7 +11340,8 @@ Return this JSON shape:
           });
         }
 
-        const effectiveRuntime = resolveRuntime(runtime);
+        const selection = resolveSpawnRuntimeModel(runtime, model, this.defaultConfig);
+        const effectiveRuntime = selection.runtime;
 
         id = `agent_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
         // Use config-specified working directory if provided, otherwise use workspace
@@ -11356,9 +11358,14 @@ Return this JSON shape:
           ...defaultPlugins.filter(p => !userPluginNames.has(p.name))
         ];
 
-        // Use default model from config if not specified
-        const effectiveModel = model || getDefaultModelForRuntime(effectiveRuntime, this.defaultConfig?.model);
-        this.ensureRuntimeReady(effectiveRuntime, effectiveModel);
+        const effectiveModel = selection.model;
+        const runtimeIssues = validateRuntimePreflight(effectiveRuntime, effectiveModel);
+        if (runtimeIssues.length > 0) {
+          const detail = runtimeIssues
+            .map((issue) => runtimeIssueHint(issue.code) || issue.message)
+            .join('; ');
+          return res.status(400).json({ error: detail, code: 'runtime_preflight_failed', issues: runtimeIssues });
+        }
 
         // Create workspace directory first (needed for plugin copy)
         mkdirSync(workingDirectory, { recursive: true });

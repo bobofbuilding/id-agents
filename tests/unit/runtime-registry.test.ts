@@ -11,6 +11,7 @@ import {
   getRuntimeProfile,
   getRuntimeProviderName,
   resolveRuntime,
+  resolveSpawnRuntimeModel,
   supportsMcpTools,
   supportsPluginSkillFallback,
   supportsSessionResume,
@@ -52,7 +53,25 @@ describe('runtime registry', () => {
     // Codex intentionally has no built-in default — the Codex CLI picks a model
     // based on the logged-in account, and agents override it per-agent in YAML.
     expect(getDefaultModelForRuntime('codex')).toBe('');
+    expect(getDefaultModelForRuntime('claude-code-cli')).toBe('');
     expect(getDefaultModelForRuntime('claude-agent-sdk')).toBe('claude-haiku-4-5-20251001');
+  });
+
+  it('keeps configured defaults paired with their configured runtime at spawn', () => {
+    const defaults = { runtime: 'codex', model: 'gpt-5.4-mini' };
+
+    expect(resolveSpawnRuntimeModel(undefined, undefined, defaults)).toEqual({
+      runtime: 'codex',
+      model: 'gpt-5.4-mini',
+    });
+    expect(resolveSpawnRuntimeModel('claude-code-cli', undefined, defaults)).toEqual({
+      runtime: 'claude-code-cli',
+      model: '',
+    });
+    expect(resolveSpawnRuntimeModel('claude-code-cli', 'sonnet', defaults)).toEqual({
+      runtime: 'claude-code-cli',
+      model: 'sonnet',
+    });
   });
 
   it('honors explicit configured defaults when provided', () => {
