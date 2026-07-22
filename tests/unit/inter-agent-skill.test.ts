@@ -96,9 +96,13 @@ describe('INTER_AGENT_SKILL — catalog-aware delegation flow', () => {
     expect(INTER_AGENT_SKILL).toContain('## Cross-team delegation');
     expect(INTER_AGENT_SKILL).toContain('$MANAGER_URL/remote');
     expect(INTER_AGENT_SKILL).toContain('/ask other-team/agent-name');
+    expect(INTER_AGENT_SKILL).toContain('context.task_ref');
+    expect(INTER_AGENT_SKILL).toContain('context.project_root');
     expect(INTER_AGENT_SKILL).toContain('Never `POST $MANAGER_URL/ask`');
     expect(INTER_AGENT_SKILL_LIGHT).toContain('## Cross-Team Delegation');
     expect(INTER_AGENT_SKILL_LIGHT).toContain('$MANAGER_URL/remote');
+    expect(INTER_AGENT_SKILL_LIGHT).toContain('task_ref');
+    expect(INTER_AGENT_SKILL_LIGHT).toContain('project_root');
     expect(INTER_AGENT_SKILL_LIGHT).toContain('Never POST to `$MANAGER_URL/ask`');
   });
 });

@@ -60,9 +60,11 @@ Every non-trivial unit of work MUST go through the task lifecycle.
   lifecycle below (create → claim → do → done).
 
 Creating a parallel task under a different name leaves the dispatcher's
-checkin firing against a phantom row. See \`skills/task-discipline/SKILL.md\`
-and \`skills/inter-agent/SKILL.md\` (section "Dispatch brief template") for
-the full guidance.
+checkin firing against a phantom row. Use the runtime-native installed skill
+paths: Codex uses \`.agents/skills/task-discipline/SKILL.md\` and
+\`.agents/skills/inter-agent/SKILL.md\`; Claude Code uses the corresponding
+\`.claude/skills/...\` paths. The inter-agent skill's "Dispatch brief template"
+section contains the full guidance.
 
 ### Lifecycle
 1. **Create**: \`POST $MANAGER_URL/tasks\` with \`{ title, name, from: "<your-name>" }\`

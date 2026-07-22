@@ -40,8 +40,9 @@ describe('PROTOCOL_DEFAULTS', () => {
   it('distinguishes assigned vs self-initiated work and points at the skills', () => {
     expect(PROTOCOL_DEFAULTS).toContain('Assigned vs self-initiated work');
     expect(PROTOCOL_DEFAULTS).toContain('do NOT create a parallel task');
-    expect(PROTOCOL_DEFAULTS).toContain('skills/task-discipline/SKILL.md');
-    expect(PROTOCOL_DEFAULTS).toContain('skills/inter-agent/SKILL.md');
+    expect(PROTOCOL_DEFAULTS).toContain('.agents/skills/task-discipline/SKILL.md');
+    expect(PROTOCOL_DEFAULTS).toContain('.agents/skills/inter-agent/SKILL.md');
+    expect(PROTOCOL_DEFAULTS).toContain('.claude/skills/...');
   });
 
   it('documents the orphan-cleanup close-note format verbatim', () => {

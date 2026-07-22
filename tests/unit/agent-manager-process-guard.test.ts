@@ -2043,6 +2043,123 @@ new org text from sidecar
     }
   });
 
+  it('rejects cross-team code validation before dispatch when task workspace context is missing', async () => {
+    const savedBrainDisabled = process.env.BRAIN_CONTEXT_DISABLED;
+    process.env.BRAIN_CONTEXT_DISABLED = 'true';
+    try {
+      const { manager, db, workDir } = await makeManager();
+      dbs.push(db);
+      workDirs.push(workDir);
+      const operationsTeamId = await db.teams.getOrCreateTeamId('operations-team');
+      const defaultTeamId = await db.teams.getOrCreateTeamId('default');
+      await db.agents.create(agentRow({
+        team_id: defaultTeamId,
+        id: 'agent-default-coder',
+        name: 'coder',
+        status: 'running',
+      }));
+
+      const result = await (manager as any).executeRemoteCommand(
+        '/ask default/coder Validate commit and npm test evidence in the repository',
+        operationsTeamId,
+        'operations-team',
+        'ops-lead',
+      );
+
+      expect(result).toMatchObject({
+        ok: false,
+        result: {
+          code: 'validation_workspace_context_required',
+          required: ['context.task_ref', 'context.project_root'],
+        },
+      });
+    } finally {
+      if (savedBrainDisabled === undefined) delete process.env.BRAIN_CONTEXT_DISABLED;
+      else process.env.BRAIN_CONTEXT_DISABLED = savedBrainDisabled;
+    }
+  });
+
+  it('preserves task, actor, and project root across a cross-team validation query', async () => {
+    const savedBrainDisabled = process.env.BRAIN_CONTEXT_DISABLED;
+    process.env.BRAIN_CONTEXT_DISABLED = 'true';
+    let talkServer: Awaited<ReturnType<typeof startTalkServer>> | null = null;
+    try {
+      const { manager, db, workDir } = await makeManager();
+      dbs.push(db);
+      workDirs.push(workDir);
+      talkServer = await startTalkServer({ query_id: 'capital-validation-query' });
+      const operationsTeamId = await db.teams.getOrCreateTeamId('operations-team');
+      const defaultTeamId = await db.teams.getOrCreateTeamId('default');
+      await db.agents.create(agentRow({
+        team_id: operationsTeamId,
+        id: 'agent-ops-lead',
+        name: 'ops-lead',
+        status: 'running',
+      }));
+      await db.agents.create(agentRow({
+        team_id: defaultTeamId,
+        id: 'agent-default-coder',
+        name: 'coder',
+        endpoint: talkServer.endpoint,
+        port: Number(new URL(talkServer.endpoint).port),
+        status: 'running',
+      }));
+      const task = {
+        ...taskRow({
+          id: 'task-capital-remediation',
+          uuid: '1234abcd-0000-4000-8000-000000000000',
+          team_id: operationsTeamId,
+          name: 'remediate-capital-production',
+          title: 'Remediate Bittrees Capital production snapshot',
+          status: 'done',
+          workflow_state: 'validation_pending',
+        }),
+        assignment_id: 'capital-owner-assignment',
+      };
+      await db.tasks.create(task);
+      const projectRoot = path.join(workDir, 'projects', 'bittrees-capital');
+      fs.mkdirSync(projectRoot, { recursive: true });
+
+      const result = await (manager as any).executeRemoteCommand(
+        '/ask default/coder Validate commit and npm test evidence in the repository',
+        operationsTeamId,
+        'operations-team',
+        'ops-lead',
+        undefined,
+        { task_ref: '#1234abcd', project_root: projectRoot },
+      );
+
+      expect(result).toMatchObject({ ok: true, result: { queryId: 'capital-validation-query' } });
+      expect(talkServer.talkBodies).toHaveLength(1);
+      const delivered = JSON.parse(talkServer.talkBodies[0]);
+      expect(delivered.message).toContain(`Project root: ${projectRoot}`);
+      expect(delivered.message).toContain('Task: #1234abcd (remediate-capital-production)');
+      expect(delivered.message).toContain('Do not treat the persistent agent workspace as the target checkout.');
+
+      const targetRow = await db.queries.getByQueryIdForTeam(defaultTeamId, 'capital-validation-query');
+      const sourceRow = await db.queries.getByQueryIdForTeam(operationsTeamId, 'capital-validation-query');
+      expect(targetRow?.metadata).toMatchObject({
+        context: {
+          kind: 'task',
+          task_id: 'task:1234abcd-0000-4000-8000-000000000000',
+          assignment_id: 'validation:1234abcd-0000-4000-8000-000000000000:agent-default-coder',
+        },
+        actor: { agent_id: 'agent-ops-lead', team_id: operationsTeamId },
+        scope: { project_root: projectRoot },
+      });
+      expect(sourceRow?.metadata).toMatchObject({
+        context: { kind: 'task' },
+        actor: { agent_id: 'agent-ops-lead', team_id: operationsTeamId },
+        shadow_of_team_id: defaultTeamId,
+        shadow_kind: 'cross_team_dispatch',
+      });
+    } finally {
+      await talkServer?.close();
+      if (savedBrainDisabled === undefined) delete process.env.BRAIN_CONTEXT_DISABLED;
+      else process.env.BRAIN_CONTEXT_DISABLED = savedBrainDisabled;
+    }
+  });
+
   it('keeps non-lead agents capped at one active /ask query by default', async () => {
     const saved = process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;
     delete process.env.ID_MAX_ACTIVE_QUERIES_PER_AGENT;

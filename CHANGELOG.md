@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.126]
+
+- Preserve source actor, task, validation assignment, and project-root context across cross-team manager dispatches.
+- Reject workspace-sensitive validation before model execution when its task or project root cannot be resolved, preventing validators from inspecting their persistent agent checkout by mistake.
+- Retain approved project scope fields through query-context hardening and inject the exact repository root into validator briefs.
+- Point generated protocol guidance at runtime-native Codex and Claude skill locations, with updated cross-team dispatch examples and regression coverage.
+
 ## [0.1.125]
 
 - Purge obsolete assignment IDs and delegation lineage from already-queued legacy tasks during lifecycle reconciliation.

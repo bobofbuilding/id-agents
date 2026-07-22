@@ -77,10 +77,27 @@ For another team's lead/member, `/ask <team>/<agent> ...` is a manager CLI comma
 curl -s -X POST "$MANAGER_URL/remote" \
   -H "Content-Type: application/json" \
   -H "X-Id-Team: $ID_TEAM" \
-  -d '{"command":"/ask other-team/agent-name your scoped objective"}'
+  -d '{"command":"/ask other-team/agent-name your scoped objective","from":"your-agent-name"}'
 ```
 
 Use the returned `queryId` with `GET $MANAGER_URL/query/<queryId>?wait=30`. Never `POST $MANAGER_URL/ask`; that route does not exist and will fail with `Cannot POST /ask`.
+
+### Task-scoped validation and repository work
+
+Cross-team code validation must preserve the existing task and workspace. Include
+`context.task_ref` and the exact absolute `context.project_root`; the manager rejects
+workspace-sensitive validation without both instead of letting the validator run in
+its persistent agent workspace.
+
+```bash
+curl -s -X POST "$MANAGER_URL/remote" \
+  -H "Content-Type: application/json" \
+  -H "X-Id-Team: $ID_TEAM" \
+  -d '{"command":"/ask default/coder validate the completed implementation","from":"your-agent-name","context":{"task_ref":"#1234abcd","project_root":"/absolute/path/to/project"}}'
+```
+
+Use the task reference and project root from the assigned task brief. Do not invent a
+new task, guess a checkout, or omit the context because a commit hash appears in prose.
 
 ## Transport routing — inter-agent vs xmtp
 

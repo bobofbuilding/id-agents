@@ -58,8 +58,9 @@ curl -s {{MANAGER_URL}}/agents -H "X-Id-Team: $ID_TEAM" | jq '.agents[].name'
 
 ## Cross-Team Delegation
 For another team's lead/member, send the CLI command through the manager:
-\`curl -s -X POST "$MANAGER_URL/remote" -H "Content-Type: application/json" -H "X-Id-Team: $ID_TEAM" -d '{"command":"/ask other-team/agent-name your scoped objective"}'\`
+\`curl -s -X POST "$MANAGER_URL/remote" -H "Content-Type: application/json" -H "X-Id-Team: $ID_TEAM" -d '{"command":"/ask other-team/agent-name your scoped objective","from":"your-agent-name"}'\`
 Never POST to \`$MANAGER_URL/ask\`; that HTTP route does not exist.
+For cross-team code validation, include \`"context":{"task_ref":"#1234abcd","project_root":"/absolute/path/to/project"}\`. The manager rejects workspace-sensitive validation without both fields.
 
 ## Key Rules
 1. Your response text is automatically sent back - no curl needed to reply

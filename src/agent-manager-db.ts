@@ -667,6 +667,21 @@ interface BrainInstruction {
   };
 }
 
+interface RemoteDispatchContext {
+  task_ref?: string;
+  assignment_id?: string;
+  project_id?: string;
+  project_root?: string;
+}
+
+interface ResolvedRemoteDispatchContext {
+  task: TaskRow | null;
+  taskId: string | null;
+  assignmentId: string | null;
+  projectId: string | null;
+  projectRoot: string | null;
+}
+
 const DEFAULT_BRAIN_CONTEXT_INSTRUCTION_CHARS = 420;
 const DEFAULT_BRAIN_CONTEXT_CANONICAL_SOURCE_LIMIT = 12;
 
@@ -12855,6 +12870,9 @@ Return this JSON shape:
           teamName,
           typeof from === 'string' ? from : undefined,
           typeof req.body?.session_id === 'string' ? req.body.session_id : undefined,
+          req.body?.context && typeof req.body.context === 'object' && !Array.isArray(req.body.context)
+            ? req.body.context as RemoteDispatchContext
+            : undefined,
         );
         res.json(result);
       } catch (error: any) {
@@ -14740,6 +14758,136 @@ Return this JSON shape:
     return { task };
   }
 
+  private isWorkspaceSensitiveValidation(message: string): boolean {
+    return /\b(?:validat(?:e|ion)|verify|review|audit)\b/i.test(message)
+      && /\b(?:build|checkout|code|commit|deploy|env|git|npm|package|repository|revision|telemetry|test|workspace)\b/i.test(message);
+  }
+
+  private explicitProjectRoot(text: string): string | null {
+    const candidates = String(text || '').match(/\/(?:Users|Volumes|private|tmp)\/[^\s'"`]+/g) || [];
+    for (const raw of candidates) {
+      let candidate = raw.replace(/:\d+(?::\d+)?$/, '').replace(/[),.;:]+$/, '');
+      while (candidate !== path.dirname(candidate) && existsSync(candidate) && !statSync(candidate).isDirectory()) {
+        candidate = path.dirname(candidate);
+      }
+      if (existsSync(candidate) && statSync(candidate).isDirectory()) return path.resolve(candidate);
+    }
+    return null;
+  }
+
+  private inferredProjectRoot(message: string, task: TaskRow | null, projectId: string | null): string | null {
+    const projectsRoot = path.resolve(this.baseWorkDir, 'projects');
+    if (projectId) {
+      const byId = path.resolve(projectsRoot, projectId);
+      if (byId.startsWith(`${projectsRoot}${path.sep}`) && existsSync(byId) && statSync(byId).isDirectory()) return byId;
+    }
+
+    const explicit = this.explicitProjectRoot(`${task?.description || ''}\n${message}`);
+    if (explicit) return explicit;
+    if (!existsSync(projectsRoot)) return null;
+
+    const haystack = `${task?.name || ''} ${task?.title || ''} ${task?.description || ''} ${message}`.toLowerCase();
+    const matches = readdirSync(projectsRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => {
+        const tokens = entry.name.toLowerCase().split(/[^a-z0-9]+/).filter((token) => token.length >= 3);
+        const matched = tokens.filter((token) => haystack.includes(token));
+        return { entry, tokens, matched };
+      })
+      .filter(({ tokens, matched }) => tokens.length >= 2 && matched.length === tokens.length)
+      .sort((a, b) => b.matched.join('').length - a.matched.join('').length);
+    if (matches.length > 1 && matches[0].matched.join('').length === matches[1].matched.join('').length) return null;
+    const selected = matches[0]?.entry.name;
+    return selected ? path.join(projectsRoot, selected) : null;
+  }
+
+  private async resolveRemoteDispatchContext(params: {
+    sourceTeamId: string;
+    targetTeamId: string;
+    targetAgent: AgentRow;
+    message: string;
+    context?: RemoteDispatchContext;
+  }): Promise<
+    | { ok: true; context: ResolvedRemoteDispatchContext }
+    | { ok: false; error: string; result: { code: string; required: string[] } }
+  > {
+    const supplied = params.context || {};
+    const rawTaskRef = typeof supplied.task_ref === 'string' ? supplied.task_ref.trim() : '';
+    let task: TaskRow | null = null;
+    if (rawTaskRef) {
+      const normalizedTaskRef = rawTaskRef.startsWith('task:') ? rawTaskRef.slice(5) : rawTaskRef;
+      const resolved = await this.resolveTaskRef(normalizedTaskRef, params.sourceTeamId);
+      if (!resolved.task) {
+        return {
+          ok: false,
+          error: resolved.error || `Task "${rawTaskRef}" was not found in the source team.`,
+          result: { code: 'remote_dispatch_task_context_invalid', required: ['context.task_ref'] },
+        };
+      }
+      task = resolved.task;
+    }
+
+    const projectId = (typeof supplied.project_id === 'string' && supplied.project_id.trim())
+      || task?.project_id
+      || null;
+    let projectRoot = typeof supplied.project_root === 'string' && supplied.project_root.trim()
+      ? path.resolve(supplied.project_root.trim())
+      : null;
+    if (projectRoot && (!existsSync(projectRoot) || !statSync(projectRoot).isDirectory())) {
+      return {
+        ok: false,
+        error: `Project root "${projectRoot}" does not exist or is not a directory.`,
+        result: { code: 'remote_dispatch_project_root_invalid', required: ['context.project_root'] },
+      };
+    }
+    projectRoot ||= this.inferredProjectRoot(params.message, task, projectId);
+
+    if (
+      params.targetTeamId !== params.sourceTeamId
+      && this.isWorkspaceSensitiveValidation(params.message)
+      && (!task || !projectRoot)
+    ) {
+      const missing = [
+        ...(!task ? ['context.task_ref'] : []),
+        ...(!projectRoot ? ['context.project_root'] : []),
+      ];
+      return {
+        ok: false,
+        error: `Cross-team code validation requires a resolvable task and project root before dispatch. Missing: ${missing.join(', ')}. Retry POST /remote with body.context so the validator cannot run in its persistent agent workspace.`,
+        result: { code: 'validation_workspace_context_required', required: missing },
+      };
+    }
+
+    const taskId = task ? `task:${task.uuid}` : null;
+    const assignmentId = task
+      ? (typeof supplied.assignment_id === 'string' && supplied.assignment_id.trim())
+        || `validation:${task.uuid}:${params.targetAgent.id}`
+      : null;
+    return {
+      ok: true,
+      context: { task, taskId, assignmentId, projectId, projectRoot },
+    };
+  }
+
+  private withRemoteDispatchContext(message: string, context: ResolvedRemoteDispatchContext): string {
+    if (!context.task && !context.projectRoot) return message;
+    const lines = [
+      '',
+      'Manager dispatch context:',
+      ...(context.task ? [
+        `- Task: ${this.taskShortRef(context.task)} (${context.task.name})`,
+        `- Task lifecycle: ${context.task.status} / ${context.task.workflow_state || 'legacy'}`,
+      ] : []),
+      ...(context.projectRoot ? [
+        `- Project root: ${context.projectRoot}`,
+        '- Run repository commands from this exact project root. Do not treat the persistent agent workspace as the target checkout.',
+        '- Preserve unrelated uncommitted changes in that checkout.',
+      ] : []),
+      '- This is validation context only; do not create a parallel task or mutate the parent task lifecycle.',
+    ];
+    return `${message}\n${lines.join('\n')}`;
+  }
+
   private async listTeamSchedules(teamId: string): Promise<Array<{ definition: ScheduleDefinitionRow; targets: AgentRow[] }>> {
     const teamAgents = await this.dbListAgents(teamId, true);
     const agentsById = new Map(teamAgents.map((agent) => [agent.id, agent]));
@@ -14822,6 +14970,7 @@ Return this JSON shape:
     teamName: string,
     callerFrom?: string,
     callerSessionId?: string,
+    callerContext?: RemoteDispatchContext,
   ): Promise<{ ok: boolean; result?: any; error?: string }> {
     // Remove leading slash if present
     const cmd = command.startsWith('/') ? command.slice(1) : command;
@@ -14840,6 +14989,7 @@ Return this JSON shape:
           teamName,
           callerFrom,
           callerSessionId,
+          callerContext,
         );
       }
 
@@ -15606,7 +15756,16 @@ Return this JSON shape:
             };
           }
         }
-        const messageForDispatch = learnRoutingDedupKey ? this.withRecursiveLearningGuard(message) : message;
+        const baseMessageForDispatch = learnRoutingDedupKey ? this.withRecursiveLearningGuard(message) : message;
+        const dispatchContext = await this.resolveRemoteDispatchContext({
+          sourceTeamId: teamId,
+          targetTeamId,
+          targetAgent: a,
+          message: baseMessageForDispatch,
+          context: callerContext,
+        });
+        if (!dispatchContext.ok) return dispatchContext;
+        const messageForDispatch = this.withRemoteDispatchContext(baseMessageForDispatch, dispatchContext.context);
         const duplicateTaskAsk = await this.findActiveDuplicateTaskAsk(teamId, a, messageForDispatch);
         if (duplicateTaskAsk) {
           return {
@@ -15638,9 +15797,10 @@ Return this JSON shape:
         const brainRequiredIntent = this.brainContextRequiredIntent(messageForDispatch);
         const brainContext = this.shouldAttachBrainContext(messageForDispatch)
           ? await this.volunteerBrainContext({
+              taskId: dispatchContext.context.taskId,
               agentId: a.id,
               text: messageForDispatch,
-              project: teamName,
+              project: dispatchContext.context.projectId || teamName,
               sessionId: callerSessionId || null,
             })
           : null;
@@ -15700,6 +15860,43 @@ Return this JSON shape:
         const askQueryId = talkResult.query_id || talkResult.queryId;
         this.bindLocalGate(askGate, askQueryId, a.name); // released when the query completes/fails
         if (askQueryId) {
+          const callerAgent = callerFrom
+            ? (await this.resolveSingleAgentForCommand(teamId, callerFrom).catch(() => ({ agent: undefined }))).agent
+            : undefined;
+          const queryMetadata: Record<string, unknown> = {
+            ...(brainContext ? { brain_context: brainContext } : {}),
+            context: dispatchContext.context.taskId && dispatchContext.context.assignmentId ? {
+              kind: 'task',
+              reason: 'task_scoped_remote_dispatch',
+              task_id: dispatchContext.context.taskId,
+              assignment_id: dispatchContext.context.assignmentId,
+            } : {
+              kind: 'non_task',
+              reason: 'direct_remote_ask_without_task',
+            },
+            actor: {
+              agent_id: callerAgent?.id || callerFrom || null,
+              team_id: teamId,
+            },
+            decision: {
+              action: targetTeamId === teamId ? 'remote_ask_dispatch' : 'cross_team_dispatch',
+              reason: dispatchContext.context.taskId ? 'task_context_preserved' : 'advisory_query',
+            },
+            scope: {
+              capability: 'inter-agent-dispatch',
+              resource: `agent:${a.id}`,
+              ...(dispatchContext.context.projectId ? { project_id: dispatchContext.context.projectId } : {}),
+              ...(dispatchContext.context.projectRoot ? { project_root: dispatchContext.context.projectRoot } : {}),
+            },
+            ...(dispatchContext.context.task ? {
+              task_probe: {
+                task_ref: this.taskShortRef(dispatchContext.context.task),
+                task_name: dispatchContext.context.task.name,
+                task_status: dispatchContext.context.task.status,
+                project_root: dispatchContext.context.projectRoot,
+              },
+            } : {}),
+          };
           await this.db.queries.create(
             targetTeamId,
             askQueryId,
@@ -15708,7 +15905,7 @@ Return this JSON shape:
             Date.now(),
             callerSessionId || undefined,
             undefined,
-            brainContext ? { brain_context: brainContext } : null,
+            queryMetadata,
           );
           if (targetTeamId !== teamId) {
             await this.db.queries.create(
@@ -15719,9 +15916,7 @@ Return this JSON shape:
               Date.now(),
               callerSessionId || undefined,
               undefined,
-              brainContext
-                ? { brain_context: brainContext, shadow_of_team_id: targetTeamId, shadow_kind: 'cross_team_dispatch' }
-                : { shadow_of_team_id: targetTeamId, shadow_kind: 'cross_team_dispatch' },
+              { ...queryMetadata, shadow_of_team_id: targetTeamId, shadow_kind: 'cross_team_dispatch' },
             );
           }
           if (brainContext) this.queryBrainContext.set(askQueryId, brainContext);

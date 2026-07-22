@@ -121,6 +121,13 @@ export function hardenQueryContext(input: {
     scope: {
       capability: stringOrNull(scope.capability) || 'remote-query',
       resource: stringOrNull(scope.resource) || (input.agentId ? `agent:${input.agentId}` : 'manager-inbox'),
+      ...(stringOrNull(scope.project) ? { project: stringOrNull(scope.project) } : {}),
+      ...(stringOrNull(scope.project_id) ? { project_id: stringOrNull(scope.project_id) } : {}),
+      ...(stringOrNull(scope.project_root) ? { project_root: stringOrNull(scope.project_root) } : {}),
+      ...(stringOrNull(scope.task_id) ? { task_id: stringOrNull(scope.task_id) } : {}),
+      ...(stringOrNull(scope.session_id) ? { session_id: stringOrNull(scope.session_id) } : {}),
+      ...(stringOrNull(scope.user_id) ? { user_id: stringOrNull(scope.user_id) } : {}),
+      ...(stringOrNull(scope.turn_id) ? { turn_id: stringOrNull(scope.turn_id) } : {}),
     },
     policy_version: QUERY_CONTEXT_POLICY_VERSION,
     redacted_summary: shortSummary(prompt),
