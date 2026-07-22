@@ -20469,6 +20469,26 @@ Return this JSON shape:
       });
     }
 
+    const queuedWithStaleAssignmentRows = (await Promise.all(([null, 'ready', 'queued'] as const).map((workflowState) =>
+      this.db.tasks.list({ status: 'todo', workflowState, order: 'updated_asc', limit: SCAN_LIMIT })
+        .catch(() => [] as TaskRow[]),
+    ))).flat();
+    const queuedWithStaleAssignment = [...new Map(queuedWithStaleAssignmentRows
+      .filter((task) => (
+        task.workflow_state == null || task.workflow_state === 'ready' || task.workflow_state === 'queued'
+      ) && Boolean(task.assignment_id || task.delegation_lineage))
+      .map((task) => [task.id, task])).values()];
+    for (const task of queuedWithStaleAssignment) {
+      await this.db.tasks.updateFields(task.id, {
+        workflow_state: task.workflow_state ?? 'queued',
+        assignment_id: null,
+        delegation_lineage: null,
+        blocked_detail: null,
+        lifecycle_updated_at: Math.floor(now / 1000),
+        updated_at: task.updated_at,
+      });
+    }
+
     const repairedTaskTeams = await this.repairMissingTaskTeams(SCAN_LIMIT).catch((err) => {
       console.warn('[Manager] Missing task team repair failed:', err?.message || err);
       return 0;

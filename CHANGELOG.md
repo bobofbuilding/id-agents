@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.125]
+
+- Purge obsolete assignment IDs and delegation lineage from already-queued legacy tasks during lifecycle reconciliation.
+- Preserve queued task activity timestamps while completing the one-time metadata repair, with regression coverage for migrated rows.
+
 ## [0.1.124]
 
 - Keep canonical task status, workflow lane, owner, assignment ID, and delegation lineage synchronized across claim, route, park, release, and backlog-requeue transitions.

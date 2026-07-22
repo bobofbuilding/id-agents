@@ -6517,11 +6517,21 @@ describe('stalled task sweeper', () => {
       delegation_lineage: { assignment_id: 'stale-assignment', to_agent_id: 'lead-1' },
       updated_at: nowSec - 600,
     });
+    const queuedWithStaleAssignment = task({
+      id: 'queued-with-stale-assignment',
+      owner: null,
+      status: 'todo',
+      workflow_state: 'queued',
+      assignment_id: 'stale-queued-assignment',
+      delegation_lineage: { assignment_id: 'stale-queued-assignment', to_agent_id: 'lead-1' },
+      updated_at: nowSec - 900,
+    });
     const db = fakeDb({
       tasks: {
         list: vi.fn(async ({ status, workflowState }: { status?: string; workflowState?: TaskRow['workflow_state'] | null } = {}) => {
           if (status === 'doing' && workflowState === 'queued') return [queuedWhileWorking];
           if (status === 'todo' && workflowState === 'executing') return [executingWithoutOwner];
+          if (status === 'todo' && workflowState === 'queued') return [queuedWithStaleAssignment];
           return [];
         }),
       },
@@ -6545,6 +6555,13 @@ describe('stalled task sweeper', () => {
       delegation_lineage: null,
       blocked_detail: null,
       updated_at: executingWithoutOwner.updated_at,
+    }));
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(queuedWithStaleAssignment.id, expect.objectContaining({
+      workflow_state: 'queued',
+      assignment_id: null,
+      delegation_lineage: null,
+      blocked_detail: null,
+      updated_at: queuedWithStaleAssignment.updated_at,
     }));
   });
 
