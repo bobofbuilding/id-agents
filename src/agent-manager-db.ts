@@ -20016,14 +20016,33 @@ Return this JSON shape:
     nowMs: number,
   ): Promise<void> {
     const nowSec = Math.floor(nowMs / 1000);
+    const resumesExecution = task.workflow_state === 'stalled' && (
+      reason === 'owner_refresh'
+      || reason === 'checkin_heartbeat_probe'
+      || reason === 'control_reply_in_progress'
+      || reason === 'control_reply_delegated'
+      || reason === 'delegated_children_complete'
+    );
     if (
       task.id
       && !this.isTerminalTaskStatus(task.status)
       && this.taskTimestampMs(task.updated_at || 0) < nowMs
     ) {
-      await this.db.tasks.updateFields(task.id, { updated_at: nowSec }).catch((err) => {
+      await this.db.tasks.updateFields(task.id, {
+        ...(resumesExecution ? {
+          workflow_state: 'executing' as const,
+          blocked_detail: null,
+          lifecycle_updated_at: nowSec,
+        } : {}),
+        updated_at: nowSec,
+      }).catch((err) => {
         this.managerLog(`Failed to bump supervised task activity for ${task.name}: ${err?.message || err}`);
       });
+      if (resumesExecution) {
+        task.workflow_state = 'executing';
+        task.blocked_detail = null;
+        task.lifecycle_updated_at = nowSec;
+      }
     }
     const input = {
       teamId,

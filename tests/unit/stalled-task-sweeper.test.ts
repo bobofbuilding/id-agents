@@ -748,6 +748,42 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('resumes a persisted stalled task when its owner recovery dispatch is accepted', async () => {
+    const stalledTask = task({
+      workflow_state: 'stalled',
+      blocked_detail: JSON.stringify({ reason: 'no_progress_before_timeout' }),
+      lifecycle_updated_at: Math.floor(NOW_MS / 1000) - 3600,
+    });
+    const db = fakeDb();
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-resume-test', db, { libraryRoot: null }) as any;
+
+    await manager.recordTaskSupervision(
+      stalledTask,
+      TEAM_ID,
+      'agent-1',
+      'owner_refresh',
+      60,
+      NOW_MS,
+    );
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(stalledTask.id, {
+      workflow_state: 'executing',
+      blocked_detail: null,
+      lifecycle_updated_at: Math.floor(NOW_MS / 1000),
+      updated_at: Math.floor(NOW_MS / 1000),
+    });
+    expect(stalledTask).toMatchObject({
+      workflow_state: 'executing',
+      blocked_detail: null,
+      lifecycle_updated_at: Math.floor(NOW_MS / 1000),
+    });
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:refreshed',
+      subject_id: stalledTask.uuid,
+      data: expect.objectContaining({ reason: 'owner_refresh' }),
+    }));
+  });
+
   it('applies an earlier completed task reply before sending another stalled supervision prompt', async () => {
     const staleTask = task();
     let currentTask = { ...staleTask };

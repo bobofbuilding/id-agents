@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.1.130]
+
+- Resume a persisted stalled task as soon as its owner recovery query is accepted, clearing stale blocker metadata while preserving the normal timeout path if work goes quiet again.
+
 ## [0.1.129]
 
 - Balance task admission and recovery by reducing the default per-team Doing ceiling from 30 to 12 while increasing each fleet-wide stalled sweep from 2 to 8 interventions.
