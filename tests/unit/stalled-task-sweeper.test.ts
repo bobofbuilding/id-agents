@@ -164,6 +164,7 @@ describe('stalled task sweeper', () => {
     delete process.env.STALL_MANUAL_RENUDGE_MS;
     delete process.env.ID_STALL_MANUAL_RENUDGE_MS;
     delete process.env.STALL_SWEEP_MAX_PER_SWEEP;
+    delete process.env.ID_VALIDATION_FALLBACK_MAX_PER_SWEEP;
     delete process.env.STALL_MAX_PROBES;
     delete process.env.STALL_PROBE_RESET_MS;
     delete process.env.ID_STALL_PROBE_RESET_MS;
@@ -215,6 +216,73 @@ describe('stalled task sweeper', () => {
 
     process.env.STALL_SWEEP_INTERVAL_MS = String(20 * 60 * 1000);
     expect(manager.getStallSweepIntervalMs()).toBe(20 * 60 * 1000);
+  });
+
+  it('gives validation routing a separate budget so old records cannot starve the review queue', async () => {
+    const pending = Array.from({ length: 5 }, (_, index) => task({
+      id: `validation-${index}`,
+      name: `validation-${index}`,
+      uuid: `0000000${index}-1234-1234-1234-123456789abc`,
+      status: 'done',
+      workflow_state: 'validation_pending',
+      updated_at: Math.floor(NOW_MS / 1000) - 3600 + index,
+    }));
+    const db = fakeDb({
+      tasks: {
+        list: vi.fn(async ({ status, workflowState }: { status?: string; workflowState?: string | null } = {}) =>
+          status === 'done' && workflowState === 'validation_pending' ? pending : []),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-validation-budget-test', db, { libraryRoot: null }) as any;
+    manager.routeExpiredValidationFallback = vi.fn(async () => 'routed');
+
+    await manager.sweepStalledTasks();
+
+    expect(manager.routeExpiredValidationFallback).toHaveBeenCalledTimes(5);
+  });
+
+  it('applies a structured validator reply without requiring the validator to call the manager API', async () => {
+    const pending = task({
+      status: 'done',
+      workflow_state: 'validation_pending',
+      validation_detail: {
+        version: 'task-validation.v1',
+        verdict: 'pending',
+        completion_query_id: 'query-completion',
+      },
+    });
+    const db = fakeDb({
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [pending]),
+        getByNameForTeam: vi.fn(async () => pending),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-validation-reply-test', db, { libraryRoot: null }) as any;
+    const query = activeQuery('validator-1', {
+      query_id: 'query-validation',
+      status: 'completed',
+      prompt: 'Validation request for task #12345678 ("Stalled work") [task-team:default]. Reply with a verdict.',
+      completed: NOW_MS,
+      result: { result: 'APPROVED\nEvidence was reproduced.' },
+    });
+
+    const result = await manager.applyTaskValidationReplyFromCompletedQuery(
+      query,
+      query.result,
+      NOW_MS,
+    );
+
+    expect(result).toMatchObject({ applied: true, verdict: 'approved', task: pending.name });
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(pending.id, expect.objectContaining({
+      status: 'done',
+      workflow_state: 'validated',
+      blocked_detail: null,
+      validation_detail: expect.objectContaining({
+        verdict: 'approved',
+        validator_id: 'validator-1',
+        evidence_ids: ['query-completion', 'query:query-validation'],
+      }),
+    }));
   });
 
   it('refreshes an exhausted stalled-probe budget after the reset window', () => {
@@ -442,6 +510,19 @@ describe('stalled task sweeper', () => {
     expect(goalFitLens).toBe(sameGoalFitLens);
     expect(goalFitLens).not.toBe(riskLens);
     expect(manager.learnRoutingDedupKey('normal task delegation with no Learn routing', 'research-lead-id')).toBeNull();
+  });
+
+  it('does not deduplicate validation against the task execution phase', () => {
+    const manager = new AgentManagerDb('/tmp/id-agents-validation-dedup-test', fakeDb(), { libraryRoot: null }) as any;
+
+    const execution = manager.activeAskDedupKey("You've been assigned task #12345678: Build the artifact");
+    const validation = manager.activeAskDedupKey('Validation request for task #12345678 ("Build the artifact") [task-team:default].');
+    const repeatedValidation = manager.activeAskDedupKey('Validation request for task #12345678 ("Build the artifact") [task-team:default]. Review it again.');
+
+    expect(execution).toBe('execution:#12345678');
+    expect(validation).toBe('validation:#12345678');
+    expect(repeatedValidation).toBe(validation);
+    expect(validation).not.toBe(execution);
   });
 
   it('adds a recursive learning guard without duplicating the guard block', () => {

@@ -905,6 +905,13 @@ export class AgentManagerDb {
       : 200;
   }
 
+  private getValidationFallbackMaxPerSweep(): number {
+    const raw = Number(process.env.ID_VALIDATION_FALLBACK_MAX_PER_SWEEP);
+    return Number.isFinite(raw) && raw > 0
+      ? Math.max(1, Math.min(100, Math.floor(raw)))
+      : 20;
+  }
+
   private getStallRenudgeMs(): number {
     return Number(process.env.STALL_RENUDGE_MS) || 90 * 60 * 1000;
   }
@@ -4097,6 +4104,7 @@ Return this JSON shape:
     if (transitioned || completedRow?.status === 'completed') {
       if (completedRow?.status === 'completed') {
         await this.applyTaskControlReplyFromCompletedQuery(completedRow, completionPayload, occurredAt);
+        await this.applyTaskValidationReplyFromCompletedQuery(completedRow, completionPayload, occurredAt);
       }
       await this.closeQueryShadowRows({
         teamId,
@@ -4192,6 +4200,83 @@ Return this JSON shape:
       if (typeof nestedMessage === 'string') return nestedMessage;
     }
     return '';
+  }
+
+  private validationReplyVerdict(message: string): 'approved' | 'revise' | 'rejected' | null {
+    const firstLine = String(message || '')
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find(Boolean) || '';
+    if (/^APPROVED\b/i.test(firstLine)) return 'approved';
+    if (/^REVISE\b/i.test(firstLine)) return 'revise';
+    if (/^REJECTED\b/i.test(firstLine)) return 'rejected';
+    return null;
+  }
+
+  private validationTaskTeamName(prompt: string | null | undefined): string | null {
+    return String(prompt || '').match(/^Validation request for task #[^\s]+ .*?\[task-team:([^\]]+)\]/i)?.[1]?.trim() || null;
+  }
+
+  private async applyTaskValidationReplyFromCompletedQuery(
+    queryRow: QueryRow,
+    payload: Record<string, unknown>,
+    occurredAt: number,
+  ): Promise<{ applied: boolean; verdict?: string; task?: string; reason?: string }> {
+    const prompt = String(queryRow.prompt || '').trim();
+    if (!/^Validation request for task #[a-z0-9_-]+\b/i.test(prompt)) {
+      return { applied: false, reason: 'not_validation_prompt' };
+    }
+    const marker = this.activeTaskAskMarker(prompt);
+    if (!marker) return { applied: false, reason: 'no_task_marker' };
+    const verdict = this.validationReplyVerdict(this.replyMessageFromPayload(payload));
+    if (!verdict) return { applied: false, reason: 'unstructured_validation_reply' };
+
+    let taskTeamId = queryRow.team_id;
+    const requestedTeamName = this.validationTaskTeamName(prompt);
+    if (requestedTeamName) {
+      const requestedTeam = await this.db.teams.getTeamByName(requestedTeamName).catch(() => null);
+      if (requestedTeam) taskTeamId = requestedTeam.id;
+    }
+    const { task } = await this.resolveTaskRef(marker, taskTeamId).catch(() => ({ task: undefined }));
+    if (!task) return { applied: false, verdict, reason: 'task_not_found' };
+    if (task.workflow_state !== 'validation_pending') {
+      return { applied: false, verdict, task: task.name, reason: 'task_not_validation_pending' };
+    }
+
+    const nowSec = Math.floor(occurredAt / 1000);
+    const priorValidation = (task.validation_detail || {}) as Record<string, unknown>;
+    const evidenceIds = [
+      typeof priorValidation.completion_query_id === 'string' ? priorValidation.completion_query_id : null,
+      `query:${queryRow.query_id}`,
+    ].filter((value): value is string => !!value);
+    const validatorId = queryRow.agent_id || queryRow.owner_id || 'manager-validator';
+    const nextState = verdict === 'approved' ? 'validated' : verdict === 'revise' ? 'executing' : 'failed';
+    const promotion = knowledgePromotionEnvelope(
+      { validation_status: verdict === 'approved' ? 'validated' : verdict },
+      { taskId: `task:${task.uuid}`, sourceIds: evidenceIds, reviewerId: validatorId, nowMs: occurredAt },
+    );
+    await this.db.tasks.updateFields(task.id, {
+      status: verdict === 'approved' ? 'done' : verdict === 'revise' ? 'doing' : 'todo',
+      workflow_state: nextState,
+      blocked_detail: verdict === 'approved' ? null : task.blocked_detail,
+      validation_detail: {
+        ...priorValidation,
+        verdict,
+        validator_id: validatorId,
+        evidence_ids: evidenceIds,
+        validation_query_id: queryRow.query_id,
+        validated_at: occurredAt,
+      },
+      outcome_detail: {
+        ...(task.outcome_detail || {}),
+        knowledge_promotion: promotion,
+        validation_passed: verdict === 'approved',
+      },
+      completed_at: verdict === 'approved' ? nowSec : null,
+      lifecycle_updated_at: nowSec,
+      updated_at: nowSec,
+    });
+    return { applied: true, verdict, task: task.name };
   }
 
   private humanDecisionBlockerMessage(message: string): boolean {
@@ -4958,11 +5043,15 @@ Return this JSON shape:
         completed_at: nowSec,
         ...(task.workflow_contract ? {
           workflow_state: 'validation_pending' as const,
+          blocked_detail: null,
           validation_detail: {
             version: 'task-validation.v1',
             verdict: 'pending',
             reason: 'completion_inferred_from_control_reply',
-            validator_deadline_at: occurredAt + 15 * 60_000,
+            completion_query_id: queryRow.query_id,
+            // Validation is a continuation of completion, not a delayed sweep.
+            // The next manager reconciliation pass can route it immediately.
+            validator_deadline_at: occurredAt,
             fallback_validators: (task.workflow_contract as any)?.validation?.fallback_validators || ['owning-team/lead', 'operations-team/task-master'],
           },
           lifecycle_updated_at: nowSec,
@@ -18958,10 +19047,33 @@ Return this JSON shape:
     );
     if (!validator) return 'waiting';
     const marker = this.taskShortRef(task);
-    if (await this.hasActiveSupervisionAskForMarker(validator.team.id, validator.agent, marker)) return 'waiting';
-    const message = `Validation fallback for task ${marker} ("${task.title}"). Review the completion evidence and POST /tasks/${task.name}/validate with verdict, validator_id, evidence_ids, and artifacts. Use approved only with reproducible evidence; otherwise use revise or rejected. This is fallback attempt ${attempts + 1}/${maxAttempts}.`;
+    const taskTeamName = team.name;
+    const completionQueryId = typeof validation.completion_query_id === 'string'
+      ? validation.completion_query_id
+      : null;
+    const message = [
+      `Validation request for task ${marker} ("${task.title}") [task-team:${taskTeamName}].`,
+      completionQueryId ? `Completion evidence query: ${completionQueryId}.` : '',
+      `Review the persisted completion evidence. Reply on the first line with exactly APPROVED, REVISE: <reason>, or REJECTED: <reason>.`,
+      `The manager applies the lifecycle transition from your reply; no shell or HTTP tool is required.`,
+      `Use APPROVED only with reproducible evidence. This is validation attempt ${attempts + 1}/${maxAttempts}.`,
+    ].filter(Boolean).join(' ');
+    if (await this.findActiveDuplicateTaskAsk(validator.team.id, validator.agent, message)) return 'waiting';
     const sent = await this.sendSupervisionAsk(validator.team.name, validator.agent.name, message);
-    if (!sent) return 'waiting';
+    if (!sent) {
+      await this.db.tasks.updateFields(task.id, {
+        validation_detail: {
+          ...validation,
+          routing_failures: Number(validation.routing_failures || 0) + 1,
+          last_route_failure_at: nowMs,
+          validator_deadline_at: nowMs + this.getStallSweepIntervalMs(),
+          routing_failure_reason: `validator_dispatch_failed:${validator.team.name}/${validator.agent.name}`,
+        },
+        lifecycle_updated_at: Math.floor(nowMs / 1000),
+        updated_at: task.updated_at,
+      });
+      return 'waiting';
+    }
     await this.db.tasks.updateFields(task.id, {
       validation_detail: {
         ...validation,
@@ -19112,8 +19224,18 @@ Return this JSON shape:
   }
 
   private activeAskDedupKey(prompt: string | null | undefined): string | null {
+    const text = String(prompt ?? '').trim().toLowerCase();
     const marker = this.activeTaskAskMarker(prompt) ?? this.supervisionPromptMarker(prompt);
-    if (marker) return `marker:${marker}`;
+    if (marker) {
+      // Execution and validation are distinct lifecycle phases. Treating both
+      // as marker:<task> caused every post-completion validation request to be
+      // expired as a duplicate of the original assignment/control query.
+      const phase = text.startsWith('validation request for ')
+        || (text.startsWith('please validate ') && text.includes(' against task #'))
+        ? 'validation'
+        : 'execution';
+      return `${phase}:${marker}`;
+    }
     const exact = this.exactControlPromptDedupKey(prompt);
     return exact ? `exact:${exact}` : null;
   }
@@ -20192,6 +20314,7 @@ Return this JSON shape:
     const RENUDGE_MS = this.getStallRenudgeMs();   // don't re-nudge a task within this
     const UNOWNED_ASSIGN_MS = this.unownedAssignMinMs();
     const MAX_PER_SWEEP = Math.max(1, Number(process.env.STALL_SWEEP_MAX_PER_SWEEP) || 2);
+    const VALIDATION_MAX_PER_SWEEP = this.getValidationFallbackMaxPerSweep();
     const UNOWNED_ASSIGN_MAX_PER_SWEEP = Math.max(
       0,
       Math.min(MAX_PER_SWEEP, Number(process.env.ID_UNOWNED_ASSIGN_MAX_PER_SWEEP) || 2),
@@ -20211,7 +20334,7 @@ Return this JSON shape:
       order: 'updated_asc',
       limit: SCAN_LIMIT,
     }).catch(() => [] as TaskRow[]);
-    for (const task of validationPending.slice(0, MAX_PER_SWEEP)) {
+    for (const task of validationPending.slice(0, VALIDATION_MAX_PER_SWEEP)) {
       await this.routeExpiredValidationFallback(task, now).catch((err) => {
         console.warn(`[Workflow] Validator fallback failed for ${task.name}: ${err?.message || err}`);
       });
