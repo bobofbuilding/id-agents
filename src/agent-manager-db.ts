@@ -13568,14 +13568,30 @@ Return this JSON shape:
 
         const now = Math.floor(Date.now() / 1000);
         const completedAt = Date.now();
+        const failureNote = [
+          req.body?.failure_note,
+          req.body?.failureNote,
+          req.body?.failure,
+          req.body?.failure_reason,
+          req.body?.failureReason,
+        ].find((value) => typeof value === 'string' && value.trim()) as string | undefined;
+        const acceptanceCoverage = req.body?.acceptance_coverage ?? req.body?.acceptanceCoverage;
+        const hasAcceptanceCoverage = Array.isArray(acceptanceCoverage)
+          ? acceptanceCoverage.length > 0
+          : acceptanceCoverage && typeof acceptanceCoverage === 'object'
+            ? Object.keys(acceptanceCoverage).length > 0
+            : typeof acceptanceCoverage === 'string' && acceptanceCoverage.trim().length > 0;
+        const failedCompletion = Boolean(failureNote) && !hasAcceptanceCoverage;
+        const completionWorkflowState = failedCompletion ? 'failed' as const : 'validated' as const;
+        const validationStatus = failedCompletion ? 'rejected' : 'validated';
         const validationEvidence = [
           ...this.stringArray(req.body?.evidence_ids || req.body?.evidenceIds),
           `task:${task.uuid}:completion-packet`,
         ];
         const promotion = knowledgePromotionEnvelope({
           ...(req.body || {}),
-          validation_status: 'validated',
-          confidence: req.body?.confidence ?? 1,
+          validation_status: validationStatus,
+          confidence: failedCompletion ? 0 : req.body?.confidence ?? 1,
           evidence_ids: validationEvidence,
         }, {
           taskId: `task:${task.uuid}`,
@@ -13585,10 +13601,10 @@ Return this JSON shape:
         await this.db.tasks.updateFields(task.id, {
           status: 'done',
           completed_at: now,
-          workflow_state: 'validated',
+          workflow_state: completionWorkflowState,
           validation_detail: {
             version: 'task-validation.v1',
-            verdict: 'validated',
+            verdict: validationStatus,
             validator_id: callerAgent?.id ?? task.owner ?? null,
             acceptance_coverage: completion.validation,
             evidence_ids: validationEvidence,
@@ -13599,7 +13615,7 @@ Return this JSON shape:
             result: this.completionPayloadSummary(req.body || {}),
             knowledge_promotion: promotion,
             cycle_time_ms: Math.max(0, completedAt - task.created_at * 1000),
-            validation_passed: true,
+            validation_passed: !failedCompletion,
             completed_at: completedAt,
           },
           blocked_detail: null,
@@ -13626,12 +13642,12 @@ Return this JSON shape:
         const learningLoop = normalizeLearningLoopCapture({
           payload: {
             ...(req.body || {}),
-            validation_status: 'validated',
-            confidence: req.body?.confidence ?? 1,
+            validation_status: validationStatus,
+            confidence: failedCompletion ? 0 : req.body?.confidence ?? 1,
             evidence_ids: validationEvidence,
             measured_outcome: {
               cycle_time_ms: Math.max(0, completedAt - task.created_at * 1000),
-              validation_passed: true,
+              validation_passed: !failedCompletion,
             },
           },
           subject: {
@@ -13728,12 +13744,14 @@ Return this JSON shape:
         }).catch((err) => {
           console.warn(`[Supervision] Delegated parent wake failed for ${updated!.name}: ${err?.message || err}`);
         });
-        void this.maybeTriggerValidatorRecommendationLoop({
-          teamId,
-          teamName,
-          task: updated!,
-          completionPayload: req.body || {},
-        });
+        if (!failedCompletion) {
+          void this.maybeTriggerValidatorRecommendationLoop({
+            teamId,
+            teamName,
+            task: updated!,
+            completionPayload: req.body || {},
+          });
+        }
         res.json({
           ok: true,
           task: await this.buildTaskResult(updated!, teamId),

@@ -751,6 +751,9 @@ describe('/talk-to auto-attach', () => {
       expect(done.status).toBe(200);
       const finished = await db.tasks.getByNameForTeam('completion-packet-task', teamId);
       expect(finished?.status).toBe('done');
+      expect(finished?.workflow_state).toBe('failed');
+      expect(finished?.validation_detail).toMatchObject({ verdict: 'rejected' });
+      expect(finished?.outcome_detail).toMatchObject({ validation_passed: false });
 
       const coverageCreated = await fetch(`${baseUrl}/tasks`, {
         method: 'POST',
@@ -782,6 +785,8 @@ describe('/talk-to auto-attach', () => {
       expect(coverageDone.status).toBe(200);
       const coverageFinished = await db.tasks.getByNameForTeam('coverage-completion-packet-task', teamId);
       expect(coverageFinished?.status).toBe('done');
+      expect(coverageFinished?.workflow_state).toBe('validated');
+      expect(coverageFinished?.outcome_detail).toMatchObject({ validation_passed: true });
     });
   });
 
