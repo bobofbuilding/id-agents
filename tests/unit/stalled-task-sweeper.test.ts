@@ -606,6 +606,60 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('applies an earlier completed task reply before sending another stalled supervision prompt', async () => {
+    const staleTask = task();
+    let currentTask = { ...staleTask };
+    const completedQuery = activeQuery(staleTask.owner!, {
+      query_id: 'completed-task-result',
+      status: 'completed',
+      prompt: `You've been assigned task #12345678: Stalled work`,
+      completed: NOW_MS - 30 * 60_000,
+      result: {
+        result: [
+          'Completed the requested artifact and verified the acceptance criteria.',
+          '/task done #12345678 --acceptance "completed the assigned scope"',
+        ].join('\n'),
+      },
+    });
+    const db = fakeDb({
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) =>
+          status === 'doing' && currentTask.status === 'doing' ? [currentTask] : []),
+        getByUuidPrefix: vi.fn(async () => [currentTask]),
+        updateFields: vi.fn(async (_id: string, fields: Partial<TaskRow>) => {
+          currentTask = { ...currentTask, ...fields };
+        }),
+      },
+      queries: {
+        getByQueryIdForTeam: vi.fn(async (_teamId: string, queryId: string) =>
+          queryId === completedQuery.query_id ? completedQuery : null),
+      },
+      adapter: {
+        query: vi.fn(async (sql: string) => {
+          if (sql.includes('FROM queries q') && sql.includes("q.status = 'completed'")) {
+            return { rows: [{ query_id: completedQuery.query_id }], rowCount: 1 };
+          }
+          return { rows: [], rowCount: 0 };
+        }),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-completion-reconcile-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.sweepStalledTasks();
+
+    expect(currentTask.status).toBe('done');
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(staleTask.id, expect.objectContaining({
+      status: 'done',
+      completed_at: Math.floor((NOW_MS - 30 * 60_000) / 1000),
+    }));
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'query:control-reply-applied',
+      subject_id: completedQuery.query_id,
+    }));
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
+  });
+
   it('bumps task activity when a backlog guard reply reports in progress', async () => {
     const staleTask = task();
     const db = fakeDb({

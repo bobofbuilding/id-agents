@@ -4702,6 +4702,52 @@ Return this JSON shape:
     });
   }
 
+  private async reconcileCompletedTaskControlReplies(
+    task: TaskRow,
+    teamId: string,
+  ): Promise<TaskRow> {
+    const ref = this.taskShortRef(task);
+    if (!ref.startsWith('#')) return task;
+
+    const dialect = this.db.adapter.dialect;
+    const p = (n: number) => dialect === 'postgres' ? `$${n}` : '?';
+    const completedSince = Math.max(0, Number(task.created_at || 0) * 1000);
+    const controlPromptWhere = this.activeControlPromptWhereSql();
+    const { rows } = await this.db.adapter.query<{ query_id: string }>(
+      `SELECT q.query_id
+         FROM queries q
+        WHERE q.team_id = ${p(1)}
+          AND q.status = 'completed'
+          AND COALESCE(q.completed, q.created) >= ${p(2)}
+          AND LOWER(q.prompt) LIKE ${p(3)}
+          AND ${controlPromptWhere}
+        ORDER BY COALESCE(q.completed, q.created) DESC, q.query_id DESC
+        LIMIT 25`,
+      [teamId, completedSince, `%${ref.toLowerCase()}%`],
+    ).catch(() => ({ rows: [] as Array<{ query_id: string }> }));
+
+    let current = task;
+    // Apply the selected recent replies in chronological order so an earlier
+    // completion wins before a later supervision acknowledgement can refresh
+    // or park a task whose state was already supposed to be terminal.
+    for (const candidate of [...rows].reverse()) {
+      const query = await this.db.queries.getByQueryIdForTeam(teamId, candidate.query_id).catch(() => null);
+      if (!query || query.status !== 'completed' || this.activeTaskAskMarker(query.prompt) !== ref.toLowerCase()) continue;
+      const payload = query.result && typeof query.result === 'object'
+        ? query.result as Record<string, unknown>
+        : {};
+      await this.applyTaskControlReplyFromCompletedQuery(
+        query,
+        payload,
+        Number(query.completed || Date.now()),
+      );
+      const resolved = await this.resolveTaskRef(ref, teamId).catch(() => ({ task: undefined }));
+      if (resolved.task) current = resolved.task;
+      if (this.isTerminalTaskStatus(current.status)) break;
+    }
+    return current;
+  }
+
   private taskAttemptApproachWindowMs(): number {
     const raw = Number(process.env.ID_TASK_ATTEMPT_APPROACH_WINDOW_MS || 6 * 60 * 60 * 1000);
     return Number.isFinite(raw) && raw >= 0 ? raw : 6 * 60 * 60 * 1000;
@@ -20362,7 +20408,8 @@ Return this JSON shape:
       supervisionSentToAgentIds.add(recipient.id);
       pendingQueriesByAgentId.delete(recipient.id);
     };
-    for (const t of doing) {
+    for (const listedTask of doing) {
+      let t = listedTask;
       if (nudged >= MAX_PER_SWEEP) break;
       if (!t.owner) {
         const teamRow = await getTeamRow(t.team_id);
@@ -20388,17 +20435,27 @@ Return this JSON shape:
         }
         continue;
       }
+      const initialAgeMs = now - this.taskLastActivityMs(t);
+      if (initialAgeMs >= earliestDoingActionMs && t.team_id) {
+        t = await this.reconcileCompletedTaskControlReplies(t, t.team_id).catch((err) => {
+          console.warn(`[Supervision] Completed task reply reconciliation failed for ${t.name}: ${err?.message || err}`);
+          return t;
+        });
+        if (t.status !== 'doing') continue;
+      }
+      const ownerId = t.owner;
+      if (!ownerId) continue;
       const updated = this.taskLastActivityMs(t);
       const ageMs = now - updated;
       const [ownerAgent, teamRow] = await Promise.all([
-        getOwnerAgent(t.owner),
+        getOwnerAgent(ownerId),
         getTeamRow(t.team_id),
       ]);
       if (!teamRow) continue;
       await this.transferCoordinatorCheckinsForAssignedTask(teamRow, t, ownerAgent, now);
       if (ageMs < earliestDoingActionMs) continue;
       const lead = await getLeadForTeam(t.team_id);
-      const ownerName = ownerAgent?.name || t.owner;
+      const ownerName = ownerAgent?.name || ownerId;
       const teamName = teamRow.name || 'default';
       const ref = this.taskShortRef(t);
       const mins = Math.round(ageMs / 60000);
@@ -20525,7 +20582,7 @@ Return this JSON shape:
           blocked_detail: {
             version: 'blocked-work.v1',
             reason: 'no_progress_before_timeout',
-            recovery_owner_id: t.owner,
+            recovery_owner_id: ownerId,
             retry_at: now + RENUDGE_MS,
             deadline_at: Number((t.workflow_contract as any)?.timing?.deadline_at || now + 24 * 60 * 60_000),
             fallback_route: String((t.workflow_contract as any)?.timing?.fallback_route || 'operations-team/task-master'),
@@ -20572,7 +20629,7 @@ Return this JSON shape:
         continue;
       }
 
-      const unavailable = ownerAgent ? `owner ${ownerName} is ${ownerAgent.status || 'not live'}` : `owner id ${t.owner} is missing`;
+      const unavailable = ownerAgent ? `owner ${ownerName} is ${ownerAgent.status || 'not live'}` : `owner id ${ownerId} is missing`;
       if (ownerAgent && this.canWakeAssignedTaskOwner(ownerAgent)) {
         const wakeKey = `task:${t.id}:owner-wake`;
         if (this.canRunStalledProbe(wakeKey, now, RENUDGE_MS, MAX_PROBES)) {
