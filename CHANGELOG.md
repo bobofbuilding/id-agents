@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.123]
+
+- Reconcile completed query evidence before stalled-task triage so finished work cannot remain falsely displayed in Doing or be restarted.
+- Recover validation queues deterministically by resolving missing validators, expiring abandoned validation leases, and returning revision requests to executable work.
+- Record failed closures truthfully, wake owners after requested revisions, and preserve bounded retry and escalation behavior across SQLite and PostgreSQL.
+- Cover stale completion, validation recovery, revision wakeup, capacity, and task-state transitions with focused regression tests.
+
 ## [0.1.122]
 
 - Exclude the optional SkillMesh provider plugin from the standard fresh-install catalog and direct plugin-detail API.
