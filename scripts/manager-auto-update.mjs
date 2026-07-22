@@ -4,14 +4,17 @@
 import {
   existsSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
+import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -202,6 +205,65 @@ export async function localActiveQueryCount(env = process.env) {
   }
 }
 
+function sqlitePathForEnv(env = process.env) {
+  if (env.DATABASE_URL) return undefined;
+  return resolve(env.SQLITE_PATH || join(env.HOME || homedir(), '.id-agents', 'id-agents.db'));
+}
+
+export function sqliteFleetSnapshot(env = process.env) {
+  const databasePath = sqlitePathForEnv(env);
+  if (!databasePath || !existsSync(databasePath)) return undefined;
+  let database;
+  try {
+    const Database = requireBetterSqlite3();
+    database = new Database(databasePath, { readonly: true, fileMustExist: true });
+    database.pragma('busy_timeout = 500');
+    const teams = database.prepare(`
+      SELECT teams.name AS name, COUNT(agents.id) AS agentCount
+      FROM teams
+      LEFT JOIN agents ON agents.team_id = teams.id AND agents.deleted_at IS NULL
+      GROUP BY teams.id, teams.name
+      ORDER BY teams.name
+    `).all().map((row) => ({ name: String(row.name), agentCount: Number(row.agentCount || 0) }));
+    return { databasePath, teams };
+  } catch {
+    return undefined;
+  } finally {
+    try { database?.close(); } catch { /* read-only cleanup is best-effort */ }
+  }
+}
+
+let BetterSqlite3;
+function requireBetterSqlite3() {
+  if (!BetterSqlite3) {
+    // manager-auto-update runs as an ES module, but better-sqlite3 is CommonJS.
+    BetterSqlite3 = createRequire(import.meta.url)('better-sqlite3');
+  }
+  return BetterSqlite3.default || BetterSqlite3;
+}
+
+export async function backupSqliteState(env = process.env, keep = 2) {
+  const databasePath = sqlitePathForEnv(env);
+  if (!databasePath || !existsSync(databasePath)) return undefined;
+  const backupDir = join(dirname(databasePath), 'backups');
+  mkdirSync(backupDir, { recursive: true, mode: 0o700 });
+  const destination = join(backupDir, `id-agents-before-update-${Date.now()}.db`);
+  let database;
+  try {
+    const Database = requireBetterSqlite3();
+    database = new Database(databasePath, { readonly: true, fileMustExist: true });
+    await database.backup(destination);
+  } finally {
+    try { database?.close(); } catch { /* backup cleanup is best-effort */ }
+  }
+  const backups = readdirSync(backupDir)
+    .filter((name) => /^id-agents-before-update-\d+\.db$/.test(name))
+    .sort()
+    .reverse();
+  for (const stale of backups.slice(Math.max(1, keep))) unlinkSync(join(backupDir, stale));
+  return destination;
+}
+
 async function waitForHealth(managerUrl, timeoutMs = 45_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -266,7 +328,19 @@ export async function updateManager(opts) {
       builtAt: new Date().toISOString(),
     });
   } else if (state.status !== 'restart-pending') {
-    return { status: 'current', version, commit: targetCommit };
+    if (opts.dryRun || (await health(opts.managerUrl)).healthy) {
+      return { status: 'current', version, commit: targetCommit };
+    }
+    // A current checkout is not a healthy installation when its managed
+    // service is offline. Enter the same guarded activation path used after a
+    // build so Settings can recover the service without requiring a new tag.
+    writeState(opts.state, {
+      status: 'restart-pending',
+      version,
+      commit: targetCommit,
+      reason: 'manager-unavailable',
+      deferredAt: new Date().toISOString(),
+    });
   }
 
   if (opts.dryRun || !opts.restart) {
@@ -301,17 +375,41 @@ export async function updateManager(opts) {
     });
     return { status: 'deferred', version, commit: targetCommit, activeQueries: readiness.activeQueries };
   }
+  const fleetBefore = sqliteFleetSnapshot();
+  const backupPath = await backupSqliteState();
   if (!restartService(opts.serviceLabel)) {
-    writeState(opts.state, { status: 'restart-pending', version, commit: targetCommit, reason: 'service-not-loaded' });
+    writeState(opts.state, { status: 'restart-pending', version, commit: targetCommit, reason: 'service-not-loaded', backupPath });
     return { status: 'restart-pending', version, commit: targetCommit };
   }
   if (!await waitForHealth(opts.managerUrl)) {
     throw new Error(`Manager did not become healthy after activating v${version}`);
   }
+  const fleetAfter = sqliteFleetSnapshot();
+  if (fleetBefore && fleetAfter) {
+    const afterNames = new Set(fleetAfter.teams.map((team) => team.name));
+    const missingTeams = fleetBefore.teams.filter((team) => !afterNames.has(team.name));
+    if (missingTeams.length > 0) {
+      writeState(opts.state, {
+        status: 'state-mismatch',
+        version,
+        commit: targetCommit,
+        databasePath: fleetBefore.databasePath,
+        backupPath,
+        missingTeams,
+        detectedAt: new Date().toISOString(),
+      });
+      throw new Error(
+        `Manager state verification failed after update: missing team(s) ${missingTeams.map((team) => team.name).join(', ')}. ` +
+        `A recovery backup is available at ${backupPath || 'the configured backup directory'}.`,
+      );
+    }
+  }
   writeState(opts.state, {
     status: 'current',
     version,
     commit: targetCommit,
+    databasePath: fleetAfter?.databasePath || fleetBefore?.databasePath,
+    backupPath,
     activatedAt: new Date().toISOString(),
   });
   return { status: 'updated', version, commit: targetCommit };

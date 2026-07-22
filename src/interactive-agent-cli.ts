@@ -166,7 +166,7 @@ const HELP_ITEMS: Array<{ cmd: string; desc: string; indent?: boolean }> = [
   { cmd: '/task assign <task-name> <agent>', desc: 'Assign task to agent' },
   { cmd: '/task done <task-name>', desc: 'Mark task done' },
   { cmd: '/task remove <task-name>', desc: 'Remove a task' },
-  { cmd: '/sync <config> [params]', desc: 'Reconcile running team with config (add/update/remove)' },
+  { cmd: '/sync <config> [params]', desc: 'Reconcile running team; removals require --allow-remove' },
   { cmd: '/status', desc: 'Check agent status' },
   { cmd: '/update <agent> [--wallet <addr>] [--name <name>]', desc: 'Update agent properties' },
   { cmd: '/wallet <agent> [chain]', desc: 'Show agent wallet address (chain: eip155:1, solana, etc.)' },
@@ -2406,8 +2406,8 @@ async function handleLine(line: string) {
     const syncArgs = parts.slice(1);
 
     if (!filePath) {
-      console.log(`\n${colors.red}Usage: /sync <config> [param=value ...] [--dry-run] [--verbose]${colors.reset}`);
-      console.log(`${colors.gray}Reconcile running team with config. Adds new, removes deleted, updates changed, leaves unchanged.${colors.reset}\n`);
+      console.log(`\n${colors.red}Usage: /sync <config> [param=value ...] [--dry-run] [--verbose] [--allow-remove]${colors.reset}`);
+      console.log(`${colors.gray}Reconcile running team with config. Add/update is safe by default; removals require a reviewed --dry-run followed by --allow-remove.${colors.reset}\n`);
       rl.prompt();
       return;
     }

@@ -134,7 +134,12 @@ describe.skipIf(!process.env.ID_CONTROL_API_KEY)('Sync Command', () => {
         { name: AGENT_C, description: 'Agent C' },
       ]);
 
-      const syncResult = await remoteSync(TEST_CONFIG_PATH);
+      const blockedSync = await remoteSync(TEST_CONFIG_PATH);
+      expect(blockedSync.ok).toBe(true);
+      expect((blockedSync.data as any).ok).toBe(false);
+      expect((blockedSync.data as any).error).toContain('--allow-remove');
+
+      const syncResult = await remoteSync(TEST_CONFIG_PATH, {}, ['--allow-remove']);
       expect(syncResult.ok).toBe(true);
 
       const data = (syncResult.data as any).result;

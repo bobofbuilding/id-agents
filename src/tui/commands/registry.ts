@@ -411,7 +411,7 @@ const REGISTRY: Record<string, CommandSpec> = {
   }),
   sync: {
     name: 'sync',
-    description: 'Sync team against YAML: `/sync <team>`',
+    description: 'Sync team against YAML; removals require `--allow-remove`',
     tier: 'powerful',
     shouldConfirm: () => true,
     confirmPreview: (args) => {

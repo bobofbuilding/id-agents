@@ -101,6 +101,40 @@ afterAll(async () => {
 });
 
 describe('POST /remote /team', () => {
+  it('requires local admin authority and an exact confirmation token on the HTTP delete route', async () => {
+    const teamName = 'http-delete-team';
+    await db.teams.getOrCreateTeamId(teamName);
+
+    const anonymous = await fetch(`${baseUrl}/teams/${teamName}`, { method: 'DELETE' });
+    expect(anonymous.status).toBe(403);
+    expect(await db.teams.getTeamByName(teamName)).not.toBeNull();
+
+    const unconfirmed = await fetch(`${baseUrl}/teams/${teamName}`, {
+      method: 'DELETE',
+      headers: headers('default'),
+    });
+    expect(unconfirmed.status).toBe(409);
+    expect(await db.teams.getTeamByName(teamName)).not.toBeNull();
+
+    const confirmed = await fetch(`${baseUrl}/teams/${teamName}?confirm=${teamName}`, {
+      method: 'DELETE',
+      headers: headers('default'),
+    });
+    expect(confirmed.status).toBe(200);
+    expect(await db.teams.getTeamByName(teamName)).toBeNull();
+    const tombstones = await db.adapter.query<{ subject_id: string; data: string }>(
+      `SELECT subject_id, data FROM event_log WHERE topic = ? AND subject_id = ?`,
+      ['config:team-removed', teamName],
+    );
+    const durable = tombstones.rows.find((row) => JSON.parse(row.data).durableTombstone === true);
+    expect(durable).toBeDefined();
+    expect(JSON.parse(durable!.data)).toMatchObject({
+      removedTeamName: teamName,
+      agentCount: 0,
+      durableTombstone: true,
+    });
+  });
+
   it('returns a YAML-anchored error instead of creating a missing team', async () => {
     await db.teams.getOrCreateTeamId('idchain');
 

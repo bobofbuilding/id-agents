@@ -11525,6 +11525,12 @@ Return this JSON shape:
       }
 
       try {
+        if (!this.isAdminRequest(req)) return res.status(403).json({ error: 'admin_required' });
+        if (String(req.query.confirm || '') !== name) {
+          return res.status(409).json({
+            error: `Team deletion requires the exact confirmation token: ?confirm=${encodeURIComponent(name)}`,
+          });
+        }
         const result = await this.deleteEmptyTeamByName(name);
         if (!result.ok) {
           return res.status(result.status).json({ error: result.error });
@@ -15004,6 +15010,30 @@ Return this JSON shape:
       };
     }
 
+    // Keep the destructive audit record in the non-deletable default team.
+    // Recording it against the team being deleted would be erased by the
+    // teams -> event_log cascade and make the incident impossible to trace.
+    const auditTeam = await this.db.teams.getTeamByName('default');
+    if (!auditTeam) {
+      return { ok: false, status: 503, error: 'Cannot delete a team while the durable default-team audit scope is unavailable' };
+    }
+    try {
+      await emitControlEvent(this.db.events, {
+        teamId: auditTeam.id,
+        topic: 'config:team-removed',
+        actorAgentId: null,
+        subjectKind: 'team',
+        subjectId: name,
+        data: {
+          removedTeamId: team.id,
+          removedTeamName: name,
+          agentCount,
+          durableTombstone: true,
+        },
+      });
+    } catch (error: any) {
+      return { ok: false, status: 503, error: `Cannot delete team without a durable audit record: ${error?.message || error}` };
+    }
     await this.db.teams.deleteTeam(team.id);
     return {
       ok: true,
@@ -16116,13 +16146,14 @@ Return this JSON shape:
 
       case 'sync': {
         // Sync running team with a config file — reconcile the diff
-        // Usage: /sync <config> [param=value ...] [--dry-run] [--verbose]
+        // Usage: /sync <config> [param=value ...] [--dry-run] [--verbose] [--allow-remove]
         const syncDryRun = args.includes('--dry-run');
         const syncVerbose = args.includes('--verbose');
-        const syncFilteredArgs = args.filter(arg => arg !== '--dry-run' && arg !== '--verbose');
+        const syncAllowRemove = args.includes('--allow-remove');
+        const syncFilteredArgs = args.filter(arg => arg !== '--dry-run' && arg !== '--verbose' && arg !== '--allow-remove');
         const syncConfigPath = syncFilteredArgs[0];
         if (!syncConfigPath) {
-          return { ok: false, error: 'Usage: /sync <config> [param=value ...] [--dry-run] [--verbose]' };
+          return { ok: false, error: 'Usage: /sync <config> [param=value ...] [--dry-run] [--verbose] [--allow-remove]' };
         }
 
         // Resolve config path (same shorthand as /deploy)
@@ -16188,6 +16219,17 @@ Return this JSON shape:
                 unchanged: plan.unchanged.map(i => i.name),
               }
             }
+          };
+        }
+
+        // IDACC can add agents after a YAML file was written. Treating every
+        // omission as authorization to delete makes a routine sync destructive,
+        // so removals require a reviewed dry-run and an explicit second step.
+        if (plan.removed.length > 0 && !syncAllowRemove) {
+          const names = plan.removed.map((item) => item.name);
+          return {
+            ok: false,
+            error: `Sync blocked: the config omits ${names.length} existing agent${names.length === 1 ? '' : 's'} (${names.join(', ')}). Run with --dry-run to review, then repeat with --allow-remove only if those deletions are intentional.`,
           };
         }
 

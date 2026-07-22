@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.128]
+
+- Make `/sync` non-destructive by default: omitted agents require a reviewed dry run and an explicit `--allow-remove` retry before they can be removed.
+- Require local-admin authorization and exact team-name confirmation for team deletion, and preserve a durable deletion tombstone in the protected default-team audit scope.
+- Back up the configured SQLite fleet before manager activation, retain a bounded recovery set, detect missing teams after restart, and recover a current-but-offline managed service through the normal guarded activation path.
+
 ## [0.1.127]
 
 - Recover pre-assigned todo tasks atomically inside the manager instead of asking remote model sandboxes to call the host-only manager loopback API.
