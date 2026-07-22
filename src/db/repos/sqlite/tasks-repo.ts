@@ -90,6 +90,7 @@ export class SqliteTasksRepo implements TasksRepository {
 
   async list(filters?: {
     status?: 'todo' | 'doing' | 'done';
+    workflowState?: TaskRow['workflow_state'] | null;
     owner?: string;
     teamId?: string | null;
     limit?: number;
@@ -101,6 +102,14 @@ export class SqliteTasksRepo implements TasksRepository {
     if (filters?.status) {
       clauses.push('status = ?');
       params.push(filters.status);
+    }
+    if (filters?.workflowState !== undefined) {
+      if (filters.workflowState === null) {
+        clauses.push('workflow_state IS NULL');
+      } else {
+        clauses.push('workflow_state = ?');
+        params.push(filters.workflowState);
+      }
     }
     if (filters?.owner) {
       clauses.push('owner = ?');
@@ -153,6 +162,29 @@ export class SqliteTasksRepo implements TasksRepository {
     if (fields.team_id !== undefined) { sets.push('team_id = ?'); params.push(fields.team_id); }
     if (fields.owner !== undefined) { sets.push('owner = ?'); params.push(fields.owner); }
     if (fields.status !== undefined) { sets.push('status = ?'); params.push(fields.status); }
+    if (fields.status === 'doing') {
+      if (fields.workflow_state === undefined) {
+        sets.push("workflow_state = 'executing'");
+      }
+      if (fields.blocked_detail === undefined) {
+        sets.push('blocked_detail = NULL');
+      }
+      if (fields.lifecycle_updated_at === undefined) {
+        sets.push('lifecycle_updated_at = ?');
+        params.push(fields.updated_at);
+      }
+    } else if (fields.status === 'done') {
+      if (fields.workflow_state === undefined) {
+        sets.push("workflow_state = 'validated'");
+      }
+      if (fields.blocked_detail === undefined) {
+        sets.push('blocked_detail = NULL');
+      }
+      if (fields.lifecycle_updated_at === undefined) {
+        sets.push('lifecycle_updated_at = ?');
+        params.push(fields.updated_at);
+      }
+    }
     if (fields.title !== undefined) { sets.push('title = ?'); params.push(fields.title); }
     if (fields.description !== undefined) { sets.push('description = ?'); params.push(fields.description); }
     if (fields.completed_at !== undefined) { sets.push('completed_at = ?'); params.push(fields.completed_at); }
@@ -188,15 +220,16 @@ export class SqliteTasksRepo implements TasksRepository {
     const limit = options?.maxDoingForTeam;
     const workflow = options?.workflow;
     const workflowSet = workflow
-      ? ", workflow_state = 'executing', assignment_id = ?, delegation_lineage = ?, lifecycle_updated_at = ?"
+      ? ', assignment_id = ?, delegation_lineage = ?'
       : '';
     const workflowParams = workflow
-      ? [workflow.assignmentId, stringifyJson(workflow.lineage), updatedAt]
+      ? [workflow.assignmentId, stringifyJson(workflow.lineage)]
       : [];
     if (limit !== undefined) {
       const { rowCount } = await this.db.query(
         `UPDATE tasks
-         SET owner = ?, status = 'doing', updated_at = ?${workflowSet}
+         SET owner = ?, status = 'doing', updated_at = ?, workflow_state = 'executing',
+             blocked_detail = NULL, lifecycle_updated_at = ?${workflowSet}
          WHERE id = ? AND (owner IS NULL OR owner = ?) AND status = 'todo'
            AND (
              SELECT COUNT(*)
@@ -207,16 +240,17 @@ export class SqliteTasksRepo implements TasksRepository {
                  OR (active.team_id IS NULL AND tasks.team_id IS NULL)
                )
            ) < ?`,
-        [ownerId, updatedAt, ...workflowParams, taskId, ownerId, limit],
+        [ownerId, updatedAt, updatedAt, ...workflowParams, taskId, ownerId, limit],
       );
       return rowCount > 0;
     }
 
     const { rowCount } = await this.db.query(
       `UPDATE tasks
-       SET owner = ?, status = 'doing', updated_at = ?${workflowSet}
+       SET owner = ?, status = 'doing', updated_at = ?, workflow_state = 'executing',
+           blocked_detail = NULL, lifecycle_updated_at = ?${workflowSet}
        WHERE id = ? AND (owner IS NULL OR owner = ?) AND status = 'todo'`,
-      [ownerId, updatedAt, ...workflowParams, taskId, ownerId],
+      [ownerId, updatedAt, updatedAt, ...workflowParams, taskId, ownerId],
     );
     return rowCount > 0;
   }

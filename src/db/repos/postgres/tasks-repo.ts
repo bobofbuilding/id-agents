@@ -76,6 +76,7 @@ export class PgTasksRepo implements TasksRepository {
 
   async list(filters?: {
     status?: 'todo' | 'doing' | 'done';
+    workflowState?: TaskRow['workflow_state'] | null;
     owner?: string;
     teamId?: string | null;
     limit?: number;
@@ -88,6 +89,14 @@ export class PgTasksRepo implements TasksRepository {
     if (filters?.status) {
       clauses.push(`status = $${idx++}`);
       params.push(filters.status);
+    }
+    if (filters?.workflowState !== undefined) {
+      if (filters.workflowState === null) {
+        clauses.push('workflow_state IS NULL');
+      } else {
+        clauses.push(`workflow_state = $${idx++}`);
+        params.push(filters.workflowState);
+      }
     }
     if (filters?.owner) {
       clauses.push(`owner = $${idx++}`);
@@ -145,6 +154,29 @@ export class PgTasksRepo implements TasksRepository {
     if (fields.team_id !== undefined) { sets.push(`team_id = $${idx++}`); params.push(fields.team_id); }
     if (fields.owner !== undefined) { sets.push(`owner = $${idx++}`); params.push(fields.owner); }
     if (fields.status !== undefined) { sets.push(`status = $${idx++}`); params.push(fields.status); }
+    if (fields.status === 'doing') {
+      if (fields.workflow_state === undefined) {
+        sets.push("workflow_state = 'executing'");
+      }
+      if (fields.blocked_detail === undefined) {
+        sets.push('blocked_detail = NULL');
+      }
+      if (fields.lifecycle_updated_at === undefined) {
+        sets.push(`lifecycle_updated_at = $${idx++}`);
+        params.push(fields.updated_at);
+      }
+    } else if (fields.status === 'done') {
+      if (fields.workflow_state === undefined) {
+        sets.push("workflow_state = 'validated'");
+      }
+      if (fields.blocked_detail === undefined) {
+        sets.push('blocked_detail = NULL');
+      }
+      if (fields.lifecycle_updated_at === undefined) {
+        sets.push(`lifecycle_updated_at = $${idx++}`);
+        params.push(fields.updated_at);
+      }
+    }
     if (fields.title !== undefined) { sets.push(`title = $${idx++}`); params.push(fields.title); }
     if (fields.description !== undefined) { sets.push(`description = $${idx++}`); params.push(fields.description); }
     if (fields.completed_at !== undefined) { sets.push(`completed_at = $${idx++}`); params.push(fields.completed_at); }
@@ -183,10 +215,10 @@ export class PgTasksRepo implements TasksRepository {
       const r = await this.db.query(
         `UPDATE tasks AS target
          SET owner = $2, status = 'doing', updated_at = $3,
-             workflow_state = CASE WHEN $5::text IS NULL THEN workflow_state ELSE 'executing' END,
+             workflow_state = 'executing', blocked_detail = NULL,
              assignment_id = COALESCE($5, assignment_id),
              delegation_lineage = COALESCE($6::jsonb, delegation_lineage),
-             lifecycle_updated_at = CASE WHEN $5::text IS NULL THEN lifecycle_updated_at ELSE $3 END
+             lifecycle_updated_at = $3
          WHERE target.id = $1 AND (target.owner IS NULL OR target.owner = $2) AND target.status = 'todo'
            AND (
              SELECT COUNT(*)
@@ -205,10 +237,10 @@ export class PgTasksRepo implements TasksRepository {
     const r = await this.db.query(
       `UPDATE tasks
        SET owner = $2, status = 'doing', updated_at = $3,
-           workflow_state = CASE WHEN $4::text IS NULL THEN workflow_state ELSE 'executing' END,
+           workflow_state = 'executing', blocked_detail = NULL,
            assignment_id = COALESCE($4, assignment_id),
            delegation_lineage = COALESCE($5::jsonb, delegation_lineage),
-           lifecycle_updated_at = CASE WHEN $4::text IS NULL THEN lifecycle_updated_at ELSE $3 END
+           lifecycle_updated_at = $3
        WHERE id = $1 AND (owner IS NULL OR owner = $2) AND status = 'todo'`,
       [taskId, ownerId, updatedAt, workflow?.assignmentId ?? null, workflow?.lineage ?? null],
     );

@@ -555,10 +555,14 @@ describe('stalled task sweeper', () => {
   });
 
   it('does not treat fresh second-based task timestamps as stalled', async () => {
-    const recent = task({ updated_at: Math.floor(NOW_MS / 1000) - 10 * 60 });
+    const recent = task({
+      updated_at: Math.floor(NOW_MS / 1000) - 10 * 60,
+      workflow_state: 'executing',
+    });
     const db = fakeDb({
       tasks: {
-        list: vi.fn(async ({ status }: { status?: string } = {}) => status === 'doing' ? [recent] : []),
+        list: vi.fn(async ({ status, workflowState }: { status?: string; workflowState?: TaskRow['workflow_state'] | null } = {}) =>
+          status === 'doing' && workflowState !== null ? [recent] : []),
         updateFields: vi.fn(async () => {}),
       },
     });
@@ -1470,6 +1474,43 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('reconciles a delegation reply that begins with the exact completed task reference', async () => {
+    const staleTask = task();
+    const db = fakeDb({
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [staleTask]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-delegation-completed-ref-test', db, { libraryRoot: null }) as any;
+
+    await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery(staleTask.owner!, {
+        query_id: 'delegation-completed-ref',
+        prompt: 'TASK DELEGATION from manager: You are assigned task #12345678 ("Stalled work"). Start this task now.',
+        status: 'completed',
+      }),
+      {
+        result: [
+          'Completed task #12345678.',
+          'Memo: output/assess-slack-connector-acrer.md',
+          'Recommendation: PILOT with bounded access.',
+          'Reusable Brain memory saved: memory ID 11138.',
+        ].join('\n'),
+      },
+      NOW_MS,
+    );
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(staleTask.id, {
+      status: 'done',
+      completed_at: Math.floor(NOW_MS / 1000),
+      updated_at: Math.floor(NOW_MS / 1000),
+    });
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:completed',
+      subject_id: staleTask.uuid,
+    }));
+  });
+
   it('closes delegated parent reconciliation when the only blocker is missing HTTP tooling', async () => {
     const parent = task({
       name: 'bootstrap-agent-bittrees-portal',
@@ -2012,6 +2053,68 @@ describe('stalled task sweeper', () => {
       reply_expected: true,
       owner_kind: 'manager',
       owner_id: TEAM_ID,
+    }));
+  });
+
+  it('does not promote sandbox loopback reachability as a human decision', async () => {
+    const db = fakeDb({
+      agents: {
+        getById: vi.fn(async () => agent({ name: 'task-master' })),
+      },
+      queries: {
+        getByQueryIdForTeam: vi.fn(async () => null),
+        create: vi.fn(async () => {}),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-loopback-blocker-inbox-test', db, { libraryRoot: null }) as any;
+
+    await manager.promoteHumanDecisionBlockerToManagerInbox(
+      activeQuery('agent-1', {
+        query_id: 'query-task-manager-loopback',
+        prompt: 'TASK DELEGATION from manager: triage an existing task.',
+        status: 'completed',
+      }),
+      { result: 'ASK-USER: The local manager endpoints at 127.0.0.1:4100 are unreachable. Is the manager service running?' },
+      NOW_MS,
+    );
+
+    expect(db.queries.create).not.toHaveBeenCalled();
+    expect(db.news.add).not.toHaveBeenCalled();
+  });
+
+  it('applies an operations task-manager completion to its original cross-team task', async () => {
+    const skillmeshTeam = team({ id: 'team-skillmesh', name: 'skillmesh-ops' });
+    const crossTeamTask = task({ team_id: skillmeshTeam.id });
+    const db = fakeDb({
+      teams: {
+        getTeam: vi.fn(async (id: string) => id === skillmeshTeam.id ? skillmeshTeam : team({ name: 'operations-team' })),
+        getTeamByName: vi.fn(async (name: string) => name === skillmeshTeam.name ? skillmeshTeam : null),
+      },
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [crossTeamTask]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-cross-team-task-manager-reply-test', db, { libraryRoot: null }) as any;
+
+    await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery('agent-1', {
+        query_id: 'query-cross-team-task-manager',
+        prompt: 'TASK DELEGATION from manager: You are assigned task-manager triage for skillmesh-ops task #12345678 ("Stalled work").',
+        status: 'completed',
+      }),
+      { result: 'DONE: existing evidence confirms the requested work is complete.' },
+      NOW_MS,
+    );
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(crossTeamTask.id, {
+      status: 'done',
+      completed_at: Math.floor(NOW_MS / 1000),
+      updated_at: Math.floor(NOW_MS / 1000),
+    });
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      team_id: skillmeshTeam.id,
+      topic: 'task:completed',
+      subject_id: crossTeamTask.uuid,
     }));
   });
 

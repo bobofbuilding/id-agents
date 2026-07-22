@@ -2204,7 +2204,7 @@ export class AgentManagerDb {
     const unblock = blocker
       ? ' If the blocker requires the lead, project manager, or user, create or update the relevant inbox/decision item with the exact missing decision and next owner; do not leave this as an unexplained retry.'
       : '';
-    return `TASK DELEGATION from manager: You are assigned task-manager triage for ${params.teamName} task ${params.ref} ("${params.task.title}"). The task has been active ${params.stalledMinutes}m, ${ownerState}, and ${leadState}.${source}${blockerDetail} New task assignment to that owner is held until this is triaged. Return a solution-oriented outcome: ROUTE to a live owner with why, SPLIT into member-owned work, ASK-USER with the exact missing decision, or PARK with a clear blocker and unblock owner.${unblock} Do not create duplicate objectives; mutate only the existing task or the minimum child tasks required to unblock it.`;
+    return `TASK DELEGATION from manager: You are assigned task-manager triage for ${params.teamName} task ${params.ref} ("${params.task.title}"). The task has been active ${params.stalledMinutes}m, ${ownerState}, and ${leadState}.${source}${blockerDetail} New task assignment to that owner is held until this is triaged. Return exactly one control directive on the first line: ROUTE: <team>/<live-agent>, BLOCKED: <concrete work blocker>, ASK-USER with the exact missing decision, or DONE: <evidence>. Add concise rationale after that line. The manager receiving this reply is live and will mutate the existing cross-team task; sandbox inability to reach localhost, $MANAGER_URL, or a manager port is never a user decision or work blocker. ASK-USER is only for a genuine external authority decision the manager and agents cannot make from available evidence.${unblock} Do not create duplicate objectives; mutate only the existing task or the minimum child tasks required to unblock it.`;
   }
 
   private taskManagerFallbackLaneKey(teamId: string): string {
@@ -4197,6 +4197,7 @@ Return this JSON shape:
   private humanDecisionBlockerMessage(message: string): boolean {
     const text = String(message || '').trim();
     if (!text) return false;
+    if (this.controlPlaneReachabilityBlockerMessage(text)) return false;
     const explicitAskUser = /\bASK[-\s]?USER\b\s*:?\s*\S/i.test(text);
     if (explicitAskUser) return true;
     const blockerSignal = /(^|\n)\s*(?:BLOCKED|BLOCKER)\s*:/i.test(text)
@@ -4212,6 +4213,16 @@ Return this JSON shape:
     // They should remain in automated task-manager triage, which already sees
     // the BLOCKED control reply and can re-route, split, or park the task.
     return false;
+  }
+
+  private controlPlaneReachabilityBlockerMessage(message: string): boolean {
+    const text = String(message || '').trim();
+    if (!text) return false;
+    const managerTarget = /\b(?:manager|control[-\s]?plane)\b/i.test(text)
+      && /\b(?:api|endpoint|service|url|port|route)\b/i.test(text);
+    const loopbackTarget = /\b(?:localhost|127\.0\.0\.1|\$MANAGER_URL)\b/i.test(text);
+    const reachabilityFailure = /\b(?:unreachable|unavailable|refused|timed?\s*out|cannot|can't|could not|failed|not running|unable)\b/i.test(text);
+    return reachabilityFailure && (managerTarget || loopbackTarget);
   }
 
   private managerBlockedDecisionQueryId(queryId: string): string {
@@ -4516,6 +4527,10 @@ Return this JSON shape:
     const artifactSignal = /\b(?:artifact|cleanup results|complete|completed|deliverable|delivered|done|memo|output|outputs|package|recommendations|report|result|results|summary|validation|workflow)\b/i.test(text);
     const markerBody = marker.replace(/^#/, '').toLowerCase();
     const escapedMarker = markerBody.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const explicitCompletedTaskRef = new RegExp(
+      `^(?:completed|finished|delivered|validated)\\s+(?:the\\s+)?task\\s+#?${escapedMarker}\\b`,
+      'i',
+    ).test(firstLine.replace(/[`*_]/g, ''));
     const firstLineTaskRefHeading = new RegExp(`^(?:#{1,6}\\s*)?(?:\\*\\*)?\\s*task\\s+#?${escapedMarker}\\b`, 'i')
       .test(firstLine.replace(/[`*_]/g, ''));
 
@@ -4531,7 +4546,7 @@ Return this JSON shape:
     const memoryArtifact = /"memory_update_package"\s*:/.test(text)
       && /\bmemor(?:y|ies)\b/i.test(`${task.title} ${task.name}`);
 
-    if (!memoryArtifact && !(artifactSignal && (firstLineTaskRefHeading || markdownArtifactHeading))) {
+    if (!memoryArtifact && !(artifactSignal && (explicitCompletedTaskRef || firstLineTaskRefHeading || markdownArtifactHeading))) {
       return null;
     }
 
@@ -4860,7 +4875,20 @@ Return this JSON shape:
     const message = this.replyMessageFromPayload(payload);
     const parsed = this.parseTaskControlReply(message);
 
-    const { task } = await this.resolveTaskRef(marker, queryRow.team_id).catch(() => ({ task: undefined }));
+    let controlTeamId = queryRow.team_id;
+    let { task } = await this.resolveTaskRef(marker, controlTeamId).catch(() => ({ task: undefined }));
+    if (!task) {
+      const targetTeamName = String(queryRow.prompt || '').match(
+        /^TASK DELEGATION from manager:\s*You are assigned task-manager triage for\s+(.+?)\s+task\s+#[a-z0-9_-]+\b/i,
+      )?.[1]?.trim();
+      if (targetTeamName) {
+        const targetTeam = await this.db.teams.getTeamByName(targetTeamName).catch(() => null);
+        if (targetTeam) {
+          controlTeamId = targetTeam.id;
+          ({ task } = await this.resolveTaskRef(marker, controlTeamId).catch(() => ({ task: undefined })));
+        }
+      }
+    }
     if (!task) return { applied: false, action: parsed.action ?? undefined, reason: 'task_not_found' };
     const delegatedParentCompletion = this.inferDelegatedParentCompletionReply(queryRow.prompt, message, parsed);
     const toolOnlyClosure = this.inferToolOnlyTaskClosureReply(queryRow.prompt, message, parsed);
@@ -4896,7 +4924,7 @@ Return this JSON shape:
         updated_at: nowSec,
       });
       await emitTaskCompleted(this.db.events, {
-        teamId: queryRow.team_id,
+        teamId: controlTeamId,
         taskUuid: task.uuid,
         taskName: task.name,
         title: task.title,
@@ -4906,16 +4934,16 @@ Return this JSON shape:
         failureNote: effectiveParsed.note,
       });
       await closeLinkedCheckinsForTerminalTask(this.db, {
-        teamId: queryRow.team_id,
+        teamId: controlTeamId,
         taskId: task.id,
         taskStatus: 'done',
         actorAgentId,
         occurredAt,
       });
-      const teamRow = await this.db.teams.getTeam(queryRow.team_id).catch(() => null);
+      const teamRow = await this.db.teams.getTeam(controlTeamId).catch(() => null);
       if (teamRow) {
         void this.wakeDelegatedParentLeadIfReady({
-          teamId: queryRow.team_id,
+          teamId: controlTeamId,
           teamName: teamRow.name,
           child: { ...task, status: 'done', completed_at: nowSec, updated_at: nowSec },
           occurredAt,
@@ -4923,7 +4951,7 @@ Return this JSON shape:
           console.warn(`[Supervision] Delegated parent wake failed for ${task.name}: ${err?.message || err}`);
         });
       }
-      await this.recordTaskSupervision(task, queryRow.team_id, actorAgentId, 'control_reply_done', stalledMinutes, occurredAt);
+      await this.recordTaskSupervision(task, controlTeamId, actorAgentId, 'control_reply_done', stalledMinutes, occurredAt);
       await this.markTaskControlReplyApplied({ teamId: queryRow.team_id, queryId: queryRow.query_id, agentId: actorAgentId, occurredAt, task, action: effectiveParsed.action });
       this.managerLog(`Applied DONE control reply for task ${task.name} from query ${queryRow.query_id}`);
       return { applied: true, action: effectiveParsed.action, task: task.name };
@@ -4932,14 +4960,14 @@ Return this JSON shape:
     if (effectiveParsed.action === 'in_progress' || effectiveParsed.action === 'delegated') {
       const attemptNote = effectiveParsed.note || message;
       const repeatedAttempt = await this.repeatedTaskAttemptWithoutChangedApproach({
-        teamId: queryRow.team_id,
+        teamId: controlTeamId,
         task,
         action: effectiveParsed.action,
         note: attemptNote,
         occurredAt,
       });
       if (repeatedAttempt) {
-        const taskTeamId = task.team_id || queryRow.team_id;
+        const taskTeamId = task.team_id || controlTeamId;
         const taskTeamRow = await this.db.teams.getTeam(taskTeamId).catch(() => null);
         const repeatNote = [
           `REPEATED-ATTEMPT: ${effectiveParsed.action} reply repeats the prior approach (${Math.round(repeatedAttempt.similarity * 100)}% overlap).`,
@@ -4972,7 +5000,7 @@ Return this JSON shape:
           updated_at: parkedTask.updated_at,
         });
         await this.recordTaskAttemptApproach({
-          teamId: queryRow.team_id,
+          teamId: controlTeamId,
           task,
           actorAgentId,
           queryId: queryRow.query_id,
@@ -4983,7 +5011,7 @@ Return this JSON shape:
         });
         await this.recordTaskSupervision(
           parkedTask,
-          taskTeamRow?.id || queryRow.team_id,
+          taskTeamRow?.id || controlTeamId,
           actorAgentId,
           'control_reply_repeated_attempt',
           stalledMinutes,
@@ -5011,7 +5039,7 @@ Return this JSON shape:
         workflow_state: 'executing', blocked_detail: null, lifecycle_updated_at: nowSec, updated_at: nowSec,
       } : { updated_at: nowSec });
       await this.recordTaskAttemptApproach({
-        teamId: queryRow.team_id,
+        teamId: controlTeamId,
         task,
         actorAgentId,
         queryId: queryRow.query_id,
@@ -5021,7 +5049,7 @@ Return this JSON shape:
       });
       await this.recordTaskSupervision(
         task,
-        queryRow.team_id,
+        controlTeamId,
         actorAgentId,
         effectiveParsed.action === 'delegated' ? 'control_reply_delegated' : 'control_reply_in_progress',
         stalledMinutes,
@@ -5045,7 +5073,7 @@ Return this JSON shape:
             task_id: task.id,
             from_agent_id: task.created_by,
             to_agent_id: actorAgentId,
-            team_id: queryRow.team_id,
+            team_id: controlTeamId,
             route: 'control_reply_claim',
             reason: 'owner_confirmed_claim',
             occurred_at: occurredAt,
@@ -5053,10 +5081,10 @@ Return this JSON shape:
           updated_at: nowSec,
         });
         const ownerAgent = await this.db.agents.getById(actorAgentId).catch(() => null);
-        const taskTeamRow = await this.db.teams.getTeam(queryRow.team_id).catch(() => null);
+        const taskTeamRow = await this.db.teams.getTeam(controlTeamId).catch(() => null);
         if (ownerAgent && taskTeamRow) {
           await this.emitTaskClaimedWithBrainContext({
-            teamId: queryRow.team_id,
+            teamId: controlTeamId,
             teamName: taskTeamRow.name,
             task,
             owner: ownerAgent,
@@ -5064,7 +5092,7 @@ Return this JSON shape:
           });
         } else {
           await emitTaskClaimed(this.db.events, {
-            teamId: queryRow.team_id,
+            teamId: controlTeamId,
             taskUuid: task.uuid,
             taskName: task.name,
             title: task.title,
@@ -5075,13 +5103,13 @@ Return this JSON shape:
       } else {
         await this.db.tasks.updateFields(task.id, { updated_at: nowSec });
       }
-      await this.recordTaskSupervision(task, queryRow.team_id, actorAgentId, 'control_reply_claimed', stalledMinutes, occurredAt);
+      await this.recordTaskSupervision(task, controlTeamId, actorAgentId, 'control_reply_claimed', stalledMinutes, occurredAt);
       await this.markTaskControlReplyApplied({ teamId: queryRow.team_id, queryId: queryRow.query_id, agentId: actorAgentId, occurredAt, task, action: effectiveParsed.action });
       this.managerLog(`Applied CLAIM control reply for task ${task.name} from query ${queryRow.query_id}`);
       return { applied: true, action: effectiveParsed.action, task: task.name };
     }
 
-    const taskTeamId = task.team_id || queryRow.team_id;
+    const taskTeamId = task.team_id || controlTeamId;
     const taskTeamRow = await this.db.teams.getTeam(taskTeamId).catch(() => null);
     let fallbackNote = effectiveParsed.note;
     let parkedDestinationTeam: TeamRow | null = null;
@@ -5243,7 +5271,7 @@ Return this JSON shape:
     });
     await this.recordTaskSupervision(
       parkedTask,
-      parkedTeam?.id || queryRow.team_id,
+      parkedTeam?.id || controlTeamId,
       actorAgentId,
       effectiveParsed.action === 'blocked' ? 'control_reply_blocked' : 'control_reply_reassign',
       stalledMinutes,
@@ -7957,7 +7985,7 @@ Return this JSON shape:
     const details = task.description
       ? `\nTask details:\n${this.compactBrainContextText(task.description, this.positiveIntEnv('ID_TASK_DELEGATION_DESCRIPTION_CHARS', 1200))}`
       : '';
-    return `TASK DELEGATION from manager: You are assigned task ${ref} ("${task.title}").${details}\nStart this task now. When complete, mark it done with \`/task done ${ref} --acceptance "..."\`. If blocked, reply with the blocker and do not create duplicate tasks.`;
+    return `TASK DELEGATION from manager: You are assigned task ${ref} ("${task.title}").${details}\nStart this task now and return the completed result, evidence, and source IDs in your reply; the manager will reconcile that reply atomically. If manager task commands are available, you may also mark it done with \`/task done ${ref} --acceptance "..."\`. Inability to reach localhost or the manager API from your workspace is not a task blocker after you have produced the requested result. If the work itself is blocked, reply BLOCKED with the concrete reason and do not create duplicate tasks.`;
   }
 
   /**
@@ -20113,10 +20141,66 @@ Return this JSON shape:
     let unownedAssigned = 0;
     const assignedTodoTaskIds = new Set<string>();
 
-    const validationPending = await this.db.tasks.list({ status: 'done', order: 'updated_asc', limit: SCAN_LIMIT }).catch(() => [] as TaskRow[]);
-    for (const task of validationPending.filter((item) => item.workflow_state === 'validation_pending').slice(0, MAX_PER_SWEEP)) {
+    const validationPending = await this.db.tasks.list({
+      status: 'done',
+      workflowState: 'validation_pending',
+      order: 'updated_asc',
+      limit: SCAN_LIMIT,
+    }).catch(() => [] as TaskRow[]);
+    for (const task of validationPending.slice(0, MAX_PER_SWEEP)) {
       await this.routeExpiredValidationFallback(task, now).catch((err) => {
         console.warn(`[Workflow] Validator fallback failed for ${task.name}: ${err?.message || err}`);
+      });
+    }
+
+    const inconsistentTerminalStates: TaskRow['workflow_state'][] = [
+      'queued',
+      'executing',
+      'blocked',
+      'stalled',
+      'triage_required',
+    ];
+    const inconsistentTerminal = (await Promise.all(inconsistentTerminalStates.map((workflowState) =>
+      this.db.tasks.list({ status: 'done', workflowState, order: 'updated_asc', limit: SCAN_LIMIT })
+        .catch(() => [] as TaskRow[]),
+    ))).flat();
+    for (const task of inconsistentTerminal) {
+      await this.db.tasks.updateFields(task.id, {
+        workflow_state: 'validated',
+        blocked_detail: null,
+        lifecycle_updated_at: Math.floor(now / 1000),
+        // State repair must not masquerade as new task activity.
+        updated_at: task.updated_at,
+      });
+    }
+
+    const legacyExecuting = await this.db.tasks.list({
+      status: 'doing',
+      workflowState: null,
+      order: 'updated_asc',
+      limit: SCAN_LIMIT,
+    }).catch(() => [] as TaskRow[]);
+    for (const task of legacyExecuting) {
+      await this.db.tasks.updateFields(task.id, {
+        workflow_state: 'executing',
+        blocked_detail: null,
+        lifecycle_updated_at: task.lifecycle_updated_at ?? task.updated_at,
+        updated_at: task.updated_at,
+      });
+    }
+
+    const ownerlessExecuting = await this.db.tasks.list({
+      status: 'todo',
+      workflowState: 'executing',
+      order: 'updated_asc',
+      limit: SCAN_LIMIT,
+    }).catch(() => [] as TaskRow[]);
+    for (const task of ownerlessExecuting) {
+      await this.db.tasks.updateFields(task.id, {
+        workflow_state: 'queued',
+        blocked_detail: null,
+        lifecycle_updated_at: task.lifecycle_updated_at ?? task.updated_at,
+        updated_at: task.updated_at,
       });
     }
 

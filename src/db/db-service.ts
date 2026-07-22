@@ -567,6 +567,7 @@ export interface TasksRepository {
   /** List tasks with optional filters on status, owner, and team. */
   list(filters?: {
     status?: 'todo' | 'doing' | 'done';
+    workflowState?: TaskRow['workflow_state'] | null;
     owner?: string;
     teamId?: string | null;
     limit?: number;
