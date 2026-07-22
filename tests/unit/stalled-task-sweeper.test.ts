@@ -285,6 +285,45 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('wakes the task owner with a distinct revision cycle after a revise verdict', async () => {
+    const pending = task({
+      status: 'done',
+      workflow_state: 'validation_pending',
+      validation_detail: { version: 'task-validation.v1', verdict: 'pending', revision_cycles: 0 },
+    });
+    const owner = agent({ id: pending.owner!, name: 'worker' });
+    const db = fakeDb({
+      agents: { getById: vi.fn(async () => owner) },
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [pending]),
+        getByNameForTeam: vi.fn(async () => pending),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-validation-revision-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+    const query = activeQuery('validator-1', {
+      query_id: 'query-validation-revise',
+      status: 'completed',
+      prompt: 'Validation request for task #12345678 ("Stalled work") [task-team:default].',
+      completed: NOW_MS,
+      result: { result: 'REVISE: persist the missing acceptance evidence.' },
+    });
+
+    await manager.applyTaskValidationReplyFromCompletedQuery(query, query.result, NOW_MS);
+    await vi.waitFor(() => expect(manager.sendSupervisionAsk).toHaveBeenCalled());
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(pending.id, expect.objectContaining({
+      status: 'doing',
+      workflow_state: 'executing',
+      validation_detail: expect.objectContaining({ revision_cycles: 1 }),
+    }));
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'worker',
+      expect.stringContaining('Supervision: validation revision for task #12345678 [revision-cycle:1]'),
+    );
+  });
+
   it('refreshes an exhausted stalled-probe budget after the reset window', () => {
     const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', fakeDb(), { libraryRoot: null }) as any;
     const renudgeMs = 90 * 60 * 1000;
@@ -518,11 +557,16 @@ describe('stalled task sweeper', () => {
     const execution = manager.activeAskDedupKey("You've been assigned task #12345678: Build the artifact");
     const validation = manager.activeAskDedupKey('Validation request for task #12345678 ("Build the artifact") [task-team:default].');
     const repeatedValidation = manager.activeAskDedupKey('Validation request for task #12345678 ("Build the artifact") [task-team:default]. Review it again.');
+    const revisionOne = manager.activeAskDedupKey('Supervision: validation revision for task #12345678 [revision-cycle:1].');
+    const revisionTwo = manager.activeAskDedupKey('Supervision: validation revision for task #12345678 [revision-cycle:2].');
 
     expect(execution).toBe('execution:#12345678');
     expect(validation).toBe('validation:#12345678');
     expect(repeatedValidation).toBe(validation);
     expect(validation).not.toBe(execution);
+    expect(revisionOne).toBe('revision-1:#12345678');
+    expect(revisionTwo).toBe('revision-2:#12345678');
+    expect(revisionOne).not.toBe(revisionTwo);
   });
 
   it('adds a recursive learning guard without duplicating the guard block', () => {

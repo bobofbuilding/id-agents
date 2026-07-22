@@ -4228,7 +4228,8 @@ Return this JSON shape:
     }
     const marker = this.activeTaskAskMarker(prompt);
     if (!marker) return { applied: false, reason: 'no_task_marker' };
-    const verdict = this.validationReplyVerdict(this.replyMessageFromPayload(payload));
+    const validatorMessage = this.replyMessageFromPayload(payload);
+    const verdict = this.validationReplyVerdict(validatorMessage);
     if (!verdict) return { applied: false, reason: 'unstructured_validation_reply' };
 
     let taskTeamId = queryRow.team_id;
@@ -4245,6 +4246,9 @@ Return this JSON shape:
 
     const nowSec = Math.floor(occurredAt / 1000);
     const priorValidation = (task.validation_detail || {}) as Record<string, unknown>;
+    const revisionCycle = verdict === 'revise'
+      ? Number(priorValidation.revision_cycles || 0) + 1
+      : Number(priorValidation.revision_cycles || 0);
     const evidenceIds = [
       typeof priorValidation.completion_query_id === 'string' ? priorValidation.completion_query_id : null,
       `query:${queryRow.query_id}`,
@@ -4265,6 +4269,7 @@ Return this JSON shape:
         validator_id: validatorId,
         evidence_ids: evidenceIds,
         validation_query_id: queryRow.query_id,
+        revision_cycles: revisionCycle,
         validated_at: occurredAt,
       },
       outcome_detail: {
@@ -4276,6 +4281,21 @@ Return this JSON shape:
       lifecycle_updated_at: nowSec,
       updated_at: nowSec,
     });
+    if (verdict === 'revise' && task.owner) {
+      const [taskTeam, owner] = await Promise.all([
+        this.db.teams.getTeam(taskTeamId).catch(() => null),
+        this.db.agents.getById(task.owner).catch(() => null),
+      ]);
+      if (taskTeam && this.isLiveForSupervision(owner)) {
+        const reason = validatorMessage.split(/\r?\n/).find(Boolean)?.trim().slice(0, 500) || 'Validator requested revision.';
+        const revisionPrompt = [
+          `Supervision: validation revision for task ${this.taskShortRef(task)} [revision-cycle:${revisionCycle}].`,
+          reason,
+          `Address the evidence gap using a materially changed approach, then reply DONE with the new artifact/evidence or BLOCKED: <specific blocker>.`,
+        ].join(' ');
+        void this.sendSupervisionAsk(taskTeam.name, owner.name, revisionPrompt).catch(() => false);
+      }
+    }
     return { applied: true, verdict, task: task.name };
   }
 
@@ -19230,10 +19250,15 @@ Return this JSON shape:
       // Execution and validation are distinct lifecycle phases. Treating both
       // as marker:<task> caused every post-completion validation request to be
       // expired as a duplicate of the original assignment/control query.
-      const phase = text.startsWith('validation request for ')
-        || (text.startsWith('please validate ') && text.includes(' against task #'))
-        ? 'validation'
-        : 'execution';
+      const revisionCycle = text.match(/\[revision-cycle:(\d+)\]/)?.[1];
+      const phase = revisionCycle
+        ? `revision-${revisionCycle}`
+        : (
+          text.startsWith('validation request for ')
+          || (text.startsWith('please validate ') && text.includes(' against task #'))
+            ? 'validation'
+            : 'execution'
+        );
       return `${phase}:${marker}`;
     }
     const exact = this.exactControlPromptDedupKey(prompt);
