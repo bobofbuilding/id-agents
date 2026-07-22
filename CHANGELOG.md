@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.127]
+
+- Recover pre-assigned todo tasks atomically inside the manager instead of asking remote model sandboxes to call the host-only manager loopback API.
+- Preserve a successful canonical claim when a stale remote reply reports that `127.0.0.1:4100` was unreachable, preventing false blocked and unassigned task state.
+- Resume recovered work through the normal worker delegation or team-lead decomposition path, with regression coverage for both state transitions.
+
 ## [0.1.126]
 
 - Preserve source actor, task, validation assignment, and project-root context across cross-team manager dispatches.

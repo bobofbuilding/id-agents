@@ -6446,7 +6446,7 @@ describe('stalled task sweeper', () => {
     }));
   });
 
-  it('flags stale owner-set todo work so the assigned lead can claim it', async () => {
+  it('atomically claims stale owner-set todo work without asking a remote harness to call localhost', async () => {
     const nowSec = Math.floor(NOW_MS / 1000);
     const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
     const ownedTodo = task({
@@ -6469,31 +6469,85 @@ describe('stalled task sweeper', () => {
           if (status === 'todo') return [ownedTodo];
           return [];
         }),
+        getByNameForTeam: vi.fn(async () => ({
+          ...ownedTodo,
+          status: 'doing',
+          workflow_state: 'executing',
+          updated_at: nowSec,
+        })),
       },
     });
     const manager = new AgentManagerDb('/tmp/id-agents-owned-todo-dead-state-test', db, { libraryRoot: null }) as any;
     manager.sendSupervisionAsk = vi.fn(async () => true);
+    manager.promptLeadForDelegationKickoff = vi.fn(async () => {});
 
     await manager.sweepStalledTasks();
 
-    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+    expect(db.tasks.claim).toHaveBeenCalledWith(ownedTodo.id, lead.id, nowSec, expect.objectContaining({
+      workflow: expect.objectContaining({
+        lineage: expect.objectContaining({ route: 'manager_preassigned_recovery' }),
+      }),
+    }));
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
+    expect(manager.promptLeadForDelegationKickoff).toHaveBeenCalledWith(
+      TEAM_ID,
       'default',
-      'lead',
-      expect.stringContaining('pre-assigned to you but still status=todo'),
-    );
-    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
-      'default',
-      'lead',
-      expect.stringContaining('POST /tasks/owned-todo-dead-state/claim'),
+      expect.objectContaining({ status: 'doing', owner: lead.id }),
+      lead,
     );
     expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
       team_id: TEAM_ID,
-      topic: 'task:triaged',
+      topic: 'task:claimed',
       actor_agent_id: lead.id,
       subject_id: ownedTodo.uuid,
       data: expect.objectContaining({
-        reason: 'owned_todo_dead_state',
+        status: 'doing',
+        owner: lead.id,
       }),
+    }));
+  });
+
+  it('keeps a successful canonical claim when a remote harness cannot reach manager localhost', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const claimedTask = task({
+      status: 'doing',
+      workflow_state: 'executing',
+      owner: 'lead-1',
+      updated_at: nowSec,
+    });
+    const db = fakeDb({
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [claimedTask]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stale-claim-transport-test', db, { libraryRoot: null }) as any;
+
+    await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery(claimedTask.owner!, {
+        query_id: 'stale-claim-transport',
+        created: NOW_MS - 10_000,
+        completed: NOW_MS,
+        status: 'completed',
+        prompt: 'Supervision: task #12345678 ("Stalled work") is pre-assigned to you but still status=todo after 2m. Claim it now via POST /tasks/stalled-work/claim with { agent_id: "lead" }.',
+      }),
+      { result: 'BLOCKED: Could not claim task `stalled-work` because the manager API at `127.0.0.1:4100` is unreachable (`curl: connection refused`). Task remains unclaimed.' },
+      NOW_MS,
+    );
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(claimedTask.id, {
+      workflow_state: 'executing',
+      blocked_detail: null,
+      lifecycle_updated_at: nowSec,
+      updated_at: nowSec,
+    });
+    expect(db.tasks.updateFields).not.toHaveBeenCalledWith(claimedTask.id, expect.objectContaining({
+      owner: null,
+      status: 'todo',
+    }));
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'query:control-reply-applied',
+      subject_id: 'stale-claim-transport',
+      data: expect.objectContaining({ action: 'stale_claim_transport_ignored' }),
     }));
   });
 

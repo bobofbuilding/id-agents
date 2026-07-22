@@ -4208,6 +4208,23 @@ Return this JSON shape:
       || lower.startsWith('urgent delegation probe:');
   }
 
+  private staleManagerClaimTransportReply(
+    prompt: string | null | undefined,
+    message: string,
+    task: TaskRow,
+    actorAgentId: string | null,
+    queryCreated: number,
+  ): boolean {
+    if (task.status !== 'doing' || !task.owner || task.owner !== actorAgentId) return false;
+    if (this.taskTimestampMs(task.updated_at || 0) < queryCreated) return false;
+    const promptText = String(prompt || '');
+    if (!/pre-assigned\b[\s\S]{0,300}\bclaim it now via POST\s+\/tasks\//i.test(promptText)) return false;
+    const reply = String(message || '');
+    return /\b(?:127\.0\.0\.1|localhost|manager api|manager_url)\b/i.test(reply)
+      && /\b(?:connection refused|refused the connection|unreachable|not reachable|failed to connect|econnrefused)\b/i.test(reply)
+      && /\b(?:could not|cannot|unable to|failed to)\s+claim\b/i.test(reply);
+  }
+
   private replyMessageFromPayload(payload: Record<string, unknown>): string {
     const direct = payload.message;
     if (typeof direct === 'string') return direct;
@@ -5076,6 +5093,39 @@ Return this JSON shape:
     const nowSec = Math.floor(occurredAt / 1000);
     const stalledMinutes = Math.max(0, Math.round((occurredAt - this.taskLastActivityMs(task)) / 60000));
     const actorAgentId = queryRow.agent_id ?? task.owner ?? null;
+
+    // A remote harness cannot reliably call the host-only manager loopback URL.
+    // If the manager has already claimed the task after issuing the supervision
+    // prompt, that transport reply is stale and must not undo canonical state.
+    if (
+      effectiveParsed.action === 'blocked'
+      && this.staleManagerClaimTransportReply(queryRow.prompt, message, task, actorAgentId, Number(queryRow.created || 0))
+    ) {
+      await this.db.tasks.updateFields(task.id, {
+        workflow_state: 'executing',
+        blocked_detail: null,
+        lifecycle_updated_at: nowSec,
+        updated_at: nowSec,
+      });
+      await this.recordTaskSupervision(
+        task,
+        controlTeamId,
+        actorAgentId,
+        'control_reply_claimed',
+        stalledMinutes,
+        occurredAt,
+      );
+      await this.markTaskControlReplyApplied({
+        teamId: queryRow.team_id,
+        queryId: queryRow.query_id,
+        agentId: actorAgentId,
+        occurredAt,
+        task,
+        action: 'stale_claim_transport_ignored',
+      });
+      this.managerLog(`Ignored stale manager-loopback claim blocker for task ${task.name} from query ${queryRow.query_id}`);
+      return { applied: true, action: 'stale_claim_transport_ignored', task: task.name };
+    }
 
     if (effectiveParsed.action === 'done') {
       await this.db.tasks.updateFields(task.id, {
@@ -20742,11 +20792,9 @@ Return this JSON shape:
       }
     }
 
-    // Dead-state pre-assigned todos: owner already set (e.g. auto-routed to
-    // a lead) but status never flipped to 'doing'. These used to be
-    // unclaimable by their own owner (claim() required owner IS NULL); now
-    // that the owner can self-claim, flag stale rows so the owner gets
-    // nudged to actually take the flip instead of the task sitting inert.
+    // Dead-state pre-assigned todos are a manager state transition, not agent
+    // work. Claim them atomically here; remote harnesses cannot be expected to
+    // reach the host-only manager loopback URL to perform their own claim.
     {
       const ownedTodo = await this.db.tasks
         .list({ status: 'todo', order: 'updated_asc', limit: SCAN_LIMIT })
@@ -20762,21 +20810,53 @@ Return this JSON shape:
         if (!teamRow) continue;
         const ownerAgent = await this.db.agents.getById(t.owner).catch(() => null);
         if (!ownerAgent) continue;
-        const ref = this.taskShortRef(t);
         const ageMinutes = Math.round((now - lastActivity) / 60000);
-        const message = `Supervision: task ${ref} ("${t.title}") is pre-assigned to you but still status=todo after ${ageMinutes}m — this is dead-state (no one can act on it until it's claimed). Claim it now via POST /tasks/${t.name}/claim with { agent_id: "${ownerAgent.name}" } to flip it to doing, or reply BLOCKED: <reason> if you cannot take it.`;
-        const sent = await this.sendRecentThrottledSupervisionAsk({
+        if (!(await this.hasDoingTaskRoom(teamRow.id))) continue;
+        const assignmentId = crypto.randomUUID();
+        const claimed = await this.db.tasks.claim(t.id, ownerAgent.id, Math.floor(now / 1000), {
+          maxDoingForTeam: this.getMaxDoingTasks(),
+          workflow: {
+            assignmentId,
+            lineage: {
+              version: 'delegation-lineage.v1',
+              assignment_id: assignmentId,
+              task_id: t.id,
+              from_agent_id: t.created_by,
+              to_agent_id: ownerAgent.id,
+              team_id: teamRow.id,
+              route: 'manager_preassigned_recovery',
+              reason: 'preassigned_todo_recovered_atomically',
+              occurred_at: now,
+            },
+          },
+        });
+        if (!claimed) continue;
+        const updated = await this.db.tasks.getByNameForTeam(t.name, teamRow.id).catch(() => null) ?? {
+          ...t,
+          status: 'doing' as const,
+          workflow_state: 'executing' as const,
+          assignment_id: assignmentId,
+          updated_at: Math.floor(now / 1000),
+        };
+        await this.emitTaskClaimedWithBrainContext({
           teamId: teamRow.id,
           teamName: teamRow.name,
-          recipient: ownerAgent,
-          message,
-          nowMs: now,
+          task: updated,
+          owner: ownerAgent,
+          occurredAt: now,
         });
-        if (sent === 'sent') {
-          this.markStalledProbe(nudgeKey, now);
-          await this.recordTaskSupervision(t, teamRow.id, ownerAgent.id, 'owned_todo_dead_state', ageMinutes, now).catch(() => {});
-          nudged++;
+        await this.wakeAssignedTaskOwner(teamRow.id, teamRow.name, updated, ownerAgent, 'task-claim');
+        const ref = this.taskShortRef(updated);
+        if (this.isConfiguredTeamLead(teamRow.name, ownerAgent)) {
+          void this.promptLeadForDelegationKickoff(teamRow.id, teamRow.name, updated, ownerAgent).catch((err) => {
+            console.warn(`[Supervision] Recovered lead delegation kickoff failed for ${updated.name}: ${err?.message || err}`);
+          });
+        } else if (!(await this.hasActiveSupervisionAskForMarker(teamRow.id, ownerAgent, ref))) {
+          await this.sendSupervisionAsk(teamRow.name, ownerAgent.name, this.taskDelegationPrompt(updated, ref));
         }
+        this.markStalledProbe(nudgeKey, now);
+        await this.recordTaskSupervision(updated, teamRow.id, ownerAgent.id, 'control_reply_claimed', ageMinutes, now).catch(() => {});
+        nudged++;
       }
     }
 
