@@ -3021,6 +3021,11 @@ export class AgentManagerDb {
               owner: null,
               status: 'todo',
               completed_at: null,
+              workflow_state: 'queued',
+              assignment_id: null,
+              delegation_lineage: null,
+              blocked_detail: null,
+              lifecycle_updated_at: nowSec,
               updated_at: nowSec,
             });
             checkinsClosed += await this.closeCheckinsForLeadBacklogRequeue(teamRow.id, task, lead.id, nowMs);
@@ -5190,9 +5195,9 @@ Return this JSON shape:
         this.managerLog(`Blocked repeated ${effectiveParsed.action} control reply for task ${task.name} from query ${queryRow.query_id}`);
         return { applied: true, action: 'repeat_attempt_blocked', task: task.name, reason: 'repeated_attempt_without_changed_approach' };
       }
-      await this.db.tasks.updateFields(task.id, task.workflow_contract ? {
+      await this.db.tasks.updateFields(task.id, {
         workflow_state: 'executing', blocked_detail: null, lifecycle_updated_at: nowSec, updated_at: nowSec,
-      } : { updated_at: nowSec });
+      });
       await this.recordTaskAttemptApproach({
         teamId: controlTeamId,
         task,
@@ -5217,12 +5222,14 @@ Return this JSON shape:
 
     if (effectiveParsed.action === 'claim') {
       if (task.status === 'todo' && !task.owner && actorAgentId) {
-        const assignmentId = task.workflow_contract ? crypto.randomUUID() : null;
+        const assignmentId = crypto.randomUUID();
         await this.db.tasks.updateFields(task.id, {
           owner: actorAgentId,
           status: 'doing',
           completed_at: null,
-          ...(task.workflow_contract ? { workflow_state: 'executing' as const, assignment_id: assignmentId, delegation_lineage: {
+          workflow_state: 'executing',
+          assignment_id: assignmentId,
+          delegation_lineage: {
             version: 'delegation-lineage.v1',
             assignment_id: assignmentId,
             task_id: task.id,
@@ -5232,7 +5239,9 @@ Return this JSON shape:
             route: 'control_reply_claim',
             reason: 'owner_confirmed_claim',
             occurred_at: occurredAt,
-          }, blocked_detail: null, lifecycle_updated_at: nowSec } : {}),
+          },
+          blocked_detail: null,
+          lifecycle_updated_at: nowSec,
           updated_at: nowSec,
         });
         const ownerAgent = await this.db.agents.getById(actorAgentId).catch(() => null);
@@ -5338,13 +5347,15 @@ Return this JSON shape:
               assignmentCapacity: true,
             }));
           } else {
-            const assignmentId = task.workflow_contract ? crypto.randomUUID() : null;
+            const assignmentId = crypto.randomUUID();
             await this.db.tasks.updateFields(task.id, {
               ...(route.team.id !== taskTeamId ? { team_id: route.team.id } : {}),
               owner: route.agent.id,
               status: 'doing',
               completed_at: null,
-              ...(task.workflow_contract ? { workflow_state: 'executing' as const, assignment_id: assignmentId, delegation_lineage: {
+              workflow_state: 'executing',
+              assignment_id: assignmentId,
+              delegation_lineage: {
                 version: 'delegation-lineage.v1',
                 assignment_id: assignmentId,
                 task_id: task.id,
@@ -5354,7 +5365,9 @@ Return this JSON shape:
                 route: 'control_reply_reassignment',
                 reason: effectiveParsed.note,
                 occurred_at: occurredAt,
-              }, blocked_detail: null, lifecycle_updated_at: nowSec } : {}),
+              },
+              blocked_detail: null,
+              lifecycle_updated_at: nowSec,
               updated_at: nowSec,
             });
             const routedTask = await this.db.tasks.getByNameForTeam(task.name, route.team.id).catch(() => null) ?? {
@@ -19708,6 +19721,11 @@ Return this JSON shape:
       owner: null,
       status: 'todo',
       completed_at: null,
+      workflow_state: 'queued',
+      assignment_id: null,
+      delegation_lineage: null,
+      blocked_detail: null,
+      lifecycle_updated_at: nowSec,
       updated_at: nowSec,
       description: this.appendTaskTriageNote(task.description, 'ownerless_doing_repaired', note, nowMs),
     };
@@ -19715,6 +19733,11 @@ Return this JSON shape:
       owner: parkedTask.owner,
       status: parkedTask.status,
       completed_at: parkedTask.completed_at,
+      workflow_state: parkedTask.workflow_state,
+      assignment_id: parkedTask.assignment_id,
+      delegation_lineage: parkedTask.delegation_lineage,
+      blocked_detail: parkedTask.blocked_detail,
+      lifecycle_updated_at: parkedTask.lifecycle_updated_at,
       description: parkedTask.description,
       updated_at: parkedTask.updated_at,
     });
@@ -19750,6 +19773,11 @@ Return this JSON shape:
       await this.db.tasks.updateFields(params.task.id, {
         status: 'todo',
         owner: retainedOwner,
+        workflow_state: 'queued',
+        assignment_id: null,
+        delegation_lineage: null,
+        blocked_detail: null,
+        lifecycle_updated_at: nowSec,
         updated_at: nowSec,
       });
     }
@@ -19961,7 +19989,7 @@ Return this JSON shape:
       const assignmentId = crypto.randomUUID();
       const claimed = await this.db.tasks.claim(current.id, owner.id, nowSec, {
         maxDoingForTeam: this.getMaxDoingTasks(),
-        ...(current.workflow_contract ? { workflow: {
+        workflow: {
           assignmentId,
           lineage: {
             version: 'delegation-lineage.v1',
@@ -19974,7 +20002,7 @@ Return this JSON shape:
             reason: `specialization_affinity=${affinity(owner)};active_tasks=${activeByOwner.get(owner.id) ?? 0}`,
             occurred_at: nowMs,
           },
-        } } : {}),
+        },
       });
       if (!claimed) return { assigned: false, reason: 'claim_race_or_limit' };
 
@@ -20386,32 +20414,57 @@ Return this JSON shape:
       });
     }
 
-    const legacyExecuting = await this.db.tasks.list({
-      status: 'doing',
-      workflowState: null,
-      order: 'updated_asc',
-      limit: SCAN_LIMIT,
-    }).catch(() => [] as TaskRow[]);
-    for (const task of legacyExecuting) {
+    const canonicalExecutingRows = (await Promise.all(([null, 'ready', 'queued'] as const).map((workflowState) =>
+      this.db.tasks.list({ status: 'doing', workflowState, order: 'updated_asc', limit: SCAN_LIMIT })
+        .catch(() => [] as TaskRow[]),
+    ))).flat();
+    const canonicalExecuting = [...new Map(canonicalExecutingRows
+      .filter((task) => task.workflow_state == null || task.workflow_state === 'ready' || task.workflow_state === 'queued')
+      .map((task) => [task.id, task])).values()];
+    for (const task of canonicalExecuting) {
+      if (!task.owner) continue;
+      const lineage = task.delegation_lineage && typeof task.delegation_lineage === 'object'
+        ? task.delegation_lineage
+        : null;
+      const assignmentAligned = Boolean(
+        task.assignment_id
+        && lineage?.assignment_id === task.assignment_id
+        && lineage?.to_agent_id === task.owner,
+      );
+      const assignmentId = assignmentAligned ? task.assignment_id! : crypto.randomUUID();
       await this.db.tasks.updateFields(task.id, {
         workflow_state: 'executing',
+        assignment_id: assignmentId,
+        delegation_lineage: assignmentAligned ? lineage : {
+          version: 'delegation-lineage.v1',
+          assignment_id: assignmentId,
+          task_id: task.id,
+          from_agent_id: task.created_by,
+          to_agent_id: task.owner,
+          team_id: task.team_id,
+          route: 'manager_state_repair',
+          reason: 'canonical_doing_owner_reconciled',
+          occurred_at: now,
+        },
         blocked_detail: null,
-        lifecycle_updated_at: task.lifecycle_updated_at ?? task.updated_at,
+        lifecycle_updated_at: Math.floor(now / 1000),
         updated_at: task.updated_at,
       });
     }
 
-    const ownerlessExecuting = await this.db.tasks.list({
+    const parkedExecuting = await this.db.tasks.list({
       status: 'todo',
       workflowState: 'executing',
       order: 'updated_asc',
       limit: SCAN_LIMIT,
     }).catch(() => [] as TaskRow[]);
-    for (const task of ownerlessExecuting) {
+    for (const task of parkedExecuting) {
       await this.db.tasks.updateFields(task.id, {
         workflow_state: 'queued',
+        assignment_id: null,
+        delegation_lineage: null,
         blocked_detail: null,
-        lifecycle_updated_at: task.lifecycle_updated_at ?? task.updated_at,
+        lifecycle_updated_at: Math.floor(now / 1000),
         updated_at: task.updated_at,
       });
     }

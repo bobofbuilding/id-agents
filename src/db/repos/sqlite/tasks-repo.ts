@@ -221,7 +221,7 @@ export class SqliteTasksRepo implements TasksRepository {
     const workflow = options?.workflow;
     const workflowSet = workflow
       ? ', assignment_id = ?, delegation_lineage = ?'
-      : '';
+      : ', assignment_id = NULL, delegation_lineage = NULL';
     const workflowParams = workflow
       ? [workflow.assignmentId, stringifyJson(workflow.lineage)]
       : [];
@@ -264,7 +264,8 @@ export class SqliteTasksRepo implements TasksRepository {
     const { rowCount } = await this.db.query(
       `UPDATE tasks
        SET owner = NULL, status = 'todo', completed_at = NULL,
-           workflow_state = 'queued', assignment_id = NULL, lifecycle_updated_at = ?, updated_at = ?
+           workflow_state = 'queued', assignment_id = NULL, delegation_lineage = NULL,
+           blocked_detail = NULL, lifecycle_updated_at = ?, updated_at = ?
        WHERE id = ? AND owner = ? AND status = 'doing' AND updated_at = ?`,
       [updatedAt, updatedAt, taskId, ownerId, claimedAt],
     );

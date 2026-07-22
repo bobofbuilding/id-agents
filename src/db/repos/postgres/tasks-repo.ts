@@ -216,8 +216,8 @@ export class PgTasksRepo implements TasksRepository {
         `UPDATE tasks AS target
          SET owner = $2, status = 'doing', updated_at = $3,
              workflow_state = 'executing', blocked_detail = NULL,
-             assignment_id = COALESCE($5, assignment_id),
-             delegation_lineage = COALESCE($6::jsonb, delegation_lineage),
+             assignment_id = $5,
+             delegation_lineage = $6::jsonb,
              lifecycle_updated_at = $3
          WHERE target.id = $1 AND (target.owner IS NULL OR target.owner = $2) AND target.status = 'todo'
            AND (
@@ -238,8 +238,8 @@ export class PgTasksRepo implements TasksRepository {
       `UPDATE tasks
        SET owner = $2, status = 'doing', updated_at = $3,
            workflow_state = 'executing', blocked_detail = NULL,
-           assignment_id = COALESCE($4, assignment_id),
-           delegation_lineage = COALESCE($5::jsonb, delegation_lineage),
+           assignment_id = $4,
+           delegation_lineage = $5::jsonb,
            lifecycle_updated_at = $3
        WHERE id = $1 AND (owner IS NULL OR owner = $2) AND status = 'todo'`,
       [taskId, ownerId, updatedAt, workflow?.assignmentId ?? null, workflow?.lineage ?? null],
@@ -256,7 +256,8 @@ export class PgTasksRepo implements TasksRepository {
     const r = await this.db.query(
       `UPDATE tasks
        SET owner = NULL, status = 'todo', completed_at = NULL,
-           workflow_state = 'queued', assignment_id = NULL, lifecycle_updated_at = $4, updated_at = $4
+           workflow_state = 'queued', assignment_id = NULL, delegation_lineage = NULL,
+           blocked_detail = NULL, lifecycle_updated_at = $4, updated_at = $4
        WHERE id = $1 AND owner = $2 AND status = 'doing' AND updated_at = $3`,
       [taskId, ownerId, claimedAt, updatedAt],
     );

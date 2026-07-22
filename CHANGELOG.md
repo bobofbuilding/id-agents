@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.124]
+
+- Keep canonical task status, workflow lane, owner, assignment ID, and delegation lineage synchronized across claim, route, park, release, and backlog-requeue transitions.
+- Repair queued tasks that already have active owners into executing work, and return executing tasks without canonical ownership to a clean queued state without falsifying task activity time.
+- Give legacy tasks the same assignment lineage guarantees as versioned workflow tasks so Dashboard and Work surfaces cannot report contradictory task state.
+- Cover control-reply claims, routed work, automatic assignment, ownerless repair, and lifecycle reconciliation with regression tests across SQLite and PostgreSQL repositories.
+
 ## [0.1.123]
 
 - Reconcile completed query evidence before stalled-task triage so finished work cannot remain falsely displayed in Doing or be restarted.

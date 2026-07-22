@@ -1051,6 +1051,50 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('creates executing workflow ownership when a legacy queued task is claimed', async () => {
+    const legacyTask = task({
+      status: 'todo',
+      owner: null,
+      workflow_state: 'queued',
+      workflow_contract: null,
+      assignment_id: 'stale-assignment',
+      delegation_lineage: { assignment_id: 'stale-assignment', to_agent_id: 'old-owner' },
+    });
+    const db = fakeDb({
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [legacyTask]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-legacy-control-claim-test', db, { libraryRoot: null }) as any;
+
+    await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery('lead-agent', {
+        query_id: 'guard-legacy-claim',
+        prompt: 'Supervision: unclaimed task #12345678 ("Stalled work") has been waiting 60m. Reply with one line: CLAIM, ROUTE: <team/agent>, or BLOCKED: <reason>.',
+        status: 'completed',
+      }),
+      { result: 'CLAIM' },
+      NOW_MS,
+    );
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(legacyTask.id, expect.objectContaining({
+      owner: 'lead-agent',
+      status: 'doing',
+      workflow_state: 'executing',
+      assignment_id: expect.any(String),
+      delegation_lineage: expect.objectContaining({
+        assignment_id: expect.any(String),
+        to_agent_id: 'lead-agent',
+        route: 'control_reply_claim',
+      }),
+      blocked_detail: null,
+      lifecycle_updated_at: Math.floor(NOW_MS / 1000),
+    }));
+    const update = db.tasks.updateFields.mock.calls[0][1];
+    expect(update.assignment_id).not.toBe('stale-assignment');
+    expect(update.delegation_lineage.assignment_id).toBe(update.assignment_id);
+  });
+
   it('assigns a routed control reply to the named live teammate', async () => {
     const routedTask = task({
       status: 'todo',
@@ -1082,12 +1126,18 @@ describe('stalled task sweeper', () => {
       NOW_MS,
     );
 
-    expect(db.tasks.updateFields).toHaveBeenCalledWith(routedTask.id, {
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(routedTask.id, expect.objectContaining({
       owner: 'agent-1',
       status: 'doing',
       completed_at: null,
+      workflow_state: 'executing',
+      assignment_id: expect.any(String),
+      delegation_lineage: expect.objectContaining({
+        to_agent_id: 'agent-1',
+        route: 'control_reply_reassignment',
+      }),
       updated_at: Math.floor(NOW_MS / 1000),
-    });
+    }));
     expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
       'default',
       'worker',
@@ -1150,13 +1200,19 @@ describe('stalled task sweeper', () => {
       NOW_MS,
     );
 
-    expect(db.tasks.updateFields).toHaveBeenCalledWith(routedTask.id, {
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(routedTask.id, expect.objectContaining({
       team_id: destination.id,
       owner: researcher.id,
       status: 'doing',
       completed_at: null,
+      workflow_state: 'executing',
+      assignment_id: expect.any(String),
+      delegation_lineage: expect.objectContaining({
+        to_agent_id: researcher.id,
+        team_id: destination.id,
+      }),
       updated_at: Math.floor(NOW_MS / 1000),
-    });
+    }));
     expect(db.tasks.getByNameForTeam).toHaveBeenCalledWith(routedTask.name, destination.id);
     expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
       'research',
@@ -2886,9 +2942,10 @@ describe('stalled task sweeper', () => {
         ],
       },
     });
-    expect(db.tasks.claim).toHaveBeenCalledWith('todo-exact-1', 'worker-2', nowSec, {
+    expect(db.tasks.claim).toHaveBeenCalledWith('todo-exact-1', 'worker-2', nowSec, expect.objectContaining({
       maxDoingForTeam: expect.any(Number),
-    });
+      workflow: expect.objectContaining({ assignmentId: expect.any(String) }),
+    }));
     expect(db.tasks.claim).not.toHaveBeenCalledWith('todo-other-1', expect.any(String), expect.any(Number), expect.any(Object));
     expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
       'default',
@@ -3609,7 +3666,10 @@ describe('stalled task sweeper', () => {
     const result = await manager.assignUnownedTodoTask(queued, team(), NOW_MS);
 
     expect(result).toMatchObject({ assigned: true, owner: expect.objectContaining({ id: freshOwner.id }) });
-    expect(db.tasks.claim).toHaveBeenCalledWith('queued-task', freshOwner.id, nowSec, { maxDoingForTeam: expect.any(Number) });
+    expect(db.tasks.claim).toHaveBeenCalledWith('queued-task', freshOwner.id, nowSec, expect.objectContaining({
+      maxDoingForTeam: expect.any(Number),
+      workflow: expect.objectContaining({ assignmentId: expect.any(String) }),
+    }));
     expect(db.tasks.claim).not.toHaveBeenCalledWith('queued-task', staleOwner.id, expect.any(Number), expect.any(Object));
     expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
       'default',
@@ -3734,7 +3794,10 @@ describe('stalled task sweeper', () => {
     const result = await manager.assignUnownedTodoTask(queued, team({ name: 'default' }), NOW_MS);
 
     expect(result).toMatchObject({ assigned: true, owner: expect.objectContaining({ id: coder.id }) });
-    expect(db.tasks.claim).toHaveBeenCalledWith('queued-task', coder.id, nowSec, { maxDoingForTeam: expect.any(Number) });
+    expect(db.tasks.claim).toHaveBeenCalledWith('queued-task', coder.id, nowSec, expect.objectContaining({
+      maxDoingForTeam: expect.any(Number),
+      workflow: expect.objectContaining({ assignmentId: expect.any(String) }),
+    }));
     expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
       'default',
       'coder',
@@ -3829,7 +3892,10 @@ describe('stalled task sweeper', () => {
       }),
     );
     expect(db.agents.updateStatus).toHaveBeenCalledWith(stoppedWorker.id, 'running');
-    expect(db.tasks.claim).toHaveBeenCalledWith('queued-task', stoppedWorker.id, nowSec, { maxDoingForTeam: expect.any(Number) });
+    expect(db.tasks.claim).toHaveBeenCalledWith('queued-task', stoppedWorker.id, nowSec, expect.objectContaining({
+      maxDoingForTeam: expect.any(Number),
+      workflow: expect.objectContaining({ assignmentId: expect.any(String) }),
+    }));
     expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
       'default',
       'stopped-worker',
@@ -3977,6 +4043,10 @@ describe('stalled task sweeper', () => {
         owner: null,
         status: 'todo',
         completed_at: null,
+        workflow_state: 'queued',
+        assignment_id: null,
+        delegation_lineage: null,
+        blocked_detail: null,
       }));
       expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
         topic: 'task:triaged',
@@ -4049,11 +4119,14 @@ describe('stalled task sweeper', () => {
       'task-manager',
       expect.stringContaining('task-manager delegation is required'),
     );
-    expect(db.tasks.updateFields).toHaveBeenCalledWith('lead-task-1', {
+    expect(db.tasks.updateFields).toHaveBeenCalledWith('lead-task-1', expect.objectContaining({
       status: 'todo',
       owner: 'research-lead-1',
+      workflow_state: 'queued',
+      assignment_id: null,
+      delegation_lineage: null,
       updated_at: nowSec,
-    });
+    }));
     expect(manager.sendSupervisionAsk).not.toHaveBeenCalledWith(
       'research',
       'research-lead',
@@ -6056,11 +6129,14 @@ describe('stalled task sweeper', () => {
       'research-lead',
       expect.any(String),
     );
-    expect(db.tasks.updateFields).toHaveBeenCalledWith('research-task-1', {
+    expect(db.tasks.updateFields).toHaveBeenCalledWith('research-task-1', expect.objectContaining({
       status: 'todo',
       owner: null,
+      workflow_state: 'queued',
+      assignment_id: null,
+      delegation_lineage: null,
       updated_at: nowSec,
-    });
+    }));
     expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
       team_id: TEAM_ID,
       topic: 'task:triaged',
@@ -6343,9 +6419,10 @@ describe('stalled task sweeper', () => {
 
     await manager.sweepStalledTasks();
 
-    expect(db.tasks.claim).toHaveBeenCalledWith('todo-assign-1', 'worker-2', nowSec, {
+    expect(db.tasks.claim).toHaveBeenCalledWith('todo-assign-1', 'worker-2', nowSec, expect.objectContaining({
       maxDoingForTeam: expect.any(Number),
-    });
+      workflow: expect.objectContaining({ assignmentId: expect.any(String) }),
+    }));
     expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
       'default',
       'worker-b',
@@ -6420,6 +6497,57 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('reconciles canonical task status with workflow assignment state', async () => {
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const queuedWhileWorking = task({
+      id: 'queued-while-working',
+      owner: 'lead-1',
+      status: 'doing',
+      workflow_state: 'queued',
+      assignment_id: null,
+      delegation_lineage: { assignment_id: 'old', to_agent_id: 'old-owner' },
+      updated_at: nowSec - 300,
+    });
+    const executingWithoutOwner = task({
+      id: 'executing-without-owner',
+      owner: null,
+      status: 'todo',
+      workflow_state: 'executing',
+      assignment_id: 'stale-assignment',
+      delegation_lineage: { assignment_id: 'stale-assignment', to_agent_id: 'lead-1' },
+      updated_at: nowSec - 600,
+    });
+    const db = fakeDb({
+      tasks: {
+        list: vi.fn(async ({ status, workflowState }: { status?: string; workflowState?: TaskRow['workflow_state'] | null } = {}) => {
+          if (status === 'doing' && workflowState === 'queued') return [queuedWhileWorking];
+          if (status === 'todo' && workflowState === 'executing') return [executingWithoutOwner];
+          return [];
+        }),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-task-state-reconciliation-test', db, { libraryRoot: null }) as any;
+
+    await manager.sweepStalledTasks();
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(queuedWhileWorking.id, expect.objectContaining({
+      workflow_state: 'executing',
+      assignment_id: expect.any(String),
+      delegation_lineage: expect.objectContaining({
+        to_agent_id: 'lead-1',
+        route: 'manager_state_repair',
+      }),
+      updated_at: queuedWhileWorking.updated_at,
+    }));
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(executingWithoutOwner.id, expect.objectContaining({
+      workflow_state: 'queued',
+      assignment_id: null,
+      delegation_lineage: null,
+      blocked_detail: null,
+      updated_at: executingWithoutOwner.updated_at,
+    }));
+  });
+
   it('repairs ownerless doing work back to todo and assigns it', async () => {
     const nowSec = Math.floor(NOW_MS / 1000);
     const ownerlessDoing = task({
@@ -6469,11 +6597,16 @@ describe('stalled task sweeper', () => {
       owner: null,
       status: 'todo',
       completed_at: null,
+      workflow_state: 'queued',
+      assignment_id: null,
+      delegation_lineage: null,
+      blocked_detail: null,
       updated_at: nowSec,
     }));
-    expect(db.tasks.claim).toHaveBeenCalledWith('ownerless-doing-1', 'worker-2', nowSec, {
+    expect(db.tasks.claim).toHaveBeenCalledWith('ownerless-doing-1', 'worker-2', nowSec, expect.objectContaining({
       maxDoingForTeam: expect.any(Number),
-    });
+      workflow: expect.objectContaining({ assignmentId: expect.any(String) }),
+    }));
     expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
       'default',
       'worker-b',
@@ -6640,9 +6773,10 @@ describe('stalled task sweeper', () => {
 
     await manager.sweepStalledTasks();
 
-    expect(db.tasks.claim).toHaveBeenCalledWith('todo-checkin-assign', 'worker-2', nowSec, {
+    expect(db.tasks.claim).toHaveBeenCalledWith('todo-checkin-assign', 'worker-2', nowSec, expect.objectContaining({
       maxDoingForTeam: expect.any(Number),
-    });
+      workflow: expect.objectContaining({ assignmentId: expect.any(String) }),
+    }));
     expect(db.checkins.updateFields).toHaveBeenCalledWith('checkin-1', TEAM_ID, {
       owner_agent_id: 'worker-2',
       updated_at: NOW_MS,
@@ -6819,9 +6953,10 @@ describe('stalled task sweeper', () => {
 
     await manager.sweepStalledTasks();
 
-    expect(db.tasks.claim).toHaveBeenCalledWith('todo-priority-1', 'idle-worker', nowSec, {
+    expect(db.tasks.claim).toHaveBeenCalledWith('todo-priority-1', 'idle-worker', nowSec, expect.objectContaining({
       maxDoingForTeam: expect.any(Number),
-    });
+      workflow: expect.objectContaining({ assignmentId: expect.any(String) }),
+    }));
     expect(manager.sendSupervisionAsk).toHaveBeenCalledTimes(1);
     expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
       'default',
