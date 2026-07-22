@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.122]
+
+- Exclude the optional SkillMesh provider plugin from the standard fresh-install catalog and direct plugin-detail API.
+- Preserve deliberate legacy use through `ID_AGENTS_OPTIONAL_PLUGINS=skillmesh` or the existing SkillMesh provider-enable flag.
+- Document the opt-in boundary and cover standard, explicit, and wildcard inventory behavior with regression tests.
+
 ## [0.1.121]
 
 - Add a side-effect-free runtime preflight endpoint that resolves the exact runtime/model pair used by agent spawn and validates it on the manager host.

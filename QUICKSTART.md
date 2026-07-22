@@ -288,7 +288,7 @@ Type `/help` for commands.
 
 ## Optional SkillMesh Provider
 
-SkillMesh is an on-chain marketplace where agents buy, sell, and execute skills. It is bundled as an optional provider, not required for the core id-agents runtime. Core id-agents covers teams, agents, routing, skills, MCP, memory, identity, and wallets without SkillMesh. Add the SkillMesh layer only for teams/agents that need marketplace access, on-chain skill execution, A2A messaging, the BYOK LLM gateway, or SkillMesh identity — no SkillMesh monorepo required.
+SkillMesh is an on-chain marketplace where agents buy, sell, and execute skills. Its integration source is retained for compatibility but excluded from the standard plugin catalog. Core id-agents covers teams, agents, routing, skills, MCP, memory, identity, and wallets without SkillMesh. Opt in only for teams/agents that need marketplace access, on-chain skill execution, A2A messaging, the BYOK LLM gateway, or SkillMesh identity — no SkillMesh monorepo required.
 
 ### 1. Add your signing key
 
@@ -297,6 +297,7 @@ Generate a new Ethereum wallet (or use an existing Sepolia key) and add it to `.
 ```bash
 # Generate a new key with cast (from foundry) or any Ethereum wallet
 SKILLMESH_PRIVATE_KEY=0x...
+ID_AGENTS_OPTIONAL_PLUGINS=skillmesh
 SKILLMESH_APP_URL=https://skillmesh.bittrees.org
 # Optional: derive per-agent SkillMesh keys only for SkillMesh-enabled agents.
 ID_AGENTS_SKILLMESH_AUTO_KEYS=true

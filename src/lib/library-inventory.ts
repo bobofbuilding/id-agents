@@ -503,6 +503,29 @@ function readPluginManifest(pluginDir: string): Record<string, unknown> | null {
   return { ...(canonical ?? {}), ...(top ?? {}) };
 }
 
+function enabledOptionalPlugins(): Set<string> {
+  const configured = String(process.env.ID_AGENTS_OPTIONAL_PLUGINS ?? '')
+    .split(',')
+    .map((name) => name.trim().toLowerCase())
+    .filter(Boolean);
+  if (/^(1|true|yes|on)$/i.test(String(process.env.ID_AGENTS_SKILLMESH_PROVIDER_ENABLED ?? '').trim())) {
+    configured.push('skillmesh');
+  }
+  return new Set(configured);
+}
+
+/** Opt-in packages stay available in source without appearing in a fresh install. */
+export function pluginIsVisible(
+  name: string,
+  manifest: Record<string, unknown> | null,
+  enabled = enabledOptionalPlugins(),
+): boolean {
+  const distribution = typeof manifest?.distribution === 'string'
+    ? manifest.distribution.trim().toLowerCase()
+    : 'standard';
+  return distribution !== 'opt-in' || enabled.has(name.toLowerCase()) || enabled.has('*');
+}
+
 /** Best-effort author display from a plugin manifest (string or `author.name`). */
 function manifestAuthor(manifest: Record<string, unknown> | null): string | null {
   if (!manifest) return null;
@@ -551,6 +574,7 @@ export function listLibraryPlugins(libraryRoot: string | null): PluginListResult
   if (!pluginsRoot) return { pluginsRoot: null, entries: [] };
   const entries = fs.readdirSync(pluginsRoot, { withFileTypes: true })
     .filter(d => d.isDirectory() && !d.name.startsWith('.'))
+    .filter(d => pluginIsVisible(d.name, readPluginManifest(path.join(pluginsRoot, d.name))))
     .map(d => decoratePluginEntry(d.name, path.join(pluginsRoot, d.name)))
     .sort((a, b) => a.name.localeCompare(b.name));
   return { pluginsRoot, entries };
@@ -565,6 +589,7 @@ export function getLibraryPlugin(libraryRoot: string | null, name: string): Plug
   const dirPath = path.resolve(pluginsRoot, name);
   if (dirPath !== pluginsRoot && !dirPath.startsWith(pluginsRoot + path.sep)) return null;
   if (!dirExists(dirPath)) return null;
+  if (!pluginIsVisible(name, readPluginManifest(dirPath))) return null;
   const base = decoratePluginEntry(name, dirPath);
   return {
     ...base,
