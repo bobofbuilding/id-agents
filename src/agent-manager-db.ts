@@ -155,7 +155,8 @@ export { MODEL_ALIASES, resolveModelAlias } from './core/model-aliases.js';
 // ES module equivalent of __dirname
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const DEFAULT_MAX_DOING_TASKS = 30;
+const DEFAULT_MAX_DOING_TASKS = 12;
+const DEFAULT_STALL_SWEEP_MAX_PER_SWEEP = 8;
 const DEFAULT_STALLED_TASK_MAX_PROBES = 3;
 const DEFAULT_LEAD_MAX_PARALLEL_OBJECTIVES = 3;
 const DEFAULT_MAX_ACTIVE_QUERIES_PER_AGENT = 1;
@@ -918,6 +919,48 @@ export class AgentManagerDb {
     return Number.isFinite(raw) && raw > 0
       ? Math.max(25, Math.min(500, Math.floor(raw)))
       : 200;
+  }
+
+  private getStallSweepMaxPerSweep(): number {
+    const raw = Number(process.env.STALL_SWEEP_MAX_PER_SWEEP || process.env.ID_STALL_SWEEP_MAX_PER_SWEEP);
+    return Number.isFinite(raw) && raw > 0
+      ? Math.max(1, Math.min(100, Math.floor(raw)))
+      : DEFAULT_STALL_SWEEP_MAX_PER_SWEEP;
+  }
+
+  private getStallDispatchRetryMs(): number {
+    const raw = Number(process.env.ID_STALL_DISPATCH_RETRY_MS);
+    return Number.isFinite(raw) && raw >= 0 ? raw : 5 * 60 * 1000;
+  }
+
+  private stalledDispatchRetryAt(task: TaskRow): number {
+    const detail = task.blocked_detail && typeof task.blocked_detail === 'object'
+      ? task.blocked_detail as Record<string, unknown>
+      : null;
+    if (detail?.reason !== 'supervision_dispatch_failed') return 0;
+    const retryAt = Number(detail.retry_at || 0);
+    return retryAt > 0 ? this.taskTimestampMs(retryAt) : 0;
+  }
+
+  private interleaveTasksByTeam(tasks: TaskRow[]): TaskRow[] {
+    const buckets = new Map<string, TaskRow[]>();
+    for (const task of tasks) {
+      const key = task.team_id || '__unassigned__';
+      const bucket = buckets.get(key);
+      if (bucket) bucket.push(task);
+      else buckets.set(key, [task]);
+    }
+    const ordered: TaskRow[] = [];
+    let remaining = tasks.length;
+    while (remaining > 0) {
+      for (const bucket of buckets.values()) {
+        const task = bucket.shift();
+        if (!task) continue;
+        ordered.push(task);
+        remaining--;
+      }
+    }
+    return ordered;
   }
 
   private getValidationFallbackMaxPerSweep(): number {
@@ -5370,7 +5413,20 @@ Return this JSON shape:
       } else {
         if (route.team.id !== taskTeamId) parkedDestinationTeam = route.team;
         const requiresDestinationSlot = route.team.id !== taskTeamId || task.status !== 'doing';
-        if (requiresDestinationSlot && !(await this.hasDoingTaskRoom(route.team.id))) {
+        const destinationConflict = route.team.id !== taskTeamId
+          ? await this.db.tasks.getByNameForTeam(task.name, route.team.id).catch(() => null)
+          : null;
+        if (destinationConflict && destinationConflict.id !== task.id) {
+          // The task name is unique inside a team. Keep the source task parked
+          // in its current team instead of throwing on a cross-team move.
+          parkedDestinationTeam = null;
+          routeBlock(`destination_task_exists_${destinationConflict.status}`, this.taskRouteEvidence({
+            processOnline: true,
+            requestLaneBusy: 'not_evaluated',
+            objectiveCapacity: false,
+            assignmentCapacity: false,
+          }));
+        } else if (requiresDestinationSlot && !(await this.hasDoingTaskRoom(route.team.id))) {
           routeBlock('doing_limit_full', this.taskRouteEvidence({
             processOnline: true,
             requestLaneBusy: 'not_evaluated',
@@ -19995,6 +20051,53 @@ Return this JSON shape:
     }
   }
 
+  private async recordStalledDispatchFailure(
+    task: TaskRow,
+    teamId: string,
+    actorAgentId: string | null,
+    stalledMinutes: number,
+    nowMs: number,
+  ): Promise<void> {
+    if (this.isTerminalTaskStatus(task.status)) return;
+    const detail = task.blocked_detail && typeof task.blocked_detail === 'object'
+      ? task.blocked_detail as Record<string, unknown>
+      : {};
+    const retryAt = nowMs + this.getStallDispatchRetryMs();
+    const blockedDetail = {
+      ...detail,
+      version: 'blocked-work.v1',
+      reason: 'supervision_dispatch_failed',
+      recovery_owner_id: task.owner,
+      retry_at: retryAt,
+      fallback_route: String(detail.fallback_route || 'operations-team/task-master'),
+      attempts: Number(detail.attempts || 0) + 1,
+      created_at: Number(detail.created_at || nowMs),
+      last_dispatch_failure_at: nowMs,
+    };
+    await this.db.tasks.updateFields(task.id, {
+      workflow_state: task.workflow_contract ? 'stalled' : task.workflow_state,
+      blocked_detail: blockedDetail,
+      lifecycle_updated_at: Math.floor(nowMs / 1000),
+      // A rejected control-plane dispatch is not evidence of task progress.
+      updated_at: task.updated_at,
+    }).catch((err) => {
+      this.managerLog(`Failed to persist stalled dispatch cooldown for ${task.name}: ${err?.message || err}`);
+    });
+    await emitTaskTriaged(this.db.events, {
+      teamId,
+      taskUuid: task.uuid,
+      taskName: task.name,
+      title: task.title,
+      ownerAgentId: task.owner,
+      actorAgentId,
+      occurredAt: nowMs,
+      reason: 'dispatch_rejected',
+      stalledMinutes,
+    }).catch((err) => {
+      this.managerLog(`Failed to record stalled dispatch rejection for ${task.name}: ${err?.message || err}`);
+    });
+  }
+
   private async repairOwnerlessDoingTask(
     task: TaskRow,
     teamRow: { id: string; name: string },
@@ -20653,7 +20756,7 @@ Return this JSON shape:
     const STALL_MS = this.getStallSweepMs();       // 'doing' this long with no update
     const RENUDGE_MS = this.getStallRenudgeMs();   // don't re-nudge a task within this
     const UNOWNED_ASSIGN_MS = this.unownedAssignMinMs();
-    const MAX_PER_SWEEP = Math.max(1, Number(process.env.STALL_SWEEP_MAX_PER_SWEEP) || 2);
+    const MAX_PER_SWEEP = this.getStallSweepMaxPerSweep();
     const VALIDATION_MAX_PER_SWEEP = this.getValidationFallbackMaxPerSweep();
     const UNOWNED_ASSIGN_MAX_PER_SWEEP = Math.max(
       0,
@@ -20902,14 +21005,17 @@ Return this JSON shape:
       }
     }
 
-    const doing = await this.db.tasks
+    const listedDoing = await this.db.tasks
       .list({ status: 'doing', order: 'updated_asc', limit: SCAN_LIMIT })
       .catch(() => [] as TaskRow[]);
+    // Keep a saturated team from monopolizing the fleet-wide recovery budget.
+    const doing = this.interleaveTasksByTeam(listedDoing);
     const teamRowsById = new Map<string, Promise<TeamRow | null>>();
     const ownerAgentsById = new Map<string, Promise<AgentRow | null>>();
     const leadsByTeamId = new Map<string, Promise<AgentRow | null>>();
     const pendingQueriesByAgentId = new Map<string, Promise<QueryRow[]>>();
     const supervisionSentToAgentIds = new Set<string>();
+    const supervisionAttemptedAgentIds = new Set<string>();
     const getTeamRow = (teamId: string | null | undefined): Promise<TeamRow | null> => {
       if (!teamId) return Promise.resolve(null);
       const cached = teamRowsById.get(teamId);
@@ -20936,7 +21042,7 @@ Return this JSON shape:
     };
     const getPendingQueriesFor = (recipient: AgentRow | null | undefined): Promise<QueryRow[]> => {
       if (!recipient?.id) return Promise.resolve([] as QueryRow[]);
-      if (supervisionSentToAgentIds.has(recipient.id)) {
+      if (supervisionSentToAgentIds.has(recipient.id) || supervisionAttemptedAgentIds.has(recipient.id)) {
         return Promise.resolve([{
           team_id: recipient.team_id || '',
           agent_id: recipient.id,
@@ -20963,6 +21069,22 @@ Return this JSON shape:
       if (!recipient?.id) return;
       supervisionSentToAgentIds.add(recipient.id);
       pendingQueriesByAgentId.delete(recipient.id);
+    };
+    const sendStalledTaskSupervision = async (
+      task: TaskRow,
+      teamRow: TeamRow,
+      recipient: AgentRow,
+      message: string,
+      stalledMinutes: number,
+    ): Promise<boolean> => {
+      if (supervisionAttemptedAgentIds.has(recipient.id)) return false;
+      supervisionAttemptedAgentIds.add(recipient.id);
+      pendingQueriesByAgentId.delete(recipient.id);
+      const sent = await this.sendSupervisionAsk(teamRow.name, recipient.name, message);
+      if (!sent) {
+        await this.recordStalledDispatchFailure(task, teamRow.id, recipient.id, stalledMinutes, now);
+      }
+      return sent;
     };
     for (const listedTask of doing) {
       let t = listedTask;
@@ -21131,6 +21253,7 @@ Return this JSON shape:
       }
 
       if (ageMs < STALL_MS) continue;
+      if (this.stalledDispatchRetryAt(t) > now) continue;
 
       if (t.workflow_contract && t.workflow_state !== 'stalled') {
         await this.db.tasks.updateFields(t.id, {
@@ -21194,7 +21317,7 @@ Return this JSON shape:
           const wake = await this.wakeAssignedTaskOwner(teamRow.id, teamName, t, ownerAgent, 'stalled-owner');
           if (wake.status === 'started') {
             const msg = `Supervision: task ${ref} ("${t.title}") was stalled for ${mins}m while you were offline. You have been restarted for this task. Reply with one line: READY-TO-RESUME, DONE, BLOCKED: <reason>, or NEEDS-REASSIGNMENT. Do not create new tasks from this control prompt.`;
-            if (await this.sendSupervisionAsk(teamName, ownerName, msg)) {
+            if (await sendStalledTaskSupervision(t, teamRow, ownerAgent, msg, mins)) {
               await this.recordTaskSupervision(t, teamRow.id, ownerAgent.id, 'owner_refresh', mins, now);
               markSupervisionSentTo(ownerAgent);
               nudged++;
@@ -21229,7 +21352,7 @@ Return this JSON shape:
               const prevProbe = this.stalledNudges.get(nudgeKey);
               this.markStalledProbeEscalated(nudgeKey, now);
               const msg = `Supervision: task ${ref} ("${t.title}") is still in progress after ${MAX_PROBES} stalled owner probes over ${mins}m. Reply with one line: CLOSE, UNBLOCK: <need>, REASSIGN: <owner>, SPLIT, or BLOCKED: <reason>. Do not create new tasks from this control prompt.`;
-              if (await this.sendSupervisionAsk(teamRow.name, lead.name, msg)) {
+              if (await sendStalledTaskSupervision(t, teamRow, lead, msg, mins)) {
                 await this.recordTaskSupervision(t, teamRow.id, lead.id, 'probe_limit_reached', mins, now);
                 markSupervisionSentTo(lead);
                 nudged++;
@@ -21244,7 +21367,7 @@ Return this JSON shape:
         const prevProbe = this.stalledNudges.get(nudgeKey);
         const attempt = this.markStalledProbe(nudgeKey, now);
         const msg = `Supervision: task ${ref} ("${t.title}") has been in progress ${mins}m with no completion (probe ${attempt}/${MAX_PROBES}). Reply with one line: DONE, BLOCKED: <reason>, NEEDS-REASSIGNMENT, or IN-PROGRESS: <next update>. Do not create new tasks from this control prompt.`;
-        if (await this.sendSupervisionAsk(teamName, ownerName, msg)) {
+        if (await sendStalledTaskSupervision(t, teamRow, ownerAgent, msg, mins)) {
           await this.recordTaskSupervision(t, teamRow.id, ownerAgent.id, 'owner_refresh', mins, now);
           markSupervisionSentTo(ownerAgent);
           nudged++;
@@ -21300,7 +21423,7 @@ Return this JSON shape:
       const prevProbe = this.stalledNudges.get(nudgeKey);
       const attempt = this.markStalledProbe(nudgeKey, now);
       const msg = `Supervision: task ${ref} ("${t.title}") has been in progress ${mins}m, but ${unavailable} (triage probe ${attempt}/${MAX_PROBES}). Reply with one line: CLAIM, REASSIGN: <owner>, ROUTE: <team/agent>, or BLOCKED: <reason>. Do not create new tasks from this control prompt.`;
-      if (await this.sendSupervisionAsk(teamRow.name, lead.name, msg)) {
+      if (await sendStalledTaskSupervision(t, teamRow, lead, msg, mins)) {
         await this.recordTaskSupervision(t, teamRow.id, lead.id, 'owner_unavailable', mins, now);
         markSupervisionSentTo(lead);
         nudged++;

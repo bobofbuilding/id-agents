@@ -164,6 +164,8 @@ describe('stalled task sweeper', () => {
     delete process.env.STALL_MANUAL_RENUDGE_MS;
     delete process.env.ID_STALL_MANUAL_RENUDGE_MS;
     delete process.env.STALL_SWEEP_MAX_PER_SWEEP;
+    delete process.env.ID_STALL_SWEEP_MAX_PER_SWEEP;
+    delete process.env.ID_STALL_DISPATCH_RETRY_MS;
     delete process.env.ID_VALIDATION_FALLBACK_MAX_PER_SWEEP;
     delete process.env.STALL_MAX_PROBES;
     delete process.env.STALL_PROBE_RESET_MS;
@@ -205,7 +207,22 @@ describe('stalled task sweeper', () => {
     const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', fakeDb(), { libraryRoot: null }) as any;
 
     expect(manager.getStallSweepIntervalMs()).toBe(2 * 60 * 1000);
+    expect(manager.getStallSweepMaxPerSweep()).toBe(8);
+    expect(manager.getMaxDoingTasks()).toBe(12);
     expect(manager.unownedAssignMinMs()).toBe(60 * 1000);
+  });
+
+  it('interleaves stalled recovery candidates across teams', () => {
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-fairness-test', fakeDb(), { libraryRoot: null }) as any;
+    const ordered = manager.interleaveTasksByTeam([
+      task({ id: 'a-1', team_id: 'team-a' }),
+      task({ id: 'a-2', team_id: 'team-a' }),
+      task({ id: 'b-1', team_id: 'team-b' }),
+      task({ id: 'b-2', team_id: 'team-b' }),
+      task({ id: 'c-1', team_id: 'team-c' }),
+    ]);
+
+    expect(ordered.map((row: TaskRow) => row.id)).toEqual(['a-1', 'b-1', 'c-1', 'a-2', 'b-2']);
   });
 
   it('allows stalled-task sweep cadence overrides with a one-minute floor', () => {
@@ -1225,6 +1242,56 @@ describe('stalled task sweeper', () => {
       subject_id: routedTask.uuid,
       data: expect.objectContaining({ owner: researcher.id }),
     }));
+  });
+
+  it('keeps a cross-team route in its source team when the destination already has that task name', async () => {
+    const routedTask = task({ status: 'todo', owner: null });
+    const destination = team({ id: 'research-team-id', name: 'research' });
+    const researcher = agent({ id: 'researcher-1', team_id: destination.id, name: 'researcher' });
+    const existing = task({
+      id: 'existing-destination-task',
+      team_id: destination.id,
+      status: 'done',
+      workflow_state: 'validated',
+    });
+    const db = fakeDb({
+      teams: {
+        getTeamByName: vi.fn(async (name: string) => name === 'research' ? destination : name === 'default' ? team() : null),
+      },
+      agents: {
+        resolve: vi.fn(async (teamId: string, ref: string) =>
+          teamId === destination.id && ref === 'researcher' ? [researcher] : [],
+        ),
+      },
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => status === 'doing' ? [] : [routedTask]),
+        getByNameForTeam: vi.fn(async (name: string, teamId: string) =>
+          name === routedTask.name && teamId === destination.id ? existing : null,
+        ),
+        getByUuidPrefix: vi.fn(async () => [routedTask]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-cross-team-conflict-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const result = await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery('lead-agent', {
+        query_id: 'guard-cross-team-conflict',
+        prompt: 'Supervision: unclaimed task #12345678 ("Stalled work") has been waiting 60m. Reply with one line: CLAIM, ROUTE: <team/agent>, or BLOCKED: <reason>.',
+        status: 'completed',
+      }),
+      { result: 'ROUTE: research/researcher' },
+      NOW_MS,
+    );
+
+    expect(result).toMatchObject({ applied: true, action: 'reassign' });
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(routedTask.id, expect.objectContaining({
+      team_id: TEAM_ID,
+      owner: null,
+      status: 'todo',
+      description: expect.stringContaining('destination_task_exists_done'),
+    }));
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
   });
 
   it('#cce9b462 queues a valid busy cross-team destination with actionable reassignment evidence', async () => {
@@ -2764,6 +2831,47 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('does not retry another stalled task for an owner after that owner rejects a sweep dispatch', async () => {
+    process.env.STALL_SWEEP_MAX_PER_SWEEP = '5';
+    const nowSec = Math.floor(NOW_MS / 1000);
+    const first = task({
+      id: 'task-1',
+      name: 'oldest-stalled-work',
+      uuid: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      title: 'Oldest stalled work',
+      updated_at: nowSec - 7200,
+    });
+    const second = task({
+      id: 'task-2',
+      name: 'second-stalled-work',
+      uuid: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      title: 'Second stalled work',
+      updated_at: nowSec - 5400,
+    });
+    const db = fakeDb({
+      tasks: {
+        list: vi.fn(async ({ status }: { status?: string } = {}) => status === 'doing' ? [first, second] : []),
+        updateFields: vi.fn(async () => {}),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-owner-rejected-single-attempt-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => false);
+
+    await manager.sweepStalledTasks();
+
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledTimes(1);
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'worker',
+      expect.stringContaining('#aaaaaaaa'),
+    );
+    expect(db.events.insert).toHaveBeenCalledTimes(1);
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      subject_id: first.uuid,
+      data: expect.objectContaining({ reason: 'dispatch_rejected' }),
+    }));
+  });
+
   it('blocks additional owner work and immediately bumps the stale task first', async () => {
     const db = fakeDb();
     const manager = new AgentManagerDb('/tmp/id-agents-stalled-owner-guard-test', db, { libraryRoot: null }) as any;
@@ -3560,34 +3668,28 @@ describe('stalled task sweeper', () => {
     }));
   });
 
-  it('does not consume a stalled-probe attempt when supervision dispatch is rejected', async () => {
+  it('persists a retry cooldown when stalled supervision dispatch is rejected', async () => {
     const db = fakeDb();
     const manager = new AgentManagerDb('/tmp/id-agents-stalled-test', db, { libraryRoot: null }) as any;
-    manager.sendSupervisionAsk = vi.fn()
-      .mockResolvedValueOnce(false)
-      .mockResolvedValueOnce(true);
+    manager.sendSupervisionAsk = vi.fn(async () => false);
 
     await manager.sweepStalledTasks();
 
     expect(manager.sendSupervisionAsk).toHaveBeenCalledTimes(1);
-    expect(db.events.insert).not.toHaveBeenCalled();
-
-    await manager.sweepStalledTasks();
-
-    expect(manager.sendSupervisionAsk).toHaveBeenCalledTimes(2);
-    expect(manager.sendSupervisionAsk).toHaveBeenNthCalledWith(
-      2,
-      'default',
-      'worker',
-      expect.stringContaining('probe 1/3'),
-    );
-    expect(db.events.insert).toHaveBeenCalledTimes(1);
+    expect(db.tasks.updateFields).toHaveBeenCalledWith('task-1', expect.objectContaining({
+      blocked_detail: expect.objectContaining({
+        reason: 'supervision_dispatch_failed',
+        retry_at: NOW_MS + 5 * 60 * 1000,
+        attempts: 1,
+      }),
+      updated_at: Math.floor(NOW_MS / 1000) - 3600,
+    }));
     expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
       team_id: TEAM_ID,
-      topic: 'task:refreshed',
+      topic: 'task:triaged',
       actor_agent_id: 'agent-1',
       data: expect.objectContaining({
-        reason: 'owner_refresh',
+        reason: 'dispatch_rejected',
         stalled_minutes: 60,
       }),
     }));

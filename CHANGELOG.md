@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.129]
+
+- Balance task admission and recovery by reducing the default per-team Doing ceiling from 30 to 12 while increasing each fleet-wide stalled sweep from 2 to 8 interventions.
+- Interleave stalled recovery candidates across teams and allow only one recovery dispatch attempt per recipient in a sweep so saturated teams and agents cannot monopolize supervision.
+- Persist rejected supervision dispatches with bounded retry metadata, preserving the real task activity timestamp while preventing control-plane retry loops.
+- Keep conflicting cross-team reassignments in their source team when the destination already contains the same task name, preventing repeated reconciliation failures.
+
 ## [0.1.128]
 
 - Make `/sync` non-destructive by default: omitted agents require a reviewed dry run and an explicit `--allow-remove` retry before they can be removed.
