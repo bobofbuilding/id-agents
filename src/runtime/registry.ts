@@ -10,6 +10,9 @@
 import type { HarnessType } from '../harness/types.js';
 import type { RuntimeInterfaceProfile, RuntimeProfile, RuntimeId, RuntimeValidationIssue } from './types.js';
 import { execFileSync, spawnSync } from 'child_process';
+import { existsSync } from 'fs';
+import { homedir } from 'os';
+import { join } from 'path';
 
 const DEFAULT_RUNTIME: RuntimeId = 'claude-agent-sdk';
 const RUNTIME_ALIASES: Record<string, RuntimeId> = {
@@ -228,6 +231,27 @@ const PROFILES: Record<RuntimeId, RuntimeProfile> = {
       supportsPluginSkillFallback: true,
     },
   },
+  'kimi-cli': {
+    id: 'kimi-cli',
+    canonicalId: 'kimi-cli',
+    displayName: 'Kimi Code',
+    providerName: 'Kimi Code CLI',
+    defaultModel: 'kimi-code/kimi-for-coding',
+    sessionPolicy: 'fresh-per-query',
+    deploymentShape: 'local-process',
+    auth: {
+      mode: 'cli-login',
+      provider: 'Moonshot AI',
+    },
+    capabilities: {
+      supportsResume: false,
+      supportsPlugins: false,
+      supportsAllowedTools: false,
+      supportsMcp: false,
+      supportsSkillFiles: true,
+      supportsPluginSkillFallback: true,
+    },
+  },
   ollama: {
     id: 'ollama',
     canonicalId: 'ollama',
@@ -416,7 +440,7 @@ export interface RuntimePaths {
 
 export function getRuntimePaths(runtime: HarnessType | string | undefined): RuntimePaths {
   const resolved = resolveRuntime(runtime);
-  if (resolved === 'codex' || resolved === 'grok' || resolved === 'antigravity' || resolved === 'copilot' || resolved === 'kiro-cli' || resolved === 'ollama' || resolved === 'provider-api') {
+  if (resolved === 'codex' || resolved === 'grok' || resolved === 'antigravity' || resolved === 'copilot' || resolved === 'kiro-cli' || resolved === 'kimi-cli' || resolved === 'ollama' || resolved === 'provider-api') {
     return {
       templateDir: '.agents',
       overlayTarget: '.agents',
@@ -502,8 +526,8 @@ export function validateRuntimeModelCompatibility(
   const family = classifyModelFamily(model);
   const issues: RuntimeValidationIssue[] = [];
 
-  // Cursor, Grok, Antigravity, Copilot, Kiro, Ollama, and provider-api accept provider-owned model strings.
-  if (resolvedRuntime === 'cursor-cli' || resolvedRuntime === 'grok' || resolvedRuntime === 'antigravity' || resolvedRuntime === 'copilot' || resolvedRuntime === 'kiro-cli' || resolvedRuntime === 'ollama' || resolvedRuntime === 'provider-api') return issues;
+  // Cursor, Grok, Antigravity, Copilot, Kiro, Kimi, Ollama, and provider-api accept provider-owned model strings.
+  if (resolvedRuntime === 'cursor-cli' || resolvedRuntime === 'grok' || resolvedRuntime === 'antigravity' || resolvedRuntime === 'copilot' || resolvedRuntime === 'kiro-cli' || resolvedRuntime === 'kimi-cli' || resolvedRuntime === 'ollama' || resolvedRuntime === 'provider-api') return issues;
 
   if (resolvedRuntime === 'codex' && family === 'claude') {
     issues.push({
@@ -563,6 +587,8 @@ export function runtimeIssueHint(code: string): string | null {
       return 'Google Antigravity CLI is not authenticated. Run `agy` or `antigravity` on this host to complete sign-in, then retry.';
     case 'kiro_auth_missing':
       return 'Kiro CLI is not authenticated. Run `kiro-cli login` on this host, then retry.';
+    case 'kimi_auth_missing':
+      return 'Kimi Code is not authenticated. Run `kimi login` on this host, finish the browser device-code flow, then retry.';
     default:
       return null;
   }
@@ -695,6 +721,25 @@ export function validateRuntimePreflight(
       issues.push({
         code: 'kiro_auth_missing',
         message: 'runtime "kiro-cli" requires an active `kiro-cli login` session',
+      });
+    }
+    return issues;
+  }
+
+  if (resolvedRuntime === 'kimi-cli') {
+    issues.push(...checkCommandAvailable('kimi'));
+    const roots = Array.from(new Set([
+      process.env.KIMI_CODE_HOME,
+      join(homedir(), '.kimi-code'),
+      join(homedir(), '.kimi'),
+    ].filter((value): value is string => Boolean(value))));
+    const credential = roots
+      .map((root) => join(root.replace(/^~(?=\/|$)/, homedir()), 'credentials', 'kimi-code.json'))
+      .find((file) => existsSync(file));
+    if (!credential) {
+      issues.push({
+        code: 'kimi_auth_missing',
+        message: 'runtime "kimi-cli" requires an active `kimi login` OAuth session',
       });
     }
     return issues;

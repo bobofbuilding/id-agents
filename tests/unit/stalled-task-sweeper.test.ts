@@ -166,6 +166,10 @@ describe('stalled task sweeper', () => {
     delete process.env.STALL_SWEEP_MAX_PER_SWEEP;
     delete process.env.ID_STALL_SWEEP_MAX_PER_SWEEP;
     delete process.env.ID_STALL_DISPATCH_RETRY_MS;
+    delete process.env.ID_STALL_ACTIVE_TASK_QUERY_GRACE_MS;
+    delete process.env.ID_HOLDING_PATTERN_MAX_MS;
+    delete process.env.ID_HOLDING_TASK_MAX_AGE_MS;
+    delete process.env.ID_HOLDING_RECOVERY_MAX_PER_SWEEP;
     delete process.env.ID_VALIDATION_FALLBACK_MAX_PER_SWEEP;
     delete process.env.STALL_MAX_PROBES;
     delete process.env.STALL_PROBE_RESET_MS;
@@ -716,6 +720,125 @@ describe('stalled task sweeper', () => {
     expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
     expect(db.tasks.updateFields).not.toHaveBeenCalled();
     expect(db.events.insert).not.toHaveBeenCalled();
+  });
+
+  it('does not move stale-looking work to Holding while its task-linked query is active', async () => {
+    const staleTask = task({
+      workflow_state: 'executing',
+      workflow_contract: { version: 'task-workflow.v1' },
+    });
+    const db = fakeDb({
+      tasks: {
+        list: vi.fn(async ({ status, workflowState }: {
+          status?: string;
+          workflowState?: TaskRow['workflow_state'] | null;
+        } = {}) => status === 'doing' && workflowState === undefined ? [staleTask] : []),
+      },
+      queries: {
+        getPending: vi.fn(async () => [activeQuery(staleTask.owner!, {
+          prompt: 'TASK DELEGATION from manager: You are assigned task #12345678 ("Stalled work").',
+        })]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-active-task-query-stall-guard-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.sweepStalledTasks();
+
+    expect(db.tasks.updateFields).not.toHaveBeenCalledWith(staleTask.id, expect.objectContaining({
+      workflow_state: 'stalled',
+    }));
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
+  });
+
+  it('moves expired stalled work to actionable triage instead of recycling Holding probes', async () => {
+    const staleTask = task({
+      workflow_state: 'stalled',
+      workflow_contract: { version: 'task-workflow.v1' },
+      assignment_id: 'assignment-1',
+      delegation_lineage: { assignment_id: 'assignment-1', to_agent_id: 'agent-1' },
+      blocked_detail: {
+        reason: 'no_progress_before_timeout',
+        created_at: NOW_MS - 7 * 60 * 60 * 1000,
+        fallback_route: 'operations-team/task-master',
+      },
+      lifecycle_updated_at: Math.floor((NOW_MS - 7 * 60 * 60 * 1000) / 1000),
+    });
+    const db = fakeDb({
+      tasks: {
+        list: vi.fn(async ({ status, workflowState }: {
+          status?: string;
+          workflowState?: TaskRow['workflow_state'] | null;
+        } = {}) => status === 'doing' && workflowState === undefined ? [staleTask] : []),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-expired-stalled-triage-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await manager.sweepStalledTasks();
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(staleTask.id, expect.objectContaining({
+      status: 'todo',
+      owner: null,
+      workflow_state: 'triage_required',
+      assignment_id: null,
+      delegation_lineage: null,
+      blocked_detail: expect.objectContaining({
+        reason: 'holding_recovery_exhausted',
+        previous_reason: 'no_progress_before_timeout',
+        previous_owner_id: 'agent-1',
+        previous_assignment_id: 'assignment-1',
+        fallback_route: 'operations-team/task-master',
+      }),
+    }));
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:triaged',
+      subject_id: staleTask.uuid,
+      data: expect.objectContaining({
+        reason: 'probe_limit_reached',
+      }),
+    }));
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
+  });
+
+  it('moves expired blocked todo work out of Holding for explicit reroute', async () => {
+    const blockedTask = task({
+      status: 'todo',
+      owner: null,
+      created_at: Math.floor((NOW_MS - 13 * 60 * 60 * 1000) / 1000),
+      workflow_state: 'blocked',
+      workflow_contract: { version: 'task-workflow.v1' },
+      blocked_detail: {
+        reason: 'no_idle_live_member',
+        created_at: NOW_MS - 30 * 60 * 1000,
+      },
+      lifecycle_updated_at: Math.floor((NOW_MS - 30 * 60 * 1000) / 1000),
+    });
+    const db = fakeDb({
+      tasks: {
+        list: vi.fn(async ({ status, workflowState }: {
+          status?: string;
+          workflowState?: TaskRow['workflow_state'] | null;
+        } = {}) => {
+          if (status === 'todo' && workflowState === 'blocked') return [blockedTask];
+          if (status === 'todo' && workflowState === undefined) return [blockedTask];
+          return [];
+        }),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-expired-blocked-triage-test', db, { libraryRoot: null }) as any;
+
+    await manager.sweepStalledTasks();
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(blockedTask.id, expect.objectContaining({
+      status: 'todo',
+      owner: null,
+      workflow_state: 'triage_required',
+      blocked_detail: expect.objectContaining({
+        reason: 'holding_recovery_exhausted',
+        previous_reason: 'no_idle_live_member',
+      }),
+    }));
   });
 
   it('bumps task activity when the stalled sweeper sends an owner supervision prompt', async () => {
@@ -1847,6 +1970,60 @@ describe('stalled task sweeper', () => {
       topic: 'task:completed',
       subject_id: staleTask.uuid,
     }));
+  });
+
+  it('reconciles a completed delegation artifact after a non-blocking transport preamble', async () => {
+    const staleTask = task();
+    const db = fakeDb({
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [staleTask]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-stalled-delegation-transport-preamble-test', db, { libraryRoot: null }) as any;
+
+    await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery(staleTask.owner!, {
+        query_id: 'delegation-transport-preamble-done',
+        prompt: 'TASK DELEGATION from manager: You are assigned task #12345678 ("Stalled work"). Start this task now.',
+        status: 'completed',
+      }),
+      {
+        result: [
+          "The manager's task-done route isn't reachable from this workspace (that endpoint 404s - it is the Brain port, not the manager API).",
+          'Per the brief, that is not a blocker once the result is produced. Returning the completed result for atomic reconciliation.',
+          '',
+          '---',
+          '',
+          '## Done - Task #12345678 "Stalled work"',
+          '',
+          '**Verdict: CONFIRMED.** The requested verification is complete.',
+          '- Artifact: output/stalled-work.md',
+          '- used_source_ids: fact:1, text:2',
+        ].join('\n'),
+      },
+      NOW_MS,
+    );
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(staleTask.id, {
+      status: 'done',
+      completed_at: Math.floor(NOW_MS / 1000),
+      updated_at: Math.floor(NOW_MS / 1000),
+    });
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:completed',
+      subject_id: staleTask.uuid,
+    }));
+  });
+
+  it('attaches canonical task context to direct manager delegation dispatches', async () => {
+    const manager = new AgentManagerDb('/tmp/id-agents-task-dispatch-context-test', fakeDb(), { libraryRoot: null }) as any;
+
+    expect(manager.supervisionDispatchContext(
+      'TASK DELEGATION from manager: You are assigned task #12345678 ("Stalled work"). Start this task now.',
+    )).toEqual({ task_ref: '#12345678' });
+    expect(manager.supervisionDispatchContext(
+      'TASK DELEGATION from manager: You are assigned task-manager triage for research task #12345678.',
+    )).toBeUndefined();
   });
 
   it('closes delegated parent reconciliation when the only blocker is missing HTTP tooling', async () => {

@@ -85,6 +85,7 @@ describe('runtime registry', () => {
     expect(usesCliLogin('antigravity')).toBe(true);
     expect(usesCliLogin('copilot')).toBe(true);
     expect(usesCliLogin('kiro-cli')).toBe(true);
+    expect(usesCliLogin('kimi-cli')).toBe(true);
     expect(usesCliLogin('claude-agent-sdk')).toBe(false);
 
     expect(supportsSessionResume('codex')).toBe(true);
@@ -93,6 +94,7 @@ describe('runtime registry', () => {
     expect(supportsSessionResume('antigravity')).toBe(true);
     expect(supportsSessionResume('copilot')).toBe(false);
     expect(supportsSessionResume('kiro-cli')).toBe(true);
+    expect(supportsSessionResume('kimi-cli')).toBe(false);
   });
 
   it('exposes one runtime-neutral interface contract for every runtime', () => {
@@ -244,6 +246,17 @@ describe('runtime registry', () => {
     expect(validateRuntimeModelCompatibility('kiro-cli', 'qwen3-coder-next')).toEqual([]);
   });
 
+  it('exposes the Kimi Code runtime profile', () => {
+    const profile = getRuntimeProfile('kimi-cli');
+    expect(profile.id).toBe('kimi-cli');
+    expect(profile.canonicalId).toBe('kimi-cli');
+    expect(profile.displayName).toBe('Kimi Code');
+    expect(profile.auth.mode).toBe('cli-login');
+    expect(profile.capabilities.supportsResume).toBe(false);
+    expect(getDefaultModelForRuntime('kimi-cli')).toBe('kimi-code/kimi-for-coding');
+    expect(validateRuntimeModelCompatibility('kimi-cli', 'kimi-code/kimi-for-coding-highspeed')).toEqual([]);
+  });
+
   it('exposes the ollama runtime profile', () => {
     const profile = getRuntimeProfile('ollama');
     expect(profile.id).toBe('ollama');
@@ -275,7 +288,7 @@ describe('runtime registry', () => {
     expect(supportsMcpTools('provider:openrouter')).toBe(true);
     expect(supportsMcpTools('cursor-cli')).toBe(false);
 
-    for (const runtime of ['claude-agent-sdk', 'claude-code-cli', 'codex', 'cursor-cli', 'grok', 'antigravity', 'copilot', 'kiro-cli', 'ollama', 'provider-api']) {
+    for (const runtime of ['claude-agent-sdk', 'claude-code-cli', 'codex', 'cursor-cli', 'grok', 'antigravity', 'copilot', 'kiro-cli', 'kimi-cli', 'ollama', 'provider-api']) {
       expect(supportsSkillFiles(runtime)).toBe(true);
       expect(supportsPluginSkillFallback(runtime)).toBe(true);
     }

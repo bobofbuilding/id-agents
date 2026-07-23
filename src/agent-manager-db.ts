@@ -933,10 +933,109 @@ export class AgentManagerDb {
     return Number.isFinite(raw) && raw >= 0 ? raw : 5 * 60 * 1000;
   }
 
+  private getActiveTaskQueryGraceMs(): number {
+    const raw = Number(process.env.ID_STALL_ACTIVE_TASK_QUERY_GRACE_MS);
+    return Number.isFinite(raw) && raw >= 0
+      ? raw
+      : Math.max(90 * 60 * 1000, this.getStallSweepMs() * 2);
+  }
+
+  private getHoldingPatternMaxMs(): number {
+    const raw = Number(process.env.ID_HOLDING_PATTERN_MAX_MS);
+    return Number.isFinite(raw) && raw > 0
+      ? Math.max(15 * 60 * 1000, Math.floor(raw))
+      : 6 * 60 * 60 * 1000;
+  }
+
+  private getHoldingTaskMaxAgeMs(): number {
+    const raw = Number(process.env.ID_HOLDING_TASK_MAX_AGE_MS);
+    return Number.isFinite(raw) && raw > 0
+      ? Math.max(30 * 60 * 1000, Math.floor(raw))
+      : 12 * 60 * 60 * 1000;
+  }
+
+  private getHoldingRecoveryMaxPerSweep(): number {
+    const raw = Number(process.env.ID_HOLDING_RECOVERY_MAX_PER_SWEEP);
+    return Number.isFinite(raw) && raw > 0
+      ? Math.max(1, Math.min(100, Math.floor(raw)))
+      : 20;
+  }
+
+  private taskBlockedDetail(task: TaskRow): Record<string, unknown> {
+    if (task.blocked_detail && typeof task.blocked_detail === 'object') {
+      return task.blocked_detail as Record<string, unknown>;
+    }
+    if (typeof task.blocked_detail === 'string') {
+      try {
+        const parsed = JSON.parse(task.blocked_detail);
+        if (parsed && typeof parsed === 'object') return parsed as Record<string, unknown>;
+      } catch {
+        // Invalid legacy detail is replaced when the next lifecycle transition is persisted.
+      }
+    }
+    return {};
+  }
+
+  private activeQueryMatchesTask(row: QueryRow, task: TaskRow): boolean {
+    if (row.status !== 'pending' && row.status !== 'processing') return false;
+    const metadata = row.metadata && typeof row.metadata === 'object'
+      ? row.metadata as Record<string, unknown>
+      : {};
+    const context = metadata.context && typeof metadata.context === 'object'
+      ? metadata.context as Record<string, unknown>
+      : {};
+    const metadataRef = String(
+      metadata.task_ref
+      ?? metadata.taskRef
+      ?? context.task_ref
+      ?? context.taskRef
+      ?? '',
+    ).trim().toLowerCase();
+    const shortRef = this.taskShortRef(task).toLowerCase();
+    const uuid = String(task.uuid || '').toLowerCase();
+    const name = String(task.name || '').toLowerCase();
+    if (metadataRef && [shortRef, uuid, name].includes(metadataRef)) return true;
+
+    const prompt = String(row.prompt || '').toLowerCase();
+    if (!prompt) return false;
+    return Boolean(
+      (shortRef && prompt.includes(shortRef))
+      || (uuid && prompt.includes(uuid))
+      || (name.length >= 8 && prompt.includes(name)),
+    );
+  }
+
+  private hasFreshActiveTaskQuery(task: TaskRow, rows: QueryRow[], nowMs: number): boolean {
+    const graceMs = this.getActiveTaskQueryGraceMs();
+    return rows.some((row) => {
+      if (!this.activeQueryMatchesTask(row, task)) return false;
+      const createdAt = rowTimestampMs(Number(row.created || 0));
+      return createdAt > 0 && nowMs - createdAt <= graceMs;
+    });
+  }
+
+  private holdingPatternStartedAtMs(task: TaskRow): number {
+    const detail = this.taskBlockedDetail(task);
+    const createdAt = Number(detail.created_at || 0);
+    if (createdAt > 0) return this.taskTimestampMs(createdAt);
+    const lifecycleAt = Number(task.lifecycle_updated_at || 0);
+    if (lifecycleAt > 0) return this.taskTimestampMs(lifecycleAt);
+    return this.taskLastActivityMs(task);
+  }
+
+  private holdingPatternRecoveryDue(task: TaskRow, nowMs: number): boolean {
+    if (task.workflow_state !== 'stalled' && task.workflow_state !== 'blocked') return false;
+    const detail = this.taskBlockedDetail(task);
+    const deadlineAt = Number(detail.deadline_at || 0);
+    if (deadlineAt > 0 && nowMs >= this.taskTimestampMs(deadlineAt)) return true;
+    const taskCreatedAt = this.taskTimestampMs(task.created_at || 0);
+    if (taskCreatedAt > 0 && nowMs - taskCreatedAt >= this.getHoldingTaskMaxAgeMs()) return true;
+    const startedAt = this.holdingPatternStartedAtMs(task);
+    return startedAt > 0 && nowMs - startedAt >= this.getHoldingPatternMaxMs();
+  }
+
   private stalledDispatchRetryAt(task: TaskRow): number {
-    const detail = task.blocked_detail && typeof task.blocked_detail === 'object'
-      ? task.blocked_detail as Record<string, unknown>
-      : null;
+    const detail = this.taskBlockedDetail(task);
     if (detail?.reason !== 'supervision_dispatch_failed') return 0;
     const retryAt = Number(detail.retry_at || 0);
     return retryAt > 0 ? this.taskTimestampMs(retryAt) : 0;
@@ -4718,6 +4817,13 @@ Return this JSON shape:
     ).test(firstLine.replace(/[`*_]/g, ''));
     const firstLineTaskRefHeading = new RegExp(`^(?:#{1,6}\\s*)?(?:\\*\\*)?\\s*task\\s+#?${escapedMarker}\\b`, 'i')
       .test(firstLine.replace(/[`*_]/g, ''));
+    const explicitDoneTaskHeading = text
+      .split(/\r?\n/)
+      .map((line) => line.trim().replace(/^(?:#{1,6}\s*|\*{1,2})/, '').replace(/\*{1,2}$/, '').trim())
+      .find((line) => new RegExp(
+        `^(?:done|completed|finished|delivered|validated)\\b.{0,100}\\btask\\s+#?${escapedMarker}\\b`,
+        'i',
+      ).test(line));
 
     const titleTokens = [...this.duplicateTitleTokens(task.title)].filter((token) => token.length > 2);
     const sharedTitleTokens = titleTokens.filter((token) => lower.includes(token));
@@ -4731,11 +4837,16 @@ Return this JSON shape:
     const memoryArtifact = /"memory_update_package"\s*:/.test(text)
       && /\bmemor(?:y|ies)\b/i.test(`${task.title} ${task.name}`);
 
-    if (!memoryArtifact && !(artifactSignal && (explicitCompletedTaskRef || firstLineTaskRefHeading || markdownArtifactHeading))) {
+    if (!memoryArtifact && !(artifactSignal && (
+      explicitCompletedTaskRef
+      || firstLineTaskRefHeading
+      || explicitDoneTaskHeading
+      || markdownArtifactHeading
+    ))) {
       return null;
     }
 
-    const note = `Artifact-style delegation completion: ${firstLine.slice(0, 220)}`;
+    const note = `Artifact-style delegation completion: ${(explicitDoneTaskHeading || firstLine).slice(0, 220)}`;
     return { action: 'done', note, target: null };
   }
 
@@ -5520,7 +5631,11 @@ Return this JSON shape:
                 console.warn(`[Supervision] Lead delegation kickoff failed for ${routedTask.name}: ${err?.message || err}`);
               });
             } else if (!(await this.hasActiveSupervisionAskForMarker(route.team.id, route.agent, ref))) {
-              const sent = await this.sendSupervisionAsk(route.team.name, route.agent.name, this.taskDelegationPrompt(routedTask, ref));
+              const sent = await this.sendSupervisionAsk(
+                route.team.name,
+                route.agent.name,
+                this.taskDelegationPrompt(routedTask, ref),
+              );
               if (!sent) this.managerLog(`Routed task ${routedTask.name} to ${route.agent.name}, but the delegation prompt could not be delivered`);
             }
             await this.markTaskControlReplyApplied({ teamId: queryRow.team_id, queryId: queryRow.query_id, agentId: actorAgentId, occurredAt, task: routedTask, action: 'route_assigned' });
@@ -6191,6 +6306,7 @@ Return this JSON shape:
       'grok',
       'copilot',
       'kiro-cli',
+      'kimi-cli',
       'cursor-cli',
     ];
     const raw = configured.length ? configured : defaults;
@@ -8274,7 +8390,7 @@ Return this JSON shape:
     const details = task.description
       ? `\nTask details:\n${this.compactBrainContextText(task.description, this.positiveIntEnv('ID_TASK_DELEGATION_DESCRIPTION_CHARS', 1200))}`
       : '';
-    return `TASK DELEGATION from manager: You are assigned task ${ref} ("${task.title}").${details}\nStart this task now and return the completed result, evidence, and source IDs in your reply; the manager will reconcile that reply atomically. If manager task commands are available, you may also mark it done with \`/task done ${ref} --acceptance "..."\`. Inability to reach localhost or the manager API from your workspace is not a task blocker after you have produced the requested result. If the work itself is blocked, reply BLOCKED with the concrete reason and do not create duplicate tasks.`;
+    return `TASK DELEGATION from manager: You are assigned task ${ref} ("${task.title}").${details}\nStart this task now and return the completed result, evidence, and source IDs in your reply. Put \`DONE: <concise completion evidence>\` on the first non-empty line when the work is complete; the manager will reconcile that reply atomically. Do not POST task lifecycle updates to Brain (:4200) or guess a localhost port. If manager task commands are unavailable, returning the completed result is sufficient and is not a blocker. If the work itself is blocked, reply \`BLOCKED: <concrete reason>\` and do not create duplicate tasks.`;
   }
 
   /**
@@ -19465,13 +19581,23 @@ Return this JSON shape:
     return 'routed';
   }
 
+  private supervisionDispatchContext(message: string): RemoteDispatchContext | undefined {
+    const directTaskRef = /^TASK DELEGATION from manager:\s*You are assigned task\s+(#[a-z0-9][a-z0-9_-]{3,})\b/i
+      .exec(message)?.[1];
+    return directTaskRef ? { task_ref: directTaskRef } : undefined;
+  }
+
   private async sendSupervisionAsk(teamName: string, agentName: string, message: string): Promise<boolean> {
     const quoted = `"${message.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+    const context = this.supervisionDispatchContext(message);
     try {
       const res = await fetch(`http://127.0.0.1:${this.managementPort}/remote`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'X-Id-Admin': '1', 'X-Id-Team': teamName },
-        body: JSON.stringify({ command: `/ask ${agentName} ${quoted}` }),
+        body: JSON.stringify({
+          command: `/ask ${agentName} ${quoted}`,
+          ...(context ? { context } : {}),
+        }),
         signal: AbortSignal.timeout(20_000),
       });
       if (!res.ok) return false;
@@ -20251,6 +20377,67 @@ Return this JSON shape:
     );
     this.managerLog(`Closed stalled validation task ${params.task.name}: ${failureNote}`);
     return true;
+  }
+
+  private async moveHoldingTaskToTriage(params: {
+    task: TaskRow;
+    teamRow: { id: string; name: string };
+    ownerAgent: AgentRow | null;
+    stalledMinutes: number;
+    nowMs: number;
+  }): Promise<void> {
+    const detail = this.taskBlockedDetail(params.task);
+    const nowSec = Math.floor(params.nowMs / 1000);
+    const previousOwnerId = params.task.owner;
+    const previousAssignmentId = params.task.assignment_id ?? null;
+    const priorReason = String(detail.reason || params.task.workflow_state || 'unknown');
+    const blockedDetail = {
+      ...detail,
+      version: 'blocked-work.v1',
+      reason: 'holding_recovery_exhausted',
+      previous_reason: priorReason,
+      previous_owner_id: previousOwnerId,
+      previous_assignment_id: previousAssignmentId,
+      recovery_owner_id: null,
+      retry_at: null,
+      escalated_at: params.nowMs,
+      created_at: Number(detail.created_at || this.holdingPatternStartedAtMs(params.task) || params.nowMs),
+      fallback_route: String(detail.fallback_route || 'operations-team/task-master'),
+      attempts: Math.max(Number(detail.attempts || 0), this.getMaxStalledTaskProbes()),
+    };
+    const description = this.appendTaskTriageNote(
+      params.task.description,
+      'holding_recovery_exhausted',
+      `Holding recovery exceeded its bounded deadline after ${params.stalledMinutes}m without verified progress. Previous blocker: ${priorReason}. The task is queued for explicit reroute, split, or retirement.`,
+      params.nowMs,
+    );
+    await this.db.tasks.updateFields(params.task.id, {
+      status: 'todo',
+      owner: null,
+      workflow_state: 'triage_required',
+      assignment_id: null,
+      delegation_lineage: null,
+      blocked_detail: blockedDetail,
+      lifecycle_updated_at: nowSec,
+      description,
+      // This is a real lifecycle handoff, so the board should show when
+      // bounded recovery ended instead of retaining a misleading old age.
+      updated_at: nowSec,
+    });
+    await emitTaskTriaged(this.db.events, {
+      teamId: params.teamRow.id,
+      taskUuid: params.task.uuid,
+      taskName: params.task.name,
+      title: params.task.title,
+      ownerAgentId: previousOwnerId,
+      actorAgentId: params.ownerAgent?.id ?? previousOwnerId,
+      occurredAt: params.nowMs,
+      reason: 'probe_limit_reached',
+      stalledMinutes: params.stalledMinutes,
+    });
+    this.managerLog(
+      `Moved ${params.task.name} from ${params.task.workflow_state || 'holding'} to triage_required after bounded recovery expired`,
+    );
   }
 
   private hasExhaustedCheckinProbe(checkins: CheckinRow[], maxProbes: number): boolean {
@@ -21274,7 +21461,40 @@ Return this JSON shape:
       if (ageMs < STALL_MS) continue;
       if (this.stalledDispatchRetryAt(t) > now) continue;
 
+      const [hasRecentSupervision, ownerPendingQueries] = await Promise.all([
+        this.hasRecentTaskSupervisionEvent(teamRow.id, t, now - RENUDGE_MS),
+        getPendingQueriesFor(ownerAgent),
+      ]);
+      const hasFreshTaskExecution = this.hasFreshActiveTaskQuery(t, ownerPendingQueries, now);
+      if (hasFreshTaskExecution) {
+        if (t.workflow_state === 'stalled') {
+          await this.db.tasks.updateFields(t.id, {
+            workflow_state: 'executing',
+            blocked_detail: null,
+            lifecycle_updated_at: Math.floor(now / 1000),
+            // Query activity is not itself a task progress update.
+            updated_at: t.updated_at,
+          });
+          t.workflow_state = 'executing';
+          t.blocked_detail = null;
+        }
+        continue;
+      }
+
+      if (this.holdingPatternRecoveryDue(t, now)) {
+        await this.moveHoldingTaskToTriage({
+          task: t,
+          teamRow,
+          ownerAgent,
+          stalledMinutes: mins,
+          nowMs: now,
+        });
+        nudged++;
+        continue;
+      }
+
       if (t.workflow_contract && t.workflow_state !== 'stalled') {
+        const existingDetail = this.taskBlockedDetail(t);
         await this.db.tasks.updateFields(t.id, {
           workflow_state: 'stalled',
           blocked_detail: {
@@ -21284,7 +21504,7 @@ Return this JSON shape:
             retry_at: now + RENUDGE_MS,
             deadline_at: Number((t.workflow_contract as any)?.timing?.deadline_at || now + 24 * 60 * 60_000),
             fallback_route: String((t.workflow_contract as any)?.timing?.fallback_route || 'operations-team/task-master'),
-            attempts: Number((t.blocked_detail as any)?.attempts || 0),
+            attempts: Number(existingDetail.attempts || 0),
             created_at: now,
           },
           lifecycle_updated_at: Math.floor(now / 1000),
@@ -21295,10 +21515,6 @@ Return this JSON shape:
         t.workflow_state = 'stalled';
       }
 
-      const [hasRecentSupervision, ownerPendingQueries] = await Promise.all([
-        this.hasRecentTaskSupervisionEvent(teamRow.id, t, now - RENUDGE_MS),
-        getPendingQueriesFor(ownerAgent),
-      ]);
       if (hasRecentSupervision) continue;
       const ownerProbeState = this.supervisionQueryStateFromRows(teamRow.id, ownerPendingQueries, ref, ownerAgent, teamName);
 
@@ -21451,6 +21667,29 @@ Return this JSON shape:
       }
     }
 
+    const blockedTodo = await this.db.tasks.list({
+      status: 'todo',
+      workflowState: 'blocked',
+      order: 'updated_asc',
+      limit: SCAN_LIMIT,
+    }).catch(() => [] as TaskRow[]);
+    let holdingRecovered = 0;
+    for (const t of blockedTodo) {
+      if (holdingRecovered >= this.getHoldingRecoveryMaxPerSweep()) break;
+      if (!t.team_id || !this.holdingPatternRecoveryDue(t, now)) continue;
+      const teamRow = await getTeamRow(t.team_id);
+      if (!teamRow) continue;
+      const ownerAgent = await getOwnerAgent(t.owner);
+      await this.moveHoldingTaskToTriage({
+        task: t,
+        teamRow,
+        ownerAgent,
+        stalledMinutes: Math.max(0, Math.round((now - this.holdingPatternStartedAtMs(t)) / 60000)),
+        nowMs: now,
+      });
+      holdingRecovered++;
+    }
+
     const todo = nudged < MAX_PER_SWEEP
       ? await this.db.tasks
         .list({ status: 'todo', order: 'updated_asc', limit: SCAN_LIMIT })
@@ -21599,7 +21838,11 @@ Return this JSON shape:
       }
     }
     this.pruneStalledNudges(now, RENUDGE_MS, MAX_PROBES);
-    if (nudged) console.log(`[Manager] Stalled-task sweep: probed ${nudged} stalled item(s)`);
+    if (nudged || holdingRecovered) {
+      console.log(
+        `[Manager] Stalled-task sweep: probed ${nudged} stalled item(s), moved ${holdingRecovered} expired Holding item(s) to triage`,
+      );
+    }
   }
 
   /**

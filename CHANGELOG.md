@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.131]
+
+- Keep task-linked active queries in execution instead of falsely moving them into Holding, and bound Holding recovery to six hours or twelve hours of total task age before preserving the blocker and assignment history in actionable triage.
+- Reconcile explicit completed-task artifacts without requiring agents to reach a guessed localhost manager endpoint, and attach canonical task context to direct manager delegations.
+- Allow the Control Center to submit idempotent Brain learning tasks through the manager relay.
+- Add the Kimi Code CLI OAuth runtime, model compatibility, private prompt-file handling, preflight checks, and regression coverage.
+
 ## [0.1.130]
 
 - Resume a persisted stalled task as soon as its owner recovery query is accepted, clearing stale blocker metadata while preserving the normal timeout path if work goes quiet again.

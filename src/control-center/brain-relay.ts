@@ -35,6 +35,7 @@ const POST_PATHS = [
   /^\/text-units\/ingest$/,
   /^\/graph\/nodes\/bulk$/,
   /^\/memory\/[^/?#]+$/,
+  /^\/learning-tasks$/,
   /^\/approvals\/[^/?#]+\/resolve$/,
 ];
 

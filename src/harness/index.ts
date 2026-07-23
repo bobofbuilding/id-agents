@@ -16,6 +16,7 @@ import { GrokHarness } from './grok.js';
 import { AntigravityHarness } from './antigravity.js';
 import { CopilotCliHarness } from './copilot-cli.js';
 import { KiroCliHarness } from './kiro-cli.js';
+import { KimiCliHarness } from './kimi-cli.js';
 import { OllamaHarness } from './ollama.js';
 import { ProviderApiHarness } from './provider-api.js';
 import { getAvailableRuntimes, isRuntimeId } from '../runtime/registry.js';
@@ -30,6 +31,7 @@ export { GrokHarness } from './grok.js';
 export { AntigravityHarness } from './antigravity.js';
 export { CopilotCliHarness } from './copilot-cli.js';
 export { KiroCliHarness } from './kiro-cli.js';
+export { KimiCliHarness } from './kimi-cli.js';
 export { OllamaHarness } from './ollama.js';
 export { ProviderApiHarness } from './provider-api.js';
 export * from './rate-limit.js';
@@ -60,12 +62,14 @@ export function createHarness(type: HarnessType = 'claude-agent-sdk'): AgentHarn
       return new CopilotCliHarness();
     case 'kiro-cli':
       return new KiroCliHarness();
+    case 'kimi-cli':
+      return new KimiCliHarness();
     case 'ollama':
       return new OllamaHarness();
     case 'provider-api':
       return new ProviderApiHarness();
     default:
-      throw new Error(`Unknown harness type: ${type}. Valid types: claude-agent-sdk, claude-code-cli, codex, cursor-cli, grok, antigravity, copilot, kiro-cli, ollama, provider-api`);
+      throw new Error(`Unknown harness type: ${type}. Valid types: claude-agent-sdk, claude-code-cli, codex, cursor-cli, grok, antigravity, copilot, kiro-cli, kimi-cli, ollama, provider-api`);
   }
 }
 

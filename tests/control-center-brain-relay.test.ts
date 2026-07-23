@@ -14,11 +14,18 @@ describe('control-center Brain relay contract', () => {
       idempotency_key: 'idacc:phase1:0001',
       body: { type: 'control:test' },
     })).toMatchObject({ method: 'POST', path: '/timeline', idempotency_key: 'idacc:phase1:0001' });
+    expect(parseControlBrainRequest({
+      method: 'POST',
+      path: '/learning-tasks',
+      idempotency_key: 'idacc:brain-review:0001',
+      body: { kind: 'skill.evidence.repair', approval_id: 1515 },
+    })).toMatchObject({ method: 'POST', path: '/learning-tasks', idempotency_key: 'idacc:brain-review:0001' });
   });
 
   it('rejects arbitrary proxy targets and writes without idempotency', () => {
     expect(() => parseControlBrainRequest({ method: 'GET', path: 'https://example.com' })).toThrow('invalid_brain_path');
     expect(() => parseControlBrainRequest({ method: 'GET', path: '/admin/export' })).toThrow('brain_path_not_allowed');
+    expect(() => parseControlBrainRequest({ method: 'POST', path: '/learning-tasks/1515', idempotency_key: 'idacc:brain-review:0002', body: {} })).toThrow('brain_path_not_allowed');
     expect(() => parseControlBrainRequest({ method: 'POST', path: '/timeline', body: {} })).toThrow('invalid_idempotency_key');
   });
 
