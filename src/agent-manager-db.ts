@@ -5670,7 +5670,9 @@ Return this JSON shape:
       status: parkedTask.status,
       completed_at: parkedTask.completed_at,
       description: parkedTask.description,
-      ...(task.workflow_contract ? { workflow_state: effectiveParsed.action === 'blocked' ? 'blocked' as const : 'queued' as const, assignment_id: null, blocked_detail: {
+      workflow_state: effectiveParsed.action === 'blocked' ? 'blocked' as const : 'queued' as const,
+      assignment_id: null,
+      blocked_detail: {
         version: 'blocked-work.v1',
         reason: fallbackNote || effectiveParsed.action,
         recovery_owner_id: 'operations-team/task-master',
@@ -5678,7 +5680,8 @@ Return this JSON shape:
         fallback_route: 'operations-team/task-master',
         attempts: Number((task.blocked_detail as any)?.attempts || 0) + 1,
         created_at: occurredAt,
-      }, lifecycle_updated_at: nowSec } : {}),
+      },
+      lifecycle_updated_at: nowSec,
       updated_at: parkedTask.updated_at,
     });
     await this.recordTaskSupervision(
@@ -18339,6 +18342,12 @@ Return this JSON shape:
 
           const nowMs = Date.now();
           const validation = await this.recoverFailedValidationTasks({ teams, limit, nowMs });
+          const waiting = await this.triageWaitingTasks({
+            teams,
+            limit,
+            nowMs,
+            force,
+          });
           const teamIds = new Set(teams.map((team) => team.id));
           const pendingRows = await this.db.tasks.list({
             status: 'done',
@@ -18380,6 +18389,7 @@ Return this JSON shape:
                 pendingRouted,
                 pendingFailed,
               },
+              waiting,
               stalled,
               unowned,
             },
@@ -19635,6 +19645,166 @@ Return this JSON shape:
     const raw = Number(task.completed_at || task.updated_at || task.created_at || 0);
     const evidenceMs = raw > 0 ? (raw < 1e12 ? raw * 1000 : raw) : nowMs;
     return Math.max(0, nowMs - evidenceMs);
+  }
+
+  private waitingTriageMaxPerSweep(): number {
+    const raw = Number(process.env.ID_WAITING_TRIAGE_MAX_PER_SWEEP || 8);
+    return Number.isFinite(raw) && raw > 0
+      ? Math.max(1, Math.min(50, Math.floor(raw)))
+      : 8;
+  }
+
+  private waitingTaskRetryAt(task: TaskRow): number {
+    const retryAt = Number(this.taskBlockedDetail(task).retry_at || 0);
+    return retryAt > 0 ? this.taskTimestampMs(retryAt) : 0;
+  }
+
+  private waitingTaskTriagePrompt(params: {
+    teamName: string;
+    task: TaskRow;
+    ref: string;
+    waitingMinutes: number;
+  }): string {
+    const detail = this.taskBlockedDetail(params.task);
+    const reason = String(detail.reason || params.task.workflow_state || 'waiting')
+      .trim()
+      .replace(/\s+/g, ' ')
+      .slice(0, 320);
+    const missingFields = Array.isArray(detail.missing_fields)
+      ? detail.missing_fields.map((field) => String(field || '').trim()).filter(Boolean).slice(0, 12)
+      : [];
+    const missing = missingFields.length
+      ? ` Missing dispatch fields: ${missingFields.join(', ')}.`
+      : '';
+    return `TASK DELEGATION from manager: You are assigned task-manager triage for ${params.teamName} task ${params.ref} ("${params.task.title}"). This existing task has waited ${params.waitingMinutes}m in ${params.task.workflow_state || 'waiting'} because ${reason}.${missing} Resolve it without asking the user unless a genuine external authority decision is required. Return exactly one control directive on the first line: ROUTE: <team>/<live-agent>, BLOCKED: <concrete work blocker>, ASK-USER: <exact external decision>, or DONE: <reproducible evidence>. Add concise rationale after that line. ROUTE must select a live non-validator executor and should only be used when the scope and acceptance evidence are sufficient. If its dispatch contract is incomplete, repair the existing task or create only the minimum properly contracted child work before closing the parent; do not duplicate the objective. The manager receiving this reply is live and will apply the lifecycle transition. Sandbox inability to reach localhost, $MANAGER_URL, or a manager port is never a user decision or work blocker.`;
+  }
+
+  private async triageWaitingTasks(params: {
+    teams?: Array<{ id: string; name: string }>;
+    limit: number;
+    nowMs: number;
+    force?: boolean;
+  }): Promise<{
+    scanned: number;
+    considered: number;
+    routed: number;
+    skipped: number;
+    items: Array<{ task: string; team: string; state: string; status: string; actor?: string; actorTeam?: string; reason?: string }>;
+  }> {
+    const teamIds = params.teams?.length ? new Set(params.teams.map((team) => team.id)) : null;
+    const configuredTeams = new Map((params.teams || []).map((team) => [team.id, team]));
+    const scanLimit = Math.max(params.limit * 4, params.limit);
+    const waitingRows = (await Promise.all((['triage_required', 'blocked'] as const).map((workflowState) =>
+      this.db.tasks.list({
+        status: 'todo',
+        workflowState,
+        order: 'updated_asc',
+        limit: scanLimit,
+      }).catch(() => [] as TaskRow[]),
+    ))).flat();
+    const waiting = this.interleaveTasksByTeam(
+      [...new Map(waitingRows.map((task) => [task.id, task])).values()]
+        .filter((task) =>
+          task.team_id
+          && (task.workflow_state === 'triage_required' || task.workflow_state === 'blocked')
+          && (!teamIds || teamIds.has(task.team_id)),
+        )
+        .sort((a, b) => this.taskLastActivityMs(a) - this.taskLastActivityMs(b)),
+    );
+    const items: Array<{ task: string; team: string; state: string; status: string; actor?: string; actorTeam?: string; reason?: string }> = [];
+    const recipientLoads = new Map<string, { active: number; scheduled: number; capacity: number }>();
+    let considered = 0;
+    let routed = 0;
+    let skipped = 0;
+
+    for (const task of waiting) {
+      if (considered >= params.limit) break;
+      if (!task.team_id) continue;
+      considered++;
+      const team = configuredTeams.get(task.team_id)
+        ?? await this.db.teams.getTeam(task.team_id).catch(() => null);
+      const teamName = team?.name || task.team_id;
+      const ref = this.taskShortRef(task);
+      const state = task.workflow_state || 'waiting';
+      const retryAt = this.waitingTaskRetryAt(task);
+      if (!params.force && retryAt > params.nowMs) {
+        skipped++;
+        items.push({ task: ref, team: teamName, state, status: 'retry_not_due', reason: new Date(retryAt).toISOString() });
+        continue;
+      }
+
+      const lead = await this.findSupervisionLead(task.team_id).catch(() => null);
+      if (lead) {
+        const recipientKey = `${task.team_id}:${lead.id}`;
+        let load = recipientLoads.get(recipientKey);
+        if (!load) {
+          const activeRows = await this.loadPendingQueriesForRecipient(lead).catch(() => [] as QueryRow[]);
+          load = {
+            active: activeRows.filter((row) => row.status === 'pending' || row.status === 'processing').length,
+            scheduled: 0,
+            capacity: this.getMaxActiveQueriesForAgent(lead, teamName),
+          };
+          recipientLoads.set(recipientKey, load);
+        }
+        if (load.active + load.scheduled >= load.capacity) {
+          skipped++;
+          items.push({ task: ref, team: teamName, state, status: 'lead_busy', actor: lead.name });
+          continue;
+        }
+
+        const waitingMinutes = Math.max(0, Math.round((params.nowMs - this.taskLastActivityMs(task)) / 60000));
+        const message = this.waitingTaskTriagePrompt({ teamName, task, ref, waitingMinutes });
+        const sent = await this.sendRecentThrottledSupervisionAsk({
+          teamId: task.team_id,
+          teamName,
+          recipient: lead,
+          message,
+          nowMs: params.nowMs,
+          // Manual reconcile may bypass retry_at, but never bypasses prompt
+          // deduplication or query capacity.
+          force: false,
+        });
+        if (sent === 'sent') {
+          load.scheduled++;
+          routed++;
+          await this.recordTaskSupervision(task, task.team_id, lead.id, 'unclaimed', waitingMinutes, params.nowMs);
+          items.push({ task: ref, team: teamName, state, status: 'sent_lead', actor: lead.name });
+        } else {
+          skipped++;
+          items.push({ task: ref, team: teamName, state, status: sent === 'recent' ? 'recent' : 'send_failed', actor: lead.name });
+        }
+        continue;
+      }
+
+      const waitingMinutes = Math.max(0, Math.round((params.nowMs - this.taskLastActivityMs(task)) / 60000));
+      const fallback = await this.routeStalledTaskToTaskManagerFallback({
+        teamId: task.team_id,
+        teamName,
+        task,
+        ref,
+        stalledMinutes: waitingMinutes,
+        ownerName: task.owner || 'unclaimed',
+        nowMs: params.nowMs,
+        renudgeMs: this.getStallRenudgeMs(),
+        maxProbes: this.getMaxStalledTaskProbes(),
+        force: false,
+        reason: 'no_live_lead',
+        eventReason: 'unclaimed',
+        blockerNote: String(this.taskBlockedDetail(task).reason || state),
+      });
+      if (fallback?.status === 'sent_task_manager') routed++;
+      else skipped++;
+      items.push({
+        task: ref,
+        team: teamName,
+        state,
+        status: fallback?.status || 'no_live_triage_owner',
+        actor: fallback?.actor,
+        actorTeam: fallback?.actorTeam,
+      });
+    }
+
+    return { scanned: waiting.length, considered, routed, skipped, items };
   }
 
   private async validationFallbackCandidates(
@@ -21259,6 +21429,18 @@ Return this JSON shape:
       this.managerLog(
         `Recovered ${failedValidationRecovery.recovered} exhausted validation task(s); routed ${failedValidationRecovery.routed}`,
       );
+    }
+
+    const waitingRecovery = await this.triageWaitingTasks({
+      limit: this.waitingTriageMaxPerSweep(),
+      nowMs: now,
+      force: false,
+    }).catch((err) => {
+      console.warn(`[Workflow] Waiting-task triage failed: ${err?.message || err}`);
+      return { scanned: 0, considered: 0, routed: 0, skipped: 0, items: [] };
+    });
+    if (waitingRecovery.routed > 0) {
+      this.managerLog(`Routed ${waitingRecovery.routed} waiting task(s) for bounded lead-first triage`);
     }
 
     const validationPending = await this.db.tasks.list({

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.139]
+
+- Automatically consume both Waiting lanes by routing `triage_required` and `blocked` tasks to their owning live team lead, with task-manager fallback only when no lead is available.
+- Bound waiting-task recovery by per-lead query capacity, retry deadlines, prompt deduplication, cross-team fairness, and a configurable per-sweep budget so reconciliation improves throughput without triggering another fan-out spike.
+- Apply blocked and reroute control replies to the canonical workflow state even for legacy tasks without a workflow contract, preventing false Under Review or Holding labels.
+- Include waiting-task recovery in `/task reconcile` and the always-on stalled-task sweep.
+
 ## [0.1.138]
 
 - Route completion evidence through the live `default/coder` and `default/researcher` validator pool before coordinator fallbacks, preventing Holding Pattern tasks from exhausting an incomplete validator set.

@@ -170,6 +170,7 @@ describe('stalled task sweeper', () => {
     delete process.env.ID_HOLDING_PATTERN_MAX_MS;
     delete process.env.ID_HOLDING_TASK_MAX_AGE_MS;
     delete process.env.ID_HOLDING_RECOVERY_MAX_PER_SWEEP;
+    delete process.env.ID_WAITING_TRIAGE_MAX_PER_SWEEP;
     delete process.env.ID_VALIDATION_FALLBACK_MAX_PER_SWEEP;
     delete process.env.STALL_MAX_PROBES;
     delete process.env.STALL_PROBE_RESET_MS;
@@ -227,6 +228,106 @@ describe('stalled task sweeper', () => {
     ]);
 
     expect(ordered.map((row: TaskRow) => row.id)).toEqual(['a-1', 'b-1', 'c-1', 'a-2', 'b-2']);
+  });
+
+  it('routes triage-required and blocked waiting tasks to the owning team lead with bounded capacity', async () => {
+    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
+    const waiting = [
+      task({
+        id: 'triage-task',
+        name: 'triage-task',
+        uuid: 'aaaaaaaa-1234-1234-1234-123456789abc',
+        status: 'todo',
+        owner: null,
+        workflow_state: 'triage_required',
+        blocked_detail: { reason: 'dispatch_contract_incomplete', missing_fields: ['goal_id', 'validation_path'] },
+      }),
+      task({
+        id: 'blocked-task',
+        name: 'blocked-task',
+        uuid: 'bbbbbbbb-1234-1234-1234-123456789abc',
+        status: 'todo',
+        owner: null,
+        workflow_state: 'blocked',
+        blocked_detail: { reason: 'prerequisite_missing' },
+      }),
+    ];
+    const db = fakeDb({
+      agents: {
+        list: vi.fn(async () => [lead]),
+      },
+      tasks: {
+        list: vi.fn(async ({ status, workflowState }: { status?: string; workflowState?: string | null } = {}) =>
+          status === 'todo'
+            ? waiting.filter((row) => row.workflow_state === workflowState)
+            : []),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-waiting-triage-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const report = await manager.triageWaitingTasks({
+      teams: [{ id: TEAM_ID, name: 'default' }],
+      limit: 5,
+      nowMs: NOW_MS,
+      force: false,
+    });
+
+    expect(report).toMatchObject({
+      scanned: 2,
+      considered: 2,
+      routed: 2,
+      skipped: 0,
+      items: [
+        { task: '#aaaaaaaa', team: 'default', state: 'triage_required', status: 'sent_lead', actor: 'lead' },
+        { task: '#bbbbbbbb', team: 'default', state: 'blocked', status: 'sent_lead', actor: 'lead' },
+      ],
+    });
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledTimes(2);
+    expect(manager.sendSupervisionAsk).toHaveBeenNthCalledWith(
+      1,
+      'default',
+      'lead',
+      expect.stringContaining('Missing dispatch fields: goal_id, validation_path'),
+    );
+  });
+
+  it('respects a blocked-task retry deadline unless manual reconcile forces review', async () => {
+    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
+    const blocked = task({
+      status: 'todo',
+      owner: null,
+      workflow_state: 'blocked',
+      blocked_detail: { reason: 'dependency_pending', retry_at: NOW_MS + 60_000 },
+    });
+    const db = fakeDb({
+      agents: {
+        list: vi.fn(async () => [lead]),
+      },
+      tasks: {
+        list: vi.fn(async ({ status, workflowState }: { status?: string; workflowState?: string | null } = {}) =>
+          status === 'todo' && workflowState === 'blocked' ? [blocked] : []),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-waiting-retry-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const automatic = await manager.triageWaitingTasks({
+      teams: [{ id: TEAM_ID, name: 'default' }],
+      limit: 5,
+      nowMs: NOW_MS,
+      force: false,
+    });
+    const manual = await manager.triageWaitingTasks({
+      teams: [{ id: TEAM_ID, name: 'default' }],
+      limit: 5,
+      nowMs: NOW_MS,
+      force: true,
+    });
+
+    expect(automatic).toMatchObject({ routed: 0, skipped: 1, items: [{ status: 'retry_not_due' }] });
+    expect(manual).toMatchObject({ routed: 1, skipped: 0, items: [{ status: 'sent_lead' }] });
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledTimes(1);
   });
 
   it('allows stalled-task sweep cadence overrides with a one-minute floor', () => {
@@ -3409,6 +3510,9 @@ describe('stalled task sweeper', () => {
     manager.recoverFailedValidationTasks = vi.fn(async () => ({
       scanned: 0, recovered: 0, routed: 0, skipped: 0, items: [],
     }));
+    manager.triageWaitingTasks = vi.fn(async () => ({
+      scanned: 0, considered: 0, routed: 0, skipped: 0, items: [],
+    }));
     manager.triageStalledOwnerBacklogs = vi.fn(async () => ({
       stallMinutes: 45, limit: 20, scannedTeams: 1, scannedOwners: 0, triagedOwners: 0, skippedOwners: [], items: [],
     }));
@@ -3422,6 +3526,8 @@ describe('stalled task sweeper', () => {
 
     expect(manager.triageStalledOwnerBacklogs).toHaveBeenNthCalledWith(1, expect.objectContaining({ force: false }));
     expect(manager.triageStalledOwnerBacklogs).toHaveBeenNthCalledWith(2, expect.objectContaining({ force: true }));
+    expect(manager.triageWaitingTasks).toHaveBeenNthCalledWith(1, expect.objectContaining({ force: false }));
+    expect(manager.triageWaitingTasks).toHaveBeenNthCalledWith(2, expect.objectContaining({ force: true }));
   });
 
   it('force-jumpstarts an exact doing task before the automatic stall threshold', async () => {
