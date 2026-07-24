@@ -18338,6 +18338,24 @@ Return this JSON shape:
 
           const nowMs = Date.now();
           const validation = await this.recoverFailedValidationTasks({ teams, limit, nowMs });
+          const teamIds = new Set(teams.map((team) => team.id));
+          const pendingRows = await this.db.tasks.list({
+            status: 'done',
+            workflowState: 'validation_pending',
+            order: 'updated_asc',
+            limit: Math.max(limit * 4, limit),
+          }).catch(() => [] as TaskRow[]);
+          let pendingReviewed = 0;
+          let pendingRouted = 0;
+          let pendingFailed = 0;
+          for (const pending of pendingRows) {
+            if (pendingReviewed >= limit) break;
+            if (!pending.team_id || !teamIds.has(pending.team_id)) continue;
+            const action = await this.routeExpiredValidationFallback(pending, nowMs);
+            pendingReviewed++;
+            if (action === 'routed') pendingRouted++;
+            if (action === 'failed') pendingFailed++;
+          }
           const stalled = await this.triageStalledOwnerBacklogs({
             teams,
             limit,
@@ -18355,7 +18373,12 @@ Return this JSON shape:
             result: {
               version: 'task-reconcile.v1',
               teams: teams.map((team) => team.name),
-              validation,
+              validation: {
+                ...validation,
+                pendingReviewed,
+                pendingRouted,
+                pendingFailed,
+              },
               stalled,
               unowned,
             },

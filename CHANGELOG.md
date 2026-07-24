@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.1.134]
+
+- Make `/task reconcile` immediately process existing validation-pending rows as well as newly recovered failures, with the same bounded batch, age window, and validator-capacity guards used by the automatic sweeper.
+
 ## [0.1.133]
 
 - Prioritize recent failed validations during reconciliation and limit automatic recovery to a configurable 24-hour window, preventing archived task history from consuming current validator capacity.
