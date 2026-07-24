@@ -19643,9 +19643,18 @@ Return this JSON shape:
     if (!task.team_id) return [];
     const team = await this.db.teams.getTeam(task.team_id).catch(() => null);
     if (!team) return [];
+    const defaultTeam = await this.db.teams.getTeamByName('default').catch(() => null);
+    const validators: Array<{ team: TeamRow; agent: AgentRow }> = [];
+    if (defaultTeam) {
+      for (const name of ['coder', 'researcher']) {
+        const agent = await this.db.agents.getByName(defaultTeam.id, name).catch(() => null);
+        if (agent) validators.push({ team: defaultTeam, agent });
+      }
+    }
     const lead = await this.findSupervisionLead(task.team_id).catch(() => null);
     const managers = await this.findTaskManagerFallbacks().catch(() => []);
     return [
+      ...validators,
       ...(lead ? [{ team, agent: lead }] : []),
       ...managers,
     ].filter((candidate, index, all) =>

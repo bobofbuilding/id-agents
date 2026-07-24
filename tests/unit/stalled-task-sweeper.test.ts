@@ -311,6 +311,46 @@ describe('stalled task sweeper', () => {
     }));
   });
 
+  it('uses the default-team validators before coordinator fallbacks', async () => {
+    const defaultTeam = team();
+    const workTeam = team({ id: 'engineering-team-id', name: 'engineering-team' });
+    const coder = agent({ id: 'coder-1', name: 'coder' });
+    const researcher = agent({ id: 'researcher-1', name: 'researcher' });
+    const engineeringLead = agent({
+      id: 'engineering-lead-1',
+      team_id: workTeam.id,
+      name: 'engineering-lead',
+      metadata: { primaryLead: true },
+    });
+    const db = fakeDb({
+      teams: {
+        getTeam: vi.fn(async (id: string) => id === workTeam.id ? workTeam : defaultTeam),
+        getTeamByName: vi.fn(async (name: string) => name === 'default' ? defaultTeam : null),
+      },
+      agents: {
+        getByName: vi.fn(async (teamId: string, name: string) => {
+          if (teamId === defaultTeam.id && name === 'coder') return coder;
+          if (teamId === defaultTeam.id && name === 'researcher') return researcher;
+          return null;
+        }),
+        list: vi.fn(async (teamId: string) => teamId === workTeam.id ? [engineeringLead] : [coder, researcher]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-validation-candidate-test', db, { libraryRoot: null }) as any;
+    manager.findTaskManagerFallbacks = vi.fn(async () => []);
+
+    const candidates = await manager.validationFallbackCandidates(task({
+      team_id: workTeam.id,
+      owner: 'worker-1',
+    }));
+
+    expect(candidates.map((candidate: { agent: AgentRow }) => candidate.agent.name)).toEqual([
+      'coder',
+      'researcher',
+      'engineering-lead',
+    ]);
+  });
+
   it('recovers legacy exhausted validation once and routes its existing evidence to an untried validator', async () => {
     const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
     const ops = team({ id: 'ops-team-id', name: 'operations-team' });

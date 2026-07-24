@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.1.138]
+
+- Route completion evidence through the live `default/coder` and `default/researcher` validator pool before coordinator fallbacks, preventing Holding Pattern tasks from exhausting an incomplete validator set.
+
 ## [0.1.137]
 
 - Apply the archived-validation age guard before retry deadlines, allowing reconciliation to retire out-of-window recovery rows immediately without waiting for a stale validator lease.
