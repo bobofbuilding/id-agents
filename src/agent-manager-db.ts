@@ -214,6 +214,42 @@ interface GoalAutopilotSyncResult {
   errors: Array<{ goal?: string; error: string }>;
 }
 
+export interface GoalAutopilotControlConfig {
+  enabled: boolean;
+  cadenceMs: number;
+  maxTasksPerRun: number;
+}
+
+export function normalizeGoalAutopilotControlConfig(
+  value: Record<string, unknown> | null | undefined,
+  fallback: GoalAutopilotControlConfig,
+): GoalAutopilotControlConfig {
+  const cadence = Number(value?.cadenceMs);
+  const maxTasks = Number(value?.maxTasksPerRun);
+  return {
+    enabled: typeof value?.enabled === 'boolean' ? value.enabled : fallback.enabled,
+    cadenceMs: Number.isFinite(cadence) && cadence > 0
+      ? Math.max(5 * 60 * 1000, Math.min(24 * 60 * 60 * 1000, Math.floor(cadence)))
+      : fallback.cadenceMs,
+    maxTasksPerRun: Number.isFinite(maxTasks) && maxTasks > 0
+      ? Math.max(1, Math.min(12, Math.floor(maxTasks)))
+      : fallback.maxTasksPerRun,
+  };
+}
+
+export function isGoalAutopilotRunDue(
+  config: GoalAutopilotControlConfig,
+  runtime: { lastStartedAt?: number; lastCompletedAt?: number } | null | undefined,
+  nowMs: number = Date.now(),
+): boolean {
+  if (!config.enabled) return false;
+  const lastStartedAt = Number(runtime?.lastStartedAt || 0);
+  const lastCompletedAt = Number(runtime?.lastCompletedAt || 0);
+  const unfinishedGuardMs = Math.max(config.cadenceMs, 15 * 60 * 1000);
+  if (lastStartedAt > lastCompletedAt && nowMs - lastStartedAt < unfinishedGuardMs) return false;
+  return !lastCompletedAt || nowMs - lastCompletedAt >= config.cadenceMs;
+}
+
 function looksLikeShortTaskRef(value: string | undefined): boolean {
   const trimmed = String(value || '').trim();
   return /^#?[0-9a-fA-F]{4,}$/.test(trimmed);
@@ -674,6 +710,26 @@ interface BrainInstruction {
     user_id?: string;
     turn_id?: string;
   };
+}
+
+export function dedupeBrainGoalInstructions<T extends BrainInstruction>(instructions: T[]): T[] {
+  const canonicalProjects = new Set(
+    instructions
+      .filter((instruction) => instruction.key.startsWith('goals:active:'))
+      .map((instruction) => instruction.scope.project || instruction.key.slice('goals:active:'.length)),
+  );
+  const seen = new Set<string>();
+  return instructions.filter((instruction) => {
+    if (instruction.key.startsWith('goals:autopilot:')) {
+      const project = instruction.scope.project || instruction.key.slice('goals:autopilot:'.length);
+      if (canonicalProjects.has(project)) return false;
+    }
+    const content = instruction.content.replace(/\s+/g, ' ').trim().toLowerCase();
+    const key = `${instruction.scope.project || ''}\u001f${instruction.key}\u001f${content}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 interface RemoteDispatchContext {
@@ -8142,7 +8198,7 @@ Return this JSON shape:
       });
       if (!res.ok) return [];
       const json = await res.json() as { memories?: Array<Record<string, unknown>> };
-      return (json.memories || []).filter((memory) => memory.agent_id === 'team-instructions').map((memory) => ({
+      const instructions = (json.memories || []).filter((memory) => memory.agent_id === 'team-instructions').map((memory) => ({
         source_id: `memory:${Number(memory.id)}`,
         memory_id: Number(memory.id),
         key: String(memory.mem_key || ''),
@@ -8155,6 +8211,7 @@ Return this JSON shape:
           turn_id: String(memory.turn_id || ''),
         },
       })).filter((instruction) => Number.isInteger(instruction.memory_id) && instruction.content.trim().length > 0);
+      return dedupeBrainGoalInstructions(instructions);
     } catch {
       return [];
     }
@@ -18190,19 +18247,21 @@ Return this JSON shape:
             if (token === '--team') { targetTeamName = rawArgs[++i]; continue; }
             if (token === '--limit') {
               const parsed = Number(rawArgs[++i]);
-              if (!Number.isInteger(parsed) || parsed < 1 || parsed > 20) {
-                return { ok: false, error: '--limit must be an integer between 1 and 20' };
+              if (!Number.isInteger(parsed) || parsed < 1 || parsed > 12) {
+                return { ok: false, error: '--limit must be an integer between 1 and 12' };
               }
               limit = parsed;
               continue;
             }
             return { ok: false, error: `Unknown option ${token}` };
           }
-          const report = await this.syncAutopilotGoals({
+          if (!dryRun) await this.updateGoalAutopilotRuntime({ lastStartedAt: Date.now() });
+          const report = await this.runGoalAutopilotSync({
             dryRun,
             limit,
             teamName: targetTeamName,
           });
+          if (!dryRun) await this.recordGoalAutopilotRun(report);
           return { ok: report.ok, result: report };
         }
 
@@ -19158,8 +19217,8 @@ Return this JSON shape:
   }
 
   private goalAutopilotSyncMaxTasks(): number {
-    const raw = Number(process.env.ID_GOAL_AUTOPILOT_SYNC_MAX_TASKS || 3);
-    return Number.isFinite(raw) && raw > 0 ? Math.min(20, Math.floor(raw)) : 3;
+    const raw = Number(process.env.ID_GOAL_AUTOPILOT_SYNC_MAX_TASKS || 12);
+    return Number.isFinite(raw) && raw > 0 ? Math.min(12, Math.floor(raw)) : 12;
   }
 
   private goalAutopilotSyncMaxOpenPerTeam(): number {
@@ -19177,14 +19236,71 @@ Return this JSON shape:
     return Number.isFinite(raw) && raw >= 0 ? Math.min(20, Math.floor(raw)) : 2;
   }
 
+  private async goalAutopilotControlTeamId(): Promise<string | null> {
+    const team = await this.db.teams.getTeamByName('default').catch(() => null);
+    return team?.id || null;
+  }
+
+  private async goalAutopilotControlConfig(): Promise<GoalAutopilotControlConfig> {
+    const fallback: GoalAutopilotControlConfig = {
+      enabled: process.env.ID_GOAL_AUTOPILOT_SYNC_DISABLED !== 'true',
+      cadenceMs: this.goalAutopilotSyncIntervalMs(),
+      maxTasksPerRun: Math.min(3, this.goalAutopilotSyncMaxTasks()),
+    };
+    const teamId = await this.goalAutopilotControlTeamId();
+    if (!teamId) return fallback;
+    const item = await this.db.controlState.get(teamId, 'global', 'goal-driver').catch(() => null);
+    return normalizeGoalAutopilotControlConfig(item?.value, fallback);
+  }
+
+  private async goalAutopilotRuntimeState(): Promise<{ lastStartedAt?: number; lastCompletedAt?: number } | null> {
+    const teamId = await this.goalAutopilotControlTeamId();
+    if (!teamId) return null;
+    const item = await this.db.controlState.get(teamId, 'global', 'goal-driver-runtime').catch(() => null);
+    return (item?.value as { lastStartedAt?: number; lastCompletedAt?: number }) || null;
+  }
+
+  private async updateGoalAutopilotRuntime(patch: Record<string, unknown>): Promise<void> {
+    const teamId = await this.goalAutopilotControlTeamId();
+    if (!teamId) return;
+    const current = await this.db.controlState.get(teamId, 'global', 'goal-driver-runtime').catch(() => null);
+    await this.db.controlState.upsert({
+      teamId,
+      scope: 'global',
+      key: 'goal-driver-runtime',
+      value: { ...(current?.value || {}), ...patch },
+      now: Date.now(),
+    });
+  }
+
+  private async recordGoalAutopilotRun(result: GoalAutopilotSyncResult): Promise<void> {
+    await this.updateGoalAutopilotRuntime({
+      lastCompletedAt: Date.now(),
+      lastError: null,
+      lastResult: {
+        ok: result.ok,
+        consideredGoals: result.consideredGoals,
+        drivenGoals: result.drivenGoals,
+        tasksSpawned: result.tasksSpawned,
+        errorCount: result.errors.length,
+      },
+    });
+  }
+
   private brainDbPath(): string {
     return process.env.BRAIN_DB_PATH || path.join(this.baseWorkDir, 'projects', 'brain', 'brain.db');
+  }
+
+  private brainApiBaseUrl(): string {
+    return String(process.env.BRAIN_URL || process.env.ID_BRAIN_URL || 'http://127.0.0.1:4200').replace(/\/+$/, '');
   }
 
   private parseBrainGoalRow(row: any): BrainAutopilotGoal | null {
     let data: Record<string, any> = {};
     try {
-      data = row?.data ? JSON.parse(String(row.data)) : {};
+      data = row?.data && typeof row.data === 'object' && !Array.isArray(row.data)
+        ? row.data
+        : (row?.data ? JSON.parse(String(row.data)) : {});
     } catch {
       data = {};
     }
@@ -19210,7 +19326,7 @@ Return this JSON shape:
     };
   }
 
-  private readBrainAutopilotGoals(): { goals: BrainAutopilotGoal[]; error?: string } {
+  private readBrainAutopilotGoalsFromDb(): { goals: BrainAutopilotGoal[]; error?: string } {
     const dbPath = this.brainDbPath();
     if (!existsSync(dbPath)) return { goals: [], error: `Brain DB not found at ${dbPath}` };
     let brainDb: Database.Database | null = null;
@@ -19236,7 +19352,38 @@ Return this JSON shape:
     }
   }
 
-  private updateBrainGoalDriver(goal: BrainAutopilotGoal, patch: Record<string, unknown>): void {
+  private async readBrainAutopilotGoals(): Promise<{ goals: BrainAutopilotGoal[]; error?: string }> {
+    try {
+      const ctrl = new AbortController();
+      const timeout = setTimeout(() => ctrl.abort(), 5_000);
+      try {
+        const response = await fetch(`${this.brainApiBaseUrl()}/entities?type=goal&status=active&limit=100`, {
+          signal: ctrl.signal,
+          headers: { accept: 'application/json' },
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const body = await response.json() as { entities?: unknown[] };
+        return {
+          goals: (Array.isArray(body.entities) ? body.entities : [])
+            .map((row) => this.parseBrainGoalRow(row))
+            .filter((goal): goal is BrainAutopilotGoal => Boolean(goal)),
+        };
+      } finally {
+        clearTimeout(timeout);
+      }
+    } catch (error: any) {
+      const fallback = this.readBrainAutopilotGoalsFromDb();
+      const apiError = error?.name === 'AbortError' ? 'request timed out' : (error?.message || String(error));
+      return {
+        goals: fallback.goals,
+        error: fallback.error
+          ? `Brain API unavailable (${apiError}); DB fallback failed (${fallback.error})`
+          : `Brain API unavailable (${apiError}); using DB fallback`,
+      };
+    }
+  }
+
+  private updateBrainGoalDriverInDb(goal: BrainAutopilotGoal, patch: Record<string, unknown>): void {
     const dbPath = this.brainDbPath();
     if (!existsSync(dbPath)) return;
     let brainDb: Database.Database | null = null;
@@ -19255,6 +19402,39 @@ Return this JSON shape:
       console.warn(`[Manager] Failed to update Brain goal driver for ${goal.id}: ${err?.message || err}`);
     } finally {
       try { brainDb?.close(); } catch { /* best effort */ }
+    }
+  }
+
+  private async updateBrainGoalDriver(goal: BrainAutopilotGoal, patch: Record<string, unknown>): Promise<void> {
+    const nextData = {
+      ...goal.data,
+      driver: {
+        ...(goal.data.driver && typeof goal.data.driver === 'object' ? goal.data.driver : {}),
+        ...patch,
+      },
+    };
+    try {
+      const response = await fetch(`${this.brainApiBaseUrl()}/entities`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify({
+          id: goal.id,
+          type: 'goal',
+          name: goal.name,
+          source: 'id-agents-manager',
+          status: goal.status || 'active',
+          tags: ['goal', goal.priority, 'dashboard-state', 'autopilot'],
+          data: nextData,
+          exactId: true,
+          mergeAliases: false,
+        }),
+        signal: AbortSignal.timeout(5_000),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return;
+    } catch (error: any) {
+      console.warn(`[Manager] Brain API goal-driver update failed for ${goal.id}; using DB fallback: ${error?.message || error}`);
+      this.updateBrainGoalDriverInDb(goal, patch);
     }
   }
 
@@ -19368,7 +19548,7 @@ Return this JSON shape:
     };
     if (!enabled) return result;
 
-    const read = this.readBrainAutopilotGoals();
+    const read = await this.readBrainAutopilotGoals();
     if (read.error) result.errors.push({ error: read.error });
     const nowMs = Date.now();
     const staleMs = this.goalAutopilotSyncStaleMs();
@@ -19417,7 +19597,7 @@ Return this JSON shape:
       const lead = this.isLiveForSupervision(preferredLead) ? preferredLead : await this.findSupervisionLead(team.id);
       if (!lead) {
         result.skipped.push({ goal: goal.id, team: team.name, reason: 'no_live_lead' });
-        this.updateBrainGoalDriver(goal, { lastRunAt: nowMs, taskRefs: goal.taskRefs, note: 'no live lead available' });
+        await this.updateBrainGoalDriver(goal, { lastRunAt: nowMs, taskRefs: goal.taskRefs, note: 'no live lead available' });
         continue;
       }
       const openForLead = openTasks.filter((task) => task.owner === lead.id && this.isAutopilotGoalTask(task)).length;
@@ -19447,7 +19627,7 @@ Return this JSON shape:
         result.tasksSpawned += 1;
         result.drivenGoals += 1;
         result.created.push({ goal: goal.id, team: team.name, owner: lead.name, task: created.task.name, shortId });
-        this.updateBrainGoalDriver(goal, {
+        await this.updateBrainGoalDriver(goal, {
           lastRunAt: nowMs,
           taskRefs: Array.from(new Set([...goal.taskRefs, shortId].filter(Boolean))),
           note: `spawned bounded autopilot coordination task ${shortId}`,
@@ -19460,39 +19640,44 @@ Return this JSON shape:
     return result;
   }
 
+  private runGoalAutopilotSync(options: { dryRun?: boolean; limit?: number; teamName?: string } = {}): Promise<GoalAutopilotSyncResult> {
+    if (this.goalAutopilotSyncInFlight) return this.goalAutopilotSyncInFlight;
+    const run = this.syncAutopilotGoals(options).finally(() => {
+      if (this.goalAutopilotSyncInFlight === run) this.goalAutopilotSyncInFlight = null;
+    });
+    this.goalAutopilotSyncInFlight = run;
+    return run;
+  }
+
   private startGoalAutopilotSync(): void {
     if (process.env.ID_GOAL_AUTOPILOT_SYNC_DISABLED === 'true') return;
-    const intervalMs = this.goalAutopilotSyncIntervalMs();
     const run = () => {
-      if (this.goalAutopilotSyncInFlight) return;
-      this.goalAutopilotSyncInFlight = this.syncAutopilotGoals()
-        .then((result) => {
-          if (result.tasksSpawned > 0 || result.errors.length > 0) {
-            console.log(`[Manager] Goal autopilot sync: spawned=${result.tasksSpawned}, considered=${result.consideredGoals}, errors=${result.errors.length}`);
-          }
-          return result;
-        })
+      void (async () => {
+        const config = await this.goalAutopilotControlConfig();
+        const runtime = await this.goalAutopilotRuntimeState();
+        if (!isGoalAutopilotRunDue(config, runtime)) return;
+        await this.updateGoalAutopilotRuntime({ lastStartedAt: Date.now() });
+        const result = await this.runGoalAutopilotSync({ limit: config.maxTasksPerRun });
+        await this.recordGoalAutopilotRun(result);
+        if (result.tasksSpawned > 0 || result.errors.length > 0) {
+          console.log(`[Manager] Goal autopilot sync: spawned=${result.tasksSpawned}, considered=${result.consideredGoals}, errors=${result.errors.length}`);
+        }
+      })()
         .catch((err) => {
           console.error('[Manager] Goal autopilot sync failed:', err);
-          return {
-            ok: false,
-            enabled: true,
-            dryRun: false,
-            consideredGoals: 0,
-            drivenGoals: 0,
-            tasksSpawned: 0,
-            skipped: [],
-            created: [],
-            errors: [{ error: err?.message || String(err) }],
-          };
-        })
-        .finally(() => {
-          this.goalAutopilotSyncInFlight = null;
+          void this.updateGoalAutopilotRuntime({
+            lastCompletedAt: Date.now(),
+            lastError: err?.message || String(err),
+          }).catch(() => undefined);
         });
     };
-    const initialMs = Math.min(intervalMs, Math.max(60_000, Number(process.env.ID_GOAL_AUTOPILOT_SYNC_INITIAL_DELAY_MS || 2 * 60 * 1000)));
+    const tickMs = 60_000;
+    const requestedInitialMs = Number(process.env.ID_GOAL_AUTOPILOT_SYNC_INITIAL_DELAY_MS || 60_000);
+    const initialMs = Number.isFinite(requestedInitialMs) && requestedInitialMs >= 0
+      ? Math.max(10_000, Math.floor(requestedInitialMs))
+      : 60_000;
     this.goalAutopilotSyncInitialTimeout = setTimeout(run, initialMs);
-    this.goalAutopilotSyncInterval = setInterval(run, intervalMs);
+    this.goalAutopilotSyncInterval = setInterval(run, tickMs);
   }
 
   private startIdleParkingSweeper(): void {

@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.141]
+
+- Harden goal autopilot cadence with persisted run state, overlap protection, bounded fan-out, missed-tick coalescing, and manager-owned execution through the same control state IDACC edits.
+- Read and update active goals through the Brain API with a local database fallback, and deduplicate legacy goal instruction copies so agents receive one canonical goal context.
+- Preserve exact canonical Claude model identifiers while supporting explicit Sonnet 4.6 aliases instead of silently redirecting them to another model.
+
 ## [0.1.140]
 
 - Deliver persisted completion evidence directly to validators, rotate immediately across available default validators when a runtime is busy or rejects dispatch, and preserve bounded capacity limits.

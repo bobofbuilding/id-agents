@@ -25,6 +25,8 @@ describe('model alias resolution', () => {
   it('preserves existing aliases (regression)', () => {
     expect(resolveModelAlias('haiku')).toBe('claude-haiku-4-5-20251001');
     expect(resolveModelAlias('sonnet')).toBe('claude-sonnet-5');
+    expect(resolveModelAlias('sonnet-4-6')).toBe('claude-sonnet-4-6');
+    expect(resolveModelAlias('sonnet-4.6')).toBe('claude-sonnet-4-6');
     expect(resolveModelAlias('opus')).toBe('claude-opus-4-5-20250514');
     expect(resolveModelAlias('opus-4-8')).toBe('claude-opus-4-8');
     expect(resolveModelAlias('opus-4.8')).toBe('claude-opus-4-8');
@@ -32,6 +34,7 @@ describe('model alias resolution', () => {
 
   it('passes unknown / already-canonical model strings through unchanged', () => {
     expect(resolveModelAlias('claude-fable-5')).toBe('claude-fable-5');
+    expect(resolveModelAlias('claude-sonnet-4-6')).toBe('claude-sonnet-4-6');
     expect(resolveModelAlias('gpt-5.4')).toBe('gpt-5.4');
     expect(resolveModelAlias('some-unknown-model')).toBe('some-unknown-model');
   });
