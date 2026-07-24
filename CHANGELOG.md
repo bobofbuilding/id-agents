@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.1.137]
+
+- Apply the archived-validation age guard before retry deadlines, allowing reconciliation to retire out-of-window recovery rows immediately without waiting for a stale validator lease.
+
 ## [0.1.136]
 
 - Honor `/task reconcile --force` explicitly instead of forcing every reconciliation, allowing automatic and maintenance passes to retain stalled-owner deduplication while the UI can still request an immediate manual nudge.

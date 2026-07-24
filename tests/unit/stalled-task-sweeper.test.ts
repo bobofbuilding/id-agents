@@ -442,7 +442,7 @@ describe('stalled task sweeper', () => {
         verdict: 'pending',
         fallback_attempts: 0,
         recovery_attempts: 1,
-        validator_deadline_at: NOW_MS,
+        validator_deadline_at: NOW_MS + 15 * 60 * 1000,
       },
     });
     const db = fakeDb();

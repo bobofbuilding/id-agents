@@ -19658,8 +19658,6 @@ Return this JSON shape:
   private async routeExpiredValidationFallback(task: TaskRow, nowMs: number): Promise<'routed' | 'failed' | 'waiting'> {
     if (task.workflow_state !== 'validation_pending') return 'waiting';
     const validation = (task.validation_detail || {}) as Record<string, unknown>;
-    const deadlineAt = Number(validation.validator_deadline_at || (task.workflow_contract as any)?.validation?.deadline_at || 0);
-    if (deadlineAt > nowMs) return 'waiting';
     const attempts = Number(validation.fallback_attempts || 0);
     const recoveryAttempts = Number(validation.recovery_attempts || 0);
     const recoveryAgeMs = this.failedValidationEvidenceAgeMs(task, nowMs);
@@ -19683,6 +19681,8 @@ Return this JSON shape:
       });
       return 'failed';
     }
+    const deadlineAt = Number(validation.validator_deadline_at || (task.workflow_contract as any)?.validation?.deadline_at || 0);
+    if (deadlineAt > nowMs) return 'waiting';
     const maxAttempts = Math.max(1, Math.min(3, Number((task.workflow_contract as any)?.validation?.max_revision_cycles || 2)));
     if (attempts >= maxAttempts) {
       const nowSec = Math.floor(nowMs / 1000);
