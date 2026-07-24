@@ -19600,6 +19600,13 @@ Return this JSON shape:
     return [...new Set(attempted)];
   }
 
+  private failedValidationRecoveryMaxAgeMs(): number {
+    const configured = Number(process.env.ID_FAILED_VALIDATION_RECOVERY_MAX_AGE_MS || 24 * 60 * 60 * 1000);
+    return Number.isFinite(configured)
+      ? Math.max(60 * 60 * 1000, Math.min(30 * 24 * 60 * 60 * 1000, configured))
+      : 24 * 60 * 60 * 1000;
+  }
+
   private async validationFallbackCandidates(
     task: TaskRow,
   ): Promise<Array<{ team: TeamRow; agent: AgentRow }>> {
@@ -19624,6 +19631,28 @@ Return this JSON shape:
     const deadlineAt = Number(validation.validator_deadline_at || (task.workflow_contract as any)?.validation?.deadline_at || 0);
     if (deadlineAt > nowMs) return 'waiting';
     const attempts = Number(validation.fallback_attempts || 0);
+    const recoveryAttempts = Number(validation.recovery_attempts || 0);
+    const recoveryAgeMs = Math.max(0, nowMs - this.taskLastActivityMs(task));
+    if (recoveryAttempts > 0 && attempts === 0 && recoveryAgeMs > this.failedValidationRecoveryMaxAgeMs()) {
+      const nowSec = Math.floor(nowMs / 1000);
+      await this.db.tasks.updateFields(task.id, {
+        workflow_state: 'failed',
+        validation_detail: {
+          ...validation,
+          verdict: 'failed',
+          failure_reason: 'validator_recovery_window_expired',
+          failed_at: nowMs,
+        },
+        outcome_detail: {
+          ...(task.outcome_detail || {}),
+          validation_passed: false,
+          validator_recovery_window_expired: true,
+        },
+        lifecycle_updated_at: nowSec,
+        updated_at: task.updated_at,
+      });
+      return 'failed';
+    }
     const maxAttempts = Math.max(1, Math.min(3, Number((task.workflow_contract as any)?.validation?.max_revision_cycles || 2)));
     if (attempts >= maxAttempts) {
       const nowSec = Math.floor(nowMs / 1000);
@@ -19701,7 +19730,7 @@ Return this JSON shape:
     const rows = await this.db.tasks.list({
       status: 'done',
       workflowState: 'failed',
-      order: 'updated_asc',
+      order: 'updated_desc',
       limit: Math.max(params.limit * 4, params.limit),
     }).catch(() => [] as TaskRow[]);
     const items: Array<{ task: string; team: string; status: string; reason: string; validator?: string }> = [];
@@ -19718,6 +19747,12 @@ Return this JSON shape:
       const team = await this.db.teams.getTeam(task.team_id).catch(() => null);
       const teamName = team?.name || task.team_id;
       const taskRef = this.taskShortRef(task);
+      const ageMs = Math.max(0, params.nowMs - this.taskLastActivityMs(task));
+      if (ageMs > this.failedValidationRecoveryMaxAgeMs()) {
+        skipped++;
+        items.push({ task: taskRef, team: teamName, status: 'skipped', reason: 'outside_recovery_window' });
+        continue;
+      }
       if (recoveryAttempts >= 1) {
         skipped++;
         items.push({ task: taskRef, team: teamName, status: 'skipped', reason: 'recovery_limit_reached' });

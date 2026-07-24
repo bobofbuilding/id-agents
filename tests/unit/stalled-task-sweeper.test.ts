@@ -404,6 +404,63 @@ describe('stalled task sweeper', () => {
     expect(db.tasks.updateFields).not.toHaveBeenCalled();
   });
 
+  it('does not reopen archived failed validation outside the recovery window', async () => {
+    const failed = task({
+      status: 'done',
+      updated_at: Math.floor((NOW_MS - 25 * 60 * 60 * 1000) / 1000),
+      workflow_state: 'failed',
+      validation_detail: {
+        verdict: 'failed',
+        failure_reason: 'validator_fallback_exhausted',
+      },
+    });
+    const db = fakeDb({
+      tasks: {
+        list: vi.fn(async ({ status, workflowState }: { status?: string; workflowState?: string } = {}) =>
+          status === 'done' && workflowState === 'failed' ? [failed] : []),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-failed-validation-age-test', db, { libraryRoot: null }) as any;
+
+    const report = await manager.recoverFailedValidationTasks({
+      limit: 10,
+      nowMs: NOW_MS,
+    });
+
+    expect(report).toMatchObject({ scanned: 1, recovered: 0, routed: 0, skipped: 1 });
+    expect(report.items[0]).toMatchObject({ status: 'skipped', reason: 'outside_recovery_window' });
+    expect(db.tasks.updateFields).not.toHaveBeenCalled();
+  });
+
+  it('expires a reopened archived validation without dispatching another validator', async () => {
+    const pending = task({
+      status: 'done',
+      updated_at: Math.floor((NOW_MS - 25 * 60 * 60 * 1000) / 1000),
+      workflow_state: 'validation_pending',
+      validation_detail: {
+        verdict: 'pending',
+        fallback_attempts: 0,
+        recovery_attempts: 1,
+        validator_deadline_at: NOW_MS,
+      },
+    });
+    const db = fakeDb();
+    const manager = new AgentManagerDb('/tmp/id-agents-recovered-validation-age-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await expect(manager.routeExpiredValidationFallback(pending, NOW_MS)).resolves.toBe('failed');
+
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(pending.id, expect.objectContaining({
+      workflow_state: 'failed',
+      validation_detail: expect.objectContaining({
+        verdict: 'failed',
+        failure_reason: 'validator_recovery_window_expired',
+      }),
+      updated_at: pending.updated_at,
+    }));
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
+  });
+
   it('applies a structured validator reply without requiring the validator to call the manager API', async () => {
     const pending = task({
       status: 'done',

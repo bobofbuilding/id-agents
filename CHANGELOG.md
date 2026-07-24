@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.133]
+
+- Prioritize recent failed validations during reconciliation and limit automatic recovery to a configurable 24-hour window, preventing archived task history from consuming current validator capacity.
+- Return reopened archived validation to a terminal failed state without dispatching another validator, preserving its evidence and preventing retry loops.
+
 ## [0.1.132]
 
 - Recover completed tasks whose validator fallback was exhausted by routing their persisted completion evidence to an untried live validator; never rerun the completed task, and allow only one bounded recovery cycle.
