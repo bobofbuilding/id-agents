@@ -19834,6 +19834,70 @@ Return this JSON shape:
     );
   }
 
+  private validationRoutingAttemptedValidatorIds(validation: Record<string, unknown>): string[] {
+    return Array.isArray(validation.routing_attempted_validator_ids)
+      ? [...new Set(validation.routing_attempted_validator_ids
+        .map((value) => String(value || '').trim())
+        .filter(Boolean))]
+      : [];
+  }
+
+  private async validationCompletionEvidence(
+    task: TaskRow,
+    completionQueryId: string | null,
+  ): Promise<string> {
+    const maxChars = this.positiveIntEnv('ID_VALIDATION_EVIDENCE_CHARS', 6_000);
+    let evidence = '';
+
+    if (task.completion_evidence) {
+      evidence = typeof task.completion_evidence === 'string'
+        ? task.completion_evidence
+        : JSON.stringify(task.completion_evidence);
+    }
+
+    if (!evidence && completionQueryId && task.team_id) {
+      const completion = await this.db.queries
+        .getByQueryIdForTeam(task.team_id, completionQueryId)
+        .catch(() => null);
+      if (completion?.result && typeof completion.result === 'object') {
+        evidence = this.replyMessageFromPayload(completion.result as Record<string, unknown>);
+      } else if (typeof completion?.result === 'string') {
+        evidence = completion.result;
+      }
+    }
+
+    const compact = this.compactBrainContextText(evidence, maxChars);
+    return compact || 'No persisted completion evidence was available. Validate only if the cited task artifacts are independently reproducible.';
+  }
+
+  private async validationDispatchStillActive(
+    task: TaskRow,
+    validation: Record<string, unknown>,
+    nowMs: number,
+  ): Promise<boolean> {
+    const activeValidatorId = typeof validation.active_validator_id === 'string'
+      ? validation.active_validator_id.trim()
+      : '';
+    if (!activeValidatorId) return false;
+
+    const validator = await this.db.agents.getById(activeValidatorId).catch(() => null);
+    if (validator) {
+      const marker = this.taskShortRef(task).toLowerCase();
+      const expectedKey = `validation:${marker}`;
+      const active = await this.loadPendingQueriesForRecipient(validator);
+      if (active.some((row) =>
+        (row.status === 'pending' || row.status === 'processing')
+        && this.activeAskDedupKey(row.prompt) === expectedKey,
+      )) {
+        return true;
+      }
+    }
+
+    const graceMs = this.positiveIntEnv('ID_VALIDATION_DISPATCH_GRACE_MS', 30_000);
+    const lastFallbackAt = Number(validation.last_fallback_at || 0);
+    return lastFallbackAt > 0 && nowMs - lastFallbackAt < graceMs;
+  }
+
   private async routeExpiredValidationFallback(task: TaskRow, nowMs: number): Promise<'routed' | 'failed' | 'waiting'> {
     if (task.workflow_state !== 'validation_pending') return 'waiting';
     const validation = (task.validation_detail || {}) as Record<string, unknown>;
@@ -19861,7 +19925,7 @@ Return this JSON shape:
       return 'failed';
     }
     const deadlineAt = Number(validation.validator_deadline_at || (task.workflow_contract as any)?.validation?.deadline_at || 0);
-    if (deadlineAt > nowMs) return 'waiting';
+    if (deadlineAt > nowMs && await this.validationDispatchStillActive(task, validation, nowMs)) return 'waiting';
     const maxAttempts = Math.max(1, Math.min(3, Number((task.workflow_contract as any)?.validation?.max_revision_cycles || 2)));
     if (attempts >= maxAttempts) {
       const nowSec = Math.floor(nowMs / 1000);
@@ -19877,51 +19941,82 @@ Return this JSON shape:
 
     const candidates = await this.validationFallbackCandidates(task);
     const attemptedValidatorIds = this.validationAttemptedValidatorIds(validation);
-    const validator = candidates.find((candidate) => !attemptedValidatorIds.includes(candidate.agent.id))
-      ?? candidates[attempts % Math.max(1, candidates.length)];
-    if (!validator) return 'waiting';
+    if (!candidates.length) return 'waiting';
     const marker = this.taskShortRef(task);
     const taskTeamName = (await this.db.teams.getTeam(task.team_id!).catch(() => null))?.name || 'default';
     const completionQueryId = typeof validation.completion_query_id === 'string'
       ? validation.completion_query_id
       : null;
+    const completionEvidence = await this.validationCompletionEvidence(task, completionQueryId);
     const message = [
       `Validation request for task ${marker} ("${task.title}") [task-team:${taskTeamName}].`,
       completionQueryId ? `Completion evidence query: ${completionQueryId}.` : '',
+      `Persisted completion evidence:\n${completionEvidence}`,
       `Review the persisted completion evidence. Reply on the first line with exactly APPROVED, REVISE: <reason>, or REJECTED: <reason>.`,
       `The manager applies the lifecycle transition from your reply; no shell or HTTP tool is required.`,
       `Use APPROVED only with reproducible evidence. This is validation attempt ${attempts + 1}/${maxAttempts}.`,
     ].filter(Boolean).join(' ');
-    if (await this.findActiveDuplicateTaskAsk(validator.team.id, validator.agent, message)) return 'waiting';
-    const sent = await this.sendSupervisionAsk(validator.team.name, validator.agent.name, message);
-    if (!sent) {
+
+    const orderedCandidates = [
+      ...candidates.filter((candidate) => !attemptedValidatorIds.includes(candidate.agent.id)),
+      ...candidates.filter((candidate) => attemptedValidatorIds.includes(candidate.agent.id)),
+    ];
+    const routingAttemptedIds = this.validationRoutingAttemptedValidatorIds(validation);
+    const failedRoutes: string[] = [];
+    const busyRoutes: string[] = [];
+
+    for (const validator of orderedCandidates) {
+      if (await this.findActiveDuplicateTaskAsk(validator.team.id, validator.agent, message)) return 'waiting';
+
+      const active = await this.loadPendingQueriesForRecipient(validator.agent);
+      if (!this.hasActiveQueryCapacityFromRows(validator.agent, validator.team.name, active)) {
+        busyRoutes.push(`${validator.team.name}/${validator.agent.name}`);
+        continue;
+      }
+
+      const sent = await this.sendSupervisionAsk(validator.team.name, validator.agent.name, message);
+      if (!sent) {
+        failedRoutes.push(`${validator.team.name}/${validator.agent.name}`);
+        routingAttemptedIds.push(validator.agent.id);
+        continue;
+      }
+
       await this.db.tasks.updateFields(task.id, {
         validation_detail: {
           ...validation,
-          routing_failures: Number(validation.routing_failures || 0) + 1,
-          last_route_failure_at: nowMs,
-          validator_deadline_at: nowMs + this.getStallSweepIntervalMs(),
-          routing_failure_reason: `validator_dispatch_failed:${validator.team.name}/${validator.agent.name}`,
+          fallback_attempts: attempts + 1,
+          active_validator_id: validator.agent.id,
+          active_validator_team_id: validator.team.id,
+          attempted_validator_ids: [...new Set([...attemptedValidatorIds, validator.agent.id])],
+          routing_attempted_validator_ids: [...new Set(routingAttemptedIds)],
+          routing_failures: Number(validation.routing_failures || 0) + failedRoutes.length,
+          validator_deadline_at: nowMs + 15 * 60_000,
+          last_fallback_at: nowMs,
+          routing_failure_reason: failedRoutes.length
+            ? `validator_dispatch_rotated_after:${failedRoutes.join(',')}`
+            : null,
         },
         lifecycle_updated_at: Math.floor(nowMs / 1000),
         updated_at: task.updated_at,
       });
-      return 'waiting';
+      return 'routed';
     }
+
     await this.db.tasks.updateFields(task.id, {
       validation_detail: {
         ...validation,
-        fallback_attempts: attempts + 1,
-        active_validator_id: validator.agent.id,
-        active_validator_team_id: validator.team.id,
-        attempted_validator_ids: [...new Set([...attemptedValidatorIds, validator.agent.id])],
-        validator_deadline_at: nowMs + 15 * 60_000,
-        last_fallback_at: nowMs,
+        routing_attempted_validator_ids: [...new Set(routingAttemptedIds)],
+        routing_failures: Number(validation.routing_failures || 0) + failedRoutes.length,
+        last_route_failure_at: failedRoutes.length ? nowMs : validation.last_route_failure_at,
+        validator_deadline_at: nowMs + this.getStallSweepIntervalMs(),
+        routing_failure_reason: failedRoutes.length
+          ? `validator_dispatch_failed:${failedRoutes.join(',')}`
+          : `validator_capacity_full:${busyRoutes.join(',')}`,
       },
       lifecycle_updated_at: Math.floor(nowMs / 1000),
       updated_at: task.updated_at,
     });
-    return 'routed';
+    return 'waiting';
   }
 
   private async recoverFailedValidationTasks(params: {
@@ -20420,7 +20515,11 @@ Return this JSON shape:
         taskByKey.set(key, resolvedTask);
       }
       task = taskByKey.get(key);
-      const terminal = task?.status === 'done' && !this.shouldPreserveFreshCompletingTaskAsk(row, task, nowMs);
+      const validationStillOpen = task?.workflow_state === 'validation_pending'
+        && this.activeAskDedupKey(row.prompt)?.startsWith('validation:');
+      const terminal = task?.status === 'done'
+        && !validationStillOpen
+        && !this.shouldPreserveFreshCompletingTaskAsk(row, task, nowMs);
       if (terminal && !terminalIdSet.has(row.query_id)) {
         terminalIdSet.add(row.query_id);
         terminalIds.push(row.query_id);

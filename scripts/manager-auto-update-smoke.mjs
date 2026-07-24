@@ -75,6 +75,7 @@ try {
   const updaterSource = readFileSync(new URL('./manager-auto-update.mjs', import.meta.url), 'utf8');
   assert.match(updaterSource, /current checkout is not a healthy installation/);
   assert.match(updaterSource, /reason: 'manager-unavailable'/);
+  assert.match(updaterSource, /Stopping agents drains runtime work but does not clean Git state/);
   console.log('manager-auto-update smoke test passed');
 } finally {
   rmSync(root, { recursive: true, force: true });

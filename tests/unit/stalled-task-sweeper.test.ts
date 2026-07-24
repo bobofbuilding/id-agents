@@ -126,6 +126,7 @@ function fakeDb(overrides: Record<string, any> = {}): any {
       expireQueuedPeerWakes: vi.fn(async () => []),
       getPending: vi.fn(async () => []),
       getPendingByOwner: vi.fn(async () => []),
+      getByQueryIdForTeam: vi.fn(async () => null),
       ...overrides.queries,
     },
     news: {
@@ -178,6 +179,7 @@ describe('stalled task sweeper', () => {
     delete process.env.ID_TASK_MANAGER_FALLBACK_COOLDOWN_MS;
     delete process.env.ID_UNOWNED_ASSIGN_MIN_MS;
     delete process.env.ID_UNOWNED_ASSIGN_MAX_PER_SWEEP;
+    delete process.env.ID_VALIDATION_DISPATCH_GRACE_MS;
     delete process.env.ID_MAX_DOING_TASKS;
     delete process.env.ID_BLOCKED_TASK_REASSIGN_COOLDOWN_MS;
     delete process.env.ID_AGENT_QUERY_CONCURRENCY;
@@ -450,6 +452,196 @@ describe('stalled task sweeper', () => {
       'researcher',
       'engineering-lead',
     ]);
+  });
+
+  it('routes validation to the idle secondary validator and embeds persisted completion evidence', async () => {
+    const pending = task({
+      status: 'done',
+      workflow_state: 'validation_pending',
+      completed_at: Math.floor(NOW_MS / 1000) - 60,
+      validation_detail: {
+        version: 'task-validation.v1',
+        verdict: 'pending',
+        completion_query_id: 'query-completion',
+        validator_deadline_at: NOW_MS,
+      },
+      workflow_contract: {
+        validation: { max_revision_cycles: 2 },
+      } as any,
+    });
+    const coder = agent({ id: 'coder-1', name: 'coder' });
+    const researcher = agent({ id: 'researcher-1', name: 'researcher' });
+    const db = fakeDb({
+      agents: {
+        getByName: vi.fn(async (_teamId: string, name: string) => {
+          if (name === 'coder') return coder;
+          if (name === 'researcher') return researcher;
+          return null;
+        }),
+        list: vi.fn(async () => [coder, researcher]),
+      },
+      queries: {
+        getPending: vi.fn(async (agentId: string) =>
+          agentId === coder.id ? [activeQuery(coder.id)] : []),
+        getByQueryIdForTeam: vi.fn(async () => activeQuery('worker-1', {
+          query_id: 'query-completion',
+          status: 'completed',
+          result: { result: 'DONE: artifact output/report.md; tests 12/12 passed.' },
+        })),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-validation-capacity-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await expect(manager.routeExpiredValidationFallback(pending, NOW_MS)).resolves.toBe('routed');
+
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledTimes(1);
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'researcher',
+      expect.stringContaining('DONE: artifact output/report.md; tests 12/12 passed.'),
+    );
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(pending.id, expect.objectContaining({
+      validation_detail: expect.objectContaining({
+        active_validator_id: researcher.id,
+        attempted_validator_ids: [researcher.id],
+        fallback_attempts: 1,
+      }),
+    }));
+  });
+
+  it('rotates to the other secondary validator when the first dispatch is rejected', async () => {
+    const pending = task({
+      status: 'done',
+      workflow_state: 'validation_pending',
+      completed_at: Math.floor(NOW_MS / 1000) - 60,
+      validation_detail: {
+        version: 'task-validation.v1',
+        verdict: 'pending',
+        validator_deadline_at: NOW_MS,
+      },
+      workflow_contract: {
+        validation: { max_revision_cycles: 2 },
+      } as any,
+    });
+    const coder = agent({ id: 'coder-1', name: 'coder' });
+    const researcher = agent({ id: 'researcher-1', name: 'researcher' });
+    const db = fakeDb({
+      agents: {
+        getByName: vi.fn(async (_teamId: string, name: string) => {
+          if (name === 'coder') return coder;
+          if (name === 'researcher') return researcher;
+          return null;
+        }),
+        list: vi.fn(async () => [coder, researcher]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-validation-send-rotation-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn()
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+
+    await expect(manager.routeExpiredValidationFallback(pending, NOW_MS)).resolves.toBe('routed');
+
+    expect(manager.sendSupervisionAsk).toHaveBeenNthCalledWith(
+      1,
+      'default',
+      'coder',
+      expect.stringContaining('Validation request for task #12345678'),
+    );
+    expect(manager.sendSupervisionAsk).toHaveBeenNthCalledWith(
+      2,
+      'default',
+      'researcher',
+      expect.stringContaining('Validation request for task #12345678'),
+    );
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(pending.id, expect.objectContaining({
+      validation_detail: expect.objectContaining({
+        active_validator_id: researcher.id,
+        routing_attempted_validator_ids: [coder.id],
+        routing_failures: 1,
+      }),
+    }));
+  });
+
+  it('reroutes an orphaned validation dispatch before its recorded deadline', async () => {
+    const coder = agent({ id: 'coder-1', name: 'coder' });
+    const researcher = agent({ id: 'researcher-1', name: 'researcher' });
+    const pending = task({
+      status: 'done',
+      workflow_state: 'validation_pending',
+      completed_at: Math.floor(NOW_MS / 1000) - 300,
+      validation_detail: {
+        version: 'task-validation.v1',
+        verdict: 'pending',
+        fallback_attempts: 1,
+        active_validator_id: coder.id,
+        attempted_validator_ids: [coder.id],
+        last_fallback_at: NOW_MS - 60_000,
+        validator_deadline_at: NOW_MS + 10 * 60_000,
+      },
+      workflow_contract: {
+        validation: { max_revision_cycles: 2 },
+      } as any,
+    });
+    const db = fakeDb({
+      agents: {
+        getById: vi.fn(async (id: string) => id === coder.id ? coder : null),
+        getByName: vi.fn(async (_teamId: string, name: string) => {
+          if (name === 'coder') return coder;
+          if (name === 'researcher') return researcher;
+          return null;
+        }),
+        list: vi.fn(async () => [coder, researcher]),
+      },
+      queries: {
+        getPending: vi.fn(async () => []),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-validation-orphan-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await expect(manager.routeExpiredValidationFallback(pending, NOW_MS)).resolves.toBe('routed');
+
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledTimes(1);
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'default',
+      'researcher',
+      expect.stringContaining('Validation request for task #12345678'),
+    );
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(pending.id, expect.objectContaining({
+      validation_detail: expect.objectContaining({
+        active_validator_id: researcher.id,
+        attempted_validator_ids: [coder.id, researcher.id],
+        fallback_attempts: 2,
+      }),
+    }));
+  });
+
+  it('does not expire an active validator query while the completed task awaits validation', async () => {
+    const pending = task({
+      status: 'done',
+      workflow_state: 'validation_pending',
+      completed_at: Math.floor(NOW_MS / 1000) - 300,
+    });
+    const validationQuery = activeQuery('coder-1', {
+      query_id: 'query-validation-active',
+      status: 'pending',
+      prompt: 'Validation request for task #12345678 ("Stalled work") [task-team:default].',
+    });
+    const adapterQuery = vi.fn(async (sql: string) => {
+      if (sql.startsWith('SELECT team_id, agent_id, query_id')) {
+        return { rows: [validationQuery], rowCount: 1 };
+      }
+      throw new Error(`unexpected terminal-query update: ${sql}`);
+    });
+    const db = fakeDb({ adapter: { query: adapterQuery } });
+    const manager = new AgentManagerDb('/tmp/id-agents-validation-terminal-query-test', db, { libraryRoot: null }) as any;
+    manager.resolveTaskRef = vi.fn(async () => ({ task: pending }));
+
+    await expect(manager.expireTerminalTaskAsks(NOW_MS)).resolves.toEqual([]);
+
+    expect(adapterQuery).toHaveBeenCalledTimes(1);
   });
 
   it('recovers legacy exhausted validation once and routes its existing evidence to an untried validator', async () => {

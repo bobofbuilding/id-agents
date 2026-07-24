@@ -177,6 +177,7 @@ export interface TaskRow {
   created_at: number;
   updated_at: number;
   completed_at: number | null;
+  completion_evidence?: string | Record<string, unknown> | null;
   /** Dashboard lineage. These are opaque control-plane IDs, not foreign keys. */
   project_id?: string | null;
   plan_id?: string | null;

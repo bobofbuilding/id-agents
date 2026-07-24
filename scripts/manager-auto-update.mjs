@@ -293,10 +293,23 @@ export async function updateManager(opts) {
   }
   const branch = run('git', ['branch', '--show-current'], { cwd: opts.target });
   if (branch !== opts.branch) throw new Error(`Checkout is on ${branch || 'detached HEAD'}; expected ${opts.branch}`);
-  const trackedStatus = run('git', ['status', '--porcelain', '--untracked-files=no'], { cwd: opts.target });
-  if (trackedStatus) throw new Error(`Tracked manager files are modified; update refused:\n${trackedStatus}`);
 
+  // Fetching updates refs only and is safe with local modifications. Do this
+  // before the preservation guard so Settings reports current release state.
   run('git', ['fetch', 'origin', opts.branch, '--tags', '--prune'], { cwd: opts.target, inherit: true });
+  const trackedStatus = run('git', ['status', '--porcelain', '--untracked-files=no'], { cwd: opts.target });
+  if (trackedStatus) {
+    const changedFiles = trackedStatus
+      .split('\n')
+      .map((line) => line.slice(3).trim())
+      .filter(Boolean);
+    throw new Error(
+      `Manager source has ${changedFiles.length} modified tracked file(s); update refused to preserve local work. ` +
+      `Stopping agents drains runtime work but does not clean Git state. Commit or restore these files first: ` +
+      changedFiles.join(', '),
+    );
+  }
+
   const targetRef = `origin/${opts.branch}`;
   const targetCommit = run('git', ['rev-parse', targetRef], { cwd: opts.target });
   const currentCommit = run('git', ['rev-parse', 'HEAD'], { cwd: opts.target });

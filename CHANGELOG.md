@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.140]
+
+- Deliver persisted completion evidence directly to validators, rotate immediately across available default validators when a runtime is busy or rejects dispatch, and preserve bounded capacity limits.
+- Keep live validation queries attached to completed tasks until a verdict is applied, and recover orphaned validator assignments immediately instead of waiting for a stale future deadline.
+- Fetch current release metadata before checking source cleanliness and replace raw Git status output with an actionable preservation message explaining that stopping agents does not clean modified source.
+
 ## [0.1.139]
 
 - Automatically consume both Waiting lanes by routing `triage_required` and `blocked` tasks to their owning live team lead, with task-manager fallback only when no lead is available.
