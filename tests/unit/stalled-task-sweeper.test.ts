@@ -435,7 +435,8 @@ describe('stalled task sweeper', () => {
   it('expires a reopened archived validation without dispatching another validator', async () => {
     const pending = task({
       status: 'done',
-      updated_at: Math.floor((NOW_MS - 25 * 60 * 60 * 1000) / 1000),
+      completed_at: Math.floor((NOW_MS - 25 * 60 * 60 * 1000) / 1000),
+      updated_at: Math.floor(NOW_MS / 1000),
       workflow_state: 'validation_pending',
       validation_detail: {
         verdict: 'pending',

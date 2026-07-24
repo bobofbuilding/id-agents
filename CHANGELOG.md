@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.1.135]
+
+- Measure failed-validation recovery age from immutable completion evidence rather than refreshed lifecycle activity, so reopened archived rows are retired at the 24-hour boundary.
+
 ## [0.1.134]
 
 - Make `/task reconcile` immediately process existing validation-pending rows as well as newly recovered failures, with the same bounded batch, age window, and validator-capacity guards used by the automatic sweeper.

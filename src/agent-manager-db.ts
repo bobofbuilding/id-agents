@@ -19630,6 +19630,12 @@ Return this JSON shape:
       : 24 * 60 * 60 * 1000;
   }
 
+  private failedValidationEvidenceAgeMs(task: TaskRow, nowMs: number): number {
+    const raw = Number(task.completed_at || task.updated_at || task.created_at || 0);
+    const evidenceMs = raw > 0 ? (raw < 1e12 ? raw * 1000 : raw) : nowMs;
+    return Math.max(0, nowMs - evidenceMs);
+  }
+
   private async validationFallbackCandidates(
     task: TaskRow,
   ): Promise<Array<{ team: TeamRow; agent: AgentRow }>> {
@@ -19655,7 +19661,7 @@ Return this JSON shape:
     if (deadlineAt > nowMs) return 'waiting';
     const attempts = Number(validation.fallback_attempts || 0);
     const recoveryAttempts = Number(validation.recovery_attempts || 0);
-    const recoveryAgeMs = Math.max(0, nowMs - this.taskLastActivityMs(task));
+    const recoveryAgeMs = this.failedValidationEvidenceAgeMs(task, nowMs);
     if (recoveryAttempts > 0 && attempts === 0 && recoveryAgeMs > this.failedValidationRecoveryMaxAgeMs()) {
       const nowSec = Math.floor(nowMs / 1000);
       await this.db.tasks.updateFields(task.id, {
@@ -19770,7 +19776,7 @@ Return this JSON shape:
       const team = await this.db.teams.getTeam(task.team_id).catch(() => null);
       const teamName = team?.name || task.team_id;
       const taskRef = this.taskShortRef(task);
-      const ageMs = Math.max(0, params.nowMs - this.taskLastActivityMs(task));
+      const ageMs = this.failedValidationEvidenceAgeMs(task, params.nowMs);
       if (ageMs > this.failedValidationRecoveryMaxAgeMs()) {
         skipped++;
         items.push({ task: taskRef, team: teamName, status: 'skipped', reason: 'outside_recovery_window' });
