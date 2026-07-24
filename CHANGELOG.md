@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.1.136]
+
+- Honor `/task reconcile --force` explicitly instead of forcing every reconciliation, allowing automatic and maintenance passes to retain stalled-owner deduplication while the UI can still request an immediate manual nudge.
+
 ## [0.1.135]
 
 - Measure failed-validation recovery age from immutable completion evidence rather than refreshed lifecycle activity, so reopened archived rows are retired at the 24-hour boundary.

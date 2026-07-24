@@ -18305,12 +18305,13 @@ Return this JSON shape:
           let targetTeamName: string | undefined;
           let allTeams = false;
           let limit = 20;
+          let force = false;
 
           for (let i = 0; i < rawArgs.length; i++) {
             const token = rawArgs[i];
             if (token === '--all') { allTeams = true; continue; }
             if (token === '--team') { targetTeamName = rawArgs[++i]; continue; }
-            if (token === '--force' || token === '--manual') continue;
+            if (token === '--force' || token === '--manual') { force = true; continue; }
             if (token === '--limit') {
               const parsed = Number(rawArgs[++i]);
               if (!Number.isInteger(parsed) || parsed < 1 || parsed > 50) {
@@ -18359,7 +18360,7 @@ Return this JSON shape:
           const stalled = await this.triageStalledOwnerBacklogs({
             teams,
             limit,
-            force: true,
+            force,
           });
           const unowned = await this.assignUnownedTodoTasks({
             teams,

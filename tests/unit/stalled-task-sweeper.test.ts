@@ -3356,6 +3356,34 @@ describe('stalled task sweeper', () => {
     expect(db.tasks.claim).not.toHaveBeenCalled();
   });
 
+  it('only forces reconcile stalled-owner prompts when the operator requests it', async () => {
+    const db = fakeDb({
+      teams: {
+        listTeams: vi.fn(async () => [team()]),
+      },
+      tasks: {
+        list: vi.fn(async () => []),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-reconcile-force-test', db, { libraryRoot: null }) as any;
+    manager.recoverFailedValidationTasks = vi.fn(async () => ({
+      scanned: 0, recovered: 0, routed: 0, skipped: 0, items: [],
+    }));
+    manager.triageStalledOwnerBacklogs = vi.fn(async () => ({
+      stallMinutes: 45, limit: 20, scannedTeams: 1, scannedOwners: 0, triagedOwners: 0, skippedOwners: [], items: [],
+    }));
+    manager.assignUnownedTodoTasks = vi.fn(async () => ({
+      scannedTeams: 1, scannedTasks: 0, considered: 0, assignedCount: 0, skippedCount: 0,
+      tooFresh: 0, checkinSupervised: 0, items: [],
+    }));
+
+    await manager.executeRemoteCommand('/task reconcile --all --limit 20', TEAM_ID, 'default');
+    await manager.executeRemoteCommand('/task reconcile --all --limit 20 --force', TEAM_ID, 'default');
+
+    expect(manager.triageStalledOwnerBacklogs).toHaveBeenNthCalledWith(1, expect.objectContaining({ force: false }));
+    expect(manager.triageStalledOwnerBacklogs).toHaveBeenNthCalledWith(2, expect.objectContaining({ force: true }));
+  });
+
   it('force-jumpstarts an exact doing task before the automatic stall threshold', async () => {
     const nowSec = Math.floor(NOW_MS / 1000);
     const selected = task({
