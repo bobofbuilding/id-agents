@@ -8,6 +8,10 @@ describe('control-center Brain relay contract', () => {
       method: 'GET',
       path: '/skills/index?limit=1',
     });
+    expect(parseControlBrainRequest({ method: 'GET', path: '/memory/tiers' })).toEqual({
+      method: 'GET',
+      path: '/memory/tiers',
+    });
     expect(parseControlBrainRequest({
       method: 'POST',
       path: '/timeline',

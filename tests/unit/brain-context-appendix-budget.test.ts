@@ -58,4 +58,21 @@ describe('Brain context prompt appendix budget', () => {
     expect(message).toContain('use the brain skill / Brain endpoints');
     expect(message).toContain('save it back to Brain/shared memory');
   });
+
+  it('includes tiered memories in the agent context appendix', () => {
+    const manager = makeManager();
+    const message = manager.withBrainContextAppendix('Continue.', {
+      bundles: [{
+        query: 'delegation policy',
+        memories: [{
+          id: 9,
+          content: 'The default lead delegates execution to team leads.',
+          memory_tier: 'core',
+        }],
+      }],
+      cited: { canonical_source_ids: ['memory:9'] },
+    });
+
+    expect(message).toContain('Memory (core): The default lead delegates execution to team leads. [memory:9]');
+  });
 });

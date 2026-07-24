@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.132]
+
+- Recover completed tasks whose validator fallback was exhausted by routing their persisted completion evidence to an untried live validator; never rerun the completed task, and allow only one bounded recovery cycle.
+- Rotate validation fallback across distinct validators instead of repeatedly selecting the default lead, and expose `/task reconcile` for an immediate deterministic pass over failed validation, stalled owners, and unowned queued work.
+- Run failed-validation recovery automatically in the manager stalled-task sweep so Holding Pattern work progresses without depending on the Control Center button.
+- Add core, long-term, medium-term, and short-term memory horizons to agent guidance and Brain context, with guarded promotion and tier-aware persistence.
+
 ## [0.1.131]
 
 - Keep task-linked active queries in execution instead of falsely moving them into Holding, and bound Holding recovery to six hours or twelve hours of total task age before preserving the blocker and assignment history in actionable triage.

@@ -31,6 +31,16 @@ describe('PROTOCOL_DEFAULTS', () => {
     expect(PROTOCOL_DEFAULTS).toContain('./output/');
   });
 
+  it('defines memory horizons and guarded promotion', () => {
+    expect(PROTOCOL_DEFAULTS).toContain('### Memory horizons');
+    expect(PROTOCOL_DEFAULTS).toContain('**core**');
+    expect(PROTOCOL_DEFAULTS).toContain('**long_term**');
+    expect(PROTOCOL_DEFAULTS).toContain('**medium_term**');
+    expect(PROTOCOL_DEFAULTS).toContain('**short_term**');
+    expect(PROTOCOL_DEFAULTS).toContain('Core constraints outrank');
+    expect(PROTOCOL_DEFAULTS).toContain('evidence, validation, and a stable owner');
+  });
+
   it('contains lifecycle steps', () => {
     expect(PROTOCOL_DEFAULTS).toContain('POST $MANAGER_URL/tasks');
     expect(PROTOCOL_DEFAULTS).toContain('/tasks/<name>/claim');

@@ -262,6 +262,148 @@ describe('stalled task sweeper', () => {
     expect(manager.routeExpiredValidationFallback).toHaveBeenCalledTimes(5);
   });
 
+  it('rotates expired validation to an untried fallback instead of retrying the same lead', async () => {
+    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
+    const ops = team({ id: 'ops-team-id', name: 'operations-team' });
+    const taskManager = agent({
+      id: 'task-manager-1',
+      team_id: ops.id,
+      name: 'task-master',
+    });
+    const pending = task({
+      status: 'done',
+      workflow_state: 'validation_pending',
+      workflow_contract: {
+        version: 'task-workflow.v1',
+        validation: { max_revision_cycles: 2 },
+      },
+      validation_detail: {
+        version: 'task-validation.v1',
+        verdict: 'pending',
+        fallback_attempts: 1,
+        active_validator_id: lead.id,
+        attempted_validator_ids: [lead.id],
+        validator_deadline_at: NOW_MS,
+      },
+    });
+    const db = fakeDb();
+    const manager = new AgentManagerDb('/tmp/id-agents-validation-rotation-test', db, { libraryRoot: null }) as any;
+    manager.validationFallbackCandidates = vi.fn(async () => [
+      { team: team(), agent: lead },
+      { team: ops, agent: taskManager },
+    ]);
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    await expect(manager.routeExpiredValidationFallback(pending, NOW_MS)).resolves.toBe('routed');
+
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'operations-team',
+      'task-master',
+      expect.stringContaining('Validation request for task #12345678'),
+    );
+    expect(db.tasks.updateFields).toHaveBeenCalledWith(pending.id, expect.objectContaining({
+      validation_detail: expect.objectContaining({
+        fallback_attempts: 2,
+        active_validator_id: taskManager.id,
+        attempted_validator_ids: [lead.id, taskManager.id],
+      }),
+      updated_at: pending.updated_at,
+    }));
+  });
+
+  it('recovers legacy exhausted validation once and routes its existing evidence to an untried validator', async () => {
+    const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
+    const ops = team({ id: 'ops-team-id', name: 'operations-team' });
+    const taskManager = agent({
+      id: 'task-manager-1',
+      team_id: ops.id,
+      name: 'task-master',
+    });
+    const failed = task({
+      status: 'done',
+      completed_at: Math.floor(NOW_MS / 1000) - 600,
+      workflow_state: 'failed',
+      workflow_contract: {
+        version: 'task-workflow.v1',
+        validation: { max_revision_cycles: 2 },
+      },
+      validation_detail: {
+        version: 'task-validation.v1',
+        verdict: 'failed',
+        completion_query_id: 'completion-query-1',
+        fallback_attempts: 2,
+        active_validator_id: lead.id,
+        failure_reason: 'validator_fallback_exhausted',
+        failed_at: NOW_MS - 60_000,
+      },
+    });
+    const db = fakeDb({
+      tasks: {
+        list: vi.fn(async ({ status, workflowState }: { status?: string; workflowState?: string } = {}) =>
+          status === 'done' && workflowState === 'failed' ? [failed] : []),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-failed-validation-recovery-test', db, { libraryRoot: null }) as any;
+    manager.validationFallbackCandidates = vi.fn(async () => [
+      { team: team(), agent: lead },
+      { team: ops, agent: taskManager },
+    ]);
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const report = await manager.recoverFailedValidationTasks({
+      teams: [{ id: TEAM_ID, name: 'default' }],
+      limit: 10,
+      nowMs: NOW_MS,
+    });
+
+    expect(report).toMatchObject({ scanned: 1, recovered: 1, routed: 1, skipped: 0 });
+    expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
+      'operations-team',
+      'task-master',
+      expect.stringContaining('Completion evidence query: completion-query-1'),
+    );
+    expect(db.tasks.updateFields).toHaveBeenNthCalledWith(1, failed.id, expect.objectContaining({
+      workflow_state: 'validation_pending',
+      validation_detail: expect.objectContaining({
+        verdict: 'pending',
+        fallback_attempts: 0,
+        attempted_validator_ids: [lead.id],
+        recovery_attempts: 1,
+      }),
+      updated_at: failed.updated_at,
+    }));
+  });
+
+  it('does not loop an exhausted validation after its bounded recovery was already used', async () => {
+    const failed = task({
+      status: 'done',
+      workflow_state: 'failed',
+      validation_detail: {
+        verdict: 'failed',
+        failure_reason: 'validator_fallback_exhausted',
+        recovery_attempts: 1,
+      },
+    });
+    const db = fakeDb({
+      tasks: {
+        list: vi.fn(async ({ status, workflowState }: { status?: string; workflowState?: string } = {}) =>
+          status === 'done' && workflowState === 'failed' ? [failed] : []),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-failed-validation-recovery-limit-test', db, { libraryRoot: null }) as any;
+    manager.sendSupervisionAsk = vi.fn(async () => true);
+
+    const report = await manager.recoverFailedValidationTasks({
+      limit: 10,
+      nowMs: NOW_MS,
+    });
+
+    expect(report).toMatchObject({ scanned: 1, recovered: 0, routed: 0, skipped: 1 });
+    expect(report.items[0]).toMatchObject({ status: 'skipped', reason: 'recovery_limit_reached' });
+    expect(manager.sendSupervisionAsk).not.toHaveBeenCalled();
+    expect(db.tasks.updateFields).not.toHaveBeenCalled();
+  });
+
   it('applies a structured validator reply without requiring the validator to call the manager API', async () => {
     const pending = task({
       status: 'done',

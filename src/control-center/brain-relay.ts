@@ -22,6 +22,7 @@ const GET_PATHS = [
   /^\/controllers(?:\?.*)?$/,
   /^\/graph\/app\/data(?:\?.*)?$/,
   /^\/skills\/index(?:\?.*)?$/,
+  /^\/memory\/tiers(?:\?.*)?$/,
   /^\/memory\/shared(?:\?.*)?$/,
   /^\/memory\/[^/?#]+\/[^/?#]+$/,
   /^\/approvals(?:\?.*)?$/,

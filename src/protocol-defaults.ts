@@ -114,7 +114,17 @@ You have a persistent, file-based memory system at \`./memory/\`. This directory
 
 Build up this memory over time so future sessions have context about your role, ongoing work, decisions made, and patterns to repeat or avoid.
 
-### Memory types (pick one per file)
+### Memory horizons (pick one per file)
+- **core** — identity, authority, safety constraints, durable user preferences, and operating policy
+- **long_term** — validated reusable knowledge, stable decisions, proven skills, and durable outcomes
+- **medium_term** — active goals, projects, plans, and coordination context
+- **short_term** — task, session, turn, and transient working context
+
+Core constraints outrank the other horizons. Promote information upward only
+after it has evidence, validation, and a stable owner. Never promote task-local
+chatter, current runtime state, or an unverified observation.
+
+### Memory content types (pick one per file)
 - **user** — people you work with, their preferences and roles
 - **feedback** — guidance on how to approach work; what to avoid or keep doing
 - **project** — active goals, in-flight work, bugs, decisions, deadlines
@@ -129,6 +139,9 @@ name: short-kebab-slug
 description: one-line summary (used to decide relevance)
 metadata:
   type: user | feedback | project | reference
+  horizon: core | long_term | medium_term | short_term
+  source_ids: []
+  reviewed_at: ISO-8601 timestamp or null
 ---
 <body>
 \`\`\`
@@ -136,7 +149,10 @@ metadata:
 Then add a one-line pointer to \`./memory/MEMORY.md\` (the index).
 
 ### When to save
-Save when you learn something non-obvious that should persist: a user preference, a project decision, a constraint, or a confirmed approach. Do NOT save ephemeral task details or things derivable from the code.
+Save when you learn something non-obvious that should persist: a user preference,
+a project decision, a constraint, or a confirmed approach. Use short-term only
+when working context must survive a session boundary. Do not preserve ordinary
+progress chatter or things derivable from the code.
 
 ### When to read
 Load relevant memories at the start of any non-trivial task. Verify file paths and symbols in memories are still current before acting on them.`;

@@ -639,6 +639,14 @@ interface BrainVolunteerContext {
     entities?: Array<{ id?: string; name?: string; type?: string }>;
     facts?: Array<{ id?: number; entity_id?: string; field?: string; value?: unknown; source?: string }>;
     textUnits?: Array<{ id?: number; title?: string; content?: string; source_kind?: string; source_id?: string }>;
+    memories?: Array<{
+      id?: number;
+      source_id?: string;
+      agent_id?: string;
+      key?: string;
+      content?: string;
+      memory_tier?: 'core' | 'long_term' | 'medium_term' | 'short_term' | string;
+    }>;
   }>;
   cited?: {
     entity_ids?: string[];
@@ -8055,6 +8063,7 @@ Return this JSON shape:
       ],
       shared: promotion.reusable === true,
       project: input.project || 'default',
+      tier: promotion.reusable === true ? 'long_term' : 'medium_term',
     });
   }
 
@@ -8315,8 +8324,10 @@ Return this JSON shape:
     return [
       `Brain workflow required for ${intent} work:`,
       '- Before acting, use the brain skill / Brain endpoints to recall relevant shared memory, source context, facts, and skill recommendations.',
+      '- Respect memory horizons: core = identity/authority/safety/policy; long-term = validated reusable knowledge; medium-term = active goals/projects/plans; short-term = task/session working context.',
+      '- Core constraints outrank other memories. Prefer relevant long-term evidence, use medium-term context only while its goal or project remains active, and never promote short-term chatter without validation and provenance.',
       '- For submissions, knowledge, materials, skills, catalog, tools, MCP, plugin, or capability-selection work, prefer Brain-backed evidence over re-fetching or guessing.',
-      '- When you use Brain context, cite source ids as used_source_ids / used_instruction_ids in your result; when you produce reusable knowledge, save it back to Brain/shared memory.',
+      '- When you use Brain context, cite source ids as used_source_ids / used_instruction_ids in your result; when you produce reusable knowledge, save it back to Brain/shared memory with the narrowest accurate memory tier.',
     ];
   }
 
@@ -8340,6 +8351,12 @@ Return this JSON shape:
       }
       for (const fact of (bundle.facts || []).slice(0, 4)) {
         if (fact?.id) lines.push(`  Fact: ${fact.entity_id}.${fact.field} = ${JSON.stringify(fact.value)} [fact:${fact.id}]`);
+      }
+      for (const memory of (bundle.memories || []).slice(0, 3)) {
+        if (!memory?.id) continue;
+        const tier = String(memory.memory_tier || 'long_term').replace(/_/g, '-');
+        const excerpt = this.compactBrainContextText(memory.content || '', 360);
+        lines.push(`  Memory (${tier}): ${excerpt} [memory:${memory.id}]`);
       }
       for (const unit of (bundle.textUnits || []).slice(0, 2)) {
         if (!unit?.id) continue;
@@ -10732,6 +10749,7 @@ Return this JSON shape:
         content: JSON.stringify(cooldown),
         shared: true,
         project: teamName,
+        tier: 'short_term',
       }).catch(() => {});
 
       const failover = await this.handleRuntimeRateLimitFailover(teamId, teamName, cooldown);
@@ -18279,6 +18297,71 @@ Return this JSON shape:
           return { ok: true, result: report };
         }
 
+        if (subCmd === 'reconcile' || subCmd === 'reconcile-holding') {
+          // /task reconcile [--team <team>|--all] [--limit N]
+          // Deterministic immediate pass over manager-owned recovery lanes. The
+          // same failed-validation recovery also runs in the background sweep.
+          const rawArgs = args.slice(1);
+          let targetTeamName: string | undefined;
+          let allTeams = false;
+          let limit = 20;
+
+          for (let i = 0; i < rawArgs.length; i++) {
+            const token = rawArgs[i];
+            if (token === '--all') { allTeams = true; continue; }
+            if (token === '--team') { targetTeamName = rawArgs[++i]; continue; }
+            if (token === '--force' || token === '--manual') continue;
+            if (token === '--limit') {
+              const parsed = Number(rawArgs[++i]);
+              if (!Number.isInteger(parsed) || parsed < 1 || parsed > 50) {
+                return { ok: false, error: '--limit must be an integer between 1 and 50' };
+              }
+              limit = parsed;
+              continue;
+            }
+            return { ok: false, error: `Unknown option ${token}` };
+          }
+          if (allTeams && targetTeamName) {
+            return { ok: false, error: 'Use either --all or --team <team>, not both' };
+          }
+
+          let teams: Array<{ id: string; name: string }>;
+          if (allTeams) {
+            teams = (await this.db.teams.listTeams()).map((team) => ({ id: team.id, name: team.name }));
+          } else if (targetTeamName) {
+            const targetTeam = await this.db.teams.getTeamByName(targetTeamName);
+            if (!targetTeam) return { ok: false, error: `Team "${targetTeamName}" not found` };
+            teams = [{ id: targetTeam.id, name: targetTeam.name }];
+          } else {
+            teams = [{ id: teamId, name: teamName }];
+          }
+
+          const nowMs = Date.now();
+          const validation = await this.recoverFailedValidationTasks({ teams, limit, nowMs });
+          const stalled = await this.triageStalledOwnerBacklogs({
+            teams,
+            limit,
+            force: true,
+          });
+          const unowned = await this.assignUnownedTodoTasks({
+            teams,
+            limit,
+            perTeamLimit: Math.max(1, Math.ceil(limit / Math.max(1, teams.length))),
+            minAgeMs: 0,
+            dispatch: true,
+          });
+          return {
+            ok: true,
+            result: {
+              version: 'task-reconcile.v1',
+              teams: teams.map((team) => team.name),
+              validation,
+              stalled,
+              unowned,
+            },
+          };
+        }
+
         if (subCmd === 'triage-stalled' || subCmd === 'stalled-triage' || subCmd === 'jumpstart-stalled' || subCmd === 'jumpstart') {
           // /task triage-stalled [--team <team>|--all] [--owner <agent>] [--limit N]
           // /task jumpstart-stalled [#task|--task <task>] targets one stalled task.
@@ -18937,7 +19020,7 @@ Return this JSON shape:
 
         return {
           ok: false,
-          error: 'Usage: /task <create|sync-autopilot-goals|list|lead-backlog|triage-stalled|jumpstart-stalled|assign-unowned|prune-backlog|assign|claim|done|remove|delete> ...',
+          error: 'Usage: /task <create|sync-autopilot-goals|list|lead-backlog|reconcile|triage-stalled|jumpstart-stalled|assign-unowned|prune-backlog|assign|claim|done|remove|delete> ...',
         };
       }
 
@@ -19504,6 +19587,37 @@ Return this JSON shape:
     return out;
   }
 
+  private validationAttemptedValidatorIds(validation: Record<string, unknown>): string[] {
+    const attempted = Array.isArray(validation.attempted_validator_ids)
+      ? validation.attempted_validator_ids
+        .map((value) => String(value || '').trim())
+        .filter(Boolean)
+      : [];
+    const active = typeof validation.active_validator_id === 'string'
+      ? validation.active_validator_id.trim()
+      : '';
+    if (active && !attempted.includes(active)) attempted.push(active);
+    return [...new Set(attempted)];
+  }
+
+  private async validationFallbackCandidates(
+    task: TaskRow,
+  ): Promise<Array<{ team: TeamRow; agent: AgentRow }>> {
+    if (!task.team_id) return [];
+    const team = await this.db.teams.getTeam(task.team_id).catch(() => null);
+    if (!team) return [];
+    const lead = await this.findSupervisionLead(task.team_id).catch(() => null);
+    const managers = await this.findTaskManagerFallbacks().catch(() => []);
+    return [
+      ...(lead ? [{ team, agent: lead }] : []),
+      ...managers,
+    ].filter((candidate, index, all) =>
+      candidate.agent.id !== task.owner
+      && this.isLiveForSupervision(candidate.agent)
+      && all.findIndex((item) => item.agent.id === candidate.agent.id) === index,
+    );
+  }
+
   private async routeExpiredValidationFallback(task: TaskRow, nowMs: number): Promise<'routed' | 'failed' | 'waiting'> {
     if (task.workflow_state !== 'validation_pending') return 'waiting';
     const validation = (task.validation_detail || {}) as Record<string, unknown>;
@@ -19523,23 +19637,13 @@ Return this JSON shape:
       return 'failed';
     }
 
-    const teamId = task.team_id;
-    if (!teamId) return 'waiting';
-    const team = await this.db.teams.getTeam(teamId).catch(() => null);
-    if (!team) return 'waiting';
-    const lead = await this.findSupervisionLead(teamId).catch(() => null);
-    const managers = await this.findTaskManagerFallbacks().catch(() => []);
-    const candidates = [
-      ...(lead ? [{ team, agent: lead }] : []),
-      ...managers,
-    ].filter((candidate, index, all) => all.findIndex((item) => item.agent.id === candidate.agent.id) === index);
-    const validator = candidates.find((candidate) =>
-      candidate.agent.id !== task.owner
-      && this.isLiveForSupervision(candidate.agent),
-    );
+    const candidates = await this.validationFallbackCandidates(task);
+    const attemptedValidatorIds = this.validationAttemptedValidatorIds(validation);
+    const validator = candidates.find((candidate) => !attemptedValidatorIds.includes(candidate.agent.id))
+      ?? candidates[attempts % Math.max(1, candidates.length)];
     if (!validator) return 'waiting';
     const marker = this.taskShortRef(task);
-    const taskTeamName = team.name;
+    const taskTeamName = (await this.db.teams.getTeam(task.team_id!).catch(() => null))?.name || 'default';
     const completionQueryId = typeof validation.completion_query_id === 'string'
       ? validation.completion_query_id
       : null;
@@ -19572,6 +19676,7 @@ Return this JSON shape:
         fallback_attempts: attempts + 1,
         active_validator_id: validator.agent.id,
         active_validator_team_id: validator.team.id,
+        attempted_validator_ids: [...new Set([...attemptedValidatorIds, validator.agent.id])],
         validator_deadline_at: nowMs + 15 * 60_000,
         last_fallback_at: nowMs,
       },
@@ -19579,6 +19684,98 @@ Return this JSON shape:
       updated_at: task.updated_at,
     });
     return 'routed';
+  }
+
+  private async recoverFailedValidationTasks(params: {
+    teams?: Array<{ id: string; name: string }>;
+    limit: number;
+    nowMs: number;
+  }): Promise<{
+    scanned: number;
+    recovered: number;
+    routed: number;
+    skipped: number;
+    items: Array<{ task: string; team: string; status: string; reason: string; validator?: string }>;
+  }> {
+    const teamIds = params.teams?.length ? new Set(params.teams.map((team) => team.id)) : null;
+    const rows = await this.db.tasks.list({
+      status: 'done',
+      workflowState: 'failed',
+      order: 'updated_asc',
+      limit: Math.max(params.limit * 4, params.limit),
+    }).catch(() => [] as TaskRow[]);
+    const items: Array<{ task: string; team: string; status: string; reason: string; validator?: string }> = [];
+    let recovered = 0;
+    let routed = 0;
+    let skipped = 0;
+
+    for (const task of rows) {
+      if (recovered >= params.limit) break;
+      if (!task.team_id || (teamIds && !teamIds.has(task.team_id))) continue;
+      const validation = (task.validation_detail || {}) as Record<string, unknown>;
+      if (validation.failure_reason !== 'validator_fallback_exhausted') continue;
+      const recoveryAttempts = Number(validation.recovery_attempts || 0);
+      const team = await this.db.teams.getTeam(task.team_id).catch(() => null);
+      const teamName = team?.name || task.team_id;
+      const taskRef = this.taskShortRef(task);
+      if (recoveryAttempts >= 1) {
+        skipped++;
+        items.push({ task: taskRef, team: teamName, status: 'skipped', reason: 'recovery_limit_reached' });
+        continue;
+      }
+
+      const attemptedValidatorIds = this.validationAttemptedValidatorIds(validation);
+      const candidates = await this.validationFallbackCandidates(task);
+      const nextValidator = candidates.find((candidate) => !attemptedValidatorIds.includes(candidate.agent.id));
+      if (!nextValidator) {
+        skipped++;
+        items.push({ task: taskRef, team: teamName, status: 'skipped', reason: 'no_untried_validator' });
+        continue;
+      }
+
+      const recoveredValidation = {
+        ...validation,
+        verdict: 'pending',
+        failure_reason: null,
+        failed_at: null,
+        fallback_attempts: 0,
+        attempted_validator_ids: attemptedValidatorIds,
+        recovery_attempts: recoveryAttempts + 1,
+        recovered_at: params.nowMs,
+        validator_deadline_at: params.nowMs,
+      };
+      await this.db.tasks.updateFields(task.id, {
+        workflow_state: 'validation_pending',
+        validation_detail: recoveredValidation,
+        outcome_detail: {
+          ...(task.outcome_detail || {}),
+          validation_passed: false,
+          validator_fallback_exhausted: false,
+          validation_recovery_started_at: params.nowMs,
+        },
+        lifecycle_updated_at: Math.floor(params.nowMs / 1000),
+        // Preserve the completion timestamp and original work activity. This
+        // recovery re-validates existing evidence; it does not rerun the task.
+        updated_at: task.updated_at,
+      });
+      recovered++;
+
+      const route = await this.routeExpiredValidationFallback({
+        ...task,
+        workflow_state: 'validation_pending',
+        validation_detail: recoveredValidation,
+      }, params.nowMs);
+      if (route === 'routed') routed++;
+      items.push({
+        task: taskRef,
+        team: teamName,
+        status: route,
+        reason: route === 'routed' ? 'failed_validation_recovered' : `validation_${route}`,
+        validator: route === 'routed' ? `${nextValidator.team.name}/${nextValidator.agent.name}` : undefined,
+      });
+    }
+
+    return { scanned: rows.length, recovered, routed, skipped, items };
   }
 
   private supervisionDispatchContext(message: string): RemoteDispatchContext | undefined {
@@ -20976,6 +21173,19 @@ Return this JSON shape:
     let nudged = 0;
     let unownedAssigned = 0;
     const assignedTodoTaskIds = new Set<string>();
+
+    const failedValidationRecovery = await this.recoverFailedValidationTasks({
+      limit: VALIDATION_MAX_PER_SWEEP,
+      nowMs: now,
+    }).catch((err) => {
+      console.warn(`[Workflow] Failed-validation recovery failed: ${err?.message || err}`);
+      return { scanned: 0, recovered: 0, routed: 0, skipped: 0, items: [] };
+    });
+    if (failedValidationRecovery.recovered > 0) {
+      this.managerLog(
+        `Recovered ${failedValidationRecovery.recovered} exhausted validation task(s); routed ${failedValidationRecovery.routed}`,
+      );
+    }
 
     const validationPending = await this.db.tasks.list({
       status: 'done',
