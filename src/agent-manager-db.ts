@@ -150,6 +150,7 @@ import {
 } from './runtime/registry.js';
 import { resolveModelAlias } from './core/model-aliases.js';
 import { buildCapabilityIntakeRecord } from './capability-intake.js';
+import { adminAuthorizationHeaders, adminBearerMatches, captureAdminToken } from './admin-auth.js';
 export { MODEL_ALIASES, resolveModelAlias } from './core/model-aliases.js';
 
 // ES module equivalent of __dirname
@@ -940,6 +941,8 @@ export class AgentManagerDb {
    * means "no library configured" — listings return empty, detail returns 404.
    */
   private libraryRoot: string | null;
+  /** Supervisor credential captured and removed from process.env before any agent spawn. */
+  private readonly idaccAdminToken: string;
 
   /** Log a manager activity message to the ring buffer (not stdout) */
   private managerLog(msg: string) {
@@ -3603,6 +3606,7 @@ export class AgentManagerDb {
         'content-type': 'application/json',
         'x-id-team': teamName,
         'x-id-admin': '1',
+        ...adminAuthorizationHeaders(this.idaccAdminToken),
       },
       body: JSON.stringify({ to, from, message }),
     });
@@ -3757,6 +3761,7 @@ Return this JSON shape:
       libraryRoot?: string | null;
     },
   ) {
+    this.idaccAdminToken = captureAdminToken();
     this.baseWorkDir = baseWorkDir;
     this.db = db;
     if (opts?.deliverFn) this.deliverFn = opts.deliverFn;
@@ -9154,14 +9159,16 @@ Return this JSON shape:
 
   /**
    * Resolve whether a request is from an admin principal.
-   * Admin = loopback IP + X-Id-Admin: 1 header.
+   * Admin = loopback IP + X-Id-Admin: 1 header. When IDACC_ADMIN_TOKEN
+   * is configured, the request must also carry its bearer credential.
    */
   private isAdminRequest(req: express.Request): boolean {
     const ip = req.ip || '';
     const isLoopback =
       ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
     const hasAdminHeader = req.headers['x-id-admin'] === '1';
-    return isLoopback && hasAdminHeader;
+    const hasAdminBearer = adminBearerMatches(req.headers.authorization, this.idaccAdminToken);
+    return isLoopback && hasAdminHeader && hasAdminBearer;
   }
 
   /**
@@ -9170,7 +9177,7 @@ Return this JSON shape:
    *   (req as any).ctx = { principal, teamName, teamId }
    *
    * principal:
-   *   'admin'  — loopback IP + X-Id-Admin: 1
+   *   'admin'  — loopback IP + X-Id-Admin: 1 + configured IDACC bearer
    *   'agent'  — X-Id-Agent: <id> present and the agent belongs to the resolved team
    *   'anon'   — all other callers
    *
@@ -20314,7 +20321,12 @@ Return this JSON shape:
     try {
       const res = await fetch(`http://127.0.0.1:${this.managementPort}/remote`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json', 'X-Id-Admin': '1', 'X-Id-Team': teamName },
+        headers: {
+          'content-type': 'application/json',
+          'X-Id-Admin': '1',
+          'X-Id-Team': teamName,
+          ...adminAuthorizationHeaders(this.idaccAdminToken),
+        },
         body: JSON.stringify({
           command: `/ask ${agentName} ${quoted}`,
           ...(context ? { context } : {}),

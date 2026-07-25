@@ -11,6 +11,8 @@
  * testable against a real in-process manager without spawning a subprocess.
  */
 
+import { adminAuthorizationHeaders } from '../admin-auth.js';
+
 export interface PublicCommandDeps {
   /** e.g. "http://127.0.0.1:4100" */
   managerBaseUrl: string;
@@ -73,6 +75,7 @@ function publicHeaders(extra?: Record<string, string>): Record<string, string> {
     'Content-Type': 'application/json',
     'X-Id-Team': 'public',
     'X-Id-Admin': '1',
+    ...adminAuthorizationHeaders(),
     ...extra,
   };
 }
@@ -372,6 +375,7 @@ export async function registerPublicOnchain(
       headers: {
         'X-Id-Team': 'public',
         'X-Id-Admin': '1',
+        ...adminAuthorizationHeaders(),
       },
     }) as any;
     if (detailResp.ok) {
