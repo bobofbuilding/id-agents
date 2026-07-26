@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.145]
+
+- Add parent-supervised, cross-platform local-agent lifecycle management with exact readiness identity, collision-safe loopback ports, private bounded logs, graceful Manager restart restoration, and explicit preservation of agents the person stopped.
+- Require exact persisted agent identity and process evidence before terminating a worker, and terminate only verified process trees across macOS, Linux, and Windows.
+- Keep every worker on the Manager's selected workspace and database, including profile-owned SQLite in the unified desktop and deliberate PostgreSQL in standalone deployments.
+- Resolve every managed CLI through portable PATH/PATHEXT rules, settle missing executables without hanging, terminate cancelled CLI process trees, keep Claude and Codex prompts on standard input, and support packaged Electron workers without shell quoting or predictable prompt files.
+- Update the task-discipline guidance to use the Manager's duplicate-task guard and current asynchronous delegation contract.
+
 ## [0.1.144]
 
 - Refresh the production dependency lock to remove all high-severity npm advisories from the shipped Manager tree.

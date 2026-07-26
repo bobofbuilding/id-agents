@@ -5,7 +5,7 @@
  * Wraps the OpenAI Codex CLI (`codex exec`) for agents.
  * Supports both API key auth (OPENAI_API_KEY) and OAuth login (codex login).
  *
- * Spawns `codex exec "<prompt>" --json --cd <dir>` for each request.
+ * Spawns `codex exec --json --cd <dir> -` and sends each request over stdin.
  * Parses JSONL output and yields HarnessMessage objects.
  *
  * Session support:
@@ -14,11 +14,13 @@
  *   combining `resume` with the non-interactive flags used here
  */
 
-import { spawn, spawnSync, ChildProcess } from 'child_process';
+import { ChildProcess } from 'child_process';
 import { AgentHarness, HarnessOptions, HarnessMessage, HarnessType, McpServerSpec } from './types.js';
 import { reportTurnUsage } from './usage-report.js';
 import { terminateChildProcessTree } from './claude-code-cli.js';
 import { detectClaudeCliRateLimit } from './rate-limit.js';
+import { resolveExecutable } from '../lib/executable-resolution.js';
+import { portableSpawn, portableSpawnSync } from '../lib/portable-spawn.js';
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -61,6 +63,19 @@ export function codexReasoningEffort(raw: string | undefined): 'low' | 'medium' 
   return undefined;
 }
 
+export interface CodexStdinInvocation {
+  args: string[];
+  stdin: string;
+}
+
+/** Keep complete prompts on stdin and out of argv/shared temporary files. */
+export function codexStdinInvocation(args: string[], prompt: string): CodexStdinInvocation {
+  return {
+    args: [...args, '-'],
+    stdin: prompt,
+  };
+}
+
 function isExecutable(file: string): boolean {
   try {
     const st = fs.statSync(file);
@@ -70,20 +85,6 @@ function isExecutable(file: string): boolean {
   } catch {
     return false;
   }
-}
-
-function findCommandOnPath(command: string, pathEnv: string | undefined): string | undefined {
-  const pathExt = process.platform === 'win32'
-    ? (process.env.PATHEXT || '.EXE;.CMD;.BAT;.COM').split(';')
-    : [''];
-  for (const dir of (pathEnv || '').split(path.delimiter)) {
-    if (!dir) continue;
-    for (const ext of pathExt) {
-      const candidate = path.join(dir, `${command}${ext}`);
-      if (isExecutable(candidate)) return candidate;
-    }
-  }
-  return undefined;
 }
 
 function codexPlatformTarget(): { packageName: string; triple: string; binary: string } | undefined {
@@ -128,20 +129,29 @@ function nativeCodexFromShim(shimPath: string): ResolvedCodexExecutable | undefi
   };
 }
 
-export function resolveCodexExecutable(env: NodeJS.ProcessEnv = process.env): ResolvedCodexExecutable {
+export function resolveCodexExecutable(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): ResolvedCodexExecutable {
   const override = env.ID_AGENT_CODEX_BIN || env.CODEX_BIN || env.CODEX_EXECUTABLE;
   if (override) {
+    const command = resolveExecutable(override, { env, platform }) || override;
     return {
-      command: override,
-      display: override,
-      native: path.basename(override).startsWith('codex') && override !== 'codex',
+      command,
+      display: command,
+      native: path.basename(command).startsWith('codex') && command !== 'codex' && !/\.(?:cmd|bat)$/i.test(command),
     };
   }
 
-  const shim = findCommandOnPath('codex', env.PATH || process.env.PATH);
+  const shim = resolveExecutable('codex', { env, platform });
   if (shim) {
     const native = nativeCodexFromShim(shim);
     if (native) return native;
+    return {
+      command: shim,
+      display: shim,
+      native: false,
+    };
   }
 
   return { command: 'codex', display: 'codex', native: false };
@@ -165,9 +175,11 @@ function compareVersions(a: string | undefined, b: string): number {
   return 0;
 }
 
-function codexVersion(command: string): string | undefined {
+export function codexVersion(command: string): string | undefined {
   try {
-    const out = spawnSync(command, ['--version'], {
+    // cross-spawn is required here as well as for execution: raw spawnSync
+    // cannot launch the npm-generated codex.cmd shim on Windows.
+    const out = portableSpawnSync(command, ['--version'], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 3000,
@@ -428,21 +440,16 @@ export class CodexHarness implements AgentHarness {
       }
     }
 
-    // Write prompt to temp file to avoid shell escaping issues
-    const promptFile = path.join(os.tmpdir(), `codex-prompt-${Date.now()}.txt`);
-    fs.writeFileSync(promptFile, prompt);
-    console.log(`[Codex] Prompt written to temp file: ${promptFile} (${prompt.length} chars)`);
-
     if (resumeId) {
       console.log(`[Codex] Resuming thread ${resumeId} for conversation continuity`);
     }
 
-    // Read prompt from stdin
-    args.push('-');
+    const invocation = codexStdinInvocation(args, prompt);
+    console.log(`[Codex] Prompt transport: stdin (${invocation.stdin.length} chars)`);
 
     // Fail-closed: never spawn with a credential on the command line.
-    assertNoSecretsInArgv(args);
-    console.log(`[Codex] Full command: ${redactForLog(codexExecutable.display)} ${redactForLog(args.join(' '))}`);
+    assertNoSecretsInArgv(invocation.args);
+    console.log(`[Codex] Full command: ${redactForLog(codexExecutable.display)} ${redactForLog(invocation.args.join(' '))}`);
     if (codexExecutable.native) {
       console.log(`[Codex] Using native binary directly; bypassing the Node CLI shim`);
     }
@@ -458,7 +465,7 @@ export class CodexHarness implements AgentHarness {
       mergedEnv.CODEX_MANAGED_PACKAGE_ROOT ||= codexExecutable.managedPackageRoot;
     }
 
-    const proc = spawn(codexExecutable.command, args, {
+    const proc = portableSpawn(codexExecutable.command, invocation.args, {
       cwd: workingDir,
       env: mergedEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -476,12 +483,8 @@ export class CodexHarness implements AgentHarness {
 
     console.log(`[Codex] Process spawned, PID: ${proc.pid}`);
 
-    // Write prompt to stdin and close
-    proc.stdin?.write(prompt);
-    proc.stdin?.end();
-
-    // Clean up temp file
-    try { fs.unlinkSync(promptFile); } catch {}
+    // Deliver the full prompt only over the child stdin pipe.
+    proc.stdin?.end(invocation.stdin);
 
     let lastResult = '';
     let sessionId: string | undefined;
@@ -530,8 +533,8 @@ export class CodexHarness implements AgentHarness {
         checkDone(); // No stdout — count it as done
       }
 
-      proc.on('exit', (code) => {
-        console.log(`[Codex] Process exited with code ${code}`);
+      proc.on('close', (code) => {
+        console.log(`[Codex] Process closed with code ${code}`);
         exitCode = code;
         checkDone();
       });
@@ -844,7 +847,7 @@ export class CodexHarness implements AgentHarness {
   }
 
   cancel(): boolean {
-    if (this.currentProcess && !this.currentProcess.killed) {
+    if (this.currentProcess && this.currentProcess.exitCode === null && this.currentProcess.signalCode === null) {
       this.cancelled = true;
       const proc = this.currentProcess;
       terminateChildProcessTree(proc, 'SIGTERM');

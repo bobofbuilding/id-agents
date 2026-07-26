@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
 
-import { claudeCliToolArgs } from '../../src/harness/claude-code-cli.js';
+import {
+  claudeCliStdinInvocation,
+  claudeCliToolArgs,
+} from '../../src/harness/claude-code-cli.js';
 
 describe('Claude Code CLI harness policy', () => {
   it('restricts available tools for control-plane prompts', () => {
@@ -22,5 +26,49 @@ describe('Claude Code CLI harness policy', () => {
       '--allowedTools',
       'Read,Write,Edit,Bash',
     ]);
+  });
+
+  it('delivers complete prompts only over direct CLI stdin', () => {
+    const prompt = 'line one\n"$(cat /shared/secret)" & echo should-not-run';
+    const invocation = claudeCliStdinInvocation([
+      '-p',
+      prompt,
+      '--output-format',
+      'json',
+      '--model',
+      'sonnet',
+    ], { CLAUDE_PATH: 'C:\\Tools\\claude.exe' });
+
+    expect(invocation.command).toBe('C:\\Tools\\claude.exe');
+    expect(invocation.args).toEqual([
+      '-p',
+      '--output-format',
+      'json',
+      '--model',
+      'sonnet',
+    ]);
+    expect(invocation.args).not.toContain(prompt);
+    expect(invocation.stdin).toBe(prompt);
+  });
+
+  it('preserves a resolved Windows .cmd shim for the portable launcher', () => {
+    const prompt = 'private prompt with %TOKEN% & shell metacharacters';
+    const invocation = claudeCliStdinInvocation(
+      ['-p', prompt],
+      { CLAUDE_PATH: 'C:\\Users\\consumer\\AppData\\Roaming\\npm\\claude.cmd' },
+      'win32',
+    );
+
+    expect(invocation.command).toBe('C:\\Users\\consumer\\AppData\\Roaming\\npm\\claude.cmd');
+    expect(invocation.args).not.toContain(prompt);
+    expect(invocation.stdin).toBe(prompt);
+  });
+
+  it('does not route prompts through bash, cat, or predictable temp files', () => {
+    const source = readFileSync(new URL('../../src/harness/claude-code-cli.ts', import.meta.url), 'utf8');
+    expect(source).not.toContain("spawn('/bin/bash'");
+    expect(source).not.toContain('"$(cat');
+    expect(source).not.toContain('claude-prompt-');
+    expect(source).toContain('portableSpawn(invocation.command, invocation.args');
   });
 });

@@ -11,11 +11,14 @@
  * on argv.
  */
 
-import { spawn, ChildProcess } from 'child_process';
+import { ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { AgentHarness, HarnessOptions, HarnessMessage, HarnessType } from './types.js';
+import { resolveExecutable } from '../lib/executable-resolution.js';
+import { portableSpawn } from '../lib/portable-spawn.js';
+import { terminateChildProcessTree } from './claude-code-cli.js';
 
 const SECRET_ENV_NAMES = [
   'OPENAI_API_KEY',
@@ -115,15 +118,17 @@ export class CopilotCliHarness implements AgentHarness {
     }
 
     const mergedEnv = { ...process.env, ...(options.env || {}) } as NodeJS.ProcessEnv;
-    const copilotPath = process.env.COPILOT_CLI_PATH || 'copilot';
+    const configuredCopilotPath = process.env.COPILOT_CLI_PATH || 'copilot';
+    const copilotPath = resolveExecutable(configuredCopilotPath, { env: mergedEnv }) || configuredCopilotPath;
     console.log(`[Copilot CLI] Full command: ${copilotPath} ${redactForLog(args.join(' '))}`);
 
     this.cancelled = false;
 
-    const proc = spawn(copilotPath, args, {
+    const proc = portableSpawn(copilotPath, args, {
       cwd: workingDir,
       env: mergedEnv,
       stdio: ['ignore', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32',
     });
 
     this.currentProcess = proc;
@@ -143,9 +148,9 @@ export class CopilotCliHarness implements AgentHarness {
     console.log(`[Copilot CLI] Process spawned, PID: ${proc.pid}`);
 
     const completionPromise = new Promise<void>((resolve) => {
-      proc.on('exit', (code) => {
+      proc.on('close', (code) => {
         exitCode = code;
-        console.log(`[Copilot CLI] Process exited with code ${code}`);
+        console.log(`[Copilot CLI] Process closed with code ${code}`);
         resolve();
       });
     });
@@ -156,7 +161,6 @@ export class CopilotCliHarness implements AgentHarness {
     while (!done) {
       await new Promise((r) => setTimeout(r, 100));
       if (this.cancelled) {
-        proc.kill('SIGTERM');
         try { fs.rmSync(promptFile, { force: true }); } catch { /* best effort */ }
         this.currentProcess = null;
         yield { type: 'error', content: 'Query was cancelled' };
@@ -193,18 +197,18 @@ export class CopilotCliHarness implements AgentHarness {
   }
 
   cancel(): boolean {
-    if (this.currentProcess && !this.currentProcess.killed) {
-      const pid = this.currentProcess.pid;
+    if (this.currentProcess && this.currentProcess.exitCode === null && this.currentProcess.signalCode === null) {
+      const proc = this.currentProcess;
+      const pid = proc.pid;
       console.log(`[Copilot CLI] Cancelling process PID: ${pid}`);
       this.cancelled = true;
-      this.currentProcess.kill('SIGTERM');
-      const proc = this.currentProcess;
+      terminateChildProcessTree(proc, 'SIGTERM');
       setTimeout(() => {
-        if (proc && !proc.killed) {
+        if (proc.exitCode === null && proc.signalCode === null) {
           console.log(`[Copilot CLI] Force killing process PID: ${pid}`);
-          proc.kill('SIGKILL');
+          terminateChildProcessTree(proc, 'SIGKILL');
         }
-      }, 2000);
+      }, 2000).unref?.();
       return true;
     }
     return false;

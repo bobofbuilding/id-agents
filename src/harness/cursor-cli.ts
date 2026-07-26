@@ -21,8 +21,11 @@
  *   {type:"result",   subtype:"success"|"error", is_error, result, session_id, duration_ms, usage}
  */
 
-import { spawn, ChildProcess } from 'child_process';
+import { ChildProcess } from 'child_process';
 import { AgentHarness, HarnessOptions, HarnessMessage, HarnessType } from './types.js';
+import { resolveExecutable } from '../lib/executable-resolution.js';
+import { portableSpawn } from '../lib/portable-spawn.js';
+import { terminateChildProcessTree } from './claude-code-cli.js';
 
 /** Extract concatenated text from a Cursor message.content[] block. */
 function extractMessageText(message: any): string {
@@ -165,15 +168,17 @@ export class CursorCliHarness implements AgentHarness {
 
     const mergedEnv = { ...process.env, ...(options.env || {}) } as NodeJS.ProcessEnv;
 
-    const cursorPath = process.env.CURSOR_AGENT_PATH || 'cursor-agent';
+    const configuredCursorPath = process.env.CURSOR_AGENT_PATH || 'cursor-agent';
+    const cursorPath = resolveExecutable(configuredCursorPath, { env: mergedEnv }) || configuredCursorPath;
     console.log(`[Cursor CLI] Full command: ${cursorPath} ${args.join(' ')}`);
 
     this.cancelled = false;
 
-    const proc = spawn(cursorPath, args, {
+    const proc = portableSpawn(cursorPath, args, {
       cwd: workingDir,
       env: mergedEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32',
     });
 
     this.currentProcess = proc;
@@ -230,8 +235,10 @@ export class CursorCliHarness implements AgentHarness {
         checkDone();
       }
 
-      proc.on('exit', (code) => {
-        console.log(`[Cursor CLI] Process exited with code ${code}`);
+      // `close` follows both normal exits and spawn errors, and only fires
+      // after stdio has closed. Waiting for `exit` alone hangs on ENOENT.
+      proc.on('close', (code) => {
+        console.log(`[Cursor CLI] Process closed with code ${code}`);
         exitCode = code;
         checkDone();
       });
@@ -259,7 +266,6 @@ export class CursorCliHarness implements AgentHarness {
       }
 
       if (this.cancelled) {
-        proc.kill('SIGTERM');
         yield { type: 'error', content: 'Cancelled' };
         state.terminalEmitted = true;
         break;
@@ -288,18 +294,18 @@ export class CursorCliHarness implements AgentHarness {
   }
 
   cancel(): boolean {
-    if (this.currentProcess && !this.currentProcess.killed) {
-      const pid = this.currentProcess.pid;
+    if (this.currentProcess && this.currentProcess.exitCode === null && this.currentProcess.signalCode === null) {
+      const proc = this.currentProcess;
+      const pid = proc.pid;
       console.log(`[Cursor CLI] Cancelling process PID: ${pid}`);
       this.cancelled = true;
-      this.currentProcess.kill('SIGTERM');
-      const proc = this.currentProcess;
+      terminateChildProcessTree(proc, 'SIGTERM');
       setTimeout(() => {
-        if (proc && !proc.killed) {
+        if (proc.exitCode === null && proc.signalCode === null) {
           console.log(`[Cursor CLI] Force killing process PID: ${pid}`);
-          proc.kill('SIGKILL');
+          terminateChildProcessTree(proc, 'SIGKILL');
         }
-      }, 2000);
+      }, 2000).unref?.();
       return true;
     }
     return false;

@@ -7,11 +7,14 @@
  * context is not exposed through argv.
  */
 
-import { spawn, ChildProcess } from 'child_process';
+import { ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { AgentHarness, HarnessOptions, HarnessMessage, HarnessType } from './types.js';
+import { resolveExecutable } from '../lib/executable-resolution.js';
+import { portableSpawn } from '../lib/portable-spawn.js';
+import { terminateChildProcessTree } from './claude-code-cli.js';
 
 function safeAgentKey(): string {
   const team = process.env.ID_AGENT_TEAM || process.env.ID_TEAM || 'default';
@@ -52,17 +55,19 @@ export class KimiCliHarness implements AgentHarness {
     if (options.model && options.model !== 'default') args.push('-m', options.model);
 
     const mergedEnv = { ...process.env, ...(options.env || {}) } as NodeJS.ProcessEnv;
-    const kimiPath = process.env.KIMI_CLI_PATH || 'kimi';
+    const configuredKimiPath = process.env.KIMI_CLI_PATH || 'kimi';
+    const kimiPath = resolveExecutable(configuredKimiPath, { env: mergedEnv }) || configuredKimiPath;
     console.log('[Kimi CLI] Starting harness');
     console.log(`[Kimi CLI] Working directory: ${workingDir}`);
     console.log(`[Kimi CLI] Model: ${options.model || 'configured default'}`);
     console.log('[Kimi CLI] Permission mode: print-mode auto policy with vendor static denies');
 
     this.cancelled = false;
-    const proc = spawn(kimiPath, args, {
+    const proc = portableSpawn(kimiPath, args, {
       cwd: workingDir,
       env: mergedEnv,
       stdio: ['ignore', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32',
     });
     this.currentProcess = proc;
 
@@ -86,7 +91,6 @@ export class KimiCliHarness implements AgentHarness {
     while (!done) {
       await new Promise((resolve) => setTimeout(resolve, 100));
       if (this.cancelled) {
-        proc.kill('SIGTERM');
         try { fs.rmSync(promptFile, { force: true }); } catch { /* best effort */ }
         this.currentProcess = null;
         yield { type: 'error', content: 'Query was cancelled' };
@@ -114,13 +118,15 @@ export class KimiCliHarness implements AgentHarness {
   }
 
   cancel(): boolean {
-    if (!this.currentProcess || this.currentProcess.killed) return false;
+    if (!this.currentProcess || this.currentProcess.exitCode !== null || this.currentProcess.signalCode !== null) return false;
     this.cancelled = true;
     const proc = this.currentProcess;
-    proc.kill('SIGTERM');
+    terminateChildProcessTree(proc, 'SIGTERM');
     setTimeout(() => {
-      if (!proc.killed) proc.kill('SIGKILL');
-    }, 2000);
+      if (proc.exitCode === null && proc.signalCode === null) {
+        terminateChildProcessTree(proc, 'SIGKILL');
+      }
+    }, 2000).unref?.();
     return true;
   }
 }

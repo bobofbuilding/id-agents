@@ -8,11 +8,14 @@
  * a short instruction to read that file.
  */
 
-import { spawn, ChildProcess } from 'child_process';
+import { ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { AgentHarness, HarnessOptions, HarnessMessage, HarnessType } from './types.js';
+import { resolveExecutable } from '../lib/executable-resolution.js';
+import { portableSpawn } from '../lib/portable-spawn.js';
+import { terminateChildProcessTree } from './claude-code-cli.js';
 
 function safeAgentKey(): string {
   const team = process.env.ID_AGENT_TEAM || process.env.ID_TEAM || 'default';
@@ -35,18 +38,13 @@ function trimmedError(stdout: string, stderr: string, fallback: string): string 
   return (combined || fallback).replace(/\s+\n/g, '\n').slice(0, 2000);
 }
 
-function resolveAntigravityCli(): string {
-  if (process.env.ANTIGRAVITY_CLI_PATH) return process.env.ANTIGRAVITY_CLI_PATH;
-  const pathDirs = (process.env.PATH || '').split(path.delimiter).filter(Boolean);
+function resolveAntigravityCli(env: NodeJS.ProcessEnv): string {
+  if (env.ANTIGRAVITY_CLI_PATH) {
+    return resolveExecutable(env.ANTIGRAVITY_CLI_PATH, { env }) || env.ANTIGRAVITY_CLI_PATH;
+  }
   for (const bin of ['agy', 'antigravity']) {
-    for (const dir of pathDirs) {
-      try {
-        fs.accessSync(path.join(dir, bin), fs.constants.X_OK);
-        return bin;
-      } catch {
-        // Try the next PATH entry.
-      }
-    }
+    const executable = resolveExecutable(bin, { env });
+    if (executable) return executable;
   }
   return 'agy';
 }
@@ -98,15 +96,16 @@ export class AntigravityHarness implements AgentHarness {
     args.push(launchPrompt);
 
     const mergedEnv = { ...process.env, ...(options.env || {}) } as NodeJS.ProcessEnv;
-    const agyPath = resolveAntigravityCli();
+    const agyPath = resolveAntigravityCli(mergedEnv);
     console.log(`[Antigravity] Full command: ${agyPath} ${args.map((a) => a === launchPrompt ? '<task-file-prompt>' : a).join(' ')}`);
 
     this.cancelled = false;
 
-    const proc = spawn(agyPath, args, {
+    const proc = portableSpawn(agyPath, args, {
       cwd: workingDir,
       env: mergedEnv,
       stdio: ['ignore', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32',
     });
 
     this.currentProcess = proc;
@@ -126,9 +125,9 @@ export class AntigravityHarness implements AgentHarness {
     console.log(`[Antigravity] Process spawned, PID: ${proc.pid}`);
 
     const completionPromise = new Promise<void>((resolve) => {
-      proc.on('exit', (code) => {
+      proc.on('close', (code) => {
         exitCode = code;
-        console.log(`[Antigravity] Process exited with code ${code}`);
+        console.log(`[Antigravity] Process closed with code ${code}`);
         resolve();
       });
     });
@@ -139,7 +138,6 @@ export class AntigravityHarness implements AgentHarness {
     while (!done) {
       await new Promise((r) => setTimeout(r, 100));
       if (this.cancelled) {
-        proc.kill('SIGTERM');
         try { fs.rmSync(promptFile, { force: true }); } catch { /* best effort */ }
         this.currentProcess = null;
         yield { type: 'error', content: 'Query was cancelled' };
@@ -176,18 +174,18 @@ export class AntigravityHarness implements AgentHarness {
   }
 
   cancel(): boolean {
-    if (this.currentProcess && !this.currentProcess.killed) {
-      const pid = this.currentProcess.pid;
+    if (this.currentProcess && this.currentProcess.exitCode === null && this.currentProcess.signalCode === null) {
+      const proc = this.currentProcess;
+      const pid = proc.pid;
       console.log(`[Antigravity] Cancelling process PID: ${pid}`);
       this.cancelled = true;
-      this.currentProcess.kill('SIGTERM');
-      const proc = this.currentProcess;
+      terminateChildProcessTree(proc, 'SIGTERM');
       setTimeout(() => {
-        if (proc && !proc.killed) {
+        if (proc.exitCode === null && proc.signalCode === null) {
           console.log(`[Antigravity] Force killing process PID: ${pid}`);
-          proc.kill('SIGKILL');
+          terminateChildProcessTree(proc, 'SIGKILL');
         }
-      }, 2000);
+      }, 2000).unref?.();
       return true;
     }
     return false;

@@ -1117,7 +1117,13 @@ export class AgentRestServer {
   private setupRoutes() {
     // Health check endpoint (no auth required)
     this.app.get('/health', (req, res) => {
-      res.json({ status: 'ok', timestamp: Date.now(), agent: this.agentName });
+      res.json({
+        status: 'ok',
+        timestamp: Date.now(),
+        agent: this.agentName,
+        agentId: process.env.ID_AGENT_ID || this.dbAgentId || null,
+        pid: process.pid,
+      });
     });
 
     // List files endpoint - JSON listing (use /files/list to avoid /files → /files/ redirects)

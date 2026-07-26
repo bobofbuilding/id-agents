@@ -8,11 +8,14 @@
  * large or sensitive agent prompts are not exposed through argv.
  */
 
-import { spawn, ChildProcess } from 'child_process';
+import { ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { AgentHarness, HarnessOptions, HarnessMessage, HarnessType } from './types.js';
+import { resolveExecutable } from '../lib/executable-resolution.js';
+import { portableSpawn } from '../lib/portable-spawn.js';
+import { terminateChildProcessTree } from './claude-code-cli.js';
 
 function safeAgentKey(): string {
   const team = process.env.ID_AGENT_TEAM || process.env.ID_TEAM || 'default';
@@ -86,15 +89,17 @@ export class KiroCliHarness implements AgentHarness {
     args.push(launchPrompt);
 
     const mergedEnv = { ...process.env, ...(options.env || {}) } as NodeJS.ProcessEnv;
-    const kiroPath = process.env.KIRO_CLI_PATH || 'kiro-cli';
+    const configuredKiroPath = process.env.KIRO_CLI_PATH || 'kiro-cli';
+    const kiroPath = resolveExecutable(configuredKiroPath, { env: mergedEnv }) || configuredKiroPath;
     console.log(`[Kiro CLI] Full command: ${kiroPath} ${args.map((a) => a === launchPrompt ? '<task-file-prompt>' : a).join(' ')}`);
 
     this.cancelled = false;
 
-    const proc = spawn(kiroPath, args, {
+    const proc = portableSpawn(kiroPath, args, {
       cwd: workingDir,
       env: mergedEnv,
       stdio: ['ignore', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32',
     });
 
     this.currentProcess = proc;
@@ -114,9 +119,9 @@ export class KiroCliHarness implements AgentHarness {
     console.log(`[Kiro CLI] Process spawned, PID: ${proc.pid}`);
 
     const completionPromise = new Promise<void>((resolve) => {
-      proc.on('exit', (code) => {
+      proc.on('close', (code) => {
         exitCode = code;
-        console.log(`[Kiro CLI] Process exited with code ${code}`);
+        console.log(`[Kiro CLI] Process closed with code ${code}`);
         resolve();
       });
     });
@@ -127,7 +132,6 @@ export class KiroCliHarness implements AgentHarness {
     while (!done) {
       await new Promise((r) => setTimeout(r, 100));
       if (this.cancelled) {
-        proc.kill('SIGTERM');
         try { fs.rmSync(promptFile, { force: true }); } catch { /* best effort */ }
         this.currentProcess = null;
         yield { type: 'error', content: 'Query was cancelled' };
@@ -164,18 +168,18 @@ export class KiroCliHarness implements AgentHarness {
   }
 
   cancel(): boolean {
-    if (this.currentProcess && !this.currentProcess.killed) {
-      const pid = this.currentProcess.pid;
+    if (this.currentProcess && this.currentProcess.exitCode === null && this.currentProcess.signalCode === null) {
+      const proc = this.currentProcess;
+      const pid = proc.pid;
       console.log(`[Kiro CLI] Cancelling process PID: ${pid}`);
       this.cancelled = true;
-      this.currentProcess.kill('SIGTERM');
-      const proc = this.currentProcess;
+      terminateChildProcessTree(proc, 'SIGTERM');
       setTimeout(() => {
-        if (proc && !proc.killed) {
+        if (proc.exitCode === null && proc.signalCode === null) {
           console.log(`[Kiro CLI] Force killing process PID: ${pid}`);
-          proc.kill('SIGKILL');
+          terminateChildProcessTree(proc, 'SIGKILL');
         }
-      }, 2000);
+      }, 2000).unref?.();
       return true;
     }
     return false;

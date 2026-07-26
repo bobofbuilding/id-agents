@@ -15,6 +15,7 @@ import { AgentRestServer } from './agent-rest-server.js';
 import { resolveRuntime } from './runtime/registry.js';
 import { detectSessionHandoffVars } from './lib/env-hygiene.js';
 import { installFatalHandlers } from './lib/fatal-handlers.js';
+import { startParentDeathWatchdog } from './lib/parent-watchdog.js';
 
 // Silent-stop incidents had the scheduler die behind a swallowed rejection —
 // the process stayed up but the tick loop was dead. Fail loud and exit so the
@@ -99,7 +100,12 @@ async function startManagerAgent() {
     const heartbeat = setInterval(() => {}, 1000 * 60 * 60);
 
     // Handle shutdown gracefully
+    let shuttingDown = false;
+    let stopParentWatchdog = () => {};
     const shutdown = async (signal: string) => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      stopParentWatchdog();
       console.log(`\n\nShutting down manager agent (${signal})...`);
       clearInterval(heartbeat);
       try {
@@ -111,7 +117,11 @@ async function startManagerAgent() {
       }
       process.exit(0);
     };
-    process.on('exit', () => { runLock?.release(); });
+    stopParentWatchdog = startParentDeathWatchdog(() => shutdown('parent-exit'));
+    process.on('exit', () => {
+      stopParentWatchdog();
+      runLock?.release();
+    });
     process.on('SIGINT', () => { void shutdown('SIGINT'); });
     process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
   } catch (err) {

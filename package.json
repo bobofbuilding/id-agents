@@ -1,6 +1,6 @@
 {
   "name": "id-agents",
-  "version": "0.1.144",
+  "version": "0.1.145",
   "description": "Local multi-agent orchestration runtime with REST APIs",
   "type": "module",
   "main": "dist/index.js",
@@ -29,6 +29,7 @@
     "test:workspace-gc": "node scripts/workspace-gc-smoke.mjs",
     "manager:update": "node scripts/manager-auto-update.mjs",
     "test:manager-update": "node scripts/manager-auto-update-smoke.mjs",
+    "test:local-agent-lifecycle": "npm run build && node scripts/local-agent-lifecycle-smoke.mjs",
     "prepublishOnly": "npm run verify:release-schema && npm run build",
     "dev": "tsc --watch",
     "lint": "npm run typecheck",
@@ -81,6 +82,7 @@
     "@xmtp/node-sdk": "^6.0.0",
     "better-sqlite3": "^12.8.0",
     "cors": "^2.8.5",
+    "cross-spawn": "7.0.6",
     "dotenv": "^16.4.5",
     "express": "^5.2.1",
     "js-yaml": "^4.1.0",

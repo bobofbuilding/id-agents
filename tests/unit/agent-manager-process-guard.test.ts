@@ -3,6 +3,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'fs';
 import http from 'node:http';
+import { EventEmitter } from 'node:events';
 import os from 'os';
 import path from 'path';
 
@@ -104,11 +105,14 @@ async function startCancelServer(response: Record<string, unknown> = { cancelled
   };
 }
 
-async function startHealthServer(status = 200) {
+async function startHealthServer(status = 200, payload: Record<string, unknown> = {}) {
   const server = http.createServer((req, res) => {
     if (req.method === 'GET' && req.url === '/health') {
       res.writeHead(status, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ status: status >= 200 && status < 300 ? 'ok' : 'error' }));
+      res.end(JSON.stringify({
+        status: status >= 200 && status < 300 ? 'ok' : 'error',
+        ...payload,
+      }));
       return;
     }
     res.writeHead(404);
@@ -212,6 +216,10 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     delete process.env.ID_IDLE_PARK_INITIAL_DELAY_MS;
     delete process.env.ID_IDLE_PARK_DISABLED;
     delete process.env.ID_PLAN_DECISION_QUERY_EXPIRY_MS;
+    delete process.env.IDACC_AGENT_LOG_DIR;
+    delete process.env.ELECTRON_RUN_AS_NODE;
+    delete process.env.IDACC_ADMIN_TOKEN;
+    delete process.env.BRAIN_TOKEN;
     while (dbs.length > 0) {
       await dbs.pop()!.close();
     }
@@ -219,6 +227,12 @@ describe('AgentManagerDb killAgentProcess guards', () => {
       fs.rmSync(workDirs.pop()!, { recursive: true, force: true });
     }
     vi.restoreAllMocks();
+  });
+
+  it('signals the detached Unix worker process group at every Manager termination site', () => {
+    const source = fs.readFileSync(new URL('../../src/agent-manager-db.ts', import.meta.url), 'utf8');
+    expect(source).toContain('detached: true');
+    expect(source.match(/detachedProcessGroup: true/g)?.length).toBeGreaterThanOrEqual(3);
   });
 
   it('skips the manager PID when port discovery includes process.pid', async () => {
@@ -244,8 +258,10 @@ describe('AgentManagerDb killAgentProcess guards', () => {
 
     const result = await (manager as any).killAgentProcess(4101);
 
-    expect(killSpy).toHaveBeenCalledTimes(1);
-    expect(killSpy).toHaveBeenCalledWith(agentPid, 'SIGTERM');
+    expect(killSpy.mock.calls).toEqual([
+      [-agentPid, 'SIGTERM'],
+      [agentPid, 'SIGTERM'],
+    ]);
     expect(result).toEqual({ killed: true, pids: [agentPid] });
   });
 
@@ -428,9 +444,262 @@ describe('AgentManagerDb killAgentProcess guards', () => {
 
     const result = await (manager as any).killAgentProcess(4106);
 
-    expect(killSpy).toHaveBeenCalledTimes(1);
-    expect(killSpy).toHaveBeenCalledWith(agentPid, 'SIGTERM');
+    expect(killSpy.mock.calls).toEqual([
+      [-agentPid, 'SIGTERM'],
+      [agentPid, 'SIGTERM'],
+    ]);
     expect(result).toEqual({ killed: true, pids: [agentPid] });
+  });
+
+  it('never kills an unrelated process just because it owns an agent port', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const unrelatedPid = process.pid + 3100;
+    (manager as any).listPidsListeningOnPort = vi.fn(() => [unrelatedPid]);
+    (manager as any).inspectProcess = vi.fn(() => ({
+      pid: unrelatedPid,
+      ppid: 1,
+      argv0: 'python',
+      commandLine: 'python -m http.server 4107',
+    }));
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    const result = await (manager as any).killAgentProcess(4107);
+
+    expect(killSpy).not.toHaveBeenCalled();
+    expect(result).toEqual({ killed: false, pids: [] });
+  });
+
+  it('uses a persisted identity-verified PID when Unix port tools are unavailable', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    const agentPid = process.pid + 3200;
+    await db.agents.create(agentRow({
+      team_id: teamId,
+      id: 'agent-windows',
+      name: 'windows-agent',
+      port: 4108,
+      metadata: {
+        runtime: 'codex',
+        pid: agentPid,
+        processOwner: 'manager-child',
+        processParentPid: process.pid,
+      },
+    }));
+
+    (manager as any).listPidsListeningOnPort = vi.fn(() => []);
+    (manager as any).inspectProcess = vi.fn(() => null);
+    (manager as any).processIsAlive = vi.fn(() => true);
+    (manager as any).probeLocalAgentIdentity = vi.fn(async () => ({ ok: true, attested: true }));
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    const result = await (manager as any).killAgentProcess(4108, 'agent-windows');
+
+    expect((manager as any).probeLocalAgentIdentity).toHaveBeenCalledWith(
+      4108,
+      { id: 'agent-windows', name: 'windows-agent', pid: agentPid },
+      { requireAttestation: true },
+    );
+    expect(killSpy.mock.calls).toEqual([
+      [-agentPid, 'SIGTERM'],
+      [agentPid, 'SIGTERM'],
+    ]);
+    expect(result).toEqual({ killed: true, pids: [agentPid] });
+  });
+
+  it('refuses kill authority when exact persisted agent attestation is unavailable', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    const agentPid = process.pid + 3250;
+    await db.agents.create(agentRow({
+      team_id: teamId,
+      id: 'agent-unattested',
+      name: 'unattested-agent',
+      port: 4109,
+      metadata: {
+        runtime: 'codex',
+        pid: agentPid,
+        processOwner: 'manager-child',
+        processParentPid: process.pid,
+      },
+    }));
+
+    (manager as any).listPidsListeningOnPort = vi.fn(() => []);
+    (manager as any).inspectProcess = vi.fn(() => null);
+    (manager as any).processIsAlive = vi.fn(() => true);
+    (manager as any).probeLocalAgentIdentity = vi.fn(async () => ({ ok: true, attested: false }));
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    const result = await (manager as any).killAgentProcess(4109, 'agent-unattested');
+
+    expect((manager as any).probeLocalAgentIdentity).toHaveBeenCalledWith(
+      4109,
+      { id: 'agent-unattested', name: 'unattested-agent', pid: agentPid },
+      { requireAttestation: true },
+    );
+    expect(killSpy).not.toHaveBeenCalled();
+    expect(result).toEqual({ killed: false, pids: [] });
+  });
+
+  it('refuses lsof-only kill authority when the requested agent has no matching persisted row', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+    const candidatePid = process.pid + 3260;
+    (manager as any).listPidsListeningOnPort = vi.fn(() => [candidatePid]);
+    (manager as any).inspectProcess = vi.fn(() => ({
+      pid: candidatePid,
+      ppid: 1,
+      argv0: 'node',
+      commandLine: 'node dist/local-agent-server.js impostor --port 4110 --id missing-agent',
+    }));
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    const result = await (manager as any).killAgentProcess(4110, 'missing-agent');
+
+    expect((manager as any).listPidsListeningOnPort).not.toHaveBeenCalled();
+    expect(killSpy).not.toHaveBeenCalled();
+    expect(result).toEqual({ killed: false, pids: [] });
+  });
+
+  it('requires the exact persisted --id and --port in command-line ownership evidence', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    const candidatePid = process.pid + 3270;
+    await db.agents.create(agentRow({
+      team_id: teamId,
+      id: 'agent-exact',
+      name: 'exact-agent',
+      port: 4111,
+      metadata: { runtime: 'codex', pid: candidatePid, processOwner: 'adopted' },
+    }));
+    (manager as any).listPidsListeningOnPort = vi.fn(() => [candidatePid]);
+    (manager as any).inspectProcess = vi.fn(() => ({
+      pid: candidatePid,
+      ppid: 1,
+      argv0: 'node',
+      commandLine: 'node dist/local-agent-server.js impostor --port 4111 --id another-agent',
+    }));
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    const result = await (manager as any).killAgentProcess(4111, 'agent-exact');
+
+    expect(killSpy).not.toHaveBeenCalled();
+    expect(result).toEqual({ killed: false, pids: [] });
+  });
+
+  it('uses loopback identity readiness instead of lsof', async () => {
+    const healthServer = await startHealthServer(200, {
+      agent: 'ready-agent',
+      agentId: 'agent-ready',
+      pid: process.pid,
+    });
+    try {
+      const { manager, db, workDir } = await makeManager();
+      dbs.push(db);
+      workDirs.push(workDir);
+      const proc = Object.assign(new EventEmitter(), { pid: process.pid });
+      (manager as any).listPidsListeningOnPort = vi.fn(() => {
+        throw new Error('readiness must not invoke lsof');
+      });
+
+      const result = await (manager as any).waitForAgentPortToBind(
+        proc,
+        healthServer.port,
+        { id: 'agent-ready', name: 'ready-agent' },
+        2_000,
+      );
+
+      expect(result).toEqual({ ok: true });
+      expect((manager as any).listPidsListeningOnPort).not.toHaveBeenCalled();
+    } finally {
+      await healthServer.close();
+    }
+  });
+
+  it('spawns with the bundled executable and writes only profile-private logs', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    await db.agents.create(agentRow({
+      team_id: teamId,
+      id: 'agent-portable',
+      name: '../../Portable Agent',
+      port: 4109,
+      status: 'pending',
+      metadata: { runtime: 'codex' },
+    }));
+    const logDir = path.join(workDir, 'profile logs', 'agents');
+    process.env.IDACC_AGENT_LOG_DIR = logDir;
+    process.env.ELECTRON_RUN_AS_NODE = '1';
+    process.env.IDACC_ADMIN_TOKEN = 'must-not-leak';
+    process.env.BRAIN_TOKEN = 'must-not-leak-either';
+
+    (manager as any).killAgentProcess = vi.fn(async () => ({ killed: false, pids: [] }));
+    (manager as any).clearAgentPid = vi.fn(async () => {});
+    (manager as any).waitForAgentPortToBind = vi.fn(async () => ({ ok: true }));
+    const proc = Object.assign(new EventEmitter(), {
+      pid: 54321,
+      unref: vi.fn(),
+    });
+    const spawnSpy = vi.fn(() => proc);
+    (manager as any).spawnLocalAgentChild = spawnSpy;
+
+    const result = await (manager as any).spawnLocalAgentProcessUnlocked(
+      teamId,
+      'default',
+      {
+        id: 'agent-portable',
+        name: '../../Portable Agent',
+        port: 4109,
+        workingDirectory: path.join(workDir, 'project with spaces'),
+      },
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.logFile).toBe(path.join(logDir, 'agent-agent-portable.log'));
+    expect(fs.statSync(logDir).isDirectory()).toBe(true);
+    expect(fs.statSync(result.logFile).isFile()).toBe(true);
+    const [executable, args, options] = spawnSpy.mock.calls[0];
+    expect(executable).toBe(process.execPath);
+    expect(args).toContain('../../Portable Agent');
+    expect(args).toContain(path.join(workDir, 'project with spaces'));
+    expect(options.env.ELECTRON_RUN_AS_NODE).toBe('1');
+    expect(options.env.IDACC_PARENT_PID).toBe(String(process.pid));
+    expect(options.env.IDACC_ADMIN_TOKEN).toBeUndefined();
+    expect(options.env.BRAIN_TOKEN).toBeUndefined();
+    expect(options.detached).toBe(true);
+    expect(options.windowsHide).toBe(true);
+    expect(proc.unref).toHaveBeenCalledOnce();
+  });
+
+  it('bounds profile-owned agent logs while retaining their newest tail', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+    process.env.IDACC_AGENT_LOG_DIR = path.join(workDir, 'logs', 'agents');
+    const logFile = (manager as any).localAgentLogFile('agent-retention');
+    const content = Buffer.alloc(2_048);
+    for (let index = 0; index < content.length; index += 1) content[index] = index % 251;
+    fs.writeFileSync(logFile, content, { mode: 0o600 });
+
+    (manager as any).enforceLocalAgentLogRetention(1_024, 256);
+
+    const retained = fs.readFileSync(logFile);
+    expect(retained.length).toBe(256);
+    expect(retained).toEqual(content.subarray(content.length - 256));
+    if (process.platform !== 'win32') {
+      expect(fs.statSync(logFile).mode & 0o777).toBe(0o600);
+    }
   });
 
   it('serializes concurrent spawn attempts for the same local agent', async () => {
@@ -475,6 +744,21 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     await Promise.all([first, second]);
 
     expect(starts).toEqual(['coder-first', 'coder-second']);
+  });
+
+  it('skips occupied loopback ports when allocating a consumer agent endpoint', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+    vi.spyOn(db.agents, 'nextPort').mockResolvedValue(4101);
+    const availability = vi.fn(async (port: number) => port === 4102);
+    (manager as any).loopbackPortIsAvailable = availability;
+
+    const port = await (manager as any).dbNextPort();
+
+    expect(port).toBe(4102);
+    expect(availability).toHaveBeenNthCalledWith(1, 4101);
+    expect(availability).toHaveBeenNthCalledWith(2, 4102);
   });
 
   it('does not expose stale PID metadata for stopped local agents', async () => {
@@ -564,6 +848,76 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     expect(row?.metadata).not.toHaveProperty('processInspectedAt');
   });
 
+  it('marks owned running agents for restoration and stops them during Manager shutdown', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    const agentPid = 65432;
+    await db.agents.create(agentRow({
+      team_id: teamId,
+      id: 'agent-shutdown-owned',
+      name: 'shutdown-owned',
+      port: 4111,
+      status: 'running',
+      metadata: {
+        runtime: 'codex',
+        pid: agentPid,
+        processOwner: 'manager-child',
+        processParentPid: process.pid,
+      },
+    }));
+    (manager as any).killAgentProcess = vi.fn(async () => ({ killed: true, pids: [agentPid] }));
+    (manager as any).processIsAlive = vi.fn(() => false);
+
+    await (manager as any).stopManagerOwnedAgentsForShutdown();
+
+    expect((manager as any).killAgentProcess).toHaveBeenCalledWith(4111, 'agent-shutdown-owned');
+    const row = await db.agents.getById('agent-shutdown-owned');
+    expect(row?.status).toBe('offline');
+    expect(row?.metadata?.managerRestartRequested).toBe(true);
+    expect(row?.metadata).not.toHaveProperty('pid');
+  });
+
+  it('restores only agents explicitly marked for Manager restart', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    await db.agents.create(agentRow({
+      team_id: teamId,
+      id: 'agent-restore',
+      name: 'restore-me',
+      port: 4112,
+      status: 'stopped',
+      metadata: { runtime: 'codex', managerRestartRequested: true },
+    }));
+    await db.agents.create(agentRow({
+      team_id: teamId,
+      id: 'agent-stay-stopped',
+      name: 'stay-stopped',
+      port: 4113,
+      status: 'stopped',
+      metadata: { runtime: 'codex' },
+    }));
+    const spawn = vi.fn(async () => ({ success: true, pid: 76543 }));
+    (manager as any).spawnLocalAgentProcess = spawn;
+
+    await (manager as any).restoreManagerOwnedAgentsAfterRestart();
+
+    expect(spawn).toHaveBeenCalledOnce();
+    expect(spawn).toHaveBeenCalledWith(teamId, 'default', expect.objectContaining({
+      id: 'agent-restore',
+      name: 'restore-me',
+      port: 4112,
+    }));
+    const restored = await db.agents.getById('agent-restore');
+    expect(restored?.status).toBe('running');
+    expect(restored?.metadata).not.toHaveProperty('managerRestartRequested');
+    const parked = await db.agents.getById('agent-stay-stopped');
+    expect(parked?.status).toBe('stopped');
+  });
+
   it('reconciles running local process ownership on startup audit', async () => {
     const { manager, db, workDir } = await makeManager();
     dbs.push(db);
@@ -597,7 +951,7 @@ describe('AgentManagerDb killAgentProcess guards', () => {
           pid,
           ppid: 1,
           argv0: 'node',
-          commandLine: 'node dist/local-agent-server.js coder --team default --port 4101',
+          commandLine: 'node dist/local-agent-server.js coder --team default --port 4101 --id agent-adopted',
         };
       }
       return null;

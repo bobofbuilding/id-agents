@@ -9,10 +9,11 @@
 
 import type { HarnessType } from '../harness/types.js';
 import type { RuntimeInterfaceProfile, RuntimeProfile, RuntimeId, RuntimeValidationIssue } from './types.js';
-import { execFileSync, spawnSync } from 'child_process';
 import { existsSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
+import { resolveExecutable } from '../lib/executable-resolution.js';
+import { portableSpawnSync } from '../lib/portable-spawn.js';
 
 const DEFAULT_RUNTIME: RuntimeId = 'claude-agent-sdk';
 const RUNTIME_ALIASES: Record<string, RuntimeId> = {
@@ -546,25 +547,48 @@ export function validateRuntimeModelCompatibility(
   return issues;
 }
 
+const RUNTIME_COMMAND_OVERRIDES: Record<string, string[]> = {
+  claude: ['CLAUDE_PATH'],
+  codex: ['ID_AGENT_CODEX_BIN', 'CODEX_BIN', 'CODEX_EXECUTABLE'],
+  'cursor-agent': ['CURSOR_AGENT_PATH'],
+  grok: ['GROK_CLI_PATH'],
+  agy: ['ANTIGRAVITY_CLI_PATH'],
+  antigravity: ['ANTIGRAVITY_CLI_PATH'],
+  copilot: ['COPILOT_CLI_PATH'],
+  'kiro-cli': ['KIRO_CLI_PATH'],
+  kimi: ['KIMI_CLI_PATH'],
+};
+
+function resolveRuntimeCommand(command: string): string | undefined {
+  const override = RUNTIME_COMMAND_OVERRIDES[command]
+    ?.map((name) => process.env[name]?.trim())
+    .find(Boolean);
+  return resolveExecutable(override || command);
+}
+
+function runRuntimeCommand(command: string, args: string[], timeout: number) {
+  const executable = resolveRuntimeCommand(command);
+  if (!executable) return null;
+  return portableSpawnSync(executable, args, {
+    encoding: 'utf8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+    timeout,
+    windowsHide: true,
+  });
+}
+
 function checkCommandAvailable(command: string): RuntimeValidationIssue[] {
-  try {
-    execFileSync(command, ['--version'], {
-      encoding: 'utf8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-      timeout: 10000,
-    });
-    return [];
-  } catch {
-    return [{
-      code: 'runtime_binary_missing',
-      message: `required runtime command "${command}" is not installed or not on PATH`,
-    }];
-  }
+  const result = runRuntimeCommand(command, ['--version'], 10000);
+  if (result && !result.error && result.status === 0) return [];
+  return [{
+    code: 'runtime_binary_missing',
+    message: `required runtime command "${command}" is not installed or not on PATH`,
+  }];
 }
 
 function firstAvailableCommand(commands: string[]): string | null {
   for (const command of commands) {
-    if (checkCommandAvailable(command).length === 0) return command;
+    if (checkCommandAvailable(command).length === 0) return resolveRuntimeCommand(command) || command;
   }
   return null;
 }
@@ -621,11 +645,8 @@ export function validateRuntimePreflight(
     issues.push(...checkCommandAvailable('cursor-agent'));
     if (!process.env.CURSOR_API_KEY) {
       try {
-        const result = spawnSync('cursor-agent', ['status'], {
-          encoding: 'utf8',
-          stdio: ['pipe', 'pipe', 'pipe'],
-          timeout: 10000,
-        });
+        const result = runRuntimeCommand('cursor-agent', ['status'], 10000);
+        if (!result) throw new Error('cursor-agent is not available');
         const combinedOutput = `${result.stdout || ''}\n${result.stderr || ''}`;
         if (/not logged in/i.test(combinedOutput)) {
           issues.push({
@@ -650,11 +671,8 @@ export function validateRuntimePreflight(
   if (resolvedRuntime === 'grok') {
     issues.push(...checkCommandAvailable('grok'));
     try {
-      const result = spawnSync('grok', ['models'], {
-        encoding: 'utf8',
-        stdio: ['pipe', 'pipe', 'pipe'],
-        timeout: 15000,
-      });
+      const result = runRuntimeCommand('grok', ['models'], 15000);
+      if (!result) throw new Error('grok is not available');
       const combinedOutput = `${result.stdout || ''}\n${result.stderr || ''}`;
       if (result.status !== 0 || !/available models/i.test(combinedOutput) || /not authenticated|not logged in|signed out|login required/i.test(combinedOutput)) {
         issues.push({
@@ -681,11 +699,8 @@ export function validateRuntimePreflight(
       return issues;
     }
     try {
-      const result = spawnSync(command, ['models'], {
-        encoding: 'utf8',
-        stdio: ['pipe', 'pipe', 'pipe'],
-        timeout: 15000,
-      });
+      const result = runRuntimeCommand(command, ['models'], 15000);
+      if (!result) throw new Error('Antigravity CLI is not available');
       const combinedOutput = `${result.stdout || ''}\n${result.stderr || ''}`;
       if (result.status !== 0 || !combinedOutput.trim() || /not authenticated|not logged in|signed out|login required/i.test(combinedOutput)) {
         issues.push({
@@ -705,11 +720,8 @@ export function validateRuntimePreflight(
   if (resolvedRuntime === 'kiro-cli') {
     issues.push(...checkCommandAvailable('kiro-cli'));
     try {
-      const result = spawnSync('kiro-cli', ['whoami'], {
-        encoding: 'utf8',
-        stdio: ['pipe', 'pipe', 'pipe'],
-        timeout: 10000,
-      });
+      const result = runRuntimeCommand('kiro-cli', ['whoami'], 10000);
+      if (!result) throw new Error('kiro-cli is not available');
       const combinedOutput = `${result.stdout || ''}\n${result.stderr || ''}`;
       if (result.status !== 0 || /not logged in|not authenticated|signed out|login required/i.test(combinedOutput)) {
         issues.push({
@@ -765,11 +777,8 @@ export function validateRuntimePreflight(
     issues.push(...checkCommandAvailable('codex'));
     if (!process.env.OPENAI_API_KEY) {
       try {
-        const result = spawnSync('codex', ['login', 'status'], {
-          encoding: 'utf8',
-          stdio: ['pipe', 'pipe', 'pipe'],
-          timeout: 10000,
-        });
+        const result = runRuntimeCommand('codex', ['login', 'status'], 10000);
+        if (!result) throw new Error('codex is not available');
         const combinedOutput = `${result.stdout || ''}\n${result.stderr || ''}`.trim();
         if (result.status !== 0 && !/logged in/i.test(combinedOutput)) {
           issues.push({

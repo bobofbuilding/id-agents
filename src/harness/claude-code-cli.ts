@@ -5,7 +5,8 @@
  * Wraps the Claude Code CLI (`claude`) for local agents that use the user's
  * logged-in Claude Code session instead of API keys.
  *
- * This harness spawns `claude -p "prompt" --output-format json` for each request.
+ * This harness spawns `claude -p --output-format json` and sends each request
+ * over stdin.
  * Unlike the SDK-based ClaudeCodeHarness, this uses whatever authentication
  * method the user has configured in their local Claude Code installation.
  *
@@ -14,12 +15,18 @@
  * - Each agent maintains its own session for context continuity
  */
 
-import { spawn, ChildProcess } from 'child_process';
+import { ChildProcess } from 'child_process';
 import { AgentHarness, HarnessOptions, HarnessMessage, HarnessType } from './types.js';
 import { resolveModelAlias } from '../core/model-aliases.js';
 import { toMcpServerRecord } from './mcp.js';
 import { reportTurnUsage } from './usage-report.js';
 import { detectClaudeCliRateLimit } from './rate-limit.js';
+import { resolveExecutable } from '../lib/executable-resolution.js';
+import { portableSpawn } from '../lib/portable-spawn.js';
+import {
+  signalOwnedProcessTree,
+  verifiedOwnedProcess,
+} from '../lib/process-tree.js';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -88,6 +95,35 @@ export function claudeCliToolArgs(options: Pick<HarnessOptions, 'allowedTools' |
     return ['--tools', toolList, '--allowedTools', toolList];
   }
   return ['--allowedTools', toolList];
+}
+
+export interface ClaudeCliStdinInvocation {
+  command: string;
+  args: string[];
+  stdin: string;
+}
+
+/**
+ * Keep the complete prompt off argv and shared temp storage. Claude's print
+ * mode reads text input from stdin when `-p` has no positional prompt value.
+ */
+export function claudeCliStdinInvocation(
+  args: string[],
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): ClaudeCliStdinInvocation {
+  const promptIndex = args.indexOf('-p');
+  const prompt = promptIndex >= 0 ? String(args[promptIndex + 1] ?? '') : '';
+  const spawnArgs = promptIndex >= 0
+    ? args.filter((_, index) => index !== promptIndex + 1)
+    : [...args];
+  const configuredCommand = env.CLAUDE_PATH || 'claude';
+  const command = resolveExecutable(configuredCommand, { env, platform }) || configuredCommand;
+  return {
+    command,
+    args: spawnArgs,
+    stdin: prompt,
+  };
 }
 
 export class ClaudeCodeCliHarness implements AgentHarness {
@@ -391,53 +427,25 @@ export class ClaudeCodeCliHarness implements AgentHarness {
       let stdout = '';
       let stderr = '';
 
-      // Use full path to claude to avoid PATH resolution issues in detached processes
-      // Can be overridden via CLAUDE_PATH env var
-      const claudePath = process.env.CLAUDE_PATH || 'claude';
-
-      console.log(`[Claude CLI] Spawning: ${claudePath} ${args.slice(0, 3).join(' ')}...`);
+      const invocation = claudeCliStdinInvocation(args, env);
+      console.log(`[Claude CLI] Spawning directly: ${invocation.command} ${invocation.args.slice(0, 3).join(' ')}...`);
       console.log(`[Claude CLI] Working directory: ${cwd}`);
       console.log(`[Claude CLI] PATH: ${env.PATH?.slice(0, 100)}...`);
+      console.log(`[Claude CLI] Prompt transport: stdin (${invocation.stdin.length} chars)`);
 
-      // Write prompt to temp file to avoid command line length issues
-      const tmpFile = path.join(os.tmpdir(), `claude-prompt-${Date.now()}.txt`);
-
-      // Get the prompt from args (first arg after -p)
-      const promptIndex = args.indexOf('-p');
-      const prompt = promptIndex >= 0 ? args[promptIndex + 1] : '';
-
-      // Write prompt to file
-      fs.writeFileSync(tmpFile, prompt);
-
-      // Build args without the prompt, using file input
-      const newArgs = args.filter((_, i) => i !== promptIndex && i !== promptIndex + 1);
-
-      // Read prompt from file using shell redirection
-      const quotedArgs = newArgs.map(shellQuote).join(' ');
-      const fullCommand = `${shellQuote(claudePath)} -p "$(cat ${shellQuote(tmpFile)})" ${quotedArgs}`;
-
-      console.log(`[Claude CLI] Prompt written to temp file: ${tmpFile} (${prompt.length} chars)`);
-      console.log(`[Claude CLI] Full command: ${claudePath} -p "$(cat ...)" ${quotedArgs}`);
-
-      let tmpCleaned = false;
-      const cleanupTmpFile = () => {
-        if (tmpCleaned) return;
-        tmpCleaned = true;
-        try { fs.rmSync(tmpFile, { force: true }); } catch { /* best-effort */ }
-      };
-
-      const proc = spawn('/bin/bash', ['-c', fullCommand], {
+      const proc = portableSpawn(invocation.command, invocation.args, {
         cwd,
         env,
         detached: process.platform !== 'win32',
-        stdio: ['pipe', 'pipe', 'pipe']
+        stdio: ['pipe', 'pipe', 'pipe'],
       });
 
       // Store process reference for cancellation
       this.currentProcess = proc;
 
-      // Close stdin immediately since we don't need it
-      proc.stdin?.end();
+      // Deliver the complete prompt without exposing it through argv or a
+      // predictable file in the host's shared temp directory.
+      proc.stdin?.end(invocation.stdin);
 
       console.log(`[Claude CLI] Process spawned, PID: ${proc.pid}`);
 
@@ -479,7 +487,6 @@ export class ClaudeCodeCliHarness implements AgentHarness {
       });
 
       proc.on('error', (err) => {
-        cleanupTmpFile();
         console.error(`[Claude CLI] Spawn error: ${err.message}`);
         reject(err);
       });
@@ -487,7 +494,6 @@ export class ClaudeCodeCliHarness implements AgentHarness {
       proc.on('close', (code) => {
         // Clear process reference
         if (this.currentProcess === proc) this.currentProcess = null;
-        cleanupTmpFile();
 
         // Flush any trailing partial line (no terminal newline) so the last
         // streamed step (often the final tool call) isn't missed.
@@ -517,8 +523,8 @@ export class ClaudeCodeCliHarness implements AgentHarness {
       console.log(`[Claude CLI] Cancelling process PID: ${pid}`);
       this.cancelled = true;
 
-      // Kill the whole process group. Killing only the bash wrapper can leave
-      // an orphaned Claude child process running after a manager-side cancel.
+      // Kill the whole detached process group so any Claude child processes
+      // are also stopped after a manager-side cancel.
       terminateChildProcessTree(this.currentProcess, 'SIGTERM');
 
       // Force kill after 2 seconds if still running
@@ -536,26 +542,33 @@ export class ClaudeCodeCliHarness implements AgentHarness {
   }
 }
 
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, "'\\''")}'`;
-}
-
 export function terminateChildProcessTree(proc: ChildProcess, signal: NodeJS.Signals): boolean {
   const pid = proc.pid;
   if (!pid) return false;
 
+  if (process.platform === 'win32') {
+    const target = verifiedOwnedProcess(
+      pid,
+      proc.pid === pid && proc.exitCode == null && proc.signalCode == null,
+    );
+    if (!target) return false;
+    return signalOwnedProcessTree(target, signal, {
+      onError: (message, error) => {
+        console.warn(`[Claude CLI] ${message}: ${error instanceof Error ? error.message : String(error)}`);
+      },
+    });
+  }
+
   let signalled = false;
 
-  if (process.platform !== 'win32') {
-    try {
-      // The CLI is spawned as a detached process group leader. Signalling the
-      // negative pid reaches the shell wrapper and its Claude child process.
-      process.kill(-pid, signal);
-      signalled = true;
-    } catch (err: any) {
-      if (err?.code !== 'ESRCH') {
-        console.warn(`[Claude CLI] Failed to signal process group ${pid}: ${err?.message || err}`);
-      }
+  try {
+    // The CLI is spawned as a detached process group leader. Signalling the
+    // negative pid reaches the shell wrapper and its Claude child process.
+    process.kill(-pid, signal);
+    signalled = true;
+  } catch (err: any) {
+    if (err?.code !== 'ESRCH') {
+      console.warn(`[Claude CLI] Failed to signal process group ${pid}: ${err?.message || err}`);
     }
   }
 

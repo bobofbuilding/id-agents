@@ -27,6 +27,7 @@ import {
   resolveRuntime,
   usesCliLogin,
 } from './runtime/registry.js';
+import { startParentDeathWatchdog } from './lib/parent-watchdog.js';
 
 interface LocalAgentConfig {
   name: string;
@@ -130,7 +131,7 @@ export async function startLocalAgent(config: LocalAgentConfig): Promise<{
   server: AgentRestServer;
   port: number;
   agentId: string;
-  stop: () => Promise<void>;
+  stop: (opts?: { restartAfterManagerStart?: boolean }) => Promise<void>;
 }> {
   const runtime = resolveRuntime(process.env.ID_HARNESS || 'claude-code-cli');
   process.env.ID_HARNESS = runtime;
@@ -317,7 +318,7 @@ export async function startLocalAgent(config: LocalAgentConfig): Promise<{
   }
 
   // Create stop function for graceful shutdown
-  const stop = async () => {
+  const stop = async (opts: { restartAfterManagerStart?: boolean } = {}) => {
     console.log('\n🛑 Stopping local agent...');
 
     // Update database status and cancel pending queries
@@ -348,6 +349,9 @@ export async function startLocalAgent(config: LocalAgentConfig): Promise<{
           console.log(`📦 Skipped stopped status for stale PID ${process.pid}; current PID is ${currentPid}`);
         } else {
           const metadata = { ...((current?.metadata as Record<string, unknown> | null | undefined) ?? {}) };
+          if (opts.restartAfterManagerStart) {
+            metadata.managerRestartRequested = true;
+          }
           if ('pid' in metadata) {
             delete metadata.pid;
             await db.agents.updateMetadata(agentId, metadata);
@@ -471,19 +475,25 @@ Examples:
 
   // Handle shutdown gracefully
   let shuttingDown = false;
-  const shutdown = async () => {
+  let stopParentWatchdog = () => {};
+  const shutdown = async (reason: 'signal' | 'parent-exit' = 'signal') => {
     if (shuttingDown) return;
     shuttingDown = true;
-    await stop();
+    stopParentWatchdog();
+    await stop({ restartAfterManagerStart: reason === 'parent-exit' });
     process.exit(0);
   };
 
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  stopParentWatchdog = startParentDeathWatchdog(() => shutdown('parent-exit'));
+  process.on('SIGINT', () => { void shutdown('signal'); });
+  process.on('SIGTERM', () => { void shutdown('signal'); });
 
   // Keep the process alive
   const heartbeat = setInterval(() => {}, 1000 * 60 * 60);
-  process.on('exit', () => clearInterval(heartbeat));
+  process.on('exit', () => {
+    stopParentWatchdog();
+    clearInterval(heartbeat);
+  });
 }
 
 // Run if called directly

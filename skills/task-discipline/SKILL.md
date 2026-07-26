@@ -29,7 +29,7 @@ has already been dispatched to you.
 
 If you received a dispatch brief that names a task — i.e. the message
 contains `task: <name>` plus explicit claim/done URLs (see the
-`inter-agent` skill, section "Dispatch brief template") — the manager
+`inter-agent` skill's asynchronous delegation flow) — the manager
 **already created the task**. Do **not** create a new task.
 
 Use the brief's URLs verbatim:
@@ -95,18 +95,25 @@ format is greppable from the task stream so the next pass can
 reconstruct which row absorbed the closed work without having to walk
 event logs.
 
-## Future hardening (deferred — not in this slice)
+## Duplicate-task guard
 
-Manager-side duplicate-task rejection — refusing `POST /tasks` when a
-dispatch has already created a task for the same logical unit of work
-— is a known followup. Until that lands, dispatchers and implementers
-prevent duplicates manually by:
+The Manager rejects task creation when the request matches an existing
+logical unit of work for the same team. It compares goal, target, and
+title signals; matching open tasks and recently completed tasks produce
+`existing_task_found` with the existing task, status, match scope, and a
+`status-check` recommendation.
 
-- Dispatchers including `task: <name>` and explicit claim/done URLs
-  in every brief (see `inter-agent` skill, "Dispatch brief template").
-- Implementers using the assigned task name **verbatim** (see
-  "Assigned work vs self-initiated work" above).
+When the guard fires:
+
+1. Do not rename the task and retry.
+2. Status-check the reported task, then claim or continue it when it owns the work.
+3. If the work is genuinely different, make that difference explicit in the goal,
+   target, title, and brief before creating a new task.
+4. Keep using an assigned task name and its lifecycle URLs verbatim.
 
 ## See also
 
-The `inter-agent` skill describes **checkins**, a complementary primitive for supervising delegated tasks. When you delegate work to another agent via `/talk-to` with a `task: {title, name}` field, the manager creates the task and an active checkin watching it; the checkin auto-closes when the task hits a terminal state. If you load `task-discipline` without `inter-agent`, you have your own task lifecycle but no built-in supervision for work you delegate. See `skills/inter-agent/SKILL.md`, section "Checkins (work supervision)".
+The `inter-agent` skill describes Manager-supervised asynchronous delegation.
+When you delegate work with a named `task` object, the Manager creates the task
+and supervises it through a terminal state. Load that skill whenever you delegate;
+use this skill for your own task lifecycle.

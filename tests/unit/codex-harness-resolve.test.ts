@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { resolveCodexExecutable } from '../../src/harness/codex.js';
+import { codexVersion, resolveCodexExecutable } from '../../src/harness/codex.js';
 
 function currentTarget(): { packageName: string; triple: string; binary: string } | undefined {
   const binary = process.platform === 'win32' ? 'codex.exe' : 'codex';
@@ -27,6 +27,24 @@ function currentTarget(): { packageName: string; triple: string; binary: string 
 describe('resolveCodexExecutable', () => {
   it('prefers an explicit binary override', () => {
     expect(resolveCodexExecutable({ ID_AGENT_CODEX_BIN: '/tmp/custom-codex' }).command).toBe('/tmp/custom-codex');
+  });
+
+  it('preserves an explicit Windows .cmd shim for the portable launcher', () => {
+    const resolved = resolveCodexExecutable(
+      { ID_AGENT_CODEX_BIN: 'C:\\Users\\consumer\\AppData\\Roaming\\npm\\codex.cmd' },
+      'win32',
+    );
+
+    expect(resolved.command).toBe('C:\\Users\\consumer\\AppData\\Roaming\\npm\\codex.cmd');
+    expect(resolved.native).toBe(false);
+  });
+
+  it.runIf(process.platform === 'win32')('reads versions from an npm-generated Windows .cmd shim', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'id-agents-codex-version-'));
+    const shim = path.join(root, 'codex.cmd');
+    fs.writeFileSync(shim, '@echo off\r\necho codex-cli 0.144.0\r\n');
+
+    expect(codexVersion(shim)).toContain('0.144.0');
   });
 
   it('resolves npm-installed codex to the native binary behind the node shim', () => {

@@ -15,8 +15,9 @@ import crypto from 'crypto';
 import path from 'path';
 import Database from 'better-sqlite3';
 import { createServer as createHttpServer, type Server as HttpServer } from 'http';
-import { existsSync, mkdirSync, rmSync, readFileSync, writeFileSync, readdirSync, copyFileSync, statSync, openSync, closeSync } from 'fs';
-import { execFileSync, spawn, type ChildProcess } from 'child_process';
+import { createServer as createNetServer } from 'net';
+import { chmodSync, existsSync, ftruncateSync, lstatSync, mkdirSync, rmSync, readFileSync, readSync, writeFileSync, writeSync, readdirSync, copyFileSync, statSync, openSync, closeSync } from 'fs';
+import { execFileSync, spawn, type ChildProcess, type SpawnOptions } from 'child_process';
 import { fileURLToPath } from 'url';
 import { WebSocketServer, WebSocket } from 'ws';
 import { type Address, type Hex } from 'viem';
@@ -30,6 +31,11 @@ import { filterClaudeEnvVars } from './lib/env-hygiene.js';
 import { LocalModelGate, isLocalModelRuntime } from './lib/local-model-gate.js';
 import { managerHealthAttestation } from './lib/service-labels.js';
 import { withDesktopResourceLimits } from './lib/resource-limits.js';
+import {
+  signalOwnedProcessTree,
+  terminateOwnedProcessTree,
+  verifiedOwnedProcess,
+} from './lib/process-tree.js';
 import { ccCapabilities } from './control-center/manifest.js';
 import {
   CONTROL_BRAIN_DELIVERED,
@@ -762,8 +768,25 @@ interface ProcessInspection {
 
 type LocalProcessOwner = 'manager-child' | 'adopted' | 'external';
 
+interface OwnedAgentProcess {
+  proc: ChildProcess;
+  agentId: string;
+  agentName: string;
+  port: number;
+}
+
+interface LocalAgentIdentityProbe {
+  ok: boolean;
+  attested: boolean;
+  error?: string;
+}
+
 function localProcessOwnerValue(value: unknown): LocalProcessOwner | null {
   return value === 'manager-child' || value === 'adopted' || value === 'external' ? value : null;
+}
+
+function escapeProcessArgumentPattern(value: string | number): string {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 type RuntimeLaneKind = 'subscription' | 'metered-api';
@@ -840,6 +863,7 @@ const DEFAULT_VALIDATOR_RECOMMENDATION_LOOP: ValidatorRecommendationLoopConfig =
   updatedAt: null,
 };
 const MANAGER_HTTP_SHUTDOWN_TIMEOUT_MS = 3_000;
+const WINDOWS_AGENT_TERMINATION_GRACE_MS = 2_000;
 const TALK_TO_DELIVERY_TIMEOUT_MS = 30_000;
 const TALK_TO_MAX_ATTEMPTS = 3;
 const TALK_TO_INITIAL_RETRY_DELAY_MS = 250;
@@ -901,6 +925,10 @@ export class AgentManagerDb {
   private runtimeFallbackRestoreInFlight: Promise<void> | null = null;
   private lastRuntimeFallbackRestoreSweepAt = 0;
   private agentLifecycleLocks: Map<string, Promise<void>> = new Map();
+  private ownedAgentProcesses: Map<number, OwnedAgentProcess> = new Map();
+  private pendingAgentPorts: Set<number> = new Set();
+  private agentLogRetentionInterval: NodeJS.Timeout | null = null;
+  private shuttingDown = false;
   private validatorRecommendationLoopLocks: Map<string, Promise<void>> = new Map();
   private taskOwnerWakeAttempts: Map<string, number> = new Map();
   private scheduleTargetWakeAttempts: Map<string, number> = new Map();
@@ -6070,7 +6098,7 @@ Return this JSON shape:
     agent: AgentRow,
   ): Promise<{ success: boolean; pid?: number; logFile?: string; error?: string }> {
     await this.cancelPendingQueriesForAgent(teamId, agent.id);
-    await this.killAgentProcess(agent.port);
+    await this.killAgentProcess(agent.port, agent.id);
     await new Promise(r => setTimeout(r, 1000));
     this.refreshPersonalityFileForRebuild(agent);
     const spawnResult = await this.spawnLocalAgentProcess(teamId, teamName, {
@@ -7064,8 +7092,59 @@ Return this JSON shape:
     return (result.rowCount ?? 0) > 0;
   }
 
+  private async loopbackPortIsAvailable(port: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const server = createNetServer();
+      let settled = false;
+      const finish = (available: boolean) => {
+        if (settled) return;
+        settled = true;
+        if (available && server.listening) {
+          try {
+            server.close(() => resolve(true));
+            return;
+          } catch { /* fall through */ }
+        }
+        try { server.close(); } catch { /* never reached listening */ }
+        resolve(false);
+      };
+      server.once('error', () => finish(false));
+      server.once('listening', () => finish(true));
+      server.unref();
+      try {
+        server.listen({ host: '127.0.0.1', port, exclusive: true });
+      } catch {
+        finish(false);
+      }
+    });
+  }
+
   private async dbNextPort(_teamId?: string): Promise<number> {
-    return this.db.agents.nextPort();
+    return this.withAgentLifecycleLock('__agent-port-allocation__', async () => {
+      const preferred = Math.max(4101, Number(await this.db.agents.nextPort()) || 4101);
+      const used = new Set<number>();
+      const teams = await this.db.teams.listTeams().catch(() => []);
+      for (const team of teams) {
+        const agents = await this.dbListAgents(team.id, true).catch(() => []);
+        for (const agent of agents) {
+          if (Number.isInteger(agent.port) && agent.port > 0) used.add(agent.port);
+        }
+      }
+
+      const range = 65535 - 4101 + 1;
+      const start = preferred <= 65535 ? preferred : 4101;
+      const maxAttempts = Math.min(range, 4096);
+      for (let offset = 0; offset < maxAttempts; offset += 1) {
+        const port = 4101 + ((start - 4101 + offset) % range);
+        if (used.has(port) || this.pendingAgentPorts.has(port)) continue;
+        if (!await this.loopbackPortIsAvailable(port)) continue;
+        this.pendingAgentPorts.add(port);
+        const release = setTimeout(() => this.pendingAgentPorts.delete(port), 30_000);
+        release.unref?.();
+        return port;
+      }
+      throw new Error(`No loopback agent port is available in the ${maxAttempts}-port allocation window`);
+    });
   }
 
   /**
@@ -12161,8 +12240,9 @@ Return this JSON shape:
         // Start the local process now when requested (the GUI "Add agent" flow).
         // Without this, /agents/spawn only creates the row and leaves the CLI to
         // spawn the worker; with start:true the manager spawns it itself.
+        let localSpawnResult: { success: boolean; pid?: number; logFile?: string; error?: string } | undefined;
         if (start === true || start === 'true') {
-          await this.spawnLocalAgentProcess(teamId, teamName, {
+          localSpawnResult = await this.spawnLocalAgentProcess(teamId, teamName, {
             name,
             id,
             port: allocatedPort,
@@ -12171,6 +12251,17 @@ Return this JSON shape:
             tokenId: tokenId || undefined,
             address: address || undefined,
           });
+          if (!localSpawnResult.success) {
+            await this.db.agents.updateStatus(id, 'error').catch(() => {});
+            return res.status(500).json({
+              error: 'local_agent_start_failed',
+              message: localSpawnResult.error || 'Local agent did not become ready',
+              id,
+              name,
+              port: allocatedPort,
+            });
+          }
+          await this.db.agents.updateStatus(id, 'running').catch(() => {});
         }
 
         res.status(201).json({
@@ -12179,7 +12270,8 @@ Return this JSON shape:
           model: effectiveModel,
           runtime: effectiveRuntime,
           port: allocatedPort,
-          status: 'pending',  // Will become 'running' when local process starts
+          status: localSpawnResult?.success ? 'running' : 'pending',
+          ...(localSpawnResult?.pid ? { pid: localSpawnResult.pid } : {}),
           type: 'claude',
           local: true,
           url,
@@ -15942,7 +16034,7 @@ Return this JSON shape:
               this.runningServers.delete(serverKey);
             }
             if (agent.port) {
-              await this.killAgentProcess(agent.port);
+              await this.killAgentProcess(agent.port, agent.id);
             }
             if (this.schedulerService) {
               await this.schedulerService.removeAgentSchedules(agent.id);
@@ -16011,7 +16103,7 @@ Return this JSON shape:
         }
 
         if (a.port) {
-          await this.killAgentProcess(a.port);
+          await this.killAgentProcess(a.port, a.id);
         }
 
         // Remove any schedules for this agent
@@ -16584,7 +16676,7 @@ Return this JSON shape:
           const row = syncableRunning.find(r => r.name === item.name);
           if (row) {
             if (row.port) {
-              await this.killAgentProcess(row.port);
+              await this.killAgentProcess(row.port, row.id);
               await new Promise(r => setTimeout(r, 500));
             }
             await this.db.agents.deleteAgent(row.id);
@@ -16607,7 +16699,7 @@ Return this JSON shape:
           const wdChanged = item.changes?.includes('workingDirectory');
           if (wdChanged) {
             if (row.port) {
-              await this.killAgentProcess(row.port);
+              await this.killAgentProcess(row.port, row.id);
               await new Promise(r => setTimeout(r, 500));
             }
             await this.db.agents.deleteAgent(row.id);
@@ -16618,7 +16710,7 @@ Return this JSON shape:
 
           // Kill old process on existing port
           if (row.port) {
-            await this.killAgentProcess(row.port);
+            await this.killAgentProcess(row.port, row.id);
             await new Promise(r => setTimeout(r, 500));
           }
 
@@ -17191,7 +17283,7 @@ Return this JSON shape:
             if (existing) {
               // Kill the old process before deleting the DB row to prevent orphans
               if (existing.port) {
-                await this.killAgentProcess(existing.port);
+                await this.killAgentProcess(existing.port, existing.id);
                 await new Promise(r => setTimeout(r, 500));
               }
               await this.db.agents.deleteAgent(existing.id);
@@ -17441,7 +17533,7 @@ Return this JSON shape:
               }
             }
             case 'stop': {
-              const killResult = await this.killAgentProcess(agent.port);
+              const killResult = await this.killAgentProcess(agent.port, agent.id);
               const cancelled = await this.cancelPendingQueriesForAgent(teamId, agent.id);
               await this.db.agents.updateStatus(agent.id, 'stopped');
               await this.clearAgentPid(agent.id);
@@ -23074,6 +23166,8 @@ Return this JSON shape:
         // coder row only. This avoids silent recurrence after one-off repairs
         // while leaving researcher and the rest of the fleet untouched.
         await this.reconcileDefaultCoderRuntimeFromConfig();
+        await this.restoreManagerOwnedAgentsAfterRestart();
+        this.startAgentLogRetention();
 
         // Start periodic health monitoring (every 30s)
         this.startHealthMonitor();
@@ -23162,6 +23256,8 @@ Return this JSON shape:
    * the manager shuts down cleanly without leaking timers or sockets.
    */
   async shutdown(): Promise<void> {
+    if (this.shuttingDown) return;
+    this.shuttingDown = true;
     if (this.checkinService) {
       this.checkinService.stop();
       this.checkinService = null;
@@ -23206,10 +23302,15 @@ Return this JSON shape:
       clearInterval(this.remoteProbeInterval);
       this.remoteProbeInterval = null;
     }
+    if (this.agentLogRetentionInterval) {
+      clearInterval(this.agentLogRetentionInterval);
+      this.agentLogRetentionInterval = null;
+    }
     for (const timer of this.leadDelegationKickoffRetryTimers.values()) {
       clearTimeout(timer);
     }
     this.leadDelegationKickoffRetryTimers.clear();
+    await this.stopManagerOwnedAgentsForShutdown();
     if (this.wss) {
       try { this.wss.close(); } catch { /* swallow */ }
       this.wss = null;
@@ -23232,6 +23333,131 @@ Return this JSON shape:
         try { (server as any).closeIdleConnections?.(); } catch { /* best effort */ }
         try { server.close(() => finish()); } catch { finish(); }
       });
+    }
+  }
+
+  private async updateManagerRestartRequest(agentId: string, requested: boolean): Promise<void> {
+    const row = await this.db.agents.getById(agentId).catch(() => null);
+    if (!row) return;
+    const metadata = { ...((row.metadata as Record<string, unknown> | null | undefined) ?? {}) };
+    if (requested) metadata.managerRestartRequested = true;
+    else delete metadata.managerRestartRequested;
+    await this.db.agents.updateMetadata(agentId, metadata);
+  }
+
+  private async stopManagerOwnedAgentsForShutdown(): Promise<void> {
+    const targets = new Map<string, { agent: AgentRow; pid?: number }>();
+    const teams = await (async () => {
+      try { return await this.db.teams.listTeams(); }
+      catch { return []; }
+    })();
+    for (const team of teams) {
+      const agents = await this.dbListAgents(team.id, true).catch(() => []);
+      for (const agent of agents) {
+        if (isRemoteEndpointRuntime(agent.runtime) || agent.type === 'virtual') continue;
+        const metadata = (agent.metadata as Record<string, unknown> | null | undefined) ?? {};
+        const pid = Number(metadata.pid);
+        const owner = localProcessOwnerValue(metadata.processOwner);
+        const registered = Number.isInteger(pid) && this.ownedAgentProcesses.has(pid);
+        if (!registered && owner !== 'manager-child' && owner !== 'adopted') continue;
+        if (agent.status !== 'running' && agent.status !== 'starting') continue;
+        targets.set(agent.id, {
+          agent,
+          ...(Number.isInteger(pid) && pid > 0 ? { pid } : {}),
+        });
+      }
+    }
+
+    for (const owned of this.ownedAgentProcesses.values()) {
+      if (targets.has(owned.agentId)) continue;
+      const agent = await this.db.agents.getById(owned.agentId).catch(() => null);
+      if (agent) targets.set(agent.id, { agent, pid: owned.proc.pid });
+    }
+    if (targets.size === 0) return;
+
+    for (const { agent } of targets.values()) {
+      await this.updateManagerRestartRequest(agent.id, true).catch(() => {});
+    }
+    for (const { agent } of targets.values()) {
+      await this.killAgentProcess(agent.port, agent.id).catch(() => ({ killed: false, pids: [] }));
+    }
+
+    const deadline = Date.now() + 3_000;
+    while (
+      Date.now() < deadline
+      && [...targets.values()].some(({ pid }) => pid && this.processIsAlive(pid))
+    ) {
+      await sleep(100);
+    }
+
+    for (const { agent, pid } of targets.values()) {
+      if (pid && this.processIsAlive(pid)) {
+        const target = verifiedOwnedProcess(
+          pid,
+          await this.verifyLocalAgentProcessOwnership(pid, agent.port, agent),
+        );
+        if (target) {
+          signalOwnedProcessTree(target, 'SIGKILL', {
+            detachedProcessGroup: true,
+            onError: (message, error) => {
+              console.warn(`[Manager] ${message}: ${error instanceof Error ? error.message : String(error)}`);
+            },
+          });
+        } else {
+          console.warn(`[Manager] Refusing shutdown force-stop for unverified PID ${pid}`);
+        }
+      }
+      if (pid) this.ownedAgentProcesses.delete(pid);
+      await this.clearAgentPid(agent.id, pid).catch(() => {});
+      const current = await this.db.agents.getById(agent.id).catch(() => null);
+      if (current?.status === 'running' || current?.status === 'starting') {
+        await this.db.agents.updateStatus(agent.id, 'offline').catch(() => {});
+      }
+    }
+  }
+
+  private async restoreManagerOwnedAgentsAfterRestart(): Promise<void> {
+    const teams = await this.db.teams.listTeams().catch(() => []);
+    for (const team of teams) {
+      const agents = await this.dbListAgents(team.id, true).catch(() => []);
+      for (const agent of agents) {
+        const metadata = (agent.metadata as Record<string, unknown> | null | undefined) ?? {};
+        if (metadata.managerRestartRequested !== true) continue;
+        if (isRemoteEndpointRuntime(agent.runtime) || agent.type === 'virtual') {
+          await this.updateManagerRestartRequest(agent.id, false).catch(() => {});
+          continue;
+        }
+
+        const pid = Number(metadata.pid);
+        if (agent.status === 'running' && Number.isInteger(pid) && pid > 0) {
+          const identity = await this.probeLocalAgentIdentity(
+            agent.port,
+            { id: agent.id, name: agent.name, pid },
+            { requireAttestation: false },
+          );
+          if (identity.ok) {
+            await this.updateManagerRestartRequest(agent.id, false).catch(() => {});
+            continue;
+          }
+        }
+
+        const result = await this.spawnLocalAgentProcess(team.id, team.name, {
+          name: agent.name,
+          id: agent.id,
+          port: agent.port,
+          model: agent.model,
+          workingDirectory: agent.working_directory ?? undefined,
+          tokenId: agent.token_id ?? undefined,
+        });
+        if (result.success) {
+          await this.db.agents.updateStatus(agent.id, 'running').catch(() => {});
+          await this.updateManagerRestartRequest(agent.id, false).catch(() => {});
+          console.log(`[Manager] Restored ${agent.name} after Manager restart`);
+        } else {
+          await this.db.agents.updateStatus(agent.id, 'offline').catch(() => {});
+          console.warn(`[Manager] Could not restore ${agent.name} after Manager restart: ${result.error || 'spawn failed'}`);
+        }
+      }
     }
   }
 
@@ -23270,8 +23496,58 @@ Return this JSON shape:
 
   private matchesLocalAgentProcess(info: ProcessInspection, agent: AgentRow): boolean {
     if (!/local-agent-server\.(js|ts)\b/.test(info.commandLine)) return false;
-    if (agent.port && !new RegExp(`--port(?:=|\\s+)${agent.port}(?:\\s|$)`).test(info.commandLine)) return false;
-    return true;
+    if (!agent.port || !new RegExp(
+      `--port(?:=|\\s+)${escapeProcessArgumentPattern(agent.port)}(?:\\s|$)`,
+    ).test(info.commandLine)) return false;
+    return new RegExp(
+      `--id(?:=|\\s+)${escapeProcessArgumentPattern(agent.id)}(?:\\s|$)`,
+    ).test(info.commandLine);
+  }
+
+  private async verifyLocalAgentProcessOwnership(
+    pid: number,
+    port: number,
+    row?: AgentRow,
+  ): Promise<boolean> {
+    if (!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid) return false;
+
+    const registered = this.ownedAgentProcesses.get(pid);
+    if (registered) {
+      if (row && registered.agentId !== row.id) return false;
+      if (registered.port !== port || registered.proc.pid !== pid) return false;
+      return registered.proc.exitCode == null && registered.proc.signalCode == null;
+    }
+
+    const info = this.inspectProcess(pid);
+    if (this.matchesManagerProcessSignature(info)) return false;
+    if (info) {
+      return row
+        ? this.matchesLocalAgentProcess(info, row)
+        : /local-agent-server\.(js|ts)\b/.test(info.commandLine)
+          && new RegExp(`--port(?:=|\\s+)${port}(?:\\s|$)`).test(info.commandLine);
+    }
+
+    if (!row || !this.processIsAlive(pid)) return false;
+    const metadata = (row.metadata as Record<string, unknown> | null | undefined) ?? {};
+    if (Number(metadata.pid) !== pid) return false;
+    const owner = localProcessOwnerValue(metadata.processOwner);
+    if (owner !== 'manager-child' && owner !== 'adopted') return false;
+    const identity = await this.probeLocalAgentIdentity(
+      port,
+      { id: row.id, name: row.name, pid },
+      { requireAttestation: true },
+    );
+    return identity.ok && identity.attested;
+  }
+
+  private processIsAlive(pid: number): boolean {
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private async reconcileLocalAgentProcessMetadata(): Promise<void> {
@@ -23300,18 +23576,37 @@ Return this JSON shape:
             continue;
           }
           const info = this.inspectProcess(pid);
-          if (!info || !this.matchesLocalAgentProcess(info, agent)) {
+          if (info && !this.matchesLocalAgentProcess(info, agent)) {
             await this.clearAgentPid(agent.id, pid);
             await this.db.agents.updateStatus(agent.id, 'offline').catch(() => {});
             cleared += 1;
             continue;
           }
-          const owner = this.localProcessOwnerFromInspection(info);
+          if (!info) {
+            const identity = this.processIsAlive(pid)
+              ? await this.probeLocalAgentIdentity(
+                  agent.port,
+                  { id: agent.id, name: agent.name, pid },
+                  { requireAttestation: false },
+                )
+              : { ok: false, attested: false };
+            if (!identity.ok) {
+              await this.clearAgentPid(agent.id, pid);
+              await this.db.agents.updateStatus(agent.id, 'offline').catch(() => {});
+              cleared += 1;
+              continue;
+            }
+          }
+          const owner = info
+            ? this.localProcessOwnerFromInspection(info)
+            : localProcessOwnerValue(metadata.processOwner) || 'adopted';
+          const parentPid = info?.ppid
+            ?? (Number.isInteger(Number(metadata.processParentPid)) ? Number(metadata.processParentPid) : null);
           const next = {
             ...metadata,
             pid,
             processOwner: owner,
-            processParentPid: info.ppid,
+            processParentPid: parentPid,
             processInspectedAt: Date.now(),
           };
           if (
@@ -23780,6 +24075,15 @@ Return this JSON shape:
     const skillmeshCreatorKey = skillmeshProviderEnabled && typeof metadata.skillmesh_creator_key === 'string'
       ? metadata.skillmesh_creator_key
       : undefined;
+    // Match createDb() exactly: DATABASE_URL is authoritative when present;
+    // otherwise workers inherit the Manager's explicit SQLite profile.
+    const managerDatabaseUrl = process.env.DATABASE_URL?.trim();
+    const managerSqlitePath = managerDatabaseUrl
+      ? undefined
+      : process.env.SQLITE_PATH?.trim();
+    const managerWorkspaceDir = process.env.ID_WORKSPACE_DIR?.trim()
+      || process.env.WORKSPACE_DIR?.trim()
+      || this.baseWorkDir;
 
     return withDesktopResourceLimits({
       PATH: process.env.PATH || '',
@@ -23789,14 +24093,52 @@ Return this JSON shape:
       USER: process.env.USER || '',
       LANG: process.env.LANG || '',
       TERM: process.env.TERM || 'xterm-256color',
+      // Preserve the reviewed Windows process/runtime environment. Desktop
+      // launches may use npm .cmd shims from APPDATA and child_process needs
+      // ComSpec/PATHEXT/SystemRoot to resolve and execute them consistently.
+      ...(process.env.APPDATA && { APPDATA: process.env.APPDATA }),
+      ...(process.env.LOCALAPPDATA && { LOCALAPPDATA: process.env.LOCALAPPDATA }),
+      ...(process.env.USERPROFILE && { USERPROFILE: process.env.USERPROFILE }),
+      ...(process.env.TEMP && { TEMP: process.env.TEMP }),
+      ...(process.env.TMP && { TMP: process.env.TMP }),
+      ...(process.env.SystemRoot && { SystemRoot: process.env.SystemRoot }),
+      ...(process.env.ComSpec && { ComSpec: process.env.ComSpec }),
+      ...(process.env.PATHEXT && { PATHEXT: process.env.PATHEXT }),
+      ...(process.env.ProgramFiles && { ProgramFiles: process.env.ProgramFiles }),
+      ...(process.env['ProgramFiles(x86)'] && { 'ProgramFiles(x86)': process.env['ProgramFiles(x86)'] }),
+      ...(process.env.NVM_HOME && { NVM_HOME: process.env.NVM_HOME }),
+      ...(process.env.NVM_SYMLINK && { NVM_SYMLINK: process.env.NVM_SYMLINK }),
+      ...(process.env.PNPM_HOME && { PNPM_HOME: process.env.PNPM_HOME }),
+      ...(process.env.VOLTA_HOME && { VOLTA_HOME: process.env.VOLTA_HOME }),
+      ...(process.env.BUN_INSTALL && { BUN_INSTALL: process.env.BUN_INSTALL }),
       ...(process.env.NVM_DIR && { NVM_DIR: process.env.NVM_DIR }),
       ...(process.env.XDG_CONFIG_HOME && { XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME }),
+      // The desktop resolves subscription executables against its augmented
+      // GUI PATH and passes these exact paths to Manager workers.
+      ...(process.env.CLAUDE_PATH && { CLAUDE_PATH: process.env.CLAUDE_PATH }),
+      ...(process.env.ID_AGENT_CODEX_BIN && { ID_AGENT_CODEX_BIN: process.env.ID_AGENT_CODEX_BIN }),
+      ...(process.env.CODEX_BIN && { CODEX_BIN: process.env.CODEX_BIN }),
+      ...(process.env.CODEX_EXECUTABLE && { CODEX_EXECUTABLE: process.env.CODEX_EXECUTABLE }),
+      ...(process.env.CURSOR_AGENT_PATH && { CURSOR_AGENT_PATH: process.env.CURSOR_AGENT_PATH }),
+      ...(process.env.GROK_CLI_PATH && { GROK_CLI_PATH: process.env.GROK_CLI_PATH }),
+      ...(process.env.ANTIGRAVITY_CLI_PATH && { ANTIGRAVITY_CLI_PATH: process.env.ANTIGRAVITY_CLI_PATH }),
+      ...(process.env.COPILOT_CLI_PATH && { COPILOT_CLI_PATH: process.env.COPILOT_CLI_PATH }),
+      ...(process.env.KIRO_CLI_PATH && { KIRO_CLI_PATH: process.env.KIRO_CLI_PATH }),
+      ...(process.env.KIMI_CLI_PATH && { KIMI_CLI_PATH: process.env.KIMI_CLI_PATH }),
       ...filterClaudeEnvVars(process.env),
       ...(agentRow?.runtime && { ID_HARNESS: runtime }),
       ID_TEAM: teamName,
       ID_AGENT_PORT: String(port),
+      IDACC_PARENT_PID: String(process.pid),
       ID_RUNTIME_LANE_ID: runtimeLane.id,
       ID_RUNTIME_LANE_KIND: runtimeLane.kind,
+      // Workers and Manager must use the same workspace and store. The desktop
+      // supplies an absolute profile workspace plus SQLITE_PATH after removing
+      // inherited DATABASE_URL. Standalone Manager keeps createDb's Postgres
+      // precedence when DATABASE_URL is deliberately configured.
+      ID_WORKSPACE_DIR: managerWorkspaceDir,
+      ...(managerSqlitePath && { SQLITE_PATH: managerSqlitePath }),
+      ...(managerDatabaseUrl && { DATABASE_URL: managerDatabaseUrl }),
       // The desktop supervisor assigns the Manager an ephemeral loopback port.
       // Workers must call back to this Manager instance, not the legacy default.
       MANAGER_URL: `http://127.0.0.1:${this.managementPort}`,
@@ -23819,6 +24161,9 @@ Return this JSON shape:
       ...(providerApiKey && { ID_PROVIDER_API_KEY: providerApiKey }),
       ...(childAnthropicApiKey && { ANTHROPIC_API_KEY: childAnthropicApiKey }),
       ...(process.env.OPENAI_API_KEY && { OPENAI_API_KEY: process.env.OPENAI_API_KEY }),
+      // A packaged Manager runs inside Electron's executable in Node mode.
+      // Its workers must inherit that mode when they reuse process.execPath.
+      ...(process.env.ELECTRON_RUN_AS_NODE === '1' && { ELECTRON_RUN_AS_NODE: '1' }),
       ...(skillmeshKey && {
         SKILLMESH_PRIVATE_KEY: skillmeshKey,
         ...(process.env.SKILLMESH_APP_URL?.trim() && {
@@ -23935,30 +24280,194 @@ Return this JSON shape:
     }
   }
 
+  private localAgentLogDirectory(): string {
+    const configured = process.env.IDACC_AGENT_LOG_DIR?.trim();
+    if (configured && !path.isAbsolute(configured)) {
+      throw new Error('IDACC_AGENT_LOG_DIR must be an absolute path');
+    }
+    const logDir = configured || path.join(this.baseWorkDir, 'logs', 'agents');
+    if (existsSync(logDir)) {
+      const stat = lstatSync(logDir);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) {
+        throw new Error(`Local-agent log directory is not a real directory: ${logDir}`);
+      }
+    } else {
+      mkdirSync(logDir, { recursive: true, mode: 0o700 });
+    }
+    try { chmodSync(logDir, 0o700); } catch { /* best effort outside POSIX */ }
+    return logDir;
+  }
+
+  private localAgentLogFile(agentId: string): string {
+    const logDir = this.localAgentLogDirectory();
+    const safeAgentId = agentId
+      .toLowerCase()
+      .replace(/[^a-z0-9._-]+/g, '_')
+      .replace(/^[_\-.]+|[_\-.]+$/g, '')
+      .slice(0, 120)
+      || crypto.createHash('sha256').update(agentId).digest('hex').slice(0, 24);
+    const logFile = path.join(logDir, `agent-${safeAgentId}.log`);
+    if (existsSync(logFile)) {
+      const stat = lstatSync(logFile);
+      if (stat.isSymbolicLink() || !stat.isFile()) {
+        throw new Error(`Local-agent log path is not a regular file: ${logFile}`);
+      }
+    }
+    return logFile;
+  }
+
+  private enforceLocalAgentLogRetention(
+    maxBytes = Math.max(1024 * 1024, Number(process.env.IDACC_AGENT_LOG_MAX_BYTES) || 16 * 1024 * 1024),
+    retainBytes = Math.max(64 * 1024, Number(process.env.IDACC_AGENT_LOG_RETAIN_BYTES) || 4 * 1024 * 1024),
+  ): void {
+    const logDir = this.localAgentLogDirectory();
+    const boundedRetainBytes = Math.min(retainBytes, maxBytes);
+    for (const entry of readdirSync(logDir, { withFileTypes: true })) {
+      if (!entry.isFile() || !/^agent-[a-z0-9._-]+\.log$/.test(entry.name)) continue;
+      const logFile = path.join(logDir, entry.name);
+      const stat = lstatSync(logFile);
+      if (stat.isSymbolicLink() || !stat.isFile() || stat.size <= maxBytes) continue;
+
+      let descriptor: number | undefined;
+      try {
+        descriptor = openSync(logFile, 'r+');
+        const tailSize = Math.min(stat.size, boundedRetainBytes);
+        const tail = Buffer.allocUnsafe(tailSize);
+        let offset = 0;
+        while (offset < tail.length) {
+          const count = readSync(
+            descriptor,
+            tail,
+            offset,
+            tail.length - offset,
+            stat.size - tail.length + offset,
+          );
+          if (count <= 0) break;
+          offset += count;
+        }
+        ftruncateSync(descriptor, 0);
+        if (offset > 0) writeSync(descriptor, tail, 0, offset, 0);
+        try { chmodSync(logFile, 0o600); } catch { /* best effort outside POSIX */ }
+      } catch (error: any) {
+        console.warn(`[Manager] Could not retain local-agent log ${entry.name}: ${error?.message || error}`);
+      } finally {
+        if (descriptor !== undefined) {
+          try { closeSync(descriptor); } catch { /* already closed */ }
+        }
+      }
+    }
+  }
+
+  private startAgentLogRetention(): void {
+    if (this.agentLogRetentionInterval) return;
+    try { this.enforceLocalAgentLogRetention(); } catch (error: any) {
+      console.warn(`[Manager] Could not initialize local-agent log retention: ${error?.message || error}`);
+    }
+    this.agentLogRetentionInterval = setInterval(() => {
+      try { this.enforceLocalAgentLogRetention(); } catch (error: any) {
+        console.warn(`[Manager] Could not enforce local-agent log retention: ${error?.message || error}`);
+      }
+    }, 60_000);
+    this.agentLogRetentionInterval.unref?.();
+  }
+
+  private spawnLocalAgentChild(
+    executable: string,
+    args: string[],
+    options: SpawnOptions,
+  ): ChildProcess {
+    return spawn(executable, args, options);
+  }
+
+  private async probeLocalAgentIdentity(
+    port: number,
+    expected: { id: string; name: string; pid?: number },
+    opts: { requireAttestation?: boolean; timeoutMs?: number } = {},
+  ): Promise<LocalAgentIdentityProbe> {
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/health`, {
+        redirect: 'error',
+        headers: { Accept: 'application/json', Connection: 'close' },
+        signal: AbortSignal.timeout(opts.timeoutMs ?? 750),
+        size: 16 * 1024,
+      });
+      if (!response.ok) {
+        return { ok: false, attested: false, error: `health returned HTTP ${response.status}` };
+      }
+      const contentType = response.headers.get('content-type')?.toLowerCase() || '';
+      if (!contentType.includes('json')) {
+        return { ok: false, attested: false, error: 'health did not return JSON' };
+      }
+      const payload = await response.json() as Record<string, unknown>;
+      if (payload.status !== 'ok') {
+        return { ok: false, attested: false, error: 'health status was not ok' };
+      }
+      if (payload.agent !== expected.name) {
+        return { ok: false, attested: false, error: 'health agent identity did not match' };
+      }
+
+      const idMatches = payload.agentId === expected.id;
+      const reportedPid = typeof payload.pid === 'number' ? payload.pid : Number(payload.pid);
+      const pidMatches = expected.pid === undefined
+        ? Number.isInteger(reportedPid) && reportedPid > 0
+        : reportedPid === expected.pid;
+      const attested = idMatches && pidMatches;
+      if (opts.requireAttestation !== false && !attested) {
+        return { ok: false, attested: false, error: 'health process attestation did not match' };
+      }
+      // Older local-agent servers do not report agentId/pid. Their exact name
+      // remains a migration-only fallback for inspecting a persisted managed PID.
+      return { ok: true, attested };
+    } catch (err: any) {
+      return {
+        ok: false,
+        attested: false,
+        error: err?.name === 'AbortError' || err?.name === 'TimeoutError'
+          ? 'health probe timed out'
+          : String(err?.message || 'health probe failed'),
+      };
+    }
+  }
+
   private async waitForAgentPortToBind(
     proc: ChildProcess,
     port: number,
+    expected: { id: string; name: string },
     timeoutMs: number = 10_000,
   ): Promise<{ ok: true } | { ok: false; error: string }> {
     const pid = proc.pid;
     if (!pid) return { ok: false, error: 'spawn did not return a process id' };
 
     let exited: { code: number | null; signal: NodeJS.Signals | null } | null = null;
+    let spawnError: Error | null = null;
     const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
       exited = { code, signal };
     };
+    const onError = (error: Error) => {
+      spawnError = error;
+    };
     proc.once('exit', onExit);
+    proc.once('error', onError);
 
     const deadline = Date.now() + timeoutMs;
     try {
       while (Date.now() < deadline) {
+        const spawnFailure = spawnError as Error | null;
+        if (spawnFailure) {
+          return { ok: false, error: `agent process ${pid} failed to spawn: ${spawnFailure.message}` };
+        }
         if (exited !== null) {
           const exitInfo = exited as { code: number | null; signal: NodeJS.Signals | null };
           const exit = exitInfo.signal ? `signal ${exitInfo.signal}` : `code ${exitInfo.code ?? 'unknown'}`;
-          return { ok: false, error: `agent process ${pid} exited before listening on port ${port} (${exit})` };
+          return { ok: false, error: `agent process ${pid} exited before becoming ready on port ${port} (${exit})` };
         }
 
-        if (this.listPidsListeningOnPort(port).includes(pid)) {
+        const probe = await this.probeLocalAgentIdentity(
+          port,
+          { ...expected, pid },
+          { requireAttestation: true, timeoutMs: 500 },
+        );
+        if (probe.ok) {
           return { ok: true };
         }
 
@@ -23966,9 +24475,10 @@ Return this JSON shape:
       }
     } finally {
       proc.off('exit', onExit);
+      proc.off('error', onError);
     }
 
-    return { ok: false, error: `agent process ${pid} did not listen on port ${port} within ${timeoutMs}ms` };
+    return { ok: false, error: `agent process ${pid} did not become identity-verified on port ${port} within ${timeoutMs}ms` };
   }
 
   private async spawnLocalAgentProcessUnlocked(
@@ -23976,12 +24486,17 @@ Return this JSON shape:
     teamName: string,
     agentData: { name: string; id: string; port: number; model?: string; workingDirectory?: string; tokenId?: string; address?: string }
   ): Promise<{ success: boolean; pid?: number; logFile?: string; error?: string }> {
+    if (this.shuttingDown) {
+      return { success: false, error: 'Manager is shutting down' };
+    }
     try {
       const scriptPath = path.resolve(__dirname, 'local-agent-server.js');
-      const { name, id, port, model, workingDirectory, tokenId, address } = agentData;
+      const { name, id, port, model, workingDirectory, tokenId } = agentData;
+      const agentRow = await this.dbQueryAgentById(teamId, id);
 
-      // Kill any existing process on this port
-      await this.killAgentProcess(port);
+      // Stop only a verified local-agent process. A random process occupying the
+      // requested port is never terminated.
+      await this.killAgentProcess(port, id);
       await this.clearAgentPid(id);
       await new Promise(r => setTimeout(r, 500));
 
@@ -23999,30 +24514,76 @@ Return this JSON shape:
 
       // Set environment
       // Look up OWS wallet name and permissions flag from agent metadata
-      const agentRow = await this.dbQueryAgentById(teamId, id);
       const localEnv = this.buildLocalAgentEnv(teamId, teamName, port, agentRow, model, tokenId);
 
-      // Create log file
-      const logFile = `/tmp/${name}.log`;
-      const logFd = openSync(logFile, 'a');
+      // Logs live inside the app-owned profile (or the Manager work directory
+      // for standalone use), never in a global /tmp namespace.
+      const logFile = this.localAgentLogFile(id);
+      const logFd = openSync(logFile, 'a', 0o600);
+      try { chmodSync(logFile, 0o600); } catch { /* best effort outside POSIX */ }
 
       console.log(`[Manager] Spawning agent process: ${name} (port ${port}, id ${id})`);
 
-      const proc = spawn('node', spawnArgs, {
-        env: localEnv,
-        stdio: ['ignore', logFd, logFd],
-        detached: true
-      });
-
-      proc.unref();
-      closeSync(logFd);
+      let proc: ChildProcess;
+      try {
+        // process.execPath is Node for standalone Manager and the signed
+        // Electron executable for packaged IDACC. ELECTRON_RUN_AS_NODE above
+        // makes the latter a self-contained Node runtime.
+        proc = this.spawnLocalAgentChild(process.execPath, spawnArgs, {
+          env: localEnv,
+          stdio: ['ignore', logFd, logFd],
+          detached: true,
+          windowsHide: true,
+        });
+      } finally {
+        closeSync(logFd);
+      }
 
       console.log(`[Manager] Agent ${name} spawned with PID ${proc.pid}`);
 
-      const bindResult = await this.waitForAgentPortToBind(proc, port);
+      if (proc.pid) {
+        const owned: OwnedAgentProcess = { proc, agentId: id, agentName: name, port };
+        this.ownedAgentProcesses.set(proc.pid, owned);
+        proc.once('exit', () => {
+          if (this.ownedAgentProcesses.get(proc.pid!)?.proc === proc) {
+            this.ownedAgentProcesses.delete(proc.pid!);
+          }
+        });
+      }
+      proc.unref();
+
+      const bindResult = await this.waitForAgentPortToBind(proc, port, { id, name });
       if (!bindResult.ok) {
         if (proc.pid) {
-          try { process.kill(proc.pid, 'SIGTERM'); } catch { /* already exited */ }
+          const pid = proc.pid;
+          if (process.platform === 'win32') {
+            await terminateOwnedProcessTree(pid, {
+              verifyOwnership: () => (
+                this.ownedAgentProcesses.get(pid)?.proc === proc
+                && proc.exitCode == null
+                && proc.signalCode == null
+              ),
+              isAlive: () => this.processIsAlive(pid),
+              graceMs: WINDOWS_AGENT_TERMINATION_GRACE_MS,
+              onError: (message, error) => {
+                console.warn(`[Manager] ${message}: ${error instanceof Error ? error.message : String(error)}`);
+              },
+            });
+          } else {
+            const target = verifiedOwnedProcess(
+              pid,
+              this.ownedAgentProcesses.get(pid)?.proc === proc,
+            );
+            if (target) {
+              signalOwnedProcessTree(target, 'SIGTERM', {
+                detachedProcessGroup: true,
+                onError: (message, error) => {
+                  console.warn(`[Manager] ${message}: ${error instanceof Error ? error.message : String(error)}`);
+                },
+              });
+            }
+          }
+          this.ownedAgentProcesses.delete(proc.pid);
           await this.clearAgentPid(id, proc.pid);
         }
         return { success: false, pid: proc.pid, logFile, error: bindResult.error };
@@ -24512,7 +25073,7 @@ Return this JSON shape:
             rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: `recent_query_activity_${freshRecentQueries}_within_${Math.round(freshRecentActivityMs / 60000)}m` });
             continue;
           }
-          const killResult = await this.killAgentProcess(agent.port);
+          const killResult = await this.killAgentProcess(agent.port, agent.id);
           const cancelled = await this.cancelPendingQueriesForAgent(team.id, agent.id);
           await this.db.agents.updateStatus(agent.id, 'stopped');
           await this.clearAgentPid(agent.id);
@@ -24556,6 +25117,7 @@ Return this JSON shape:
   }
 
   private listPidsListeningOnPort(port: number): number[] {
+    if (process.platform === 'win32') return [];
     try {
       const lsofOutput = execFileSync('lsof', [`-tiTCP:${port}`, '-sTCP:LISTEN'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
       if (!lsofOutput) return [];
@@ -24612,33 +25174,97 @@ Return this JSON shape:
     );
   }
 
-  private isManagerProcess(pid: number): boolean {
-    if (pid === process.pid) return true;
-    return this.matchesManagerProcessSignature(this.inspectProcess(pid));
+  private async persistedLocalAgentRowsForPort(port: number, expectedAgentId?: string): Promise<AgentRow[]> {
+    if (expectedAgentId) {
+      const row = await this.db.agents.getById(expectedAgentId).catch(() => null);
+      return row && row.port === port && !isRemoteEndpointRuntime(row.runtime) ? [row] : [];
+    }
+
+    const rows: AgentRow[] = [];
+    const teams = await this.db.teams.listTeams().catch(() => []);
+    for (const team of teams) {
+      const agents = await this.dbListAgents(team.id, true).catch(() => []);
+      rows.push(...agents.filter((agent) => (
+        agent.port === port
+        && !isRemoteEndpointRuntime(agent.runtime)
+      )));
+    }
+    return rows;
   }
 
   /**
-   * Kill the agent process running on a given port.
+   * Stop a verified local-agent process on a given port.
+   *
+   * Persisted Manager-owned PIDs are the cross-platform source of truth.
+   * Unix port discovery is migration/fallback evidence only, and an unrelated
+   * process is never terminated merely because it occupies the requested port.
    */
-  private async killAgentProcess(port: number): Promise<{ killed: boolean; pids: number[] }> {
+  private async killAgentProcess(port: number, expectedAgentId?: string): Promise<{ killed: boolean; pids: number[] }> {
     if (!port) return { killed: false, pids: [] };
-    const candidatePids = this.listPidsListeningOnPort(port);
+    const rows = await this.persistedLocalAgentRowsForPort(port, expectedAgentId);
+    const expectedRow = expectedAgentId
+      ? rows.find((row) => row.id === expectedAgentId)
+      : undefined;
+    if (expectedAgentId && !expectedRow) {
+      console.warn(`[Manager] Refusing to stop port ${port}: no persisted local agent matches ${expectedAgentId}`);
+      return { killed: false, pids: [] };
+    }
+    const rowsByPid = new Map<number, AgentRow>();
+    for (const row of rows) {
+      const rawPid = (row.metadata as Record<string, unknown> | null | undefined)?.pid;
+      const pid = typeof rawPid === 'number' ? rawPid : Number(rawPid);
+      if (Number.isInteger(pid) && pid > 0) rowsByPid.set(pid, row);
+    }
+    const candidatePids = [...new Set([
+      ...rowsByPid.keys(),
+      ...this.listPidsListeningOnPort(port),
+    ])];
     if (candidatePids.length === 0) return { killed: false, pids: [] };
 
     const killedPids: number[] = [];
     for (const pid of candidatePids) {
-      if (this.isManagerProcess(pid)) {
+      if (pid === process.pid) {
         console.warn(`[Manager] Skipping manager PID ${pid} on port ${port}`);
         continue;
       }
 
-      try {
-        process.kill(pid, 'SIGTERM');
-        killedPids.push(pid);
-        console.log(`[Manager] Killed process PID ${pid} on port ${port}`);
-      } catch {
-        // Process may have already exited
+      const row = rowsByPid.get(pid) ?? expectedRow;
+      const verifyOwnership = () => this.verifyLocalAgentProcessOwnership(pid, port, row);
+      let signalled = false;
+      if (process.platform === 'win32') {
+        const result = await terminateOwnedProcessTree(pid, {
+          verifyOwnership,
+          isAlive: () => this.processIsAlive(pid),
+          graceMs: WINDOWS_AGENT_TERMINATION_GRACE_MS,
+          // Shutdown first requests every child to exit, then applies one
+          // coordinated force pass after the shared three-second grace.
+          forceAfterGrace: !this.shuttingDown,
+          onError: (message, error) => {
+            console.warn(`[Manager] ${message}: ${error instanceof Error ? error.message : String(error)}`);
+          },
+        });
+        signalled = result.gracefulSignalled || result.forcedSignalled || result.exited;
+      } else {
+        const target = verifiedOwnedProcess(pid, await verifyOwnership());
+        if (target) {
+          signalled = signalOwnedProcessTree(target, 'SIGTERM', {
+            detachedProcessGroup: true,
+            onError: (message, error) => {
+              console.warn(`[Manager] ${message}: ${error instanceof Error ? error.message : String(error)}`);
+            },
+          });
+        }
       }
+      if (!signalled) {
+        console.warn(`[Manager] Refusing to stop unverified PID ${pid} on port ${port}`);
+        continue;
+      }
+
+      killedPids.push(pid);
+      if (!this.shuttingDown) {
+        this.ownedAgentProcesses.delete(pid);
+      }
+      console.log(`[Manager] Stopped process tree PID ${pid} on port ${port}`);
     }
     return { killed: killedPids.length > 0, pids: killedPids };
   }
