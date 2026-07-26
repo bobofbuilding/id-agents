@@ -27,6 +27,7 @@ import {
   resolveRuntime,
   usesCliLogin,
 } from './runtime/registry.js';
+import { isDirectEntrypoint } from './lib/direct-entrypoint.js';
 import { startParentDeathWatchdog } from './lib/parent-watchdog.js';
 
 interface LocalAgentConfig {
@@ -497,7 +498,7 @@ Examples:
 }
 
 // Run if called directly
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isDirectEntrypoint(import.meta.url)) {
   main().catch((error) => {
     console.error('Fatal error:', error);
     process.exit(1);

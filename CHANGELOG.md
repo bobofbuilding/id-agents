@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.147]
+
+- Normalize direct-entrypoint detection as a file URL so packaged local agents and the legacy CLI start correctly from consumer application paths containing spaces or escaped characters.
+- Add regression coverage for absolute and relative application paths containing spaces, `#`, `%`, and Unicode.
+
 ## [0.1.146]
 
 - Give every team-scoped Manager event feed a stable stream identity and expose its unfiltered latest retained sequence on normal and tail reads.

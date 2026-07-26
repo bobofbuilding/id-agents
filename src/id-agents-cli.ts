@@ -6,6 +6,7 @@
  */
 
 import fetch from 'node-fetch';
+import { isDirectEntrypoint } from './lib/direct-entrypoint.js';
 
 const MANAGER_URL = process.env.ID_MANAGER_URL || 'http://localhost:3100';
 
@@ -234,7 +235,7 @@ Examples:
 }
 
 // Run CLI if executed directly
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isDirectEntrypoint(import.meta.url)) {
   main();
 }
 
