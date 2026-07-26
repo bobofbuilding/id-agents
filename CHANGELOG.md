@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.148]
+
+- Apply each managed Claude Code agent's standard or fast output-speed preference through Claude Code's documented process-local `--settings` contract instead of leaving Fast as an inert UI choice.
+- Pin standard mode explicitly for managed Claude workers so a persistent user-level fast preference cannot silently change an agent's model or cost, while withholding the setting from unsupported runtimes.
+- Add regression coverage for launch arguments, invalid values, the legacy Claude runtime identifier, resumed sessions, and cross-runtime isolation.
+
 ## [0.1.147]
 
 - Normalize direct-entrypoint detection as a file URL so packaged local agents and the legacy CLI start correctly from consumer application paths containing spaces or escaped characters.

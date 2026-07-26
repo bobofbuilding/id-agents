@@ -24086,7 +24086,6 @@ Return this JSON shape:
     const effortRaw = (agentRow?.metadata as any)?.effort;
     const effort = (typeof effortRaw === 'string' && /^(minimal|low|medium|high|xhigh)$/.test(effortRaw)) ? effortRaw : undefined;
     const speedRaw = (agentRow?.metadata as any)?.speed;
-    const speed = (typeof speedRaw === 'string' && /^(default|fast)$/.test(speedRaw) && speedRaw !== 'default') ? speedRaw : undefined;
 
     // External MCP servers attached to this agent (Modules view → metadata).
     // Serialized as JSON for claude-agent-server to parse into HarnessOptions.
@@ -24095,6 +24094,13 @@ Return this JSON shape:
       ? JSON.stringify(mcpServers)
       : undefined;
     const runtime = resolveRuntime((agentRow?.runtime || metadata.runtime) as string | undefined);
+    // Claude Code persists fast mode globally by default. Always give managed
+    // Claude Code workers an explicit per-agent standard/fast preference so one
+    // person's CLI setting cannot silently change another agent's cost or model.
+    // Other harnesses have no reviewed output-speed launch contract.
+    const speed = runtime === 'claude-code-cli' || runtime === 'claude-code-local'
+      ? (speedRaw === 'fast' ? 'fast' : 'default')
+      : undefined;
     const providerRuntime = this.providerRuntimeForAgent(agentRow, metadata);
     const providerApiKey = providerRuntime?.apiKey
       || (providerRuntime?.keyEnv ? process.env[providerRuntime.keyEnv] : undefined)

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 
 import {
+  claudeCliSpeedSettingsArgs,
   claudeCliStdinInvocation,
   claudeCliToolArgs,
 } from '../../src/harness/claude-code-cli.js';
@@ -26,6 +27,46 @@ describe('Claude Code CLI harness policy', () => {
       '--allowedTools',
       'Read,Write,Edit,Bash',
     ]);
+  });
+
+  it('uses Claude Code launch settings for explicit per-agent speed', () => {
+    expect(claudeCliSpeedSettingsArgs('fast')).toEqual([
+      '--settings',
+      '{"fastMode":true}',
+    ]);
+    expect(claudeCliSpeedSettingsArgs('default')).toEqual([
+      '--settings',
+      '{"fastMode":false}',
+    ]);
+  });
+
+  it('does not invent settings for missing or unsupported speed values', () => {
+    expect(claudeCliSpeedSettingsArgs(undefined)).toEqual([]);
+    expect(claudeCliSpeedSettingsArgs('turbo')).toEqual([]);
+  });
+
+  it('preserves launch-scoped fast mode when resuming a non-interactive session', () => {
+    const prompt = 'continue the reviewed work';
+    const invocation = claudeCliStdinInvocation([
+      '-p',
+      prompt,
+      ...claudeCliSpeedSettingsArgs('fast'),
+      '--resume',
+      'f65d4adc-72c7-4c54-9ec2-c2d80064df37',
+      '--output-format',
+      'json',
+    ]);
+
+    expect(invocation.args).toEqual([
+      '-p',
+      '--settings',
+      '{"fastMode":true}',
+      '--resume',
+      'f65d4adc-72c7-4c54-9ec2-c2d80064df37',
+      '--output-format',
+      'json',
+    ]);
+    expect(invocation.stdin).toBe(prompt);
   });
 
   it('delivers complete prompts only over direct CLI stdin', () => {

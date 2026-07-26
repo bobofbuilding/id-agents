@@ -109,4 +109,40 @@ describe('Manager worker environment portability', () => {
     expect(env.ID_WORKSPACE_DIR).toBe('/profiles/default/workspace');
     expect(env.WORKSPACE_DIR).toBeUndefined();
   });
+
+  it('pins output speed for Claude Code workers without leaking it to unsupported runtimes', () => {
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'manager-worker-speed-env-'));
+    workDirs.push(workDir);
+    const manager = new AgentManagerDb(workDir, {} as any, { libraryRoot: null }) as any;
+
+    const defaultClaude = manager.buildLocalAgentEnv(
+      'team-id',
+      'default',
+      43125,
+      { runtime: 'claude-code-cli', metadata: {} },
+    );
+    const fastClaude = manager.buildLocalAgentEnv(
+      'team-id',
+      'default',
+      43126,
+      { runtime: 'claude-code-local', metadata: { speed: 'fast' } },
+    );
+    const invalidClaude = manager.buildLocalAgentEnv(
+      'team-id',
+      'default',
+      43127,
+      { runtime: 'claude-code-cli', metadata: { speed: 'turbo' } },
+    );
+    const codex = manager.buildLocalAgentEnv(
+      'team-id',
+      'default',
+      43128,
+      { runtime: 'codex', metadata: { speed: 'fast' } },
+    );
+
+    expect(defaultClaude.ID_AGENT_SPEED).toBe('default');
+    expect(fastClaude.ID_AGENT_SPEED).toBe('fast');
+    expect(invalidClaude.ID_AGENT_SPEED).toBe('default');
+    expect(codex.ID_AGENT_SPEED).toBeUndefined();
+  });
 });

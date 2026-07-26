@@ -104,6 +104,17 @@ export interface ClaudeCliStdinInvocation {
 }
 
 /**
+ * Translate IDACC's per-agent output-speed preference into Claude Code's
+ * documented launch-settings contract. Supplying an explicit false value for
+ * "default" prevents a user's persistent global fast-mode preference from
+ * silently changing the cost or model used by a Manager-launched agent.
+ */
+export function claudeCliSpeedSettingsArgs(speed: string | undefined): string[] {
+  if (speed !== 'default' && speed !== 'fast') return [];
+  return ['--settings', JSON.stringify({ fastMode: speed === 'fast' })];
+}
+
+/**
  * Keep the complete prompt off argv and shared temp storage. Claude's print
  * mode reads text input from stdin when `-p` has no positional prompt value.
  */
@@ -184,13 +195,17 @@ export class ClaudeCodeCliHarness implements AgentHarness {
       console.log(`[Claude CLI] Reasoning effort: ${effortRaw}`);
     }
 
-    // Output speed (set per-agent in the Control Center). The installed Claude
-    // CLI exposes /fast as an interactive toggle, but `claude --help` currently
-    // shows no launch-time --fast flag or speed env var. Do not invent one; log
-    // this so operators know the requested setting could not be applied.
+    // Output speed (set per-agent in the Control Center). Claude Code documents
+    // fastMode as a settings key and accepts additional settings JSON through
+    // --settings, including in non-interactive print mode. Keep the preference
+    // process-local instead of mutating the user's persistent settings file.
     const speedRaw = process.env.ID_AGENT_SPEED;
-    if (speedRaw === 'fast') {
-      console.log('[Claude CLI] TODO: speed=fast requested, but no Claude CLI launch-time fast flag is available; /fast is interactive only.');
+    const speedArgs = claudeCliSpeedSettingsArgs(speedRaw);
+    if (speedArgs.length > 0) {
+      args.push(...speedArgs);
+      console.log(speedRaw === 'fast'
+        ? '[Claude CLI] Output speed: fast (eligible Opus model; higher per-token cost is billed from usage credits)'
+        : '[Claude CLI] Output speed: standard');
     }
 
     // Add session resume if provided
