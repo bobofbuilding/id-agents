@@ -245,7 +245,7 @@ function validBriefFields() {
     validation_path: { required_default_validators: ['coder', 'researcher'] },
     out_of_scope: ['optional recommendations'],
     backlog_policy: 'Non-required recommendations become backlog candidates.',
-    bittrees_relevance: 'medium: improves validator routing reliability for Bittrees contributor work.',
+    work_relevance: 'medium: improves validator routing reliability for Bittrees contributor work.',
   };
 }
 
@@ -694,7 +694,7 @@ describe('/talk-to auto-attach', () => {
         headers: adminHeaders(cliRoutingTeam),
         body: JSON.stringify({
           from: 'manager',
-          command: '/task create "CLI default lead owner task" --name cli-default-lead-owner --goal goal_mqxibu5r_2k2my --expected-output "implementation patch and tests" --acceptance "covers CLI default lead owner" --validation-path "coder and researcher" --out-of-scope "optional recommendations" --recommendation-routing "Non-required recommendations become backlog candidates." --bittrees-relevance "medium: improves manager delegation reliability for Bittrees contributor work."',
+          command: '/task create "CLI default lead owner task" --name cli-default-lead-owner --goal goal_mqxibu5r_2k2my --expected-output "implementation patch and tests" --acceptance "covers CLI default lead owner" --validation-path "coder and researcher" --out-of-scope "optional recommendations" --recommendation-routing "Non-required recommendations become backlog candidates." --work-relevance "medium: improves manager delegation reliability for Bittrees contributor work."',
         }),
       });
       expect(cliCreate.status).toBe(200);
@@ -1021,7 +1021,7 @@ describe('/talk-to auto-attach', () => {
       headers: adminHeaders('engineering-team'),
       body: JSON.stringify({
         from: 'engineering-lead',
-        command: '/task create "CLI blocked lead parent" --name cli-blocked-lead-parent --owner engineering-lead --goal goal_mqxibu5r_2k2my --expected-output "implementation patch and tests" --acceptance "covers CLI lead backlog guard" --validation-path "coder and researcher" --out-of-scope "optional recommendations" --backlog-policy "Non-required recommendations become backlog candidates." --bittrees-relevance "medium: improves manager delegation reliability for Bittrees contributor work."',
+        command: '/task create "CLI blocked lead parent" --name cli-blocked-lead-parent --owner engineering-lead --goal goal_mqxibu5r_2k2my --expected-output "implementation patch and tests" --acceptance "covers CLI lead backlog guard" --validation-path "coder and researcher" --out-of-scope "optional recommendations" --backlog-policy "Non-required recommendations become backlog candidates." --work-relevance "medium: improves manager delegation reliability for Bittrees contributor work."',
       }),
     });
     expect(cliBlocked.status).toBe(200);
@@ -1292,7 +1292,7 @@ describe('/talk-to auto-attach', () => {
       headers: adminHeaders('engineering-team'),
       body: JSON.stringify({
         from: 'manager',
-        command: '/task create "Remote combined-capacity objective" --name remote-combined-capacity-objective --owner engineering-lead --goal goal_mr4khc5x_lf68y --expected-output "implementation patch and tests" --acceptance "returns both blocker types" --validation-path "coder and researcher" --out-of-scope "unrelated guard refactors" --backlog-policy "Non-required follow-ups become backlog candidates." --bittrees-relevance "medium: improves manager delegation reliability for Bittrees contributor work."',
+        command: '/task create "Remote combined-capacity objective" --name remote-combined-capacity-objective --owner engineering-lead --goal goal_mr4khc5x_lf68y --expected-output "implementation patch and tests" --acceptance "returns both blocker types" --validation-path "coder and researcher" --out-of-scope "unrelated guard refactors" --backlog-policy "Non-required follow-ups become backlog candidates." --work-relevance "medium: improves manager delegation reliability for Bittrees contributor work."',
       }),
     });
 
@@ -1563,7 +1563,7 @@ describe('/talk-to auto-attach', () => {
         'GitHub release page shows v0.1.100 with the release commits',
       ],
       backlog_policy: 'Block duplicate release work until the release is verified.',
-      bittrees_relevance: 'high: ships core ID Agents infrastructure.',
+      work_relevance: 'high: ships core ID Agents infrastructure.',
     };
 
     const first = await fetch(`${baseUrl}/tasks`, {
@@ -1625,7 +1625,7 @@ describe('/talk-to auto-attach', () => {
       headers: adminHeaders(TEAM),
       body: JSON.stringify({
         from: 'manager',
-        command: '/task create "Push and publish id-agents v0.1.100 [release-id-agents-bd661c7-6db1769]" --name push-publish-id-agents-v0-1-100-remote --goal goal_release_id_agents_v0_1_100 --expected-output "id-agents v0.1.100 pushed to bobofbuilding/id-agents remote; GitHub release v0.1.100 published." --acceptance "git tag v0.1.100 on bobofbuilding/id-agents remote; GitHub release page shows v0.1.100" --validation-path "coder and researcher" --out-of-scope "npm publish" --backlog-policy "block duplicate release work" --bittrees-relevance "high: release shipping work"',
+        command: '/task create "Push and publish id-agents v0.1.100 [release-id-agents-bd661c7-6db1769]" --name push-publish-id-agents-v0-1-100-remote --goal goal_release_id_agents_v0_1_100 --expected-output "id-agents v0.1.100 pushed to bobofbuilding/id-agents remote; GitHub release v0.1.100 published." --acceptance "git tag v0.1.100 on bobofbuilding/id-agents remote; GitHub release page shows v0.1.100" --validation-path "coder and researcher" --out-of-scope "npm publish" --backlog-policy "block duplicate release work" --work-relevance "high: release shipping work"',
       }),
     });
     expect(remoteDuplicate.status).toBe(200);
@@ -1660,7 +1660,7 @@ describe('/talk-to auto-attach', () => {
         'Review links point at the same target page',
       ],
       backlog_policy: 'Block duplicate edits to the same target page until the owner reports status.',
-      bittrees_relevance: 'high: protects a live Bittrees page workflow from duplicate churn.',
+      work_relevance: 'high: protects a live Bittrees page workflow from duplicate churn.',
     };
 
     const first = await fetch(`${baseUrl}/tasks`, {
@@ -1715,7 +1715,7 @@ describe('/talk-to auto-attach', () => {
       expected_output: 'Legal signoff for the agent.bittrees.org launch page',
       acceptance_criteria: ['Legal review is complete for the target page'],
       backlog_policy: 'Send status checks to the current owner instead of opening duplicate legal reviews.',
-      bittrees_relevance: 'medium: reduces duplicate legal-team dispatches for Bittrees launch work.',
+      work_relevance: 'medium: reduces duplicate legal-team dispatches for Bittrees launch work.',
     };
 
     const first = await fetch(`${baseUrl}/talk-to`, {
@@ -1791,7 +1791,7 @@ describe('/talk-to auto-attach', () => {
         'Validation path: coder and researcher',
         'Out of scope: duplicate review creation',
         'Backlog policy: status-check recent owner before reopening',
-        'Bittrees relevance: medium: avoids duplicate review loops',
+        'Work relevance: medium: avoids duplicate review loops',
       ].join('\n'),
       status: 'done',
       created_by: dispatcherId,
@@ -1814,7 +1814,7 @@ describe('/talk-to auto-attach', () => {
         expected_output: 'duplicate follow-up on the same recently reviewed target',
         acceptance_criteria: ['duplicate would have created a new review task'],
         backlog_policy: 'status-check the recent owner instead of reopening',
-        bittrees_relevance: 'medium: avoids duplicate legal-team dispatches.',
+        work_relevance: 'medium: avoids duplicate legal-team dispatches.',
       }),
     });
     expect(duplicate.status).toBe(409);
@@ -1918,14 +1918,14 @@ describe('/talk-to auto-attach', () => {
           title: 'Generic validator tuning',
           name: 'generic-validator-tuning',
           ...validBriefFields(),
-          bittrees_relevance: 'low/backlog: generic validator tuning without direct Bittrees contributor relevance.',
+          work_relevance: 'low/backlog: generic validator tuning without direct Work relevance.',
         },
       }),
     });
     expect(lowRelevance.status).toBe(422);
     const lowBody = await lowRelevance.json() as { error: string; brief_validation?: { reason_codes?: string[] } };
     expect(lowBody.error).toBe('task_brief_not_dispatch_ready');
-    expect(lowBody.brief_validation?.reason_codes).toContain('low_bittrees_relevance_live_dispatch');
+    expect(lowBody.brief_validation?.reason_codes).toContain('low_work_relevance_live_dispatch');
     expect(await db.tasks.getByNameForTeam('generic-validator-tuning', teamId)).toBeNull();
   });
 
@@ -1950,7 +1950,7 @@ describe('/talk-to auto-attach', () => {
         headers: adminHeaders(TEAM),
         body: JSON.stringify({
           from: 'manager',
-          command: '/task create "CLI ready task" --name cli-ready-task --goal goal_mqxibu5r_2k2my --expected-output "implementation patch and tests" --acceptance "covers CLI create" --validation-path "coder and researcher" --out-of-scope "optional recommendations" --recommendation-routing "Non-required recommendations become backlog candidates." --bittrees-relevance "medium: improves validator routing reliability for Bittrees contributor work."',
+          command: '/task create "CLI ready task" --name cli-ready-task --goal goal_mqxibu5r_2k2my --expected-output "implementation patch and tests" --acceptance "covers CLI create" --validation-path "coder and researcher" --out-of-scope "optional recommendations" --recommendation-routing "Non-required recommendations become backlog candidates." --work-relevance "medium: improves validator routing reliability for Bittrees contributor work."',
         }),
       });
       expect(validCreate.status).toBe(200);

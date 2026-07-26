@@ -32,7 +32,10 @@ describe('manager control state and task lineage', () => {
     ]);
     expect(concurrent.filter(Boolean)).toHaveLength(1);
     expect((await repo.get('team-1', 'project', 'alpha'))?.version).toBe(3);
-    expect(await repo.delete('team-1', 'project', 'alpha')).toBe(true);
+    expect(await repo.delete('team-1', 'project', 'alpha', 2)).toBe('version_conflict');
+    expect((await repo.get('team-1', 'project', 'alpha'))?.version).toBe(3);
+    expect(await repo.delete('team-1', 'project', 'alpha', 3)).toBe('deleted');
+    expect(await repo.delete('team-1', 'project', 'alpha', 3)).toBe('not_found');
   });
 
   it('stores project and plan lineage on task rows', async () => {

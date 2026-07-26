@@ -26,7 +26,7 @@ describe('task workflow contract', () => {
       'validation_path',
       'out_of_scope',
       'backlog_policy',
-      'bittrees_relevance',
+      'work_relevance',
     ]));
   });
 
@@ -38,7 +38,7 @@ describe('task workflow contract', () => {
       validation_path: ['default/researcher'],
       out_of_scope: ['Unrelated refactors'],
       backlog_policy: 'defer when saturated',
-      bittrees_relevance: 'Improves manager reliability',
+      work_relevance: 'Improves manager reliability',
       source_ids: ['fact:1'],
     }, {
       taskId: 'task-1',
@@ -53,6 +53,30 @@ describe('task workflow contract', () => {
     expect(result.state).toBe('executing');
     expect((result.contract.timing as any).timeout_at).toBeGreaterThan(1_000);
     expect((result.contract.validation as any).fallback_validators).toHaveLength(2);
+  });
+
+  it('normalizes pre-neutral relevance input without emitting the legacy field', () => {
+    const result = buildTaskWorkflowContract({
+      goal_id: 'goal-legacy',
+      expected_output: 'A compatible task',
+      acceptance_criteria: ['Task remains usable'],
+      validation_path: ['default/researcher'],
+      out_of_scope: ['New organization-specific policy'],
+      backlog_policy: 'defer optional work',
+      bittrees_relevance: 'medium - legacy task',
+      source_ids: ['request:operator'],
+    }, {
+      taskId: 'task-legacy',
+      taskUuid: 'uuid-legacy',
+      teamId: 'team-1',
+      teamName: 'default',
+      ownerId: 'agent-1',
+      nowMs: 1_000,
+    });
+
+    expect(result.missing).toEqual([]);
+    expect(result.contract.relevance).toBe('medium - legacy task');
+    expect(result.contract).not.toHaveProperty('bittrees_relevance');
   });
 
   it('rejects invalid lifecycle jumps', () => {

@@ -4,11 +4,11 @@ import { describe, expect, it } from 'vitest';
 
 import {
   appendTaskBriefFieldsToDescription,
-  getBittreesContributorPriority,
+  getWorkPriority,
   shouldBlockTaskBrief,
   validateTaskBrief,
   validateTaskCompletionPacket,
-  type BittreesContributorPriority,
+  type WorkPriority,
   type TaskBriefValidationInput,
   type TaskBriefValidationMode,
   type TaskBriefValidationResult,
@@ -26,7 +26,7 @@ const completeBrief: TaskBriefValidationInput = {
   validation_path: ['coder', 'researcher'],
   out_of_scope: 'Integration tests and production code changes',
   backlog_policy: 'Move edge cases requiring module changes into follow-up tasks',
-  bittrees_relevance: 'high - dispatch validation protects Bittrees task quality',
+  work_relevance: 'high - dispatch validation protects Bittrees task quality',
 };
 
 function failingResult(mode: TaskBriefValidationMode): TaskBriefValidationResult {
@@ -66,7 +66,7 @@ describe('validateTaskBrief', () => {
     ['validation_path', 'validation_path'],
     ['out_of_scope', 'out_of_scope'],
     ['backlog_policy', 'backlog_policy'],
-    ['bittrees_relevance', 'bittrees_relevance'],
+    ['work_relevance', 'work_relevance'],
   ] as Array<[keyof TaskBriefValidationInput, string]>)('reports missing %s', (inputKey, reportedField) => {
     const input = { ...completeBrief };
     delete input[inputKey];
@@ -79,16 +79,16 @@ describe('validateTaskBrief', () => {
     expect(result.dispatch_ready).toBe(false);
   });
 
-  it('reports a provided but keyword-less bittrees_relevance as invalid, not missing', () => {
+  it('reports a provided but keyword-less work_relevance as invalid, not missing', () => {
     const result = validateTaskBrief({
       ...completeBrief,
-      bittrees_relevance: 'keeps the fleet manager sweeper reliable for all agent teams',
+      work_relevance: 'keeps the fleet manager sweeper reliable for all agent teams',
     }, 'enforce');
 
     expect(result.ok).toBe(false);
-    expect(result.invalid).toContain('bittrees_relevance');
-    expect(result.missing).not.toContain('bittrees_relevance');
-    expect(result.reason_codes).toContain('invalid_bittrees_relevance');
+    expect(result.invalid).toContain('work_relevance');
+    expect(result.missing).not.toContain('work_relevance');
+    expect(result.reason_codes).toContain('invalid_work_relevance');
     expect(result.dispatch_ready).toBe(false);
   });
 
@@ -147,7 +147,7 @@ describe('validateTaskBrief', () => {
           'Validation path: coder validates implementation and researcher validates coverage',
           'Out of scope: integration tests',
           'Backlog policy: track module behavior changes separately',
-          'Bittrees relevance: medium - improves dispatch quality',
+          'Work relevance: medium - improves dispatch quality',
         ].join('\n'),
       },
       'warn',
@@ -172,7 +172,7 @@ describe('validateTaskBrief', () => {
           'Validation path: coder validates implementation and researcher validates coverage',
           'Out of scope: integration tests',
           'Recommendation routing: low-relevance suggestions stay in backlog; approved high/medium follow-ups route through lead.',
-          'Bittrees relevance: medium - improves dispatch quality',
+          'Work relevance: medium - improves dispatch quality',
         ].join('\n'),
       },
       'enforce',
@@ -301,7 +301,7 @@ describe('validateTaskCompletionPacket', () => {
   });
 });
 
-describe('getBittreesContributorPriority', () => {
+describe('getWorkPriority', () => {
   it.each([
     ['high', 'high'],
     ['medium', 'medium'],
@@ -309,22 +309,27 @@ describe('getBittreesContributorPriority', () => {
     ['backlog', 'low/backlog'],
     ['low/backlog', 'low/backlog'],
     ['reject', 'reject'],
-  ] as Array<[string, BittreesContributorPriority]>)('extracts %s priority from structured fields', (value, expected) => {
-    expect(getBittreesContributorPriority({ bittrees_relevance: `${value} - rationale` })).toBe(expected);
+  ] as Array<[string, WorkPriority]>)('extracts %s priority from structured fields', (value, expected) => {
+    expect(getWorkPriority({ work_relevance: `${value} - rationale` })).toBe(expected);
   });
 
   it.each([
-    ['Bittrees relevance: high - urgent infrastructure work', 'high'],
-    ['Bittrees contributor relevance: medium - useful hardening', 'medium'],
+    ['Work relevance: high - urgent infrastructure work', 'high'],
+    ['Work relevance: medium - useful hardening', 'medium'],
     ['Contributor relevance: low - can wait', 'low/backlog'],
     ['Relevance: backlog - revisit after release', 'low/backlog'],
-    ['Bittrees relevance: reject - unrelated to contributor outcomes', 'reject'],
-  ] as Array<[string, BittreesContributorPriority]>)('extracts priority from text label "%s"', (text, expected) => {
-    expect(getBittreesContributorPriority({}, text)).toBe(expected);
+    ['Work relevance: reject - unrelated to contributor outcomes', 'reject'],
+  ] as Array<[string, WorkPriority]>)('extracts priority from text label "%s"', (text, expected) => {
+    expect(getWorkPriority({}, text)).toBe(expected);
   });
 
-  it('returns null when no Bittrees priority is present', () => {
-    expect(getBittreesContributorPriority({}, 'No relevance label here.')).toBeNull();
+  it('accepts the pre-neutral schema only as an input compatibility alias', () => {
+    expect(getWorkPriority({ bittrees_relevance: 'medium - legacy task' })).toBe('medium');
+    expect(getWorkPriority({}, 'Bittrees relevance: low/backlog - legacy task')).toBe('low/backlog');
+  });
+
+  it('returns null when no work priority is present', () => {
+    expect(getWorkPriority({}, 'No relevance label here.')).toBeNull();
   });
 });
 
@@ -370,7 +375,7 @@ describe('appendTaskBriefFieldsToDescription', () => {
       validation_path: ['coder', 'researcher'],
       out_of_scope: 'Production code changes',
       backlog_policy: 'Track discovered edge cases separately',
-      bittrees_relevance: 'high - task dispatch infrastructure',
+      work_relevance: 'high - task dispatch infrastructure',
       target: 'https://agent.bittrees.org/docs/launch',
       parent_task: '#40077396',
       validation_purpose: 'Confirm unit coverage before merge',
@@ -385,7 +390,7 @@ describe('appendTaskBriefFieldsToDescription', () => {
       'Validation path: coder; researcher',
       'Out of scope: Production code changes',
       'Backlog policy: Track discovered edge cases separately',
-      'Bittrees relevance: high - task dispatch infrastructure',
+      'Work relevance: high - task dispatch infrastructure',
       'Target: https://agent.bittrees.org/docs/launch',
       'Parent task: #40077396',
       'Validation purpose: Confirm unit coverage before merge',
@@ -402,7 +407,7 @@ describe('appendTaskBriefFieldsToDescription', () => {
       'Validation path: coder and researcher already present',
       'Out of scope: already present',
       'Backlog policy: already present',
-      'Bittrees relevance: high - already present',
+      'Work relevance: high - already present',
       'Target: https://agent.bittrees.org/docs/launch',
       'Parent task: #parent',
       'Validation purpose: already present',
@@ -415,7 +420,7 @@ describe('appendTaskBriefFieldsToDescription', () => {
       validation_path: ['coder', 'researcher'],
       out_of_scope: 'Production code changes',
       backlog_policy: 'Track discovered edge cases separately',
-      bittrees_relevance: 'medium - task dispatch infrastructure',
+      work_relevance: 'medium - task dispatch infrastructure',
       target: 'https://agent.bittrees.org/docs/launch',
       parent_task: '#40077396',
       validation_purpose: 'Confirm unit coverage before merge',

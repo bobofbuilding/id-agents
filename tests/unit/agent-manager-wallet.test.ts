@@ -50,6 +50,8 @@ describe('AgentManagerDb wallet helpers', () => {
   const dbs: Array<Awaited<ReturnType<typeof createInMemoryDb>>> = [];
   const originalEnv = {
     SKILLMESH_MASTER_KEY: process.env.SKILLMESH_MASTER_KEY,
+    SKILLMESH_APP_URL: process.env.SKILLMESH_APP_URL,
+    SKILLMESH_RPC_URL: process.env.SKILLMESH_RPC_URL,
     ID_AGENTS_SKILLMESH_AUTO_KEYS: process.env.ID_AGENTS_SKILLMESH_AUTO_KEYS,
     ID_AGENTS_SKILLMESH_PROVIDER_ENABLED: process.env.ID_AGENTS_SKILLMESH_PROVIDER_ENABLED,
   };
@@ -166,6 +168,46 @@ describe('AgentManagerDb wallet helpers', () => {
     expect(stored?.metadata?.skillmesh_private_key).toBe(enabled.skillmesh_private_key);
   });
 
+  it('never discovers optional-provider private keys from workspace .env files', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+    delete process.env.SKILLMESH_MASTER_KEY;
+    const providerDir = path.join(workDir, 'packages', 'skill-master');
+    fs.mkdirSync(providerDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(providerDir, '.env'),
+      `SKILL_MASTER_PRIVATE_KEY=0x${'44'.repeat(32)}\n`,
+    );
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    await db.agents.create({
+      team_id: teamId,
+      id: 'explicit-config-only',
+      name: 'explicit-config-only',
+      type: 'claude',
+      model: 'gpt-5',
+      status: 'pending',
+      created_at: Date.now(),
+      metadata: {
+        name: 'explicit-config-only',
+        providers: { skillmesh: { enabled: true } },
+      },
+      runtime: 'codex-cli',
+    });
+
+    const result = await (manager as any).maybeAssignSkillmeshKey(
+      'explicit-config-only',
+      'default',
+      {
+        name: 'explicit-config-only',
+        providers: { skillmesh: { enabled: true } },
+      },
+    );
+
+    expect(result.skillmesh_private_key).toBeUndefined();
+    expect(result.skillmesh_address).toBeUndefined();
+  });
+
   it('injects SkillMesh secrets into child env only for SkillMesh-enabled agents', async () => {
     const { manager, db, workDir } = await makeManager();
     dbs.push(db);
@@ -173,6 +215,8 @@ describe('AgentManagerDb wallet helpers', () => {
     const teamId = await db.teams.getOrCreateTeamId('default');
     const staleKey = `0x${'22'.repeat(32)}`;
     const creatorKey = `0x${'33'.repeat(32)}`;
+    delete process.env.SKILLMESH_APP_URL;
+    delete process.env.SKILLMESH_RPC_URL;
 
     const neutralEnv = (manager as any).buildLocalAgentEnv(teamId, 'default', 4101, {
       runtime: 'codex-cli',
@@ -196,5 +240,20 @@ describe('AgentManagerDb wallet helpers', () => {
     expect(neutralEnv.SKILLMESH_CREATOR_PRIVATE_KEY).toBeUndefined();
     expect(enabledEnv.SKILLMESH_PRIVATE_KEY).toBe(staleKey);
     expect(enabledEnv.SKILLMESH_CREATOR_PRIVATE_KEY).toBe(creatorKey);
+    expect(enabledEnv.SKILLMESH_APP_URL).toBeUndefined();
+    expect(enabledEnv.SKILLMESH_RPC_URL).toBeUndefined();
+
+    process.env.SKILLMESH_APP_URL = 'https://optional-provider.example';
+    process.env.SKILLMESH_RPC_URL = 'https://rpc.optional-provider.example';
+    const configuredEnv = (manager as any).buildLocalAgentEnv(teamId, 'default', 4103, {
+      runtime: 'codex-cli',
+      metadata: {
+        name: 'skillmesh-enabled',
+        providers: { skillmesh: { enabled: true } },
+        skillmesh_private_key: staleKey,
+      },
+    }, 'gpt-5', 'tok-3');
+    expect(configuredEnv.SKILLMESH_APP_URL).toBe('https://optional-provider.example');
+    expect(configuredEnv.SKILLMESH_RPC_URL).toBe('https://rpc.optional-provider.example');
   });
 });

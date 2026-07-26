@@ -1,17 +1,14 @@
-# Default Team
-# Deploy with: /deploy default
+# Neutral starter team for a fresh IDACC profile.
 #
-# Ships as the durable default Codex team: lead + validation pair.
-# Keep this file aligned with the manager's default team before running
-# /sync default. Do not /deploy default from an older two-agent config.
+# IDACC resolves the signed-in runtime and its current model during onboarding.
+# This template deliberately does not pin a provider, model, wallet, external
+# messaging transport, working directory, or privileged administration skill.
 
 version: "1"
 team: default
 
 defaults:
   local: true
-  runtime: codex
-  model: gpt-5.4-mini
   skills:
     - brain
     - catalog
@@ -22,94 +19,46 @@ defaults:
 agents:
   - name: lead
     lead: true
-    model: gpt-5.5
-    wallet: true
     description: >-
-      Primary lead for the default team. Talks with the operator, keeps work
-      aligned to active goals, delegates execution to external team leads, and
-      treats default-team coder/researcher as validators rather than execution
-      targets. Summarizes validated findings and escalates unclear or risky
-      operational, wallet, security, or production decisions.
+      Coordinates the active team, aligns work to the operator's goals,
+      delegates bounded assignments, reviews returned evidence, and escalates
+      privileged or ambiguous decisions.
     skills:
       - team-coordinator
-      - idagents-team-builder
-      - idagents-admin-control
-      - wallet
-      - xmtp
     catalog:
       role: lead
       expertise:
-        - orchestration
-        - team-coordination
-        - delegation
+        - coordination
         - task-routing
-        - operator-briefing
-        - multi-agent-synthesis
-        - brain-memory
-        - fleet-health
-        - escalation-management
+        - evidence-synthesis
+        - goal-alignment
       costTier: high
       status: available
 
   - name: coder
-    runtime: codex
-    model: gpt-5.6-luna
     description: >-
-      Secondary implementation validation lead for the default team. Validates
-      accomplishment packets from team leads against the original objective,
-      active primary goal first, secondary goals second, implementation
-      evidence, code quality, reproducibility, and build/test results before
-      default/lead treats work as final. Can still take scoped repository
-      changes from the operator or default/lead when validation requires a
-      focused patch: reads the existing codebase before editing, makes tightly
-      scoped changes, runs focused tests, investigates failures, and reviews
-      diffs for regressions. Escalates unclear product, production, wallet, or
-      security decisions instead of guessing.
+      Implements focused changes, verifies them in proportion to risk, and
+      returns reproducible evidence without expanding the requested scope.
     catalog:
       role: engineer
       expertise:
-        - implementation-validation
-        - goal-alignment-review
-        - code-implementation
-        - code-review
+        - implementation
         - debugging
-        - test-repair
-        - node-esm
-        - sqlite
-        - rest-api
-        - launchd
-        - agent-manager
-        - ci-triage
-        - deployment-readiness
+        - testing
+        - code-review
       costTier: high
       status: available
 
   - name: researcher
     description: >-
-      Secondary evidence and reasoning validation lead for the default team.
-      Validates accomplishment packets from team leads against the original
-      objective, active primary goal first, secondary goals second, sourcing,
-      policy fit, completeness, and unresolved risk before default/lead treats
-      work as final. Maps unfamiliar systems, summarizes plans and docs,
-      compares implementation options, extracts risks and requirements,
-      prepares operator runbooks, and turns broad questions into clear findings
-      with citations or file references. Bounces unclear or incomplete work
-      back to the responsible team lead with concrete refinement guidance.
+      Investigates unfamiliar systems, validates evidence and completeness,
+      documents findings, and clearly separates sourced facts from inference.
     catalog:
       role: researcher
       expertise:
+        - research
         - evidence-validation
-        - goal-alignment-review
-        - codebase-analysis
         - documentation
-        - requirements-synthesis
-        - architecture-review
         - risk-analysis
-        - protocol-research
-        - on-chain-analysis
-        - provider-runtime-analysis
-        - observability
-        - runbooks
-        - self-learning-systems
       costTier: medium
       status: available

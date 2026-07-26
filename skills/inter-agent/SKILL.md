@@ -1,477 +1,111 @@
 ---
 name: inter-agent
-description: Communicate with other agents in your team — send messages, delegate tasks, list agents, check news. Use when asked to contact another agent or coordinate work.
+description: Communicate and delegate within the active Manager team through runtime-provided, loopback-only coordination endpoints.
 allowed-tools: Bash
 ---
 
-# Inter-Agent Communication
+# Inter-agent communication
 
-You are part of a multi-agent team. Communicate with other agents via `curl` from the Bash tool. Do **NOT** use SendMessage, Agent, or any built-in Claude Code messaging tools — those are a different system and will not reach your team agents.
+IDACC assigns each agent a private local wrapper address through
+`ID_AGENT_PORT` and the active Manager address through `MANAGER_URL`. Use those
+environment values; never assume a port or launch another service.
 
-## The three patterns — copy these exactly
+The examples below are for agents in the current team. Privileged team changes
+and cross-team administration belong in the IDACC application.
 
-There are three ways to reach another agent. Copy the example for your case verbatim and change only `to` and `message`.
-
-### 1. `/talk-to` — sync delegation (you need the reply)
+## Discover available teammates
 
 ```bash
-curl -s -X POST http://localhost:$ID_AGENT_PORT/talk-to \
+curl -fsS "$MANAGER_URL/agents" \
+  -H "X-Id-Team: $ID_TEAM"
+```
+
+Before delegating, inspect each candidate's catalog and choose by role,
+expertise, availability, cost tier, and `notSuitableFor`. Do not select an agent
+from its name alone.
+
+```bash
+curl -fsS "http://127.0.0.1:$ID_AGENT_PORT/catalog"
+```
+
+## Synchronous request
+
+Use `/talk-to` when the reply is needed before you can continue:
+
+```bash
+curl -fsS -X POST "http://127.0.0.1:$ID_AGENT_PORT/talk-to" \
   -H "Content-Type: application/json" \
-  -d '{"to":"agent-name","message":"what is your name?"}'
+  -d '{"to":"teammate-name","message":"Return the requested evidence and any unresolved risk."}'
 ```
 
-Blocks until the recipient replies. The reply is in the response body.
+The call waits for the teammate's response. Include that response when the
+operator asked you to consult another agent.
 
-### 2. `/news-to` without `trigger` — passive notification (LLM is NOT woken)
+## Asynchronous delegation
+
+Use `/news-to` with a literal boolean `trigger: true` for work that may continue
+independently:
 
 ```bash
-curl -s -X POST http://localhost:$ID_AGENT_PORT/news-to \
+curl -fsS -X POST "http://127.0.0.1:$ID_AGENT_PORT/news-to" \
   -H "Content-Type: application/json" \
-  -d '{"to":"agent-name","message":"I am ready for work"}'
-```
-
-Returns 202 immediately. The message lands in the recipient's news feed but their LLM is **not** woken. They see it the next time they poll `/news` or are otherwise active. Use for status pings, "I claimed this task", "heads up — restarting in 5".
-
-### 3. `/news-to` with `"trigger":true` — async delegation (LLM IS woken)
-
-```bash
-curl -s -X POST http://localhost:$ID_AGENT_PORT/news-to \
-  -H "Content-Type: application/json" \
-  -d '{"to":"agent-name","message":"I have a message, please pass it to the manager","trigger":true}'
-```
-
-Returns 202 immediately. The recipient's LLM **is** woken and processes the message as a new task. You do not get a reply on this HTTP call — the recipient can `/news-to` you back later with results. Use for telephone chains, long-running pipelines, and any handoff where holding a sync HTTP connection open would be wrong.
-
-> ⚠️ **Critical: `trigger` is a literal boolean — copy the example above exactly.**
->
-> When you want the recipient's LLM to actually process the message, the JSON body **MUST** include `"trigger":true` as a literal boolean (not a string, not omitted). Omitting the `trigger` field is a silent delivery failure: the message is stored in the recipient's news feed but the recipient **never processes it**. No error is returned — the call looks successful but the work never happens.
->
-> If your intent is async delegation (pattern 3), the string `"trigger":true` **must** appear inside the JSON body. Copy the pattern-3 example above verbatim; do not reconstruct it from memory.
-
-## When in doubt, use `/talk-to`
-
-When you are not sure whether to use `/news-to` with `trigger:true` or `/talk-to`, **use `/talk-to`**. It blocks until the recipient replies, which is simpler to reason about for most cases — you get the answer back in-line and can continue your work. Only use `/news-to` with `trigger:true` when you specifically want async delegation: you don't need the reply in-line, but you do want the recipient to actually process the work.
-
-Decision shortcut:
-- Need the answer now to continue → `/talk-to` (pattern 1).
-- Just telling somebody something → `/news-to` without `trigger` (pattern 2).
-- Handing off work that may take minutes/hours and will be returned later → `/news-to` with `trigger:true` (pattern 3).
-
-## Mandatory rule: when asked to "ask another agent"
-
-If the user or manager says "ask coder …", "can you ask x …", or requests you to contact another agent:
-
-1. You MUST use `/talk-to` (pattern 1) via curl and WAIT for their reply.
-2. Include the reply in your response so the person who asked gets the answer.
-3. Do NOT use SendMessage, Agent, or other built-in tools — use curl.
-
-## Do not use `/message`
-
-The old `/message` endpoint on the manager is **deprecated** — it responds with an `X-Deprecated` header and will be removed. Use `/talk-to` or `/news-to` on your local wrapper instead.
-
-## Cross-team delegation
-
-For another team's lead/member, `/ask <team>/<agent> ...` is a manager CLI command, not a standalone HTTP route. Send it through `$MANAGER_URL/remote`:
-
-```bash
-curl -s -X POST "$MANAGER_URL/remote" \
-  -H "Content-Type: application/json" \
-  -H "X-Id-Team: $ID_TEAM" \
-  -d '{"command":"/ask other-team/agent-name your scoped objective","from":"your-agent-name"}'
-```
-
-Use the returned `queryId` with `GET $MANAGER_URL/query/<queryId>?wait=30`. Never `POST $MANAGER_URL/ask`; that route does not exist and will fail with `Cannot POST /ask`.
-
-### Task-scoped validation and repository work
-
-Cross-team code validation must preserve the existing task and workspace. Include
-`context.task_ref` and the exact absolute `context.project_root`; the manager rejects
-workspace-sensitive validation without both instead of letting the validator run in
-its persistent agent workspace.
-
-```bash
-curl -s -X POST "$MANAGER_URL/remote" \
-  -H "Content-Type: application/json" \
-  -H "X-Id-Team: $ID_TEAM" \
-  -d '{"command":"/ask default/coder validate the completed implementation","from":"your-agent-name","context":{"task_ref":"#1234abcd","project_root":"/absolute/path/to/project"}}'
-```
-
-Use the task reference and project root from the assigned task brief. Do not invent a
-new task, guess a checkout, or omit the context because a commit hash appears in prose.
-
-## Transport routing — inter-agent vs xmtp
-
-Use the right transport based on who the recipient is:
-
-| Recipient | Transport |
-|---|---|
-| Same-team agent (name/alias from `GET /agents`) | **This skill** — `/talk-to` or `/news-to` |
-| External agent or user (ENS name, wallet address, off-team identity) | **`xmtp` skill** — `/xmtp/send` |
-
-**Quick rule:** if the recipient appears in `GET $MANAGER_URL/agents`, use inter-agent. If you have an ENS name like `bob.eth` or a `0x…` wallet address, use xmtp. Never use `/xmtp/send` for teammates — manager routing is faster and does not require wallet resolution.
-
-## How replies work (automatic)
-
-**When someone sends you a message, your reply is sent automatically.** You do NOT need to run any curl command to reply.
-
-1. Another agent sends you a message via `/talk-to` (which reaches you as `/talk`).
-2. You process the message and generate your response.
-3. Your response is automatically sent back to the sender.
-
-**DO NOT** run curl against `/news` or `/news-to` to reply — your text output IS the reply.
-
-## List available agents
-
-```bash
-curl -s $MANAGER_URL/agents -H "X-Id-Team: $ID_TEAM" | jq
-```
-
-The `name` field is the agent's full identifier (ENS domain after registration, or local name). Use this name as the `to` value when sending messages. The `url` field is the peer's REST-AP base URL — used by the catalog-aware selection flow below.
-
-Both `/talk-to` and `/news-to` are exposed on your own local agent wrapper (`http://localhost:$ID_AGENT_PORT`). The wrapper looks up the target in the manager catalog and delivers the message.
-
-## Choosing the right agent to delegate to
-
-`/agents` only tells you **who exists**. It does not tell you who is the right peer for a given piece of work. Before `/talk-to` or `/news-to`, always run the catalog-aware selection flow.
-
-### Step 1 — Enumerate peers
-
-List candidates from the manager:
-
-```bash
-curl -s $MANAGER_URL/agents -H "X-Id-Team: $ID_TEAM" | jq '.agents[] | {name, alias, status, url}'
-```
-
-### Step 2 — BEFORE delegating, fetch each candidate's catalog
-
-For every candidate from Step 1, GET `/catalog` and read `role`, `expertise`, `status`, `costTier`, and `notSuitableFor`. Do **not** rely on names or aliases alone:
-
-```bash
-# Single peer
-curl -s http://localhost:<peer-port>/catalog | jq
-```
-
-```bash
-# Manager-discovery substitution: resolve every peer's /catalog in one pass
-for url in $(curl -s $MANAGER_URL/agents -H "X-Id-Team: $ID_TEAM" | jq -r '.agents[].url'); do
-  echo "== $url =="
-  curl -s "$url/catalog" | jq '{role, expertise, status, costTier, notSuitableFor}'
-done
-```
-
-### Step 3 — Filter
-
-Drop any candidate where:
-
-- `status !== "available"` (e.g., `busy`, `offline`, `error`) — they cannot take new work.
-- `notSuitableFor` lists a work pattern matching what you intend to delegate (e.g., your task is "production deploys" and the catalog says `"notSuitableFor": ["production deploys"]`).
-
-### Step 4 — Rank and pick
-
-Apply these rules in order:
-
-1. **Prefer a specialist over a generalist** — a candidate whose `role`/`expertise` directly matches the task beats a generalist whose catalog only loosely overlaps.
-2. **Prefer the lower `costTier`** when complexity allows — for well-scoped, low-risk work pick `low` over `medium` over `high` to conserve cost.
-3. **Never assign to a `costTier: "low"` agent**:
-   - multi-file schema changes,
-   - security or key-handling work (wallets, signing, secret rotation, auth code),
-   - routing-logic changes (manager dispatch, inter-agent skills, message broker code).
-   These must go to `medium` or `high` even if a `low` agent is "available" — promote the work, do not downgrade it.
-
-Only after a candidate survives Steps 3 and 4 do you send the actual `/talk-to` or `/news-to`.
-
-> **Catalog-check before delegating** — list `/agents`, then GET each candidate's `/catalog` and apply the four-step flow above. Never pick a peer by name alone.
-
-## Check your news feed
-
-Your news feed contains incoming messages, conversation history, and task results. Poll with the `since_id` cursor for incremental updates:
-
-```bash
-# First poll — pick up everything new and save the returned next_since_id
-curl -s "http://localhost:$ID_AGENT_PORT/news?since_id=0&limit=100" | jq
-
-# Subsequent polls — pass the last id you saw
-curl -s "http://localhost:$ID_AGENT_PORT/news?since_id=$LAST_ID&limit=100" | jq
-```
-
-The response includes `items[]` (ascending by id) and `next_since_id` when there is more to fetch. Each item carries an `id`, `type`, `timestamp`, `message`, and optional `data` / `query_id` / `kind` (`talk` or `notify`) / `reply_expected`.
-
-If you already know a `query_id`, do **not** page through the whole news feed looking for it. Use a targeted query instead:
-
-```bash
-# Preferred manager long-poll for a known dispatched query
-curl -s -H "X-Id-Team: $ID_TEAM" "$MANAGER_URL/query/$QID?wait=30" | jq
-
-# Or filter the local news feed by the known query id
-curl -s "http://localhost:$ID_AGENT_PORT/news?query_id=$QID&limit=20" | jq
-```
-
-Broad `/news?since_id=0` pagination is only for general inbox review. It is too slow for confirmation of a known dispatch and can waste minutes on agents with long histories.
-
-The older `?since=<ms-timestamp>` cursor still works for one release but is deprecated — the response will include an `X-Deprecated` header. Prefer `since_id`.
-
-Check your news feed before starting new tasks to maintain context.
-
-## Task management
-
-The `task-discipline` skill owns the full task lifecycle (create → claim → do → done) and the canonical endpoint patterns. Load it whenever your agent is assigned non-trivial work. The brief summary: every real piece of work gets a task row; use the explicit claim and done URLs from the dispatch brief verbatim; never create a parallel task when one was already dispatched to you.
-
-## Dispatch brief template
-
-When you delegate work that should become a manager task — i.e. an
-async delegation via `/news-to` with `"trigger":true`, or a `/talk-to`
-with `task: {title, name}` auto-attach — **always include both of the
-following in the brief** so the implementer can claim and close the
-lifecycle without having to construct URLs from memory:
-
-1. `task: <name>` — the exact kebab-case task name the manager will
-   create. Same name you pass in the `task: {title, name}` body field
-   of `/talk-to` auto-attach (or post manually via `POST /tasks`).
-2. **Explicit claim and done URLs**, pasted verbatim:
-
-   ```
-   claim URL: http://127.0.0.1:4100/tasks/<name>/claim
-   done URL:  http://127.0.0.1:4100/tasks/<name>/done
-   ```
-
-Why both: the task name alone is greppable but does not unambiguously
-tell the implementer which manager origin to address. The explicit
-URLs survive paste into a different agent / different shell context
-and remove any guesswork about route shape.
-
-A complete dispatch brief looks like:
-
-> Manager-approved slice 2 of foo. Task: implement-foo.
->
-> Required explicit task URLs:
-> - claim URL: http://127.0.0.1:4100/tasks/implement-foo/claim
-> - done URL: http://127.0.0.1:4100/tasks/implement-foo/done
->
-> Scope: …
-
-Implementers MUST use the assigned task name **verbatim** — see the
-`task-discipline` skill, section "Assigned work vs self-initiated
-work". A parallel task under a different name leaves the dispatcher's
-checkin firing against a phantom row.
-
-> **Future hardening (deferred):** manager-side duplicate-task
-> rejection — refusing `POST /tasks` when a dispatch has already
-> created a task for the same logical unit of work — would catch the
-> parallel-task mistake automatically. Not in scope for this slice;
-> the dispatch-brief convention above is the manual guardrail.
-
-## Checkins (work supervision)
-
-### What it is
-
-A **checkin** is a dispatcher-owned watch that pings the dispatcher's inbox at intervals while a delegated task is in progress, and **auto-closes** when the linked task hits a terminal state (e.g. `done`). The dispatcher is whoever delegated the work; the checkin lives in their inbox, not the delegate's. If the delegate finishes fast, the checkin closes silently. If the delegate stalls, the dispatcher gets pinged.
-
-### When to use it
-
-Use a checkin for any **delegation that creates a manager task**, i.e. a `/talk-to` request that includes `task: {title, name}`. Do NOT attach a checkin to:
-- one-off chats / synchronous Q&A (`/talk-to` without a `task` field)
-- fire-and-forget pings (`/news-to`)
-
-> A direct `POST /checkins` whose `linked_task` is already in `done` (or any terminal status) will be rejected with `409 linked_task_terminal`. If you missed the window, just read the task result instead of opening a check-in on it.
-
-### How to attach a checkin (auto-attach)
-
-Auto-attach is the default: include a `task: {title, name}` field in the body of `POST $MANAGER_URL/talk-to` and the manager creates the task **and** an active checkin watching it. The checkin is owned by the caller (`from`), interval defaults to **600s / 10m**, `close_when` defaults to `{task_status: ['done']}`.
-
-```bash
-curl -s -X POST "$MANAGER_URL/talk-to" \
-  -H "Content-Type: application/json" \
-  -H "X-Id-Team: $ID_TEAM" \
   -d '{
-    "to": "coder",
-    "from": "'$ID_AGENT_ALIAS'",
-    "message": "Please implement the X feature and report back when done.",
-    "task": { "title": "Implement X feature", "name": "implement-x" }
+    "to":"teammate-name",
+    "message":"Complete the bounded assignment and return evidence.",
+    "trigger":true,
+    "task":{"title":"Validate the bounded assignment","name":"validate-bounded-assignment"}
   }'
 ```
 
-> **Important:** the `task: {…}` auto-attach lives on the **manager's** `/talk-to`, not on the local wrapper at `http://localhost:$ID_AGENT_PORT/talk-to`. The local wrapper only forwards `to` / `message` / `from` to the target's `/talk` endpoint and will silently strip the `task` field. To get auto-attach, hit `$MANAGER_URL/talk-to` directly (as shown above).
+The Manager creates and supervises the named task when the `task` object is
+accepted. Reuse that exact task name; do not create a duplicate. The Manager
+supplies the effective task reference and lifecycle addresses at runtime, so do
+not construct task URLs from a remembered host or port.
 
-### How to tune the checkin
-
-Add any of these flags to the same request body. The CLI flag forms map onto body fields:
-
-| Flag                    | Body field                    | Effect                                                                  |
-|-------------------------|-------------------------------|-------------------------------------------------------------------------|
-| `--no-checkin`          | `"no_checkin": true`          | Create the task but no checkin row.                                     |
-| `--checkin <duration>`  | `"checkin": "30m"` or `1800`  | Override the 600s default. Accepts `s`/`m`/`h`/`d` suffixes or seconds. |
-| `--checkin-iters <N>`   | `"checkin_iters": 6`          | Cap how many times the checkin fires before auto-expiring.              |
+For a passive status notice that must not start an LLM turn, omit `trigger`:
 
 ```bash
-# Example: every 30m, max 6 fires
-curl -s -X POST "$MANAGER_URL/talk-to" \
+curl -fsS -X POST "http://127.0.0.1:$ID_AGENT_PORT/news-to" \
   -H "Content-Type: application/json" \
-  -H "X-Id-Team: $ID_TEAM" \
-  -d '{
-    "to": "coder",
-    "from": "'$ID_AGENT_ALIAS'",
-    "message": "Long migration — wake me every 30m.",
-    "task": { "title": "Run migration", "name": "run-migration" },
-    "checkin": "30m",
-    "checkin_iters": 6
-  }'
+  -d '{"to":"teammate-name","message":"The evidence packet is ready for review."}'
 ```
 
-### How to inspect checkins
+## Read your news cursor
 
 ```bash
-# Default: returns checkins in ALL statuses (active, snoozed, closed, expired)
-curl -s "$MANAGER_URL/checkins" -H "X-Id-Team: $ID_TEAM" | jq
-
-# Narrow by status (CSV) — there is no `?include_closed=true`; the default already includes them
-curl -s "$MANAGER_URL/checkins?status=active,snoozed" -H "X-Id-Team: $ID_TEAM" | jq
-
-# Narrow by owner or by linked task
-curl -s "$MANAGER_URL/checkins?owner=$ID_AGENT_ALIAS" -H "X-Id-Team: $ID_TEAM" | jq
-curl -s "$MANAGER_URL/checkins?linked_task=implement-x" -H "X-Id-Team: $ID_TEAM" | jq
-
-# Find checkins about to fire
-curl -s "$MANAGER_URL/checkins?due_before=$(date +%s)000" -H "X-Id-Team: $ID_TEAM" | jq
+curl -fsS "http://127.0.0.1:$ID_AGENT_PORT/news?since_id=0&limit=100"
 ```
 
-> `GET /checkins/:id` is **not** implemented in the current daemon. To inspect a single checkin, list and filter by `linked_task` (or by `owner`) and pick out the row whose `id` matches.
-
-### How to act on a checkin
-
-- **Snooze** (push the next fire out by a duration). Body field is `duration`, not `duration_seconds`. Accepts `"30m"` style strings or a number of seconds.
-
-  ```bash
-  curl -s -X POST "$MANAGER_URL/checkins/<id>/snooze" \
-    -H "Content-Type: application/json" \
-    -H "X-Id-Team: $ID_TEAM" \
-    -d '{"duration":"30m"}'
-  ```
-
-- **Close manually** (e.g. you've taken over and want to stop pings):
-
-  ```bash
-  curl -s -X POST "$MANAGER_URL/checkins/<id>/close" \
-    -H "Content-Type: application/json" \
-    -H "X-Id-Team: $ID_TEAM" \
-    -d '{"reason":"manual_intervention"}'
-  ```
-
-- **Auto-close** happens for you whenever the linked task transitions to a terminal status (default `done`). You do not need to close the checkin yourself in the happy path.
-
-- `DELETE /checkins/:id` exists but requires the **admin** principal (loopback + `X-Id-Admin: 1`). Agents should use `POST /checkins/:id/close` instead.
-
-### What you see when a checkin fires
-
-When a checkin fires, a **news item** lands in your inbox. Read it the same way you read every other inbound message:
+Save `next_since_id` and pass it as `since_id` on the next read. If a dispatch
+returned a query ID, prefer the Manager's bounded query wait:
 
 ```bash
-# First poll — returns items in ascending id order, plus next_since_id when more remain
-curl -s "http://localhost:$ID_AGENT_PORT/news?since_id=0&limit=100" | jq
-
-# Subsequent polls — pass the last id you saw
-curl -s "http://localhost:$ID_AGENT_PORT/news?since_id=$LAST_ID&limit=100" | jq
+curl -fsS "$MANAGER_URL/query/$QID?wait=30" \
+  -H "X-Id-Team: $ID_TEAM"
 ```
 
-> The live API prefers `?since_id=<id>` over the older `?since=<ms-timestamp>` cursor. Both still work; `?since_id` is the recommended form.
-> For a known `query_id`, use `$MANAGER_URL/query/<id>?wait=30` or `/news?query_id=<id>` instead of scanning every page.
+Terminal query states include `delivered`, `failed`, `cancelled`, and
+`expired`. A wait timeout is not completion; repeat the bounded wait when the
+task is still active.
 
-The fired-checkin news item carries:
-- linked task (name, status, owner)
-- last activity timestamp / idle time
-- iteration count vs `maxIterations`
-- action affordances — typically: **nudge** the delegate, **snooze** the checkin, **close** the checkin, or **inspect** the linked task
+## Delegation packet
 
-When a fire wakes you, follow the probe ladder in the next section before deciding to nudge, snooze, or close. Pinging the delegate via `/talk-to` is the LAST resort: it costs the delegate's tokens and blocks both sides while the delegate composes a status reply.
+Every non-trivial handoff should state:
 
-### Picking the right interval
+- the exact objective and expected deliverable;
+- the smallest necessary scope;
+- acceptance evidence;
+- applicable goal and authority limits;
+- the exact task name when one already exists;
+- risks that require operator review.
 
-The interval should be **slightly longer than the expected task duration**, not aggressively short. The first fire is meant to land *after* the work should plausibly be done, so its arrival is a real signal that something is off rather than routine noise.
+Do not include credentials, unrelated profile data, or instructions to perform
+privileged Manager actions. Treat teammate output as evidence to review, not as
+automatic authorization.
 
-Rules of thumb:
-- Task you expect to take 5 min → set `checkin: "6m"` (or `7m`). First fire = "should be done by now, why isn't it?"
-- Task you expect to take 30 min → set `checkin: "35m"`, `checkin_iters: 3`. Each fire is a meaningful checkpoint, not a buzz.
-- Task with unknown duration (audit, exploration, research) → set the interval to your patience threshold, not your hope. If you'd want to know after 10 min, that's the interval.
+## Reply behavior
 
-Aggressive intervals (every 90s on a 5-min task) generate noise the dispatcher learns to ignore. Conservative intervals (longer than expected) make every fire actionable.
-
-### How to react to a fire — the probe ladder
-
-When a `checkin_due` lands in your inbox, walk this ladder from cheapest to most expensive. Stop at the first signal that tells you what's happening. Most fires resolve at step 1 or 2 — you rarely need to escalate to `/talk-to`.
-
-**1. Re-read the linked task — has it advanced since last fire?**
-
-```bash
-curl -s "$MANAGER_URL/tasks/$LINKED_TASK_NAME" -H "X-Id-Team: $ID_TEAM" | jq '{status, updated_at, owner: .ownerName}'
-```
-
-If `updated_at` is recent (within the last fire interval), the task is moving. Decision: do nothing, the next fire will tell you more.
-
-**2. Look at the workdir — were files actually edited?**
-
-```bash
-# Find files modified in the last N minutes inside the delegate's working directory
-find <delegate-workdir> -type f -mmin -<interval-min> -not -path '*/node_modules/*' -not -path '*/.git/*' 2>/dev/null | head -20
-
-# Or check git activity if it's a code repo
-( cd <delegate-workdir> && git status --short && git diff --stat )
-```
-
-If files are changing, the delegate is working. Decision: do nothing.
-
-**3. Read the delegate's own news feed — what was its last activity?**
-
-```bash
-curl -s "http://localhost:<delegate-port>/news?since_id=0&limit=10" | jq '.items | reverse | .[:5] | .[] | {type, timestamp, message: (.message // "")[0:80]}'
-```
-
-`query.tool_use`, `query.progress`, `outbound.reply` types within the last interval = alive and active. Long silence (no entries) = something may be wrong; advance to step 4.
-
-**4. Health-probe the delegate's REST-AP endpoint.**
-
-```bash
-curl -sf -m 5 "http://localhost:<delegate-port>/.well-known/restap.json" >/dev/null && echo alive || echo unresponsive
-```
-
-Unresponsive = the agent process itself is down or its server is hung. Decision: close the checkin with `reason="delegate_unresponsive"` and either restart the delegate (admin action) or escalate to the user. Do not bother sending `/talk-to`; it will hang too.
-
-**5. Last resort — `/talk-to` the delegate to ask for a status line.**
-
-Only after steps 1-4 give ambiguous signals (delegate is responsive, task hasn't moved, news shows nothing recent). The status query itself costs the delegate one LLM turn:
-
-```bash
-curl -s -X POST "$MANAGER_URL/talk-to" \
-  -H "Content-Type: application/json" -H "X-Id-Team: $ID_TEAM" \
-  -d '{"to":"<delegate>","from":"'$ID_AGENT_ALIAS'","message":"Status check on '$LINKED_TASK_NAME'. Reply with one sentence: what step are you on, and is anything blocked?","timeout":60000}'
-```
-
-Use a short timeout (60s). If the delegate is genuinely stuck inside its current LLM turn, the `/talk-to` will time out and you'll know.
-
-### Decision after the probe
-
-| Probe result | Action |
-|---|---|
-| Task `updated_at` recent OR files changing | Do nothing — let the next fire confirm continued progress. |
-| Task idle but delegate news shows recent activity | Snooze the checkin one interval (`POST /checkins/:id/snooze {"duration":"<interval>"}`). The delegate is alive but on something else. |
-| Task idle AND delegate news silent BUT delegate responsive | `/talk-to` for a status line (step 5). |
-| Delegate unresponsive (step 4) | Close the checkin (`POST /checkins/:id/close {"reason":"delegate_unresponsive"}`). Escalate to user; this is operator-level. |
-| Task transitioned to a terminal status while you were probing | The checkin will auto-close on its own. Do nothing. |
-
-The big idea: **a checkin's job is to wake you. The probe ladder's job is to tell you, cheaply, whether the wake was a false alarm or a real one.** Most wakes are false alarms (work is progressing fine, the interval was just too aggressive); a few are real (delegate stuck, dead, or genuinely needs help). The ladder distinguishes them without spending the delegate's tokens.
-
-### Lifecycle
-
-```
-created (status=active)
-   │
-   ├─► (optional) snooze ──► status=snoozed ──► next_fire_at is moved out
-   │
-   ├─► linked task hits a terminal status (e.g. `done`)  ──► auto-close (status=closed)
-   │
-   └─► fires `max_iterations` times without resolution    ──► auto-expire (status=expired)
-```
-
-A checkin in `closed` or `expired` state never fires again. Snoozing a closed/expired checkin returns 409 `checkin_terminal`.
-
-### Why this exists
-
-Checkins solve the **claimed-and-idled** failure mode: a delegate accepts a task, then stops making progress for hours without saying so. Without supervision, the dispatcher only finds out when they happen to look. With auto-attach, the dispatcher gets pinged on a cadence, can decide whether to nudge / snooze / close, and pays nothing in the happy path because successful tasks auto-close their own checkin silently.
+When another agent contacts you, your normal textual response is returned
+automatically. Do not send a second message merely to deliver the same reply.
+Use the `task-discipline` skill for task creation, claiming, completion, and
+completion-packet requirements.

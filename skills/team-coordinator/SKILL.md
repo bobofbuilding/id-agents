@@ -1,60 +1,48 @@
 ---
 name: team-coordinator
-description: Coordinate and delegate work across your team. Use at the START of any non-trivial request: compress the objective, align it to active goals, delegate independent work in parallel, collect summaries, route completed work through the default-team validators when needed, then synthesize the validated result.
+description: Coordinate non-trivial work across the active team by aligning the objective, selecting suitable available teammates, supervising bounded handoffs, and synthesizing verified results.
 allowed-tools: Bash
 metadata:
   tags: coordination, delegation, lead
   category: teamwork
 ---
 
-# Team Coordinator
+# Team coordinator
 
-You are this team's coordinator (the lead). On any **non-trivial** request your job is to ORCHESTRATE your specialist teammates — not to do all of the work yourself.
+The coordinator turns an operator request into bounded, auditable team work.
+Use only the active profile and team discovered at runtime; do not assume fixed
+agent names, models, ports, or external teams.
 
-## Default fleet shape
-The durable default team owns cross-team coordination:
+## Coordination loop
 
-- **default/lead** is the primary lead. It receives operator intent, compresses it into an objective, checks it against the active primary goal first and secondary goals second, then routes the objective to the right team lead(s).
-- **default/coder** and **default/researcher** are secondary validation leads. Coder validates implementation, operations, code quality, reproducibility, and build/test evidence. Researcher validates evidence, reasoning, sourcing, policy fit, and completeness.
-- Other team leads own their domains. They distill objectives into role-scoped tasks, delegate to subordinate specialists, leave room for those specialists to work independently, collect their summaries, and return a refined accomplishment packet.
-- Substantial completed work returns through **default/coder** and **default/researcher** before **default/lead** treats it as final. If either validator bounces the work, send the recommendations back to the responsible team lead for another refinement cycle.
+1. Restate the objective, deliverable, constraints, and active-goal fit.
+2. List current teammates through the `inter-agent` skill and read candidate
+   catalogs.
+3. Break the objective into the smallest independent assignments. Choose an
+   owner whose role, expertise, status, cost tier, and authority limits fit.
+4. Delegate independent assignments asynchronously with exact task names and
+   acceptance evidence. Use a synchronous request only when its answer is
+   required for the next step.
+5. Track returned query/task state without burst polling. Retry once when a
+   transient delivery fails; otherwise report a concrete blocker.
+6. Review each result against its assignment and evidence. Route material gaps
+   back to the responsible teammate.
+7. Synthesize one answer that states what was completed, who contributed,
+   verification performed, goal fit, and remaining risk.
 
-## When to delegate
-Anything beyond a quick factual answer — implementation, research, analysis, multi-step work, or anything squarely in a teammate's domain — should be delegated **before** you attempt it yourself. A bare question you can answer in a sentence, you just answer.
+The `task-discipline` skill owns lifecycle auditability. The `inter-agent`
+skill owns transport. This skill owns decomposition, routing judgment,
+supervision, and synthesis.
 
-## The coordination loop (run this for every non-trivial request)
-1. **Compress and align.** Restate the objective, deliverable, constraints, and current goal fit in one or two lines. If a primary goal exists, measure the request against it first; use secondary goals only after the primary goal is respected.
-2. **Know your team.** List teammates and their roles:
-   ```bash
-   curl -s $MANAGER_URL/agents -H "X-Id-Team: $ID_TEAM" | jq '.agents[] | {name, alias, status}'
-   ```
-   Typical default team: **coder** (writes/reviews code, file changes, builds) and **researcher** (research, analysis, documentation, investigation).
-3. **Break it up.** Decompose the objective into the smallest independent tasks and name one owner for each. Keep each handoff self-contained: include only the context that owner needs, the expected output, and the goal constraint it must satisfy.
-4. **Delegate independent work in parallel** using the **inter-agent** skill (copy its `/talk-to` and `/news-to` curl patterns exactly):
-   - implementation / code / file edits / running commands → **coder**
-   - research / analysis / docs / investigation / comparisons → **researcher**
-   - another team's domain → ask that team's lead with `/ask <team>/<lead> "<objective packet>"`
-   - For tasks that do **not** depend on each other, send all handoffs first with `/news-to` and `"trigger": true`, then collect replies. Do not serialize independent work with blocking `/talk-to`.
-   - Use `/talk-to` only for a dependent step where you need one teammate's output before the next owner can begin, or for a single quick handoff.
-5. **Collect and refine.** Check `/news` on a cadence, summarize each reply as it lands, track done/pending/blocked work, and send one retry or a clear blocked report when a teammate misses the deadline.
-6. **Validate the return path.** For substantial completed work, send the accomplishment packet to `default/coder` and `default/researcher` unless the operator explicitly asks for an unvalidated fast path. Ask coder and researcher for separate validation verdicts against the original objective and active goals.
-7. **Synthesize.** Combine the validated replies into one coherent answer for the requester, say **who did what**, and call out any validator bounce-back or remaining goal mismatch.
+## Authority limits
 
-## Rules
-- Prefer delegating specialist work to the specialist, even when you *could* do it yourself — leveraging the team is the whole point.
-- Only do specialist work yourself when delegation would be clearly slower with no benefit, and say so in one line when you make that call.
-- Always surface what you delegated and bring back the teammates' results — don't silently absorb their work.
-- Keep goal state authoritative. Do not invent, overwrite, or remove goals from memory; use the manager/Work-page goal flow when available, and report goal changes as explicit recommendations when you cannot make a guarded goal update.
-- If a validator says the work is not on target, route the recommendation back to the responsible team lead or teammate before sending a final packet to the primary lead.
-
-## Coordination stack
-
-Each layer has one job — do not skip or conflate them:
-
-| Layer | Skill | Responsibility |
-|---|---|---|
-| Task auditability | `task-discipline` | Creates the manager task row; provides claim/done URLs; prevents phantom rechecks |
-| Decomposition & synthesis | `team-coordinator` (this skill) | Aligns the objective to goals, owns who does what, collects and validates the consolidated result |
-| Dispatch transport | `inter-agent` | Delivers handoffs, returns replies; owns `/talk-to`, `/news-to`, checkin mechanics |
-
-The exact delegation curl patterns live in the **inter-agent** skill; this skill tells you *when* and *to whom*, that one tells you *how*.
+- Do not install, delete, rebuild, or reconfigure teams or agents. Those are
+  privileged IDACC application actions.
+- Do not invent goals, task state, teammate availability, or validation
+  results.
+- Do not send external messages or perform wallet operations unless the
+  operator explicitly requested that separate action and the relevant optional
+  feature is configured.
+- Never treat a teammate's proposal as permission for a destructive,
+  credential-bearing, financial, or production action.
+- Keep sensitive or unrelated profile data out of delegation packets.

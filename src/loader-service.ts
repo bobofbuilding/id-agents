@@ -14,13 +14,14 @@ import { readFileSync, openSync, closeSync } from 'node:fs';
 import path from 'node:path';
 import { nodeOptionsForManager } from './lib/resource-limits.js';
 import { liveOriginalManagerPids, normalizeOriginalManagerPids } from './lib/manager-restart-guard.js';
+import { managerLaunchdLabel } from './lib/service-labels.js';
 
 const LOADER_PORT = parseInt(process.env.LOADER_PORT || '3100');
 const MANAGER_PORT = parseInt(process.env.AGENT_MANAGER_PORT || '4100');
 // Trusted local setup — no auth
 const WORK_DIR = process.env.LOADER_WORK_DIR || process.cwd();
 const LOG_FILE = process.env.MANAGER_LOG_FILE || '/tmp/manager.log';
-const MANAGER_LAUNCHD_LABEL = process.env.MANAGER_LAUNCHD_LABEL || 'io.bittrees.idagents-manager';
+const MANAGER_LAUNCHD_LABEL = managerLaunchdLabel();
 const MANAGER_SHUTDOWN_TIMEOUT_MS = Math.max(5_000, parseInt(process.env.MANAGER_SHUTDOWN_TIMEOUT_MS || '30000'));
 const MANAGER_RESTART_COOLDOWN_MS = Math.max(0, parseInt(process.env.MANAGER_RESTART_COOLDOWN_MS || '30000'));
 

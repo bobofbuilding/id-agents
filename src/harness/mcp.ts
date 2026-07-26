@@ -51,3 +51,81 @@ export function parseMcpServersEnv(raw: string | undefined): McpServerSpec[] | u
   }
   return undefined;
 }
+
+function canonicalJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalJsonValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([, entry]) => entry !== undefined)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, entry]) => [key, canonicalJsonValue(entry)]),
+    );
+  }
+  return value;
+}
+
+/**
+ * Compare an MCP list against the exact snapshot a caller reviewed. Object-key
+ * ordering is irrelevant, while server/argument ordering and every connection
+ * value remain significant.
+ */
+export function sameMcpServerSnapshot(
+  expected: McpServerSpec[],
+  current: McpServerSpec[],
+): boolean {
+  return JSON.stringify(canonicalJsonValue(expected))
+    === JSON.stringify(canonicalJsonValue(current));
+}
+
+/**
+ * Parse the bundled Brain MCP argv without shell syntax or whitespace
+ * splitting. JSON is the canonical transport because an application path may
+ * contain spaces on every supported desktop platform.
+ *
+ * A legacy BRAIN_MCP_ARGS value is retained as one literal argument only. That
+ * is intentionally fail-safe: callers that need multiple arguments must move
+ * to BRAIN_MCP_ARGS_JSON instead of relying on ambiguous shell tokenization.
+ */
+export function parseBrainMcpArgs(
+  json: string | undefined,
+  legacy: string | undefined,
+  defaultScript: string,
+): string[] | null {
+  if (json !== undefined) {
+    try {
+      const parsed = JSON.parse(json);
+      if (
+        !Array.isArray(parsed)
+        || parsed.length < 1
+        || parsed.length > 32
+        || parsed.some((value) => (
+          typeof value !== 'string'
+          || !value
+          || value.length > 16_384
+          || value.includes('\0')
+        ))
+      ) return null;
+      return parsed;
+    } catch {
+      return null;
+    }
+  }
+  if (legacy?.trim()) return [legacy.trim()];
+  return [defaultScript];
+}
+
+/** Environment intentionally carried by the auto-attached bundled Brain MCP. */
+export function brainMcpProcessEnv(
+  baseUrl: string,
+  token: string | undefined,
+): Record<string, string> {
+  return {
+    BRAIN_MCP_BASE_URL: baseUrl,
+    // The desktop uses Electron's executable as its pinned Node runtime.
+    // Agent launchers sanitize their environment, so never rely on inheriting
+    // this flag from the Manager process.
+    ELECTRON_RUN_AS_NODE: '1',
+    ...(token ? { BRAIN_TOKEN: token } : {}),
+  };
+}

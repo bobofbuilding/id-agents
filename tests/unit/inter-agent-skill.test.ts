@@ -22,88 +22,86 @@ const SKILL_MD_PATH = path.resolve(
   'SKILL.md'
 );
 
-describe('INTER_AGENT_SKILL — catalog-aware delegation flow', () => {
-  it('contains the exact "Choosing the right agent to delegate to" section title', () => {
-    expect(INTER_AGENT_SKILL).toContain('## Choosing the right agent to delegate to');
+describe('INTER_AGENT_SKILL — consumer-safe delegation flow', () => {
+  it('uses only runtime-provided Manager and private wrapper addresses', () => {
+    expect(INTER_AGENT_SKILL).toContain('`ID_AGENT_PORT`');
+    expect(INTER_AGENT_SKILL).toContain('`MANAGER_URL`');
+    expect(INTER_AGENT_SKILL).toContain('$MANAGER_URL/agents');
+    expect(INTER_AGENT_SKILL).toContain('127.0.0.1:$ID_AGENT_PORT');
   });
 
-  it('teaches all four steps in order', () => {
-    const idxStep1 = INTER_AGENT_SKILL.indexOf('Step 1');
-    const idxStep2 = INTER_AGENT_SKILL.indexOf('Step 2');
-    const idxStep3 = INTER_AGENT_SKILL.indexOf('Step 3');
-    const idxStep4 = INTER_AGENT_SKILL.indexOf('Step 4');
-
-    expect(idxStep1).toBeGreaterThan(0);
-    expect(idxStep2).toBeGreaterThan(idxStep1);
-    expect(idxStep3).toBeGreaterThan(idxStep2);
-    expect(idxStep4).toBeGreaterThan(idxStep3);
+  it('contains no fixed peer ports, raw admin relay, or checkout assumptions', () => {
+    expect(INTER_AGENT_SKILL).not.toMatch(/localhost:<peer-port>|127\.0\.0\.1:(?:4050|4100|4200)/);
+    expect(INTER_AGENT_SKILL).not.toContain('$MANAGER_URL/remote');
+    expect(INTER_AGENT_SKILL).not.toMatch(/(?:^|\s)\/ask(?:\s|$)/);
+    expect(INTER_AGENT_SKILL).not.toMatch(/\/workspace\/teams|project_root|task_ref/);
   });
 
-  it('Step 1 enumerates peers via GET /agents', () => {
-    expect(INTER_AGENT_SKILL).toMatch(/Step 1[\s\S]{0,400}\/agents/);
+  it('discovers current teammates before routing by catalog evidence', () => {
+    const discovery = INTER_AGENT_SKILL.split('## Discover available teammates')[1]?.split('## Synchronous request')[0] ?? '';
+    expect(discovery).toContain('$MANAGER_URL/agents');
+    expect(discovery).toContain('/catalog');
+    expect(discovery).toContain('role');
+    expect(discovery).toContain('expertise');
+    expect(discovery).toContain('availability');
+    expect(discovery).toContain('cost tier');
+    expect(discovery).toContain('notSuitableFor');
+    expect(discovery).toMatch(/Do not select an agent\s+from its name alone/i);
   });
 
-  it('Step 2 reads each candidate /catalog before /ask and names the four routing fields', () => {
-    const step2Block = INTER_AGENT_SKILL.split('### Step 2')[1]?.split('### Step 3')[0] ?? '';
-    expect(step2Block).toContain('/catalog');
-    expect(step2Block).toContain('role');
-    expect(step2Block).toContain('expertise');
-    expect(step2Block).toContain('status');
-    expect(step2Block).toContain('costTier');
-    expect(step2Block).toContain('notSuitableFor');
+  it('limits direct coordination to the current team', () => {
+    expect(INTER_AGENT_SKILL).toContain('current team');
+    expect(INTER_AGENT_SKILL).toContain('cross-team administration belong in the IDACC application');
+    expect(INTER_AGENT_SKILL).not.toMatch(/other-team\/agent|cross-team delegation/i);
   });
 
-  it('Step 3 filters out unavailable peers and notSuitableFor matches', () => {
-    const step3Block = INTER_AGENT_SKILL.split('### Step 3')[1]?.split('### Step 4')[0] ?? '';
-    expect(step3Block).toMatch(/status\s*!==\s*"available"/);
-    expect(step3Block).toContain('notSuitableFor');
+  it('uses talk-to only for a reply that is required before continuing', () => {
+    const synchronous = INTER_AGENT_SKILL.split('## Synchronous request')[1]?.split('## Asynchronous delegation')[0] ?? '';
+    expect(synchronous).toContain('/talk-to');
+    expect(synchronous).toMatch(/reply is needed before you can continue/i);
+    expect(synchronous).toMatch(/Include that response/i);
   });
 
-  it('Step 4 prefers specialist, prefers lower costTier, and forbids low costTier for sensitive work', () => {
-    const step4Block = INTER_AGENT_SKILL.split('### Step 4')[1] ?? '';
-    expect(step4Block).toMatch(/specialist/i);
-    expect(step4Block).toMatch(/lower\s+`?costTier`?/i);
-    expect(step4Block).toMatch(/never/i.source ? /never/i : /never/);
-    // The three forbidden categories for costTier=low
-    expect(step4Block).toMatch(/multi-file schema/i);
-    expect(step4Block).toMatch(/security|key.handling/i);
-    expect(step4Block).toMatch(/routing.logic/i);
-    expect(step4Block).toMatch(/costTier:\s*"low"/);
+  it('uses news-to with a literal trigger and stable task identity for asynchronous work', () => {
+    const asynchronous = INTER_AGENT_SKILL.split('## Asynchronous delegation')[1]?.split('## Read your news cursor')[0] ?? '';
+    expect(asynchronous).toContain('/news-to');
+    expect(asynchronous).toContain('"trigger":true');
+    expect(asynchronous).toContain('"task"');
+    expect(asynchronous).toMatch(/Reuse that exact task name/i);
   });
 
-  it('includes the per-peer curl recipe', () => {
-    expect(INTER_AGENT_SKILL).toContain('curl -s http://localhost:<peer-port>/catalog | jq');
+  it('documents a passive notice that cannot start a model turn', () => {
+    expect(INTER_AGENT_SKILL).toMatch(/passive status notice[\s\S]{0,160}omit `trigger`/i);
+    expect(INTER_AGENT_SKILL).toContain('The evidence packet is ready for review.');
   });
 
-  it('includes a manager-discovery recipe (env var + jq url extraction)', () => {
-    // The full skill is now sourced from skills/inter-agent/SKILL.md, which uses
-    // shell env vars ($MANAGER_URL) rather than {{MANAGER_URL}} placeholders.
-    // The recipe should still reference the manager URL *and* fan out to each peer's /catalog.
-    const block = INTER_AGENT_SKILL;
-    expect(block).toContain('$MANAGER_URL/agents');
-    expect(block).toMatch(/jq[^\n]*\.agents\[\]\.url/);
-    expect(block).toContain('"$url/catalog"');
+  it('uses a cursor and bounded query wait instead of broad polling', () => {
+    expect(INTER_AGENT_SKILL).toContain('since_id=0&limit=100');
+    expect(INTER_AGENT_SKILL).toContain('next_since_id');
+    expect(INTER_AGENT_SKILL).toContain('$MANAGER_URL/query/$QID?wait=30');
+    expect(INTER_AGENT_SKILL).toContain('A wait timeout is not completion');
+    for (const state of ['delivered', 'failed', 'cancelled', 'expired']) {
+      expect(INTER_AGENT_SKILL).toContain(`\`${state}\``);
+    }
   });
 
-  it('removes the old "pick by name from /agents alone" framing', () => {
-    // The pre-change "Best Practices" line told agents to just "List agents first".
-    expect(INTER_AGENT_SKILL).not.toMatch(/^\s*\d+\.\s+\*\*List agents first\*\*/m);
-    // And the section that previously told you to "always use this name" should now redirect to the catalog flow.
-    expect(INTER_AGENT_SKILL).toContain('Catalog-check before delegating');
+  it('requires a bounded handoff packet and protects profile credentials', () => {
+    expect(INTER_AGENT_SKILL).toContain('## Delegation packet');
+    expect(INTER_AGENT_SKILL).toContain('exact objective and expected deliverable');
+    expect(INTER_AGENT_SKILL).toContain('smallest necessary scope');
+    expect(INTER_AGENT_SKILL).toContain('acceptance evidence');
+    expect(INTER_AGENT_SKILL).toContain('authority limits');
+    expect(INTER_AGENT_SKILL).toContain('Do not include credentials, unrelated profile data');
+    expect(INTER_AGENT_SKILL).toMatch(/evidence to review, not as\s+automatic authorization/i);
   });
 
-  it('routes cross-team /ask through manager /remote and forbids POST /ask', () => {
-    expect(INTER_AGENT_SKILL).toContain('## Cross-team delegation');
-    expect(INTER_AGENT_SKILL).toContain('$MANAGER_URL/remote');
-    expect(INTER_AGENT_SKILL).toContain('/ask other-team/agent-name');
-    expect(INTER_AGENT_SKILL).toContain('context.task_ref');
-    expect(INTER_AGENT_SKILL).toContain('context.project_root');
-    expect(INTER_AGENT_SKILL).toContain('Never `POST $MANAGER_URL/ask`');
-    expect(INTER_AGENT_SKILL_LIGHT).toContain('## Cross-Team Delegation');
-    expect(INTER_AGENT_SKILL_LIGHT).toContain('$MANAGER_URL/remote');
-    expect(INTER_AGENT_SKILL_LIGHT).toContain('task_ref');
-    expect(INTER_AGENT_SKILL_LIGHT).toContain('project_root');
-    expect(INTER_AGENT_SKILL_LIGHT).toContain('Never POST to `$MANAGER_URL/ask`');
+  it('keeps the lightweight contract under the same consumer-safety boundary', () => {
+    expect(INTER_AGENT_SKILL_LIGHT).toContain('$MANAGER_URL/agents');
+    expect(INTER_AGENT_SKILL_LIGHT).toContain('127.0.0.1:$ID_AGENT_PORT/talk-to');
+    expect(INTER_AGENT_SKILL_LIGHT).toContain('127.0.0.1:$ID_AGENT_PORT/news-to');
+    expect(INTER_AGENT_SKILL_LIGHT).toContain('$MANAGER_URL/query/$QID?wait=30');
+    expect(INTER_AGENT_SKILL_LIGHT).not.toContain('$MANAGER_URL/remote');
+    expect(INTER_AGENT_SKILL_LIGHT).not.toMatch(/\/workspace\/teams|other-team\/agent|localhost:<peer-port>/);
   });
 });
 

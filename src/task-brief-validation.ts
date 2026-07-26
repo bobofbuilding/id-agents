@@ -29,9 +29,15 @@ export interface TaskBriefValidationInput {
   recommendationRouting?: unknown;
   recommendation_routing_instructions?: unknown;
   recommendationRoutingInstructions?: unknown;
+  work_relevance?: unknown;
+  workRelevance?: unknown;
+  /** @deprecated Read-only compatibility for tasks created before the neutral work-relevance schema. */
   bittrees_relevance?: unknown;
+  /** @deprecated Read-only compatibility for tasks created before the neutral work-relevance schema. */
   bittreesRelevance?: unknown;
+  /** @deprecated Read-only compatibility for tasks created before the neutral work-relevance schema. */
   bittrees_contributor_relevance?: unknown;
+  /** @deprecated Read-only compatibility for tasks created before the neutral work-relevance schema. */
   bittreesContributorRelevance?: unknown;
   relevance?: unknown;
   target?: unknown;
@@ -83,7 +89,7 @@ export interface TaskCompletionValidationResult {
 }
 
 const GOAL_RE = /\bgoal_[a-z0-9_]+\b/i;
-export type BittreesContributorPriority = 'high' | 'medium' | 'low/backlog' | 'reject';
+export type WorkPriority = 'high' | 'medium' | 'low/backlog' | 'reject';
 
 export function getTaskBriefValidationMode(raw = process.env.ID_TASK_BRIEF_VALIDATION): TaskBriefValidationMode {
   const normalized = String(raw || 'warn').trim().toLowerCase();
@@ -134,11 +140,11 @@ export function validateTaskBrief(
   if (!hasValidationPath(input, text)) missing.push('validation_path');
   if (!hasOutOfScope(input, text)) missing.push('out_of_scope');
   if (!hasBacklogPolicy(input, text)) missing.push('backlog_policy');
-  if (!hasBittreesContributorRelevance(input, text)) {
+  if (!hasWorkRelevance(input, text)) {
     // A provided-but-unparseable relevance (no high/medium/low/backlog/reject
     // priority keyword) is a different failure than an absent field; report it
     // as invalid so "missing" stops masking the real fix for the submitter.
-    (hasBittreesRelevanceField(input) ? invalid : missing).push('bittrees_relevance');
+    (hasWorkRelevanceField(input) ? invalid : missing).push('work_relevance');
   }
 
   const bypassReason = firstString(input.bypass_reason, input.bypassReason);
@@ -222,9 +228,11 @@ export function appendTaskBriefFieldsToDescription(
   appendIfMissing(
     additions,
     existing,
-    'Bittrees relevance',
+    'Work relevance',
     formatValue(
-      input.bittrees_relevance
+      input.work_relevance
+      ?? input.workRelevance
+      ?? input.bittrees_relevance
       ?? input.bittreesRelevance
       ?? input.bittrees_contributor_relevance
       ?? input.bittreesContributorRelevance
@@ -307,13 +315,15 @@ function hasBacklogPolicy(input: TaskBriefValidationInput, text: string): boolea
     || hasRecommendationRoutingInstructionLabel(text);
 }
 
-function hasBittreesContributorRelevance(input: TaskBriefValidationInput, text: string): boolean {
-  return getBittreesContributorPriority(input, text) !== null;
+function hasWorkRelevance(input: TaskBriefValidationInput, text: string): boolean {
+  return getWorkPriority(input, text) !== null;
 }
 
-function hasBittreesRelevanceField(input: TaskBriefValidationInput): boolean {
+function hasWorkRelevanceField(input: TaskBriefValidationInput): boolean {
   return hasNonEmpty(
-    input.bittrees_relevance
+    input.work_relevance
+    ?? input.workRelevance
+    ?? input.bittrees_relevance
     ?? input.bittreesRelevance
     ?? input.bittrees_contributor_relevance
     ?? input.bittreesContributorRelevance
@@ -321,24 +331,26 @@ function hasBittreesRelevanceField(input: TaskBriefValidationInput): boolean {
   );
 }
 
-export function getBittreesContributorPriority(
+export function getWorkPriority(
   input: TaskBriefValidationInput,
   text = '',
-): BittreesContributorPriority | null {
-  const raw = input.bittrees_relevance
+): WorkPriority | null {
+  const raw = input.work_relevance
+    ?? input.workRelevance
+    ?? input.bittrees_relevance
     ?? input.bittreesRelevance
     ?? input.bittrees_contributor_relevance
     ?? input.bittreesContributorRelevance
     ?? input.relevance;
-  const rawPriority = parseBittreesPriority(formatValue(raw));
+  const rawPriority = parseWorkPriority(formatValue(raw));
   if (rawPriority) return rawPriority;
-  const labeled = text.match(/(?:^|\n)\s*(?:bittrees relevance|bittrees contributor relevance|contributor relevance|relevance)\s*:\s*([^\n]+)/i)?.[1] || null;
-  const labeledPriority = parseBittreesPriority(labeled);
+  const labeled = text.match(/(?:^|\n)\s*(?:work relevance|contributor relevance|bittrees relevance|bittrees contributor relevance|relevance)\s*:\s*([^\n]+)/i)?.[1] || null;
+  const labeledPriority = parseWorkPriority(labeled);
   if (labeledPriority) return labeledPriority;
   return null;
 }
 
-function parseBittreesPriority(value: string | null): BittreesContributorPriority | null {
+function parseWorkPriority(value: string | null): WorkPriority | null {
   const normalized = value?.toLowerCase() || '';
   if (!normalized) return null;
   if (/\breject(ed|ion)?\b/.test(normalized)) return 'reject';

@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.143]
+
+- Ship a provider-neutral starter fleet and consumer-safe core skill set without embedded organization routes, wallets, signing material, provider URLs, or local workspace assumptions.
+- Add versioned service identity attestation, a space-safe bundled Brain MCP launch contract, exact MCP attachment compare-and-swap, redacted Brain relay responses, and version-checked control-state deletion.
+- Replace organization-specific work relevance with a neutral task contract while retaining read-only compatibility for existing records, and harden listener, task-workflow, and inter-agent execution boundaries.
+
+## [0.1.142]
+
+- Require the supervisor-only bearer credential for Manager administration while retaining loopback and explicit admin-header checks, and remove that credential from the environment inherited by agents.
+
 ## [0.1.141]
 
 - Harden goal autopilot cadence with persisted run state, overlap protection, bounded fan-out, missed-tick coalescing, and manager-owned execution through the same control state IDACC edits.

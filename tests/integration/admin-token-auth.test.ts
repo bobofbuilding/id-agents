@@ -17,6 +17,7 @@ import { SqliteNewsRepo } from '../../src/db/repos/sqlite/news-repo.js';
 import { SqliteSchedulesRepo } from '../../src/db/repos/sqlite/schedules-repo.js';
 import { SqliteTasksRepo } from '../../src/db/repos/sqlite/tasks-repo.js';
 import { SqliteEventsRepo } from '../../src/db/repos/sqlite/events-repo.js';
+import { SqliteControlStateRepo } from '../../src/db/repos/sqlite/control-state-repo.js';
 
 const ADMIN_TOKEN = 'integration-admin-session-token';
 const TEAM = 'admin-token-auth';
@@ -33,6 +34,7 @@ async function createInMemoryDb() {
     schedules: new SqliteSchedulesRepo(adapter),
     tasks: new SqliteTasksRepo(adapter),
     events: new SqliteEventsRepo(adapter),
+    controlState: new SqliteControlStateRepo(adapter),
     async close() { await adapter.close(); },
   };
 }
@@ -64,6 +66,7 @@ describe('IDACC Manager admin bearer', () => {
   let previousAdminToken: string | undefined;
   let previousBrainUrl: string | undefined;
   let previousBrainToken: string | undefined;
+  const brainRequests: Array<{ url: string; authorization: string }> = [];
 
   beforeAll(async () => {
     previousAdminToken = process.env.IDACC_ADMIN_TOKEN;
@@ -75,13 +78,31 @@ describe('IDACC Manager admin bearer', () => {
     const brainPort = await findFreePort();
     process.env.BRAIN_URL = `http://127.0.0.1:${brainPort}`;
     brainServer = http.createServer((req, res) => {
-      if (req.url !== '/health') {
-        res.writeHead(404);
-        res.end();
+      brainRequests.push({
+        url: String(req.url || ''),
+        authorization: String(req.headers.authorization || ''),
+      });
+      if (req.url === '/health') {
+        res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        res.end(JSON.stringify({ ok: true, nodes: 0, edges: 0 }));
         return;
       }
-      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-      res.end(JSON.stringify({ ok: true, nodes: 0, edges: 0 }));
+      if (req.url === '/timeline?type=control%3Atest&limit=2') {
+        res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        res.end(JSON.stringify({
+          events: [{
+            id: 7,
+            type: 'control:test',
+            data: {
+              token: 'must-not-leave-manager',
+              nested: { api_key: 'must-not-leave-manager', summary: 'visible' },
+            },
+          }],
+        }));
+        return;
+      }
+      res.writeHead(404);
+      res.end();
     });
     await new Promise<void>((resolve) => brainServer.listen(brainPort, '127.0.0.1', resolve));
 
@@ -118,7 +139,10 @@ describe('IDACC Manager admin bearer', () => {
     else process.env.BRAIN_TOKEN = previousBrainToken;
   });
 
-  async function relay(headers: Record<string, string>): Promise<Response> {
+  async function relay(
+    headers: Record<string, string>,
+    operation: Record<string, unknown> = { method: 'GET', path: '/health' },
+  ): Promise<Response> {
     return fetch(`${managerUrl}/control/brain`, {
       method: 'POST',
       headers: {
@@ -126,7 +150,7 @@ describe('IDACC Manager admin bearer', () => {
         'X-Id-Team': TEAM,
         ...headers,
       },
-      body: JSON.stringify({ method: 'GET', path: '/health' }),
+      body: JSON.stringify(operation),
     });
   }
 
@@ -147,5 +171,90 @@ describe('IDACC Manager admin bearer', () => {
     expect(response.status).toBe(200);
     const body = await response.json() as { body?: { ok?: boolean } };
     expect(body.body?.ok).toBe(true);
+  });
+
+  it('relays only bounded timeline reads and redacts the Brain response', async () => {
+    const before = brainRequests.length;
+    const response = await relay({
+      'X-Id-Admin': '1',
+      Authorization: `Bearer ${ADMIN_TOKEN}`,
+    }, {
+      method: 'GET',
+      path: '/timeline?type=control%3Atest&limit=2',
+    });
+    expect(response.status).toBe(200);
+    expect(brainRequests).toHaveLength(before + 1);
+    expect(brainRequests.at(-1)).toEqual({
+      url: '/timeline?type=control%3Atest&limit=2',
+      authorization: 'Bearer brain-agent-compatible',
+    });
+    const body = await response.json() as {
+      body?: { events?: Array<{ data?: Record<string, any> }> };
+      noStore?: boolean;
+    };
+    expect(body.noStore).toBe(true);
+    expect(body.body?.events?.[0]?.data).toEqual({
+      token: '[redacted]',
+      nested: { api_key: '[redacted]', summary: 'visible' },
+    });
+  });
+
+  it('rejects unbounded or expanded timeline reads before contacting Brain', async () => {
+    const headers = {
+      'X-Id-Admin': '1',
+      Authorization: `Bearer ${ADMIN_TOKEN}`,
+    };
+    const before = brainRequests.length;
+    expect((await relay(headers, { method: 'GET', path: '/timeline' })).status).toBe(400);
+    expect((await relay(headers, { method: 'GET', path: '/timeline?limit=101' })).status).toBe(400);
+    expect((await relay(headers, { method: 'GET', path: '/timeline?limit=2&include=secrets' })).status).toBe(400);
+    expect(brainRequests).toHaveLength(before);
+  });
+
+  it('requires compare-and-delete for control state and preserves newer state on conflict', async () => {
+    const headers = {
+      'content-type': 'application/json',
+      'X-Id-Team': TEAM,
+      'X-Id-Admin': '1',
+      Authorization: `Bearer ${ADMIN_TOKEN}`,
+    };
+    const stateUrl = `${managerUrl}/control/state/project/release-readiness`;
+    const created = await fetch(stateUrl, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ expected_version: 0, value: { status: 'draft' } }),
+    });
+    expect(created.status).toBe(200);
+    expect(((await created.json()) as any).item.version).toBe(1);
+
+    const updated = await fetch(stateUrl, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ expected_version: 1, value: { status: 'ready' } }),
+    });
+    expect(updated.status).toBe(200);
+    expect(((await updated.json()) as any).item.version).toBe(2);
+
+    expect((await fetch(stateUrl, { method: 'DELETE', headers })).status).toBe(400);
+    const stale = await fetch(`${stateUrl}?expected_version=1`, { method: 'DELETE', headers });
+    expect(stale.status).toBe(409);
+    expect(await stale.json()).toMatchObject({
+      error: 'control_state_version_conflict',
+      expected_version: 1,
+      current_version: 2,
+    });
+    const retained = await fetch(stateUrl, { headers });
+    expect(retained.status).toBe(200);
+    expect(await retained.json()).toMatchObject({
+      item: { version: 2, value: { status: 'ready' } },
+    });
+
+    const removed = await fetch(stateUrl, {
+      method: 'DELETE',
+      headers,
+      body: JSON.stringify({ expected_version: 2 }),
+    });
+    expect(removed.status).toBe(200);
+    expect(await removed.json()).toEqual({ ok: true, deleted: true });
   });
 });

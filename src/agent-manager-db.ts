@@ -28,6 +28,7 @@ import { defaultDeliverFn, redactSshTarget, type DeliverFn } from './lib/ssh-del
 import { probeRemoteAgent, defaultHealthProbeFn, type HealthProbeFn } from './lib/remote-heartbeat.js';
 import { filterClaudeEnvVars } from './lib/env-hygiene.js';
 import { LocalModelGate, isLocalModelRuntime } from './lib/local-model-gate.js';
+import { managerHealthAttestation } from './lib/service-labels.js';
 import { withDesktopResourceLimits } from './lib/resource-limits.js';
 import { ccCapabilities } from './control-center/manifest.js';
 import {
@@ -78,7 +79,7 @@ import {
 } from './default-coder-drift.js';
 import {
   appendTaskBriefFieldsToDescription,
-  getBittreesContributorPriority,
+  getWorkPriority,
   getTaskBriefValidationMode,
   shouldBlockTaskBrief,
   shouldBlockTaskCompletion,
@@ -130,6 +131,7 @@ import {
 } from './core/learning-loop-capture.js';
 import { appendSpecialistRoutingNote, inferSpecialistOwnerTeam } from './core/specialist-routing.js';
 import type { HarnessType, McpServerSpec } from './harness/types.js';
+import { brainMcpProcessEnv, parseBrainMcpArgs, sameMcpServerSnapshot } from './harness/mcp.js';
 import { SchedulerService } from './scheduling/scheduler-service.js';
 import type { DispatchResult, DispatchTarget, DueRun } from './scheduling/schedule-types.js';
 import { heartbeatToSchedule, calendarToSchedule, validateIntervalSeconds, HEARTBEAT_GENERIC_MESSAGE } from './scheduling/schedule-config.js';
@@ -1333,11 +1335,11 @@ export class AgentManagerDb {
     options: { immediateExecution?: boolean } = {},
   ): { validation: TaskBriefValidationResult; blocked: boolean } {
     const validation = validateTaskBrief(input, getTaskBriefValidationMode());
-    const priority = getBittreesContributorPriority(input, this.taskBriefGuardText(input));
+    const priority = getWorkPriority(input, this.taskBriefGuardText(input));
     if (options.immediateExecution && (priority === 'low/backlog' || priority === 'reject')) {
       const reasonCode = priority === 'reject'
-        ? 'rejected_bittrees_relevance_live_dispatch'
-        : 'low_bittrees_relevance_live_dispatch';
+        ? 'rejected_work_relevance_live_dispatch'
+        : 'low_work_relevance_live_dispatch';
       return {
         validation: {
           ...validation,
@@ -1345,8 +1347,8 @@ export class AgentManagerDb {
           decision: 'goal_triage_required',
           route: 'goal-triage',
           dispatch_ready: false,
-          invalid: [...new Set([...validation.invalid, 'bittrees_relevance'])],
-          message: 'Low/backlog or rejected Bittrees contributor relevance must be routed to backlog, not live delegated work.',
+          invalid: [...new Set([...validation.invalid, 'work_relevance'])],
+          message: 'Low/backlog or rejected work relevance must be routed to backlog, not live delegated work.',
           reason_codes: [...new Set([...validation.reason_codes, reasonCode])],
         },
         blocked: true,
@@ -1393,6 +1395,9 @@ export class AgentManagerDb {
       (input as any).siteUrl,
       (input as any).site_url,
       (input as any).url,
+      (input as any).work_relevance,
+      (input as any).workRelevance,
+      // Read-only upgrade compatibility; new task output is always work_relevance.
       (input as any).bittrees_relevance,
       (input as any).bittreesRelevance,
       (input as any).bittrees_contributor_relevance,
@@ -3651,7 +3656,7 @@ Validation-loop guardrails:
 - Use one validator pass per parent task and at most one rework cycle.
 - If a validator stayed processing after bounded polling and one retry, treat that stalled validation as terminal evidence and close it with a failure note instead of redispatching a replacement automatically.
 - Low/backlog or generic recommendations must be routed to backlog, not live child tasks.
-- Every live follow-up recommendation must include goal_id, expected_output, acceptance_criteria, validation_path, out_of_scope, backlog_policy or recommendation_routing, and Bittrees contributor relevance.
+- Every live follow-up recommendation must include goal_id, expected_output, acceptance_criteria, validation_path, out_of_scope, backlog_policy or recommendation_routing, and work relevance.
 
 Return this JSON shape:
 {
@@ -3671,7 +3676,7 @@ Return this JSON shape:
       "owner_team": "engineering-team | legal | onchain-execution | ops-team | research | technology-security | installed optional provider team",
       "priority": "high | medium | low/backlog | reject",
       "goal_id": "goal_...",
-      "bittrees_relevance": "high | medium | low/backlog | reject - one sentence",
+      "work_relevance": "high | medium | low/backlog | reject - one sentence",
       "rationale": "...",
       "expected_output": "...",
       "dependencies": ["..."],
@@ -3959,8 +3964,12 @@ Return this JSON shape:
     const skillmeshKey = skillmeshProviderEnabled ? (agent.metadata as any)?.skillmesh_private_key : undefined;
     if (skillmeshKey) {
       env.SKILLMESH_PRIVATE_KEY = skillmeshKey;
-      env.SKILLMESH_APP_URL = process.env.SKILLMESH_APP_URL || 'https://skillmesh.bittrees.org';
-      env.SKILLMESH_RPC_URL = process.env.SKILLMESH_RPC_URL || 'https://sepolia.drpc.org';
+      if (process.env.SKILLMESH_APP_URL?.trim()) {
+        env.SKILLMESH_APP_URL = process.env.SKILLMESH_APP_URL.trim();
+      }
+      if (process.env.SKILLMESH_RPC_URL?.trim()) {
+        env.SKILLMESH_RPC_URL = process.env.SKILLMESH_RPC_URL.trim();
+      }
     }
     // Inject creator key for agents that need to publish skills on-chain
     const skillmeshCreatorKey = skillmeshProviderEnabled ? (agent.metadata as any)?.skillmesh_creator_key : undefined;
@@ -7577,21 +7586,20 @@ Return this JSON shape:
     if (envFlagDisabled(process.env.ID_AUTO_ATTACH_BRAIN_MCP)) return null;
     const explicit = process.env.BRAIN_MCP_COMMAND;
     const command = explicit && explicit.trim() ? explicit.trim() : process.execPath;
-    const explicitArgs = process.env.BRAIN_MCP_ARGS;
     const defaultScript = path.join(this.baseWorkDir, 'projects', 'brain', 'brain-mcp.mjs');
-    const args = explicitArgs && explicitArgs.trim()
-      ? explicitArgs.split(/\s+/).filter(Boolean)
-      : [defaultScript];
+    const args = parseBrainMcpArgs(
+      process.env.BRAIN_MCP_ARGS_JSON,
+      process.env.BRAIN_MCP_ARGS,
+      defaultScript,
+    );
+    if (!args) return null;
     if (!explicit && !existsSync(defaultScript)) return null;
     return {
       name: 'brain',
       transport: 'stdio',
       command,
       args,
-      env: {
-        BRAIN_MCP_BASE_URL: this.brainUrl(),
-        ...(process.env.BRAIN_TOKEN ? { BRAIN_TOKEN: process.env.BRAIN_TOKEN } : {}),
-      },
+      env: brainMcpProcessEnv(this.brainUrl(), process.env.BRAIN_TOKEN),
     };
   }
 
@@ -9367,6 +9375,7 @@ Return this JSON shape:
       ]);
       res.json({
         status: 'ok',
+        ...managerHealthAttestation(),
         team: teamName,
         agents: parseInt(count || '0'),
         activeQueries,
@@ -9773,7 +9782,7 @@ Return this JSON shape:
         const responseText = await response.text();
         let responseBody: unknown = null;
         if (responseText) {
-          try { responseBody = JSON.parse(responseText); } catch { responseBody = null; }
+          try { responseBody = redactControlBrainValue(JSON.parse(responseText)); } catch { responseBody = null; }
         }
         const cacheControl = response.headers.get('cache-control');
         const noStore = cacheControl?.toLowerCase().split(',').map((part) => part.trim()).includes('no-store') ?? false;
@@ -9934,9 +9943,47 @@ Return this JSON shape:
       const scope = controlScope(req.params.scope);
       const key = controlKey(req.params.key);
       if (!scope || !key) return res.status(400).json({ error: !scope ? 'invalid_control_scope' : 'invalid_control_key' });
+      const queryExpectedVersion = req.query?.expected_version;
+      const bodyExpectedVersion = req.body?.expected_version;
+      if (
+        queryExpectedVersion !== undefined
+        && bodyExpectedVersion !== undefined
+        && String(queryExpectedVersion) !== String(bodyExpectedVersion)
+      ) {
+        return res.status(400).json({ error: 'conflicting_expected_version' });
+      }
+      const expectedVersionValue = bodyExpectedVersion ?? queryExpectedVersion;
+      if (expectedVersionValue === undefined) {
+        return res.status(400).json({ error: 'expected_version_required' });
+      }
+      const expectedVersion = typeof expectedVersionValue === 'number'
+        ? expectedVersionValue
+        : /^\d+$/.test(String(expectedVersionValue))
+          ? Number(expectedVersionValue)
+          : NaN;
+      if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1) {
+        return res.status(400).json({ error: 'invalid_expected_version' });
+      }
       const { id: teamId } = await this.getTeam(req);
-      const deleted = await this.db.controlState.delete(teamId, scope, key);
-      if (deleted) await emitControlEvent(this.db.events, { teamId, topic: scope === 'project' ? 'project:removed' : 'control:state-removed', subjectKind: scope, subjectId: key, data: { scope, key } });
+      const result = await this.db.controlState.delete(teamId, scope, key, expectedVersion);
+      if (result === 'version_conflict') {
+        const current = await this.db.controlState.get(teamId, scope, key);
+        return res.status(409).json({
+          error: 'control_state_version_conflict',
+          expected_version: expectedVersion,
+          current_version: current?.version ?? null,
+        });
+      }
+      const deleted = result === 'deleted';
+      if (deleted) {
+        await emitControlEvent(this.db.events, {
+          teamId,
+          topic: scope === 'project' ? 'project:removed' : 'control:state-removed',
+          subjectKind: scope,
+          subjectId: key,
+          data: { scope, key, version: expectedVersion },
+        });
+      }
       return res.json({ ok: true, deleted });
     });
 
@@ -10260,11 +10307,24 @@ Return this JSON shape:
         if (!Array.isArray(raw)) {
           return res.status(400).json({ error: 'Missing servers array in request body' });
         }
+        if (raw.length > 64) {
+          return res.status(400).json({ error: 'At most 64 MCP servers may be attached to one agent' });
+        }
+        const expectedRaw = (req.body || {}).expectedServers;
+        if (expectedRaw !== undefined && !Array.isArray(expectedRaw)) {
+          return res.status(400).json({ error: 'expectedServers must be an array when provided' });
+        }
         const servers: any[] = [];
+        const serverNames = new Set<string>();
         for (const s of raw) {
           if (!s || typeof s.name !== 'string' || !s.name.trim()) {
             return res.status(400).json({ error: 'Each server needs a non-empty name' });
           }
+          const normalizedName = s.name.trim();
+          if (serverNames.has(normalizedName)) {
+            return res.status(400).json({ error: `Duplicate MCP server name "${normalizedName}"` });
+          }
+          serverNames.add(normalizedName);
           const transport = s.transport || 'stdio';
           if (transport === 'stdio') {
             if (typeof s.command !== 'string' || !s.command.trim()) {
@@ -10290,7 +10350,7 @@ Return this JSON shape:
             return res.status(400).json({ error: `server "${s.name}" headers must be a string map` });
           }
           servers.push({
-            name: s.name.trim(),
+            name: normalizedName,
             transport,
             ...(s.command && { command: s.command }),
             ...(Array.isArray(s.args) && { args: s.args }),
@@ -10300,11 +10360,38 @@ Return this JSON shape:
           });
         }
 
-        const cur = (agent.metadata as Record<string, unknown>) || {};
-        await this.db.agents.updateMetadata(agent.id, { ...cur, mcpServers: servers });
-        res.json({ agent: agent.name, mcpServers: servers, needsRebuild: true });
+        const mutation = await this.withAgentLifecycleLock(
+          this.agentLifecycleKey(teamId, agent),
+          async (): Promise<{ status: number; body: Record<string, unknown> }> => {
+            const currentAgent = await this.dbQueryAgentById(teamId, agent.id);
+            if (!currentAgent) return { status: 404, body: { error: 'Agent not found' } };
+            const cur = (currentAgent.metadata as Record<string, unknown>) || {};
+            const currentServers = Array.isArray(cur.mcpServers)
+              ? cur.mcpServers as McpServerSpec[]
+              : [];
+            if (
+              Array.isArray(expectedRaw)
+              && !sameMcpServerSnapshot(expectedRaw as McpServerSpec[], currentServers)
+            ) {
+              return {
+                status: 409,
+                body: {
+                  error: 'mcp_servers_changed',
+                  message: 'MCP attachments changed after review; refresh and retry.',
+                  currentServers,
+                },
+              };
+            }
+            await this.db.agents.updateMetadata(currentAgent.id, { ...cur, mcpServers: servers });
+            return {
+              status: 200,
+              body: { agent: currentAgent.name, mcpServers: servers, needsRebuild: true },
+            };
+          },
+        );
+        return res.status(mutation.status).json(mutation.body);
       } catch (e: any) {
-        res.status(500).json({ error: e?.message || String(e) });
+        return res.status(500).json({ error: e?.message || String(e) });
       }
     });
 
@@ -17864,7 +17951,7 @@ Return this JSON shape:
           let validationPath: string | undefined;
           let outOfScope: string | undefined;
           let backlogPolicy: string | undefined;
-          let bittreesRelevance: string | undefined;
+          let workRelevance: string | undefined;
           let target: string | undefined;
           let parentTask: string | undefined;
           let projectId: string | undefined;
@@ -17890,7 +17977,11 @@ Return this JSON shape:
               || token === '--recommendation-routing'
               || token === '--recommendation-routing-instructions'
             ) { backlogPolicy = rawArgs[++i]; continue; }
-            if (token === '--bittrees-relevance' || token === '--relevance') { bittreesRelevance = rawArgs[++i]; continue; }
+            if (
+              token === '--work-relevance'
+              || token === '--relevance'
+              || token === '--bittrees-relevance'
+            ) { workRelevance = rawArgs[++i]; continue; }
             if (
               token === '--target'
               || token === '--target-url'
@@ -17934,7 +18025,7 @@ Return this JSON shape:
             validation_path: validationPath,
             out_of_scope: outOfScope,
             backlog_policy: backlogPolicy,
-            bittrees_relevance: bittreesRelevance,
+            work_relevance: workRelevance,
             target,
             parent_task: parentTask,
             validation_purpose: validationPurpose,
@@ -17965,7 +18056,7 @@ Return this JSON shape:
             validation_path: validationPath,
             out_of_scope: outOfScope,
             backlog_policy: backlogPolicy,
-            bittrees_relevance: bittreesRelevance,
+            work_relevance: workRelevance,
             target,
             parent_task: parentTask,
             validation_purpose: validationPurpose,
@@ -19508,7 +19599,7 @@ Return this JSON shape:
         validation_path: 'team lead -> suitable team members -> completion refs reported to manager',
         out_of_scope: 'Unbounded fanout, duplicate work, or lead doing all implementation work directly.',
         backlog_policy: 'Create only the minimum child tasks needed now; park optional follow-ups as backlog.',
-        bittrees_relevance: 'high: active autopilot goal advancement and Brain-manager sync',
+        work_relevance: 'high: active autopilot goal advancement and Brain-manager sync',
       },
     );
     const taskRow: TaskRow = {
@@ -23706,7 +23797,9 @@ Return this JSON shape:
       ID_AGENT_PORT: String(port),
       ID_RUNTIME_LANE_ID: runtimeLane.id,
       ID_RUNTIME_LANE_KIND: runtimeLane.kind,
-      MANAGER_URL: `http://127.0.0.1:4100`,
+      // The desktop supervisor assigns the Manager an ephemeral loopback port.
+      // Workers must call back to this Manager instance, not the legacy default.
+      MANAGER_URL: `http://127.0.0.1:${this.managementPort}`,
       ID_AGENT_SKIP_PERMISSIONS: skipPermissions ? 'true' : 'false',
       ...safeLaneEnv,
       ...(useMeteredOverflow && { ID_AGENT_CLAUDE_BARE: '1' }),
@@ -23728,8 +23821,12 @@ Return this JSON shape:
       ...(process.env.OPENAI_API_KEY && { OPENAI_API_KEY: process.env.OPENAI_API_KEY }),
       ...(skillmeshKey && {
         SKILLMESH_PRIVATE_KEY: skillmeshKey,
-        SKILLMESH_APP_URL: process.env.SKILLMESH_APP_URL || 'https://skillmesh.bittrees.org',
-        SKILLMESH_RPC_URL: process.env.SKILLMESH_RPC_URL || 'https://sepolia.drpc.org',
+        ...(process.env.SKILLMESH_APP_URL?.trim() && {
+          SKILLMESH_APP_URL: process.env.SKILLMESH_APP_URL.trim(),
+        }),
+        ...(process.env.SKILLMESH_RPC_URL?.trim() && {
+          SKILLMESH_RPC_URL: process.env.SKILLMESH_RPC_URL.trim(),
+        }),
       }),
       ...(skillmeshCreatorKey && { SKILLMESH_CREATOR_PRIVATE_KEY: skillmeshCreatorKey }),
     });

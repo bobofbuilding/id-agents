@@ -79,7 +79,13 @@ export function buildTaskWorkflowContract(input: Record<string, unknown>, contex
   if (!outOfScope.length) outOfScope.push(...list(label(description, 'Out of scope')));
   const backlogPolicy = first(input, ['backlog_policy', 'backlogPolicy', 'recommendation_routing', 'recommendationRouting'])
     || label(description, 'Backlog policy');
-  const relevance = first(input, ['bittrees_relevance', 'bittreesRelevance', 'relevance']) || label(description, 'Bittrees relevance');
+  const relevance = first(input, [
+    'work_relevance',
+    'workRelevance',
+    'bittrees_relevance',
+    'bittreesRelevance',
+    'relevance',
+  ]) || label(description, 'Work relevance') || label(description, 'Bittrees relevance');
   const sourceIds = list(input.source_ids ?? input.sourceIds ?? input.provenance_refs ?? input.provenanceRefs);
   const parentTaskId = first(input, ['parent_task_id', 'parentTaskId', 'parent_task', 'parentTask']) || label(description, 'Parent task');
   const inputs = list(input.inputs ?? input.input_refs ?? input.inputRefs);
@@ -104,7 +110,7 @@ export function buildTaskWorkflowContract(input: Record<string, unknown>, contex
     !validationPath.length && 'validation_path',
     !outOfScope.length && 'out_of_scope',
     !backlogPolicy && 'backlog_policy',
-    !relevance && 'bittrees_relevance',
+    !relevance && 'work_relevance',
     !sourceIds.length && 'source_ids',
   ].filter((value): value is string => Boolean(value));
 

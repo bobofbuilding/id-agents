@@ -50,8 +50,17 @@ export class SqliteControlStateRepo implements ControlStateRepository {
     );
     return this.get(input.teamId, input.scope, input.key);
   }
-  async delete(teamId: string, scope: ControlStateRow['scope'], key: string): Promise<boolean> {
-    const result = await this.db.query('DELETE FROM control_state WHERE team_id=? AND scope=? AND state_key=?', [teamId, scope, key]);
-    return (result.rowCount ?? 0) > 0;
+  async delete(
+    teamId: string,
+    scope: ControlStateRow['scope'],
+    key: string,
+    expectedVersion: number,
+  ): Promise<'deleted' | 'not_found' | 'version_conflict'> {
+    const result = await this.db.query(
+      'DELETE FROM control_state WHERE team_id=? AND scope=? AND state_key=? AND version=?',
+      [teamId, scope, key, expectedVersion],
+    );
+    if ((result.rowCount ?? 0) > 0) return 'deleted';
+    return await this.get(teamId, scope, key) ? 'version_conflict' : 'not_found';
   }
 }

@@ -836,7 +836,12 @@ export interface ControlStateRepository {
     expectedVersion?: number;
     now: number;
   }): Promise<ControlStateRow | null>;
-  delete(teamId: string, scope: ControlStateRow['scope'], key: string): Promise<boolean>;
+  delete(
+    teamId: string,
+    scope: ControlStateRow['scope'],
+    key: string,
+    expectedVersion: number,
+  ): Promise<'deleted' | 'not_found' | 'version_conflict'>;
 }
 
 // ---------------------------------------------------------------------------

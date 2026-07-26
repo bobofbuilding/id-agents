@@ -5,13 +5,11 @@
  * This helper is intentionally inert unless the SkillMesh provider/plugin is
  * attached or explicitly enabled. Neutral agents do not receive these keys.
  *
- * Master key resolution order:
- *   1. SKILLMESH_MASTER_KEY env var (preferred)
- *   2. ${workspaceDir}/packages/skill-master/.env → SKILL_MASTER_PRIVATE_KEY
+ * The master key is accepted only from the explicit SKILLMESH_MASTER_KEY
+ * process environment. Consumer installs never search workspaces, repositories,
+ * or .env files for signing material.
  */
 
-import { existsSync, readFileSync } from 'fs';
-import path from 'path';
 import { HDKey } from '@scure/bip32';
 import { privateKeyToAccount } from 'viem/accounts';
 
@@ -22,24 +20,14 @@ export interface SkillmeshKeyInfo {
   privateKey: string;
 }
 
-/** Load the master private key without ever logging it. */
-export function loadMasterKey(workspaceDir: string): string | null {
-  const fromEnv = process.env.SKILLMESH_MASTER_KEY;
-  if (fromEnv?.startsWith('0x')) return fromEnv;
-
-  const cwd = process.cwd();
-  const candidates = [
-    path.join(workspaceDir, 'packages', 'skill-master', '.env'),
-    path.join(workspaceDir, 'projects', 'skillmesh', 'packages', 'skill-master', '.env'),
-    path.join(cwd, 'packages', 'skill-master', '.env'),
-    path.join(cwd, 'projects', 'skillmesh', 'packages', 'skill-master', '.env'),
-  ];
-  for (const p of candidates) {
-    if (!existsSync(p)) continue;
-    const match = readFileSync(p, 'utf8').match(/^SKILL_MASTER_PRIVATE_KEY=(\S+)/m);
-    if (match?.[1]?.startsWith('0x')) return match[1];
+/** Load an explicitly configured master private key without ever logging it. */
+export function loadMasterKey(_workspaceDir?: string): string | null {
+  const fromEnv = process.env.SKILLMESH_MASTER_KEY?.trim();
+  if (!fromEnv) return null;
+  if (!/^0x[0-9a-fA-F]{64}$/.test(fromEnv)) {
+    throw new Error('SKILLMESH_MASTER_KEY must be an explicit 32-byte hex private key');
   }
-  return null;
+  return fromEnv;
 }
 
 /** Derive a key at the given BIP44 index from a raw 32-byte hex private key seed. */

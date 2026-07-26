@@ -119,7 +119,7 @@ function validBriefFields() {
     validation_path: { required_default_validators: ['coder', 'researcher'] },
     out_of_scope: ['optional recommendations'],
     backlog_policy: 'Non-required recommendations become backlog candidates.',
-    bittrees_relevance: 'medium: improves checkin lifecycle reliability for Bittrees contributor work.',
+    work_relevance: 'medium: improves checkin lifecycle reliability for Bittrees contributor work.',
   };
 }
 

@@ -29,10 +29,10 @@ Always set `workingDirectory` explicitly per agent:
 ```yaml
 agents:
   - name: cso
-    workingDirectory: /Users/me/projects/security/agents/cso
+    workingDirectory: $HOME/id-agents/workspace/agents/cso
     description: "..."
   - name: security-stack-a
-    workingDirectory: /Users/me/projects/security/agents/security-stack-a
+    workingDirectory: $HOME/id-agents/workspace/agents/security-stack-a
     description: "..."
 ```
 
@@ -202,7 +202,7 @@ Single chain of command: when a stack agent owns a finding, the CSO routes speci
 
 ```bash
 # 1. Pick a parent dir for the team.
-PARENT=/Users/me/projects/my-security
+PARENT="$HOME/id-agents/workspace/teams/my-security"
 
 # 2. Create per-agent workspaces with role files.
 for name in lead worker-a worker-b; do

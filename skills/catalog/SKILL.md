@@ -1,49 +1,51 @@
 ---
 name: catalog
-description: Update your REST-AP catalog to describe your role, expertise, and status to other agents and the manager.
+description: Read and update the agent's advertised role, expertise, availability, cost tier, and routing constraints through its runtime-local catalog.
 allowed-tools: Bash
 ---
 
-# Agent Catalog
+# Agent catalog
 
-You can update your own catalog to describe what you do, your role, skills, and current status. This information is visible to other agents and the manager via your `/.well-known/restap.json` endpoint.
+The Manager advertises each agent's catalog to teammates. IDACC supplies the
+agent's local service port through `ID_AGENT_PORT`; never assume a fixed port.
 
-## View Your Catalog
+## Read the current catalog
 
 ```bash
-curl -s http://localhost:$ID_AGENT_PORT/catalog | jq
+curl -fsS "http://127.0.0.1:$ID_AGENT_PORT/catalog"
 ```
 
-## Update Your Catalog
+## Update routing metadata
 
 ```bash
-curl -s -X PATCH http://localhost:$ID_AGENT_PORT/catalog \
+curl -fsS -X PATCH "http://127.0.0.1:$ID_AGENT_PORT/catalog" \
   -H "Content-Type: application/json" \
   -d '{
-    "description": "I specialize in TypeScript and React development",
-    "role": "developer",
-    "expertise": ["typescript", "react", "node", "testing"],
-    "status": "available",
-    "currentTask": "Working on user authentication",
-    "model": "claude-opus-4-7",
-    "workingDirectory": "/Users/nxt3d/projects/id2/id-agents/workspace/agents/agents",
-    "costTier": "high",
-    "notSuitableFor": ["bulk data crunching", "long-running batch jobs"]
+    "description":"I validate implementation evidence and focused code changes.",
+    "role":"engineer",
+    "expertise":["implementation","review","testing"],
+    "status":"available",
+    "currentTask":null,
+    "costTier":"medium",
+    "notSuitableFor":["production deployment","credential changes"]
   }'
 ```
 
-## Standard Catalog Fields
+Catalog fields describe routing intent:
 
-| Field | Description | Example |
-|-------|-------------|---------|
-| `description` | What you do | "Full-stack developer focusing on React" |
-| `role` | Your assigned role | "developer", "researcher", "pm" |
-| `expertise` | Array of skills | ["typescript", "react", "testing"] |
-| `status` | Availability | "available", "busy", "offline" |
-| `currentTask` | What you're working on | "Implementing login flow" |
-| `model` | Underlying LLM model id | "claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5-20251001" |
-| `workingDirectory` | Absolute path to your agent workspace | "/Users/alice/projects/foo/workspace/agents/coder" |
-| `costTier` | Relative cost of routing work to you — `low`, `medium`, or `high` | "high" (Opus), "medium" (Sonnet), "low" (Haiku) |
-| `notSuitableFor` | Array of work patterns where the manager should route elsewhere | ["bulk data crunching", "image generation", "production deploys"] |
+| Field | Meaning |
+|---|---|
+| `description` | A concise statement of the agent's responsibility. |
+| `role` | A neutral functional role such as `lead`, `engineer`, or `researcher`. |
+| `expertise` | Specific capabilities that help a coordinator choose this agent. |
+| `status` | Current availability, normally `available`, `busy`, or `offline`. |
+| `currentTask` | A short current assignment label, or `null`. |
+| `costTier` | Relative routing cost: `low`, `medium`, or `high`. |
+| `notSuitableFor` | Work this agent should not receive because of authority, risk, or capability limits. |
 
-Update your catalog when starting work (set status to "busy") and when done (set to "available"). Keep `model`, `workingDirectory`, `costTier`, and `notSuitableFor` accurate so the manager can route work to the right agent: `costTier` and `notSuitableFor` together act as routing hints, while `model` and `workingDirectory` let other agents reason about your capabilities and where your artifacts live.
+The Manager already knows the selected runtime, model, and profile-owned working
+directory. Do not duplicate or guess those values in the catalog.
+
+Set `status` to `busy` when beginning an assignment and back to `available` when
+the assignment reaches a terminal state. Never advertise authority or
+capabilities the agent does not actually have.

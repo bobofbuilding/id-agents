@@ -13,6 +13,13 @@ describe('control-center Brain relay contract', () => {
       path: '/memory/tiers',
     });
     expect(parseControlBrainRequest({
+      method: 'GET',
+      path: '/timeline?type=control%3Atest&source=idacc&since=00042&limit=005',
+    })).toEqual({
+      method: 'GET',
+      path: '/timeline?type=control%3Atest&source=idacc&since=42&limit=5',
+    });
+    expect(parseControlBrainRequest({
       method: 'POST',
       path: '/timeline',
       idempotency_key: 'idacc:phase1:0001',
@@ -29,6 +36,11 @@ describe('control-center Brain relay contract', () => {
   it('rejects arbitrary proxy targets and writes without idempotency', () => {
     expect(() => parseControlBrainRequest({ method: 'GET', path: 'https://example.com' })).toThrow('invalid_brain_path');
     expect(() => parseControlBrainRequest({ method: 'GET', path: '/admin/export' })).toThrow('brain_path_not_allowed');
+    expect(() => parseControlBrainRequest({ method: 'GET', path: '/timeline' })).toThrow('invalid_brain_timeline_query');
+    expect(() => parseControlBrainRequest({ method: 'GET', path: '/timeline?limit=0' })).toThrow('invalid_brain_timeline_query');
+    expect(() => parseControlBrainRequest({ method: 'GET', path: '/timeline?limit=101' })).toThrow('invalid_brain_timeline_query');
+    expect(() => parseControlBrainRequest({ method: 'GET', path: '/timeline?limit=5&limit=6' })).toThrow('invalid_brain_timeline_query');
+    expect(() => parseControlBrainRequest({ method: 'GET', path: '/timeline?cursor=secret&limit=5' })).toThrow('invalid_brain_timeline_query');
     expect(() => parseControlBrainRequest({ method: 'POST', path: '/learning-tasks/1515', idempotency_key: 'idacc:brain-review:0002', body: {} })).toThrow('brain_path_not_allowed');
     expect(() => parseControlBrainRequest({ method: 'POST', path: '/timeline', body: {} })).toThrow('invalid_idempotency_key');
   });
@@ -42,6 +54,23 @@ describe('control-center Brain relay contract', () => {
       token: '[redacted]',
       nested: { api_key: '[redacted]', safe: 'visible' },
       signer: '[redacted-hex-secret]',
+    });
+    expect(redactControlBrainValue({
+      events: [{
+        id: 1,
+        data: {
+          authorization: 'Bearer private-value',
+          nested: { access_token: 'private-value', summary: 'visible' },
+        },
+      }],
+    })).toEqual({
+      events: [{
+        id: 1,
+        data: {
+          authorization: '[redacted]',
+          nested: { access_token: '[redacted]', summary: 'visible' },
+        },
+      }],
     });
   });
 });
