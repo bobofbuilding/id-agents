@@ -1,7 +1,7 @@
 {
   "name": "id-agents",
-  "version": "0.1.143",
-  "description": "Multi-agent orchestration platform with REST-AP interfaces",
+  "version": "0.1.144",
+  "description": "Local multi-agent orchestration runtime with REST APIs",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -11,11 +11,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/idchain-world/id-agents.git"
+    "url": "git+https://github.com/bobofbuilding/id-agents.git"
   },
-  "homepage": "https://github.com/idchain-world/id-agents#readme",
+  "homepage": "https://github.com/bobofbuilding/id-agents#readme",
   "bugs": {
-    "url": "https://github.com/idchain-world/id-agents/issues"
+    "url": "https://github.com/bobofbuilding/id-agents/issues"
   },
   "engines": {
     "node": ">=20.0.0"

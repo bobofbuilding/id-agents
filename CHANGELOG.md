@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.144]
+
+- Refresh the production dependency lock to remove all high-severity npm advisories from the shipped Manager tree.
+- Correct package provenance and consumer-facing metadata to the public Manager repository.
+
 ## [0.1.143]
 
 - Ship a provider-neutral starter fleet and consumer-safe core skill set without embedded organization routes, wallets, signing material, provider URLs, or local workspace assumptions.
