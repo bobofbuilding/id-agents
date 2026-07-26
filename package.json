@@ -1,6 +1,6 @@
 {
   "name": "id-agents",
-  "version": "0.1.145",
+  "version": "0.1.146",
   "description": "Local multi-agent orchestration runtime with REST APIs",
   "type": "module",
   "main": "dist/index.js",
@@ -63,6 +63,7 @@
     "plugins/**/*",
     "configs/**/*",
     "README.md",
+    "MANAGER-POLLING.md",
     "LICENSE",
     "CONTRIBUTING.md"
   ],
@@ -107,5 +108,8 @@
     "tsx": "^4.21.0",
     "typescript": "^5.7.2",
     "vitest": "^4.0.17"
+  },
+  "overrides": {
+    "@hono/node-server": "1.19.15"
   }
 }

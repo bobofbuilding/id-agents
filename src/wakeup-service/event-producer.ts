@@ -4,8 +4,9 @@
  * Wakeup-service event producers.
  *
  * Thin wrappers around `db.events.insert(...)` that emit one event_log row
- * per lifecycle transition for tasks and queries. Topics, envelope fields,
- * and payload policy follow output/wakeup-service-design.md.
+ * per lifecycle transition for tasks and queries. Exported topic constants
+ * below are the producer source of truth; the read envelope is documented in
+ * MANAGER-POLLING.md.
  *
  * Producers swallow no errors — callers should already be inside the same
  * try/catch that handles the lifecycle write so that an event-log failure

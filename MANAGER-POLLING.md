@@ -23,7 +23,8 @@ One call. Server holds the connection open until the query reaches a terminal st
 
 ### `GET /query/:id?wait=<seconds>`
 
-Source: `agent-manager-db.ts:2627-2710`.
+Implementation anchor: search `src/agent-manager-db.ts` for
+`app.get('/query/:id'`.
 
 - `wait` is clamped to `[0, 30]`. `0` (the default) returns whatever the DB says right now without blocking.
 - If the row is non-terminal AND `wait > 0`, the handler registers a single-shot waker against the in-process `queryStatusWaiters` map and races it against a setTimeout. When `completeQueryDelivery` fires (success or failure path) it wakes every registered waiter for that `(team, queryId)` pair, the handler re-reads the DB, and returns.
@@ -64,7 +65,11 @@ Each iteration is one TCP connection that hangs for up to 30s. No spam. No TIME_
 
 ### `GET /events?since=<seq>`
 
-Source: `agent-manager-db.ts:4510-4603`. Wakeup-service event stream — every team-scoped state change carries a monotonic `seq` so a client can replay from a cursor. Use this when you are watching multiple queries / tasks / agents at once and want a single call to surface everything new since the last check.
+Implementation anchor: search `src/agent-manager-db.ts` for
+`WAKEUP SERVICE: GET /events`. Every team-scoped state change carries a
+monotonic `seq` so a client can replay from a cursor. Use this when you are
+watching multiple queries / tasks / agents at once and want a single call to
+surface everything new since the last check.
 
 ```bash
 LAST_SEQ=0
@@ -72,8 +77,8 @@ while :; do
   resp=$(curl -s -H "X-Id-Team: idchain" \
     "http://localhost:4100/events?since=$LAST_SEQ&limit=100")
   echo "$resp" | jq '.events[] | {seq, topic, subject, data}'
-  LAST_SEQ=$(echo "$resp" | jq -r '.events | last | .seq // empty')
-  [ -z "$LAST_SEQ" ] && sleep 30
+  LAST_SEQ=$(echo "$resp" | jq -r '.next_seq')
+  sleep 30
 done
 ```
 
@@ -81,6 +86,7 @@ Response shape:
 
 ```json
 {
+  "stream_id": "team_…",
   "events": [
     {
       "seq": 322,
@@ -99,20 +105,36 @@ Response shape:
         "actions": { "inspect": "…", "nudge": "…", "snooze": "…", "close": "…" }
       }
     }
-  ]
+  ],
+  "next_seq": 322,
+  "latest_available_seq": 322,
+  "cursor_reset": false,
+  "replay_truncated": false,
+  "earliest_available_seq": 1
 }
 ```
+
+`stream_id` is the stable internal team ID. Persist it with `next_seq`: a
+different stream ID means the cursor belongs to another team. If a supplied
+cursor is ahead of this team's current log, the endpoint returns HTTP 200 with
+an empty `events` array, `cursor_reset: true`,
+`cursor_reset_reason: "ahead_of_log"`, and `next_seq` rewound to immediately
+before the earliest retained event (or `0` when the log is empty). Use that
+`next_seq` on the next request. `latest_available_seq` is the unfiltered team
+tail, so topic filters do not change cursor-reset detection.
 
 Useful topics:
 
 - `query:received`, `query:delivered`, `query:failed` — agent dispatch lifecycle
 - `task:created`, `task:claimed`, `task:done`, `task:removed` — task lifecycle
 - `checkin:due` — supervision pings firing on linked tasks
-- `agent:online`, `agent:offline` — fleet health
+- `agent:started`, `agent:stopped`, `agent:rebuild` — agent lifecycle
+  (`agent:lifecycle` is the server-side filter alias for these concrete topics)
 
 Filter with `?topics=task:done,task:claimed` to narrow.
 
-Per the in-code comment: "SSE/webhook delivery land in separate slices." The endpoint returns a batch (not text/event-stream) today. For waiting on a single query, prefer `GET /query/:id?wait=` — it's purpose-built and simpler.
+The endpoint returns JSON batches, not `text/event-stream`. For waiting on a
+single query, prefer `GET /query/:id?wait=` — it's purpose-built and simpler.
 
 ## What NOT to do
 
@@ -182,4 +204,6 @@ This doc should stay synced with:
 
 When adding a new long-poll surface (e.g., `GET /task/:name?wait=`), update the endpoints table above and call out the difference from `/query/:id?wait=`.
 
-If this doc drifts from the code, the doc is wrong. Cite a file:line ref when fixing.
+If this doc drifts from the code, the doc is wrong. Cite a durable route or
+symbol anchor when fixing it; line numbers become obsolete as the daemon
+changes.

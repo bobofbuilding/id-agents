@@ -11,11 +11,12 @@
  *   - exclusive `since` cursor semantics
  *   - topic CSV filter and alias expansion (query:terminal)
  *   - default limit, explicit limit, and the 1000 hard cap
- *   - response shape for next_seq, replay_truncated, earliest_available_seq
+ *   - stable stream identity and ahead-of-log cursor recovery
+ *   - response shape for next_seq, latest_available_seq,
+ *     replay_truncated, and earliest_available_seq
  *   - team scoping via X-Id-Team header
  *
- * Wire format / field semantics: output/wakeup-service-design.md
- * ("`GET /events`").
+ * Wire format / field semantics: MANAGER-POLLING.md ("GET /events").
  */
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -91,7 +92,11 @@ interface EventsResponse {
     subject: { kind: string | null; id: string | null } | null;
     data: Record<string, unknown>;
   }>;
+  stream_id: string;
   next_seq: number;
+  latest_available_seq: number | null;
+  cursor_reset: boolean;
+  cursor_reset_reason?: 'ahead_of_log';
   replay_truncated: boolean;
   earliest_available_seq: number | null;
 }
@@ -138,9 +143,34 @@ describe('GET /events — wakeup-service catch-up read', () => {
     const { status, body } = await getEvents(baseUrl, TEAM, { since: 0 });
     expect(status).toBe(200);
     expect(body.events).toEqual([]);
+    expect(body.stream_id).toBe(teamId);
     expect(body.next_seq).toBe(0);
+    expect(body.latest_available_seq).toBeNull();
+    expect(body.cursor_reset).toBe(false);
+    expect(body.cursor_reset_reason).toBeUndefined();
     expect(body.replay_truncated).toBe(false);
     expect(body.earliest_available_seq).toBeNull();
+  });
+
+  it.each([
+    ['normal read', {}],
+    ['tail read', { tail: 1 }],
+  ])('resets an ahead cursor against an empty team log for a %s', async (_label, extraQuery) => {
+    const { status, body } = await getEvents(baseUrl, TEAM, {
+      since: 42,
+      ...extraQuery,
+    });
+    expect(status).toBe(200);
+    expect(body).toMatchObject({
+      events: [],
+      stream_id: teamId,
+      next_seq: 0,
+      latest_available_seq: null,
+      cursor_reset: true,
+      cursor_reset_reason: 'ahead_of_log',
+      replay_truncated: false,
+      earliest_available_seq: null,
+    });
   });
 
   it('returns all events in seq order with the documented envelope shape (since=0)', async () => {
@@ -176,7 +206,11 @@ describe('GET /events — wakeup-service catch-up read', () => {
     const { status, body } = await getEvents(baseUrl, TEAM, { since: 0 });
     expect(status).toBe(200);
     expect(body.events.map((e) => e.seq)).toEqual([a.seq, b.seq, c.seq]);
+    expect(body.stream_id).toBe(teamId);
     expect(body.next_seq).toBe(c.seq);
+    expect(body.latest_available_seq).toBe(c.seq);
+    expect(body.cursor_reset).toBe(false);
+    expect(body.cursor_reset_reason).toBeUndefined();
     expect(body.replay_truncated).toBe(false);
     expect(body.earliest_available_seq).toBe(a.seq);
 
@@ -195,6 +229,84 @@ describe('GET /events — wakeup-service catch-up read', () => {
     const cEnv = body.events.find((e) => e.seq === c.seq)!;
     expect(cEnv.subject).toBeNull();
     expect(cEnv.actor).toBeNull();
+  });
+
+  it('resets a cursor ahead of a non-empty team log independently of topic filters', async () => {
+    const earliest = await db.events.earliestSeq(teamId);
+    const latest = await db.events.latestSeq(teamId);
+    expect(earliest).not.toBeNull();
+    expect(latest).not.toBeNull();
+
+    const { status, body } = await getEvents(baseUrl, TEAM, {
+      since: latest! + 100,
+      topics: 'no:such:topic',
+    });
+    expect(status).toBe(200);
+    expect(body).toMatchObject({
+      events: [],
+      stream_id: teamId,
+      next_seq: earliest! - 1,
+      latest_available_seq: latest,
+      cursor_reset: true,
+      cursor_reset_reason: 'ahead_of_log',
+      replay_truncated: false,
+      earliest_available_seq: earliest,
+    });
+  });
+
+  it('returns an ahead-cursor reset promptly instead of holding the long poll', async () => {
+    const waitTeam = `wakeup-events-ahead-wait-${Date.now()}`;
+    const waitTeamId = await db.teams.getOrCreateTeamId(waitTeam);
+    const retained = await db.events.insert({
+      team_id: waitTeamId,
+      topic: 'task:created',
+      actor_agent_id: 'cto',
+      subject_kind: 'task',
+      subject_id: 'ahead-wait',
+      occurred_at: Date.now(),
+      data: { name: 'ahead-wait' },
+    });
+
+    const started = Date.now();
+    const { status, body } = await getEvents(baseUrl, waitTeam, {
+      since: retained.seq + 100,
+      wait: 3,
+    });
+    const elapsed = Date.now() - started;
+
+    expect(status).toBe(200);
+    expect(body).toEqual({
+      events: [],
+      stream_id: waitTeamId,
+      next_seq: retained.seq - 1,
+      latest_available_seq: retained.seq,
+      cursor_reset: true,
+      cursor_reset_reason: 'ahead_of_log',
+      replay_truncated: false,
+      earliest_available_seq: retained.seq,
+    });
+    expect(elapsed).toBeLessThan(1_000);
+  });
+
+  it('keeps stream identity stable across normal, filtered, and tail reads', async () => {
+    const latest = await db.events.latestSeq(teamId);
+    expect(latest).not.toBeNull();
+
+    const [normal, filtered, tail] = await Promise.all([
+      getEvents(baseUrl, TEAM, { since: 0, limit: 1 }),
+      getEvents(baseUrl, TEAM, { since: 0, topics: 'no:such:topic' }),
+      getEvents(baseUrl, TEAM, { since: 0, tail: 1 }),
+    ]);
+
+    for (const response of [normal, filtered, tail]) {
+      expect(response.status).toBe(200);
+      expect(response.body.stream_id).toBe(teamId);
+      expect(response.body.latest_available_seq).toBe(latest);
+      expect(response.body.cursor_reset).toBe(false);
+      expect(response.body.cursor_reset_reason).toBeUndefined();
+    }
+    expect(tail.body.events).toEqual([]);
+    expect(tail.body.next_seq).toBe(latest);
   });
 
   it('treats `since` as an exclusive cursor (returns events with seq > since only)', async () => {

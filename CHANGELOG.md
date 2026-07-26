@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.146]
+
+- Give every team-scoped Manager event feed a stable stream identity and expose its unfiltered latest retained sequence on normal and tail reads.
+- Detect profile cursors ahead of empty or restored event logs and return an explicit replay reset target before the earliest retained event, independent of topic filters and without long-poll delay.
+- Add regression coverage for stream identity stability, empty and non-empty reset behavior, filtered reads, and the expanded event-feed response contract.
+- Pin the officially patched Hono 1.19.15 backport used by the supported MCP runtime dependency range.
+
 ## [0.1.145]
 
 - Add parent-supervised, cross-platform local-agent lifecycle management with exact readiness identity, collision-safe loopback ports, private bounded logs, graceful Manager restart restoration, and explicit preservation of agents the person stopped.

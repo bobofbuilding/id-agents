@@ -329,8 +329,8 @@ interface RestAPCatalog {
 /**
  * Wakeup-service topic aliases. The `GET /events` route accepts both
  * concrete topics (e.g. `query:delivered`) and the aliases below, which
- * expand server-side into their concrete topic set. Source of truth:
- * output/wakeup-service-design.md → "Topic set for v1" / "Alias expansions".
+ * expand server-side into their concrete topic set. The consumer contract is
+ * documented in MANAGER-POLLING.md.
  */
 const TOPIC_ALIASES: Record<string, readonly string[]> = {
   'query:terminal': ['query:delivered', 'query:failed', 'query:expired'],
@@ -14410,11 +14410,9 @@ Return this JSON shape:
     });
 
     // ==================== WAKEUP SERVICE: GET /events ====================
-    // Catch-up read over the team-scoped event log. Wire-format and
-    // semantics are defined in output/wakeup-service-design.md
-    // ("`GET /events`" section). Auth/team gating is the same as /remote
-    // (handled by teamContextMiddleware → getTeam(req)). Producers and
-    // SSE/webhook delivery land in separate slices.
+    // Catch-up read over the team-scoped event log. Wire format and semantics
+    // are documented in MANAGER-POLLING.md. Auth/team gating is the same as
+    // /remote (handled by teamContextMiddleware → getTeam(req)).
     this.managementApp.get('/events', async (req, res) => {
       try {
         const { id: teamId, name: teamName } = await this.getTeam(req);
@@ -14483,14 +14481,43 @@ Return this JSON shape:
         // retained event through the UI on launch or tab switches.
         const tailRaw = req.query.tail;
         const tail = tailRaw === '1' || tailRaw === 'true';
+
+        const cursorIsAheadOfLog = (latestAvailableSeq: number | null): boolean =>
+          latestAvailableSeq === null ? since > 0 : since > latestAvailableSeq;
+
+        const sendCursorReset = (
+          earliestAvailableSeq: number | null,
+          latestAvailableSeq: number | null,
+        ) => res.json({
+          events: [],
+          stream_id: teamId,
+          // `since` is exclusive. Rewinding to the sequence immediately
+          // before the first retained event guarantees that the next read
+          // includes that event. An empty team log always restarts at zero.
+          next_seq: earliestAvailableSeq === null
+            ? 0
+            : Math.max(0, earliestAvailableSeq - 1),
+          latest_available_seq: latestAvailableSeq,
+          cursor_reset: true,
+          cursor_reset_reason: 'ahead_of_log',
+          replay_truncated: false,
+          earliest_available_seq: earliestAvailableSeq,
+        });
+
         if (tail) {
           const [earliestAvailableSeq, latestSeq] = await Promise.all([
             this.db.events.earliestSeq(teamId),
             this.db.events.latestSeq(teamId),
           ]);
+          if (cursorIsAheadOfLog(latestSeq)) {
+            return sendCursorReset(earliestAvailableSeq, latestSeq);
+          }
           return res.json({
             events: [],
+            stream_id: teamId,
             next_seq: latestSeq ?? since,
+            latest_available_seq: latestSeq,
+            cursor_reset: false,
             replay_truncated: false,
             earliest_available_seq: earliestAvailableSeq,
           });
@@ -14503,14 +14530,29 @@ Return this JSON shape:
           limit,
         });
         let rows = await queryRows();
+
+        let [earliestAvailableSeq, latestAvailableSeq] = await Promise.all([
+          this.db.events.earliestSeq(teamId),
+          this.db.events.latestSeq(teamId),
+        ]);
+        if (cursorIsAheadOfLog(latestAvailableSeq)) {
+          return sendCursorReset(earliestAvailableSeq, latestAvailableSeq);
+        }
+
         if (rows.length === 0 && waitMs > 0) {
           const deadline = Date.now() + waitMs;
           while (rows.length === 0 && Date.now() < deadline) {
             await new Promise((resolve) => setTimeout(resolve, Math.min(500, Math.max(0, deadline - Date.now()))));
             rows = await queryRows();
           }
+          [earliestAvailableSeq, latestAvailableSeq] = await Promise.all([
+            this.db.events.earliestSeq(teamId),
+            this.db.events.latestSeq(teamId),
+          ]);
+          if (rows.length === 0 && cursorIsAheadOfLog(latestAvailableSeq)) {
+            return sendCursorReset(earliestAvailableSeq, latestAvailableSeq);
+          }
         }
-        const earliestAvailableSeq = await this.db.events.earliestSeq(teamId);
 
         const events = rows.map((row) => ({
           seq: row.seq,
@@ -14539,7 +14581,10 @@ Return this JSON shape:
 
         res.json({
           events,
+          stream_id: teamId,
           next_seq: nextSeq,
+          latest_available_seq: latestAvailableSeq,
+          cursor_reset: false,
           replay_truncated: replayTruncated,
           earliest_available_seq: earliestAvailableSeq,
         });
