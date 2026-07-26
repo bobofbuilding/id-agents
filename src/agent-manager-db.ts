@@ -14,7 +14,11 @@ import express from 'express';
 import crypto from 'crypto';
 import path from 'path';
 import Database from 'better-sqlite3';
-import { createServer as createHttpServer, type Server as HttpServer } from 'http';
+import {
+  createServer as createHttpServer,
+  type IncomingMessage,
+  type Server as HttpServer,
+} from 'http';
 import { createServer as createNetServer } from 'net';
 import { chmodSync, existsSync, ftruncateSync, lstatSync, mkdirSync, rmSync, readFileSync, readSync, writeFileSync, writeSync, readdirSync, copyFileSync, statSync, openSync, closeSync } from 'fs';
 import { execFileSync, spawn, type ChildProcess, type SpawnOptions } from 'child_process';
@@ -681,6 +685,15 @@ interface WSClient {
   authenticated: boolean;
 }
 
+type WebSocketAuthorization =
+  | { ok: true }
+  | {
+      ok: false;
+      statusCode: 401 | 403;
+      statusMessage: 'Unauthorized' | 'Forbidden';
+      reason: 'admin_credentials_required' | 'browser_origin_forbidden' | 'loopback_required';
+    };
+
 // Pending waiter for /talk-to replies - persists until reply arrives
 interface QueryWaiter {
   resolve: (result: { from: string; message: string }) => void;
@@ -902,6 +915,12 @@ function nonNegativeEnvNumber(name: string): number | null {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isLoopbackAddress(address: string | undefined): boolean {
+  return address === '127.0.0.1'
+    || address === '::1'
+    || address === '::ffff:127.0.0.1';
 }
 
 export class AgentManagerDb {
@@ -9263,11 +9282,52 @@ Return this JSON shape:
    */
   private isAdminRequest(req: express.Request): boolean {
     const ip = req.ip || '';
-    const isLoopback =
-      ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
+    const isLoopback = isLoopbackAddress(ip);
     const hasAdminHeader = req.headers['x-id-admin'] === '1';
     const hasAdminBearer = adminBearerMatches(req.headers.authorization, this.idaccAdminToken);
     return isLoopback && hasAdminHeader && hasAdminBearer;
+  }
+
+  /**
+   * Managed desktop mode is indicated by the supervisor-only admin token.
+   * There is no browser WebSocket consumer in the desktop application, so
+   * managed mode accepts only native loopback clients that can send both admin
+   * headers. Reject every Origin-bearing upgrade to prevent a hostile webpage
+   * from using the browser WebSocket API against the local control plane.
+   *
+   * Standalone installs that do not configure IDACC_ADMIN_TOKEN retain the
+   * historical team-scoped WebSocket behavior for CLI/mobile compatibility.
+   */
+  private authorizeWebSocketRequest(req: IncomingMessage): WebSocketAuthorization {
+    if (!this.idaccAdminToken) return { ok: true };
+    if (req.headers.origin !== undefined) {
+      return {
+        ok: false,
+        statusCode: 403,
+        statusMessage: 'Forbidden',
+        reason: 'browser_origin_forbidden',
+      };
+    }
+    if (!isLoopbackAddress(req.socket.remoteAddress)) {
+      return {
+        ok: false,
+        statusCode: 403,
+        statusMessage: 'Forbidden',
+        reason: 'loopback_required',
+      };
+    }
+    if (
+      req.headers['x-id-admin'] !== '1'
+      || !adminBearerMatches(req.headers.authorization, this.idaccAdminToken)
+    ) {
+      return {
+        ok: false,
+        statusCode: 401,
+        statusMessage: 'Unauthorized',
+        reason: 'admin_credentials_required',
+      };
+    }
+    return { ok: true };
   }
 
   /**
@@ -23123,11 +23183,28 @@ Return this JSON shape:
       this.httpServer.headersTimeout = Number.isFinite(headersRaw) ? Math.max(keepAliveTimeoutMs + 1_000, headersRaw) : 10_000;
       this.httpServer.maxRequestsPerSocket = Number.isFinite(maxRequestsRaw) ? Math.max(1, maxRequestsRaw) : 500;
 
-      // Create WebSocket server attached to HTTP server
-      this.wss = new WebSocketServer({ server: this.httpServer, path: '/ws' });
+      // Managed desktop mode fails the WebSocket upgrade before a browser or
+      // unauthenticated local client reaches the command handler. Standalone
+      // mode (no supervisor token) retains the legacy connection contract.
+      this.wss = new WebSocketServer({
+        server: this.httpServer,
+        path: '/ws',
+        verifyClient: (info, done) => {
+          const authorization = this.authorizeWebSocketRequest(info.req);
+          if (!authorization.ok) {
+            this.managerLog(`Rejected WebSocket upgrade: ${authorization.reason}`);
+            done(false, authorization.statusCode, authorization.statusMessage);
+            return;
+          }
+          done(true);
+        },
+      });
 
       this.wss.on('connection', (ws, req) => {
-        this.handleWebSocketConnection(ws, req);
+        void this.handleWebSocketConnection(ws, req).catch((error) => {
+          this.managerLog(`WebSocket connection setup failed: ${error?.message || error}`);
+          try { ws.close(1011, 'connection_setup_failed'); } catch { /* already closed */ }
+        });
       });
 
       const cleanupListenFailure = () => {
@@ -23682,8 +23759,36 @@ Return this JSON shape:
   /**
    * Handle a new WebSocket connection
    */
-  private async handleWebSocketConnection(ws: WebSocket, req: any) {
-    const url = new URL(req.url || '', `http://${req.headers.host}`);
+  private async handleWebSocketConnection(ws: WebSocket, req: IncomingMessage) {
+    let client: WSClient | null = null;
+    let disconnected = ws.readyState !== WebSocket.OPEN;
+    let resolvedTeamName: string | null = null;
+    const forgetClient = () => {
+      disconnected = true;
+      if (client) this.wsClients.delete(client);
+    };
+    // Install cleanup before the first await. A peer can disconnect while the
+    // team lookup is pending; in that case it must never be retained later.
+    ws.on('close', () => {
+      forgetClient();
+      if (resolvedTeamName) {
+        console.log(`[WS] Client disconnected (team: ${resolvedTeamName})`);
+      }
+    });
+    ws.on('error', (err) => {
+      forgetClient();
+      console.error(
+        `[WS] Error for client${resolvedTeamName ? ` (team: ${resolvedTeamName})` : ''}:`,
+        err.message,
+      );
+    });
+
+    const authorization = this.authorizeWebSocketRequest(req);
+    if (!authorization.ok) {
+      ws.close(1008, authorization.reason);
+      return;
+    }
+    const url = new URL(req.url || '/', 'http://localhost');
     const teamHeader = req.headers['x-id-team'] || req.headers['x-id-project'] || url.searchParams.get('team');
 
     // Resolve team — look up only; do NOT auto-create. A stale client
@@ -23700,7 +23805,10 @@ Return this JSON shape:
     }
     const teamId = teamRow.id;
 
-    const client: WSClient = { ws, teamId, teamName, authenticated: true };
+    if (disconnected || ws.readyState !== WebSocket.OPEN) return;
+
+    resolvedTeamName = teamName;
+    client = { ws, teamId, teamName, authenticated: true };
     this.wsClients.add(client);
 
     console.log(`[WS] Client connected (team: ${teamName})`);
@@ -23718,16 +23826,6 @@ Return this JSON shape:
       } catch (err: any) {
         ws.send(JSON.stringify({ type: 'error', error: err.message }));
       }
-    });
-
-    ws.on('close', () => {
-      this.wsClients.delete(client);
-      console.log(`[WS] Client disconnected (team: ${teamName})`);
-    });
-
-    ws.on('error', (err) => {
-      console.error(`[WS] Error for client (team: ${teamName}):`, err.message);
-      this.wsClients.delete(client);
     });
   }
 

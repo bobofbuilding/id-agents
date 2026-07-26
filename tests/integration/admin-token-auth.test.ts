@@ -7,6 +7,7 @@ import * as http from 'node:http';
 import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import WebSocket, { type ClientOptions } from 'ws';
 import { AgentManagerDb } from '../../src/agent-manager-db.js';
 import { SqliteAdapter } from '../../src/db/sqlite-adapter.js';
 import { migrateSqlite } from '../../src/db/migrations/sqlite.js';
@@ -154,6 +155,86 @@ describe('IDACC Manager admin bearer', () => {
     });
   }
 
+  function rejectedWebSocket(
+    options: ClientOptions = {},
+    extraQuery = '',
+  ): Promise<number> {
+    return new Promise((resolve, reject) => {
+      const url = managerUrl.replace(/^http/, 'ws')
+        + `/ws?team=${encodeURIComponent(TEAM)}${extraQuery}`;
+      const ws = new WebSocket(url, options);
+      const timeout = setTimeout(() => {
+        reject(new Error('timed out waiting for WebSocket upgrade rejection'));
+      }, 2_000);
+      ws.on('error', () => {});
+      ws.once('open', () => {
+        clearTimeout(timeout);
+        ws.close();
+        reject(new Error('unauthorized WebSocket unexpectedly opened'));
+      });
+      ws.once('unexpected-response', (_request, response) => {
+        clearTimeout(timeout);
+        response.resume();
+        resolve(response.statusCode ?? 0);
+      });
+    });
+  }
+
+  function openAdminWebSocket(): Promise<{
+    ws: WebSocket;
+    connected: Promise<Record<string, unknown>>;
+  }> {
+    const url = managerUrl.replace(/^http/, 'ws')
+      + `/ws?team=${encodeURIComponent(TEAM)}`;
+    const ws = new WebSocket(url, {
+      headers: {
+        'X-Id-Admin': '1',
+        Authorization: `Bearer ${ADMIN_TOKEN}`,
+      },
+    });
+    const connected = new Promise<Record<string, unknown>>((resolve, reject) => {
+      const timeout = setTimeout(
+        () => reject(new Error('timed out waiting for WebSocket connected frame')),
+        2_000,
+      );
+      ws.once('message', (raw) => {
+        clearTimeout(timeout);
+        try {
+          resolve(JSON.parse(raw.toString()) as Record<string, unknown>);
+        } catch (error) {
+          reject(error);
+        }
+      });
+      ws.once('error', (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+    });
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(
+        () => reject(new Error('timed out opening authenticated WebSocket')),
+        2_000,
+      );
+      ws.once('open', () => {
+        clearTimeout(timeout);
+        resolve({ ws, connected });
+      });
+      ws.once('error', (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+    });
+  }
+
+  async function waitForManagerWebSocketClientCount(expected: number): Promise<void> {
+    const clients = (manager as unknown as { wsClients: Set<unknown> }).wsClients;
+    const deadline = Date.now() + 1_000;
+    while (clients.size !== expected && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(clients.size).toBe(expected);
+  }
+
   it('rejects a forged admin header without the bearer', async () => {
     expect((await relay({ 'X-Id-Admin': '1' })).status).toBe(403);
   });
@@ -171,6 +252,109 @@ describe('IDACC Manager admin bearer', () => {
     expect(response.status).toBe(200);
     const body = await response.json() as { body?: { ok?: boolean } };
     expect(body.body?.ok).toBe(true);
+  });
+
+  it('rejects an unauthenticated managed-mode WebSocket upgrade', async () => {
+    expect(await rejectedWebSocket()).toBe(401);
+    expect(await rejectedWebSocket({
+      headers: { 'X-Id-Admin': '1' },
+    })).toBe(401);
+    expect(await rejectedWebSocket({
+      headers: {
+        'X-Id-Admin': '1',
+        Authorization: 'Bearer wrong',
+      },
+    })).toBe(401);
+    expect(await rejectedWebSocket({
+      headers: { Authorization: `Bearer ${ADMIN_TOKEN}` },
+    })).toBe(401);
+    expect(await rejectedWebSocket(
+      {},
+      `&apiKey=${encodeURIComponent(ADMIN_TOKEN)}`,
+    )).toBe(401);
+  });
+
+  it('rejects every browser-origin WebSocket in managed mode', async () => {
+    expect(await rejectedWebSocket({
+      origin: 'https://hostile.example',
+      headers: {
+        'X-Id-Admin': '1',
+        Authorization: `Bearer ${ADMIN_TOKEN}`,
+      },
+    })).toBe(403);
+  });
+
+  it('allows a native loopback WebSocket with the exact admin bearer', async () => {
+    const { ws, connected } = await openAdminWebSocket();
+    expect(await connected).toMatchObject({
+      type: 'connected',
+      team: TEAM,
+    });
+    const closed = new Promise<void>((resolve) => ws.once('close', () => resolve()));
+    ws.close();
+    await closed;
+    await waitForManagerWebSocketClientCount(0);
+  });
+
+  it('does not retain a client that disconnects during team lookup', async () => {
+    const teams = db.teams as typeof db.teams & {
+      getTeamByName: (name: string) => ReturnType<typeof db.teams.getTeamByName>;
+    };
+    const originalGetTeamByName = teams.getTeamByName;
+    let releaseLookup!: () => void;
+    let signalLookupStarted!: () => void;
+    const lookupGate = new Promise<void>((resolve) => { releaseLookup = resolve; });
+    const lookupStarted = new Promise<void>((resolve) => { signalLookupStarted = resolve; });
+    await waitForManagerWebSocketClientCount(0);
+
+    teams.getTeamByName = async (name: string) => {
+      signalLookupStarted();
+      await lookupGate;
+      return originalGetTeamByName.call(teams, name);
+    };
+
+    const serverSocket = new Promise<WebSocket>((resolve) => {
+      (manager as unknown as {
+        wss: { once: (event: 'connection', listener: (socket: WebSocket) => void) => void };
+      }).wss.once('connection', resolve);
+    });
+    const url = managerUrl.replace(/^http/, 'ws')
+      + `/ws?team=${encodeURIComponent(TEAM)}`;
+    const ws = new WebSocket(url, {
+      headers: {
+        'X-Id-Admin': '1',
+        Authorization: `Bearer ${ADMIN_TOKEN}`,
+      },
+    });
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(
+          () => reject(new Error('timed out opening lookup-race WebSocket')),
+          2_000,
+        );
+        ws.once('open', () => {
+          clearTimeout(timeout);
+          resolve();
+        });
+        ws.once('error', (error) => {
+          clearTimeout(timeout);
+          reject(error);
+        });
+      });
+      await lookupStarted;
+      const acceptedSocket = await serverSocket;
+      const clientClosed = new Promise<void>((resolve) => ws.once('close', () => resolve()));
+      const serverClosed = new Promise<void>((resolve) => acceptedSocket.once('close', () => resolve()));
+      ws.terminate();
+      await Promise.all([clientClosed, serverClosed]);
+      releaseLookup();
+      await waitForManagerWebSocketClientCount(0);
+    } finally {
+      releaseLookup();
+      teams.getTeamByName = originalGetTeamByName;
+      if (ws.readyState !== WebSocket.CLOSED) ws.terminate();
+    }
   });
 
   it('relays only bounded timeline reads and redacts the Brain response', async () => {

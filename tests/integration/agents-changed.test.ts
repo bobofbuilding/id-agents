@@ -91,8 +91,11 @@ let manager: AgentManagerDb;
 let baseUrl: string;
 let workDir: string;
 let teamId: string;
+let previousAdminToken: string | undefined;
 
 beforeAll(async () => {
+  previousAdminToken = process.env.IDACC_ADMIN_TOKEN;
+  delete process.env.IDACC_ADMIN_TOKEN;
   port = await findFreePort();
   workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agents-changed-test-'));
   baseUrl = `http://127.0.0.1:${port}`;
@@ -112,9 +115,20 @@ afterAll(async () => {
     });
   }
   try { fs.rmSync(workDir, { recursive: true, force: true }); } catch { /* ignore */ }
+  if (previousAdminToken === undefined) delete process.env.IDACC_ADMIN_TOKEN;
+  else process.env.IDACC_ADMIN_TOKEN = previousAdminToken;
 });
 
 describe('agents_changed WebSocket broadcast', () => {
+  it('retains legacy team-scoped WebSocket access without a supervisor token', async () => {
+    const client = await openClient(baseUrl, 'default');
+    expect(await waitFor(() => client.received.find(m => m.type === 'connected'))).toMatchObject({
+      type: 'connected',
+      team: 'default',
+    });
+    client.ws.close();
+  });
+
   it('broadcastAgentsChanged emits to clients on the matching team only', async () => {
     const a = await openClient(baseUrl, 'default');
     // Drain the initial 'connected' frame so subsequent waits only see broadcasts.
