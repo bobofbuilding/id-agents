@@ -87,6 +87,8 @@ import {
   appendTaskBriefFieldsToDescription,
   getWorkPriority,
   getTaskBriefValidationMode,
+  isRelevanceCliFlag,
+  relevanceFieldValues,
   shouldBlockTaskBrief,
   shouldBlockTaskCompletion,
   validateTaskBrief,
@@ -651,6 +653,24 @@ function metadataSkills(metadata: AgentMetadata | null | undefined): string[] {
 
 function hasBrainSkill(metadata: AgentMetadata | null | undefined): boolean {
   return metadataSkills(metadata).includes('brain');
+}
+
+function catalogResponsibilityLaneValues(catalog: Record<string, unknown>): unknown[] {
+  return Object.entries(catalog)
+    .filter(([key]) => {
+      const normalized = key
+        .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+        .replace(/-/g, '_')
+        .toLowerCase();
+      return normalized === 'primary_lane'
+        || normalized === 'secondary_lane'
+        || normalized === 'secondary_lanes'
+        || normalized.endsWith('_primary_lane')
+        || normalized.endsWith('_secondary_lane')
+        || normalized.endsWith('_secondary_lanes');
+    })
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([, value]) => value);
 }
 
 // WebSocket client tracking
@@ -1423,14 +1443,7 @@ export class AgentManagerDb {
       (input as any).siteUrl,
       (input as any).site_url,
       (input as any).url,
-      (input as any).work_relevance,
-      (input as any).workRelevance,
-      // Read-only upgrade compatibility; new task output is always work_relevance.
-      (input as any).bittrees_relevance,
-      (input as any).bittreesRelevance,
-      (input as any).bittrees_contributor_relevance,
-      (input as any).bittreesContributorRelevance,
-      (input as any).relevance,
+      ...relevanceFieldValues(input as Record<string, unknown>),
       (input as any).validation_purpose,
       (input as any).validationPurpose,
       (input as any).parent_task,
@@ -6647,8 +6660,7 @@ Return this JSON shape:
       catalog.description,
       catalog.expertise,
       catalog.contributorTitle,
-      catalog.bittreesPrimaryLane,
-      catalog.bittreesSecondaryLanes,
+      ...catalogResponsibilityLaneValues(catalog),
     ].map((value) => Array.isArray(value) ? value.join(' ') : String(value || '')).join('\n').toLowerCase();
 
     const agentName = agent.name.toLowerCase();
@@ -18114,11 +18126,7 @@ Return this JSON shape:
               || token === '--recommendation-routing'
               || token === '--recommendation-routing-instructions'
             ) { backlogPolicy = rawArgs[++i]; continue; }
-            if (
-              token === '--work-relevance'
-              || token === '--relevance'
-              || token === '--bittrees-relevance'
-            ) { workRelevance = rawArgs[++i]; continue; }
+            if (isRelevanceCliFlag(token)) { workRelevance = rawArgs[++i]; continue; }
             if (
               token === '--target'
               || token === '--target-url'

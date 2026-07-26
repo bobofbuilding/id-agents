@@ -5,6 +5,8 @@ import { describe, expect, it } from 'vitest';
 import {
   appendTaskBriefFieldsToDescription,
   getWorkPriority,
+  isRelevanceCliFlag,
+  isRelevanceFieldName,
   shouldBlockTaskBrief,
   validateTaskBrief,
   validateTaskCompletionPacket,
@@ -26,7 +28,7 @@ const completeBrief: TaskBriefValidationInput = {
   validation_path: ['coder', 'researcher'],
   out_of_scope: 'Integration tests and production code changes',
   backlog_policy: 'Move edge cases requiring module changes into follow-up tasks',
-  work_relevance: 'high - dispatch validation protects Bittrees task quality',
+  work_relevance: 'high - dispatch validation protects task quality',
 };
 
 function failingResult(mode: TaskBriefValidationMode): TaskBriefValidationResult {
@@ -323,9 +325,24 @@ describe('getWorkPriority', () => {
     expect(getWorkPriority({}, text)).toBe(expected);
   });
 
-  it('accepts the pre-neutral schema only as an input compatibility alias', () => {
-    expect(getWorkPriority({ bittrees_relevance: 'medium - legacy task' })).toBe('medium');
-    expect(getWorkPriority({}, 'Bittrees relevance: low/backlog - legacy task')).toBe('low/backlog');
+  it('accepts arbitrary namespaced compatibility fields and labels without naming an organization', () => {
+    expect(getWorkPriority({ tenant_relevance: 'medium - imported task' })).toBe('medium');
+    expect(getWorkPriority({ tenantContributorRelevance: 'high - imported task' })).toBe('high');
+    expect(getWorkPriority({}, 'Tenant relevance: low/backlog - imported task')).toBe('low/backlog');
+    expect(getWorkPriority({
+      work_relevance: 'high - neutral field wins',
+      tenant_relevance: 'low - compatibility field',
+    })).toBe('high');
+    expect(isRelevanceFieldName('tenant_relevance')).toBe(true);
+    expect(isRelevanceFieldName('tenantContributorRelevance')).toBe(true);
+    expect(isRelevanceFieldName('irrelevance')).toBe(false);
+  });
+
+  it('accepts neutral and arbitrary namespaced relevance CLI flags', () => {
+    expect(isRelevanceCliFlag('--relevance')).toBe(true);
+    expect(isRelevanceCliFlag('--work-relevance')).toBe(true);
+    expect(isRelevanceCliFlag('--tenant-relevance')).toBe(true);
+    expect(isRelevanceCliFlag('--tenant-context')).toBe(false);
   });
 
   it('returns null when no work priority is present', () => {

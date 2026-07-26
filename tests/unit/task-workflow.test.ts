@@ -55,7 +55,7 @@ describe('task workflow contract', () => {
     expect((result.contract.validation as any).fallback_validators).toHaveLength(2);
   });
 
-  it('normalizes pre-neutral relevance input without emitting the legacy field', () => {
+  it('normalizes arbitrary namespaced relevance input without emitting the source field', () => {
     const result = buildTaskWorkflowContract({
       goal_id: 'goal-legacy',
       expected_output: 'A compatible task',
@@ -63,7 +63,7 @@ describe('task workflow contract', () => {
       validation_path: ['default/researcher'],
       out_of_scope: ['New organization-specific policy'],
       backlog_policy: 'defer optional work',
-      bittrees_relevance: 'medium - legacy task',
+      tenant_relevance: 'medium - imported task',
       source_ids: ['request:operator'],
     }, {
       taskId: 'task-legacy',
@@ -75,8 +75,8 @@ describe('task workflow contract', () => {
     });
 
     expect(result.missing).toEqual([]);
-    expect(result.contract.relevance).toBe('medium - legacy task');
-    expect(result.contract).not.toHaveProperty('bittrees_relevance');
+    expect(result.contract.relevance).toBe('medium - imported task');
+    expect(result.contract).not.toHaveProperty('tenant_relevance');
   });
 
   it('rejects invalid lifecycle jumps', () => {

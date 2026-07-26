@@ -11,6 +11,7 @@ export type TaskBriefDecision =
   | 'bypass_with_reason';
 
 export interface TaskBriefValidationInput {
+  [key: string]: unknown;
   title?: unknown;
   description?: unknown;
   goal_id?: unknown;
@@ -31,14 +32,8 @@ export interface TaskBriefValidationInput {
   recommendationRoutingInstructions?: unknown;
   work_relevance?: unknown;
   workRelevance?: unknown;
-  /** @deprecated Read-only compatibility for tasks created before the neutral work-relevance schema. */
-  bittrees_relevance?: unknown;
-  /** @deprecated Read-only compatibility for tasks created before the neutral work-relevance schema. */
-  bittreesRelevance?: unknown;
-  /** @deprecated Read-only compatibility for tasks created before the neutral work-relevance schema. */
-  bittrees_contributor_relevance?: unknown;
-  /** @deprecated Read-only compatibility for tasks created before the neutral work-relevance schema. */
-  bittreesContributorRelevance?: unknown;
+  contributor_relevance?: unknown;
+  contributorRelevance?: unknown;
   relevance?: unknown;
   target?: unknown;
   targetUrl?: unknown;
@@ -90,6 +85,52 @@ export interface TaskCompletionValidationResult {
 
 const GOAL_RE = /\bgoal_[a-z0-9_]+\b/i;
 export type WorkPriority = 'high' | 'medium' | 'low/backlog' | 'reject';
+
+const RELEVANCE_FIELD_PRIORITY = [
+  'work_relevance',
+  'workRelevance',
+  'contributor_relevance',
+  'contributorRelevance',
+  'relevance',
+] as const;
+
+function normalizedMetadataKey(value: string): string {
+  return value
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/-/g, '_')
+    .toLowerCase();
+}
+
+/**
+ * Preserve old consumer data without teaching the runtime any organization
+ * name. Neutral fields win; arbitrary namespaced `*_relevance` fields remain
+ * readable in a deterministic order and are rewritten as `work_relevance`.
+ */
+export function isRelevanceFieldName(value: string): boolean {
+  const normalized = normalizedMetadataKey(value);
+  return normalized === 'relevance' || normalized.endsWith('_relevance');
+}
+
+export function relevanceFieldValues(input: Record<string, unknown>): unknown[] {
+  const preferred = new Set<string>(RELEVANCE_FIELD_PRIORITY);
+  const namespaced = Object.keys(input)
+    .filter((key) => !preferred.has(key) && isRelevanceFieldName(key))
+    .sort((left, right) => left.localeCompare(right));
+  return [...RELEVANCE_FIELD_PRIORITY, ...namespaced]
+    .filter((key) => Object.prototype.hasOwnProperty.call(input, key))
+    .map((key) => input[key]);
+}
+
+export function relevanceLabelValue(text: string): string | null {
+  return text.match(
+    /(?:^|\n)\s*(?:[a-z0-9][a-z0-9 ._-]{0,63}\s+)?relevance\s*:\s*([^\n]+)/i,
+  )?.[1]?.trim() || null;
+}
+
+export function isRelevanceCliFlag(token: string): boolean {
+  return token === '--relevance'
+    || /^--[a-z0-9](?:[a-z0-9-]{0,62})-relevance$/i.test(token);
+}
 
 export function getTaskBriefValidationMode(raw = process.env.ID_TASK_BRIEF_VALIDATION): TaskBriefValidationMode {
   const normalized = String(raw || 'warn').trim().toLowerCase();
@@ -225,20 +266,12 @@ export function appendTaskBriefFieldsToDescription(
   if (recommendationRouting && !hasRecommendationRoutingInstructionLabel(existing)) {
     additions.push(`Backlog policy: ${recommendationRouting}`);
   }
-  appendIfMissing(
-    additions,
-    existing,
-    'Work relevance',
-    formatValue(
-      input.work_relevance
-      ?? input.workRelevance
-      ?? input.bittrees_relevance
-      ?? input.bittreesRelevance
-      ?? input.bittrees_contributor_relevance
-      ?? input.bittreesContributorRelevance
-      ?? input.relevance,
-    ),
-  );
+  const workRelevance = relevanceFieldValues(input)
+    .map(formatValue)
+    .find((value): value is string => Boolean(value)) || null;
+  if (workRelevance && !relevanceLabelValue(existing)) {
+    additions.push(`Work relevance: ${workRelevance}`);
+  }
   appendIfMissing(
     additions,
     existing,
@@ -320,32 +353,18 @@ function hasWorkRelevance(input: TaskBriefValidationInput, text: string): boolea
 }
 
 function hasWorkRelevanceField(input: TaskBriefValidationInput): boolean {
-  return hasNonEmpty(
-    input.work_relevance
-    ?? input.workRelevance
-    ?? input.bittrees_relevance
-    ?? input.bittreesRelevance
-    ?? input.bittrees_contributor_relevance
-    ?? input.bittreesContributorRelevance
-    ?? input.relevance,
-  );
+  return relevanceFieldValues(input).some(hasNonEmpty);
 }
 
 export function getWorkPriority(
   input: TaskBriefValidationInput,
   text = '',
 ): WorkPriority | null {
-  const raw = input.work_relevance
-    ?? input.workRelevance
-    ?? input.bittrees_relevance
-    ?? input.bittreesRelevance
-    ?? input.bittrees_contributor_relevance
-    ?? input.bittreesContributorRelevance
-    ?? input.relevance;
-  const rawPriority = parseWorkPriority(formatValue(raw));
-  if (rawPriority) return rawPriority;
-  const labeled = text.match(/(?:^|\n)\s*(?:work relevance|contributor relevance|bittrees relevance|bittrees contributor relevance|relevance)\s*:\s*([^\n]+)/i)?.[1] || null;
-  const labeledPriority = parseWorkPriority(labeled);
+  for (const raw of relevanceFieldValues(input)) {
+    const rawPriority = parseWorkPriority(formatValue(raw));
+    if (rawPriority) return rawPriority;
+  }
+  const labeledPriority = parseWorkPriority(relevanceLabelValue(text));
   if (labeledPriority) return labeledPriority;
   return null;
 }

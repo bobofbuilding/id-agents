@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.149]
+
+- Remove organization-named task and catalog compatibility branches from the shipped Manager while retaining old consumer data through neutral, deterministic namespaced relevance and responsibility-lane matching.
+- Accept arbitrary namespaced relevance fields, labels, and CLI flags without embedding any organization identity, while continuing to emit the canonical `work_relevance` contract.
+- Add regression coverage for generic imported relevance metadata and generic primary/secondary catalog lanes.
+
 ## [0.1.148]
 
 - Apply each managed Claude Code agent's standard or fast output-speed preference through Claude Code's documented process-local `--settings` contract instead of leaving Fast as an inert UI choice.

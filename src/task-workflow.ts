@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT
 
 import type { TaskWorkflowState } from './db/types.js';
+import {
+  relevanceFieldValues,
+  relevanceLabelValue,
+} from './task-brief-validation.js';
 
 export const TASK_WORKFLOW_VERSION = 'task-workflow.v1';
 
@@ -79,13 +83,11 @@ export function buildTaskWorkflowContract(input: Record<string, unknown>, contex
   if (!outOfScope.length) outOfScope.push(...list(label(description, 'Out of scope')));
   const backlogPolicy = first(input, ['backlog_policy', 'backlogPolicy', 'recommendation_routing', 'recommendationRouting'])
     || label(description, 'Backlog policy');
-  const relevance = first(input, [
-    'work_relevance',
-    'workRelevance',
-    'bittrees_relevance',
-    'bittreesRelevance',
-    'relevance',
-  ]) || label(description, 'Work relevance') || label(description, 'Bittrees relevance');
+  const relevance = relevanceFieldValues(input)
+    .map(text)
+    .find(Boolean)
+    || relevanceLabelValue(description)
+    || '';
   const sourceIds = list(input.source_ids ?? input.sourceIds ?? input.provenance_refs ?? input.provenanceRefs);
   const parentTaskId = first(input, ['parent_task_id', 'parentTaskId', 'parent_task', 'parentTask']) || label(description, 'Parent task');
   const inputs = list(input.inputs ?? input.input_refs ?? input.inputRefs);

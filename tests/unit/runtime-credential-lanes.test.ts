@@ -880,6 +880,22 @@ describe('runtime credential lanes', () => {
       model: 'gpt-5.4-mini',
       metadata: { catalog: { expertise: ['monitoring', 'event-streaming', 'incident-response'] } },
     })).toMatchObject({ runtime: 'ollama', model: 'qwen3:1.7b' });
+
+    expect(manager.resolveRateLimitLocalFallback({
+      ...baseAgent,
+      id: 'namespaced-lane-1',
+      name: 'specialist',
+      model: 'gpt-5.4-mini',
+      metadata: { catalog: { tenantPrimaryLane: 'security engineering' } },
+    })).toMatchObject({ runtime: 'ollama', model: 'qwen2.5-coder:7b' });
+
+    expect(manager.resolveRateLimitLocalFallback({
+      ...baseAgent,
+      id: 'namespaced-lane-2',
+      name: 'specialist',
+      model: 'gpt-5.4-mini',
+      metadata: { catalog: { tenantSecondaryLanes: ['monitoring', 'incident response'] } },
+    })).toMatchObject({ runtime: 'ollama', model: 'qwen3:1.7b' });
   });
 
   it('honors per-agent local fallback metadata before inferred responsibility', async () => {
