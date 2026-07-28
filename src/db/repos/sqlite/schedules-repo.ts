@@ -156,6 +156,21 @@ export class SqliteSchedulesRepo implements SchedulesRepository {
     await this.db.query(`DELETE FROM schedule_definitions WHERE id IN (${placeholders})`, ids);
   }
 
+  async deleteByExactSource(sourceType: string, sourceKey: string): Promise<void> {
+    const { rows } = await this.db.query<{ id: string }>(
+      `SELECT id FROM schedule_definitions
+       WHERE source_type = ? AND source_key = ?`,
+      [sourceType, sourceKey],
+    );
+    if (rows.length === 0) return;
+
+    const ids = rows.map((row) => row.id);
+    const placeholders = ids.map(() => '?').join(', ');
+    await this.db.query(`DELETE FROM schedule_runs WHERE schedule_id IN (${placeholders})`, ids);
+    await this.db.query(`DELETE FROM schedule_targets WHERE schedule_id IN (${placeholders})`, ids);
+    await this.db.query(`DELETE FROM schedule_definitions WHERE id IN (${placeholders})`, ids);
+  }
+
   // ---------------------------------------------------------------------------
   // Targets
   // ---------------------------------------------------------------------------

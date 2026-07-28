@@ -123,6 +123,7 @@ const env = {
   SQLITE_PATH: join(scratch, 'manager', 'id-agents.db'),
   IDACC_AGENT_LOG_DIR: logRoot,
   IDACC_ADMIN_TOKEN: token,
+  IDACC_MANAGER_SERVICE_TOKEN: `${token}-manager-service-separation`,
   ID_MANAGER_ALLOW_DUPLICATE_START: 'true',
   ID_IDLE_PARK_DISABLED: '1',
 };

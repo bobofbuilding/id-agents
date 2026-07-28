@@ -172,15 +172,13 @@ describe('agent-manager-db spawn-flow wiring guard', () => {
     expect(source).not.toMatch(/writeFileSync\(\s*personalityPath/);
   });
 
-  it('spawn-flow paths call writePersonalityFile + appendLibraryPersonaToAgentsMd, and rebuild refreshes framework', () => {
-    const writeCalls = source.match(/writePersonalityFile\(workingDirectory,/g) ?? [];
-    const appendCalls = source.match(/appendLibraryPersonaToAgentsMd\(workingDirectory,/g) ?? [];
-    expect(writeCalls.length).toBeGreaterThanOrEqual(5);
-    expect(appendCalls.length).toBe(4);
-    expect(source).toContain('this.refreshPersonalityFileForRebuild(agent)');
+  it('spawn-flow paths use the unified overlay reconciler and rebuild refreshes the whole overlay', () => {
+    const reconcileCalls = source.match(/this\.reconcileAgentManagedOverlay\(\{/g) ?? [];
+    expect(reconcileCalls.length).toBeGreaterThanOrEqual(8);
+    expect(source).toContain('await this.refreshManagedOverlayForRebuild(teamId, teamName, agent)');
   });
 
-  it('writePersonalityFile is imported from config-parser', () => {
-    expect(source).toMatch(/writePersonalityFile,?[\s\S]{0,200}from '\.\/config-parser\.js'/);
+  it('the transactional managed overlay reconciler is imported', () => {
+    expect(source).toMatch(/reconcileManagedOverlay,?[\s\S]{0,300}from '\.\/lib\/managed-overlay-reconciler\.js'/);
   });
 });

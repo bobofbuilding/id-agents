@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.1.152]
+
+- Add a managed-desktop HTTP privacy boundary while preserving the standalone
+  Manager contract when managed mode is not enabled.
+- Keep anonymous managed access to minimal readiness and REST-AP discovery,
+  require the existing loopback admin credential for administration, and give
+  Brain a separate read-only service credential restricted to teams, agents,
+  and events.
+- Give every Manager-owned worker a team-, agent-, and process-generation-bound
+  credential derived from a Manager-only root; enforce a strict callback and
+  same-team coordination allowlist with durable identity and reply-provenance
+  checks.
+- Keep supervisor and Brain service secrets out of worker environments, add
+  authenticated worker callbacks, and direct workers to their own loopback news
+  feed for late replies instead of the Manager-wide query endpoint.
+
 ## [0.1.149]
 
 - Remove organization-named task and catalog compatibility branches from the shipped Manager while retaining old consumer data through neutral, deterministic namespaced relevance and responsibility-lane matching.

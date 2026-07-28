@@ -81,7 +81,8 @@ You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage
 to purchase more credits or try again at 9:41 AM.
 ```
 
-This does **not** trigger the CC rate-limit failover. Key differences:
+This is detected by the shared rate-limit path even though its evidence differs
+from Claude Code:
 
 | Dimension | Claude Code CLI | Codex CLI |
 |---|---|---|
@@ -90,7 +91,12 @@ This does **not** trigger the CC rate-limit failover. Key differences:
 | Link | Anthropic console | `chatgpt.com/codex/settings/usage` |
 | Status field | `api_error_status: 429` | None (plain text only) |
 
-If a Codex agent reports this message, treat it as a scheduled retry — no reassignment or escalation needed unless it recurs past the stated retry time. Codex lanes are not yet wired into the credential-pool failover system.
+The Manager records the Codex lane cooldown, parses the retry time when one is
+present, and selects an eligible configured runtime or model fallback. It
+replays the exact query through that lane and restores the preferred lane after
+the cooldown and replay are complete. If no eligible fallback is active, the
+agent remains safely cooled until retry rather than silently bypassing the
+limit.
 
 ---
 
@@ -115,24 +121,34 @@ runtimeCredentialPool:
 
 `kind: subscription` lanes are used by default. When one exhausts, the manager looks for the next available `metered-api` lane.
 
+Lane IDs must be unique within one canonical runtime. Distinct canonical
+runtimes may reuse a raw ID (for example, `codex` and `claude-code-cli`);
+runtime aliases that share a canonical runtime may not
+(`claude-code-local` and `claude-code-cli` share the latter namespace).
+
 ### Cooldown persistence
 
 Exhausted lanes are recorded in the `runtime_lane_cooldowns` SQLite/Postgres table:
 
 ```sql
 CREATE TABLE runtime_lane_cooldowns (
-  lane_id         TEXT PRIMARY KEY,
-  runtime         TEXT NOT NULL,
-  kind            TEXT NOT NULL,
+  lane_id          TEXT NOT NULL,
+  runtime          TEXT NOT NULL,
+  runtime_namespace TEXT NOT NULL,
+  team_id          TEXT NOT NULL,
+  kind             TEXT NOT NULL,
   cooling_until_ms INTEGER NOT NULL,
   ...
   reset_text      TEXT,
-  message         TEXT
+  message         TEXT,
+  PRIMARY KEY (team_id, runtime_namespace, lane_id)
 );
 CREATE INDEX runtime_lane_cooldowns_until_idx ON runtime_lane_cooldowns(cooling_until_ms);
 ```
 
-On startup, the manager prunes expired rows and reloads active cooldowns (`coolingUntilMs > now`) into memory. The in-memory map is the fast path at spawn time; the table survives restarts.
+On startup, the manager prunes expired rows and reloads active cooldowns
+(`coolingUntilMs > now`) into a map keyed by the same team, canonical runtime,
+and raw lane ID tuple. The table survives restarts.
 
 ### Failover sequence (`POST /runtime/rate-limit`)
 
@@ -319,7 +335,7 @@ If `--bare` is absent on a `metered-api` lane run, check that `ID_AGENT_CLAUDE_B
 | Agent respawned but still 429 | Metered key invalid or quota exceeded | Rotate `ANTHROPIC_API_KEY` in lane config |
 | Detection miss | CC output format changed | Run `tests/unit/rate-limit-detector.test.ts` against latest CC output; update regex in `src/harness/rate-limit.ts` |
 | Agent wedged after respawn | `rebuildLocalClaudeAgent` left process in bad state | Check `GET /agents` for agent status; hit `:PORT/health` directly; escalate to operator if it's the primary lead |
-| Codex agent limit not failing over | Codex lane not wired | Expected — Codex failover not yet implemented (see Open Items) |
+| Codex agent limit not failing over | No eligible fallback runtime/model is active | Refresh the configured runtime/model catalog and make at least one fallback lane available; confirmed usage-limit and model-capacity responses are detected and replayed through the shared failover path |
 
 ---
 
@@ -327,5 +343,5 @@ If `--bare` is absent on a `metered-api` lane run, check that `ID_AGENT_CLAUDE_B
 
 | # | Item | Status |
 |---|---|---|
-| Gate #4 | Live-fire test against a real or mock 429 response end-to-end | **Not yet run** |
-| Codex lane failover | Wire `"You've hit your usage limit"` + retry-at parser for Codex-backed agents | Not started |
+| Gate #4 | Deterministic 429/cap detection, cooldown, rebuild, replay, and restoration coverage | Complete; a real-provider live-fire remains an optional credentialed acceptance check |
+| Codex lane failover | Detect usage-limit/reset and model-capacity responses, then replay through an eligible runtime/model lane | Complete |

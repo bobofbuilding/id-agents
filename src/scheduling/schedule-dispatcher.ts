@@ -201,7 +201,10 @@ export class ScheduleDispatcher {
     try {
       const response = await fetch(`${target.endpoint}${path}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          ...(target.requestHeaders || {}),
+          'Content-Type': 'application/json',
+        },
         body: JSON.stringify(payload),
       });
 

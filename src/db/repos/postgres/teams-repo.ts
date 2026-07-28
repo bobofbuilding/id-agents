@@ -10,6 +10,18 @@ export class PgTeamsRepo implements TeamsRepository {
 
   async getOrCreateTeamId(teamName: string): Promise<string> {
     const name = teamName || 'default';
+    const existing = await this.db.query<{ id: string; name: string }>(
+      'SELECT id, name FROM teams WHERE lower(name) = lower($1) LIMIT 1',
+      [name],
+    );
+    if (existing.rows[0]) {
+      if (existing.rows[0].name !== name) {
+        throw new Error(
+          `Team name case collision: "${name}" conflicts with existing "${existing.rows[0].name}"`,
+        );
+      }
+      return existing.rows[0].id;
+    }
     const r = await this.db.query<{ id: string }>(
       'INSERT INTO teams (id, name) VALUES ($1, $2) ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id',
       [randomUUID(), name],
@@ -27,10 +39,16 @@ export class PgTeamsRepo implements TeamsRepository {
 
   async getTeamByName(name: string): Promise<TeamRow | null> {
     const r = await this.db.query<TeamRow>(
-      'SELECT id, name FROM teams WHERE name = $1',
+      'SELECT id, name FROM teams WHERE lower(name) = lower($1) LIMIT 1',
       [name],
     );
-    return r.rows[0] || null;
+    if (!r.rows[0]) return null;
+    if (r.rows[0].name !== name) {
+      throw new Error(
+        `Team name case collision: "${name}" conflicts with existing "${r.rows[0].name}"`,
+      );
+    }
+    return r.rows[0];
   }
 
   async getConfig(teamId: string): Promise<Record<string, unknown>> {

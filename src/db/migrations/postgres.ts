@@ -49,22 +49,121 @@ export async function migratePostgres(adapter: DbAdapter): Promise<void> {
       created_at timestamptz NOT NULL DEFAULT now()
     );
   `);
+  const { rows: teamNameCollisions } = await adapter.query<{ folded_name: string; count: string }>(`
+    SELECT lower(name) AS folded_name, COUNT(*)::text AS count
+    FROM teams
+    GROUP BY lower(name)
+    HAVING COUNT(*) > 1
+    LIMIT 1
+  `);
+  if (teamNameCollisions.length === 0) {
+    await adapter.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS teams_name_casefold_unique
+        ON teams (lower(name))
+    `);
+  } else {
+    console.error(
+      '[Manager migration] Case-only duplicate team names detected. Existing teams were preserved, but new team creation and ambiguous lookup will fail closed until an operator renames the duplicates to unique portable names.',
+    );
+  }
 
   await adapter.query(`
     CREATE TABLE IF NOT EXISTS runtime_lane_cooldowns (
-      lane_id text PRIMARY KEY,
+      lane_id text NOT NULL,
       runtime text NOT NULL,
+      runtime_namespace text NOT NULL,
       kind text NOT NULL,
       cooling_until_ms bigint NOT NULL,
       observed_at_ms bigint NOT NULL,
       reason text NOT NULL,
-      team_id text,
+      team_id text NOT NULL,
       agent_id text,
       agent_name text,
       query_id text,
       reset_text text,
-      message text
+      message text,
+      PRIMARY KEY (team_id, runtime_namespace, lane_id)
     );
+  `);
+  await adapter.query(`ALTER TABLE runtime_lane_cooldowns ADD COLUMN IF NOT EXISTS runtime_namespace text;`);
+  await adapter.query(`
+    DO $$
+    BEGIN
+      LOCK TABLE runtime_lane_cooldowns IN ACCESS EXCLUSIVE MODE;
+
+      WITH ranked AS (
+        SELECT
+          ctid AS source_ctid,
+          ROW_NUMBER() OVER (
+            PARTITION BY
+              COALESCE(team_id, ''),
+              CASE
+                WHEN COALESCE(runtime_namespace, runtime) = 'codex-cli' THEN 'codex'
+                WHEN COALESCE(runtime_namespace, runtime) = 'claude-code-local' THEN 'claude-code-cli'
+                ELSE COALESCE(runtime_namespace, runtime)
+              END,
+              lane_id
+            ORDER BY cooling_until_ms DESC, observed_at_ms DESC, ctid DESC
+          ) AS retention_rank
+        FROM runtime_lane_cooldowns
+      )
+      DELETE FROM runtime_lane_cooldowns AS candidate
+      USING ranked
+      WHERE candidate.ctid = ranked.source_ctid
+        AND ranked.retention_rank > 1;
+
+      UPDATE runtime_lane_cooldowns
+      SET
+        runtime_namespace = CASE
+          WHEN COALESCE(runtime_namespace, runtime) = 'codex-cli' THEN 'codex'
+          WHEN COALESCE(runtime_namespace, runtime) = 'claude-code-local' THEN 'claude-code-cli'
+          ELSE COALESCE(runtime_namespace, runtime)
+        END,
+        team_id = COALESCE(team_id, '')
+      WHERE runtime_namespace IS NULL
+         OR runtime_namespace IN ('codex-cli', 'claude-code-local')
+         OR team_id IS NULL;
+    END $$;
+  `);
+  await adapter.query(`ALTER TABLE runtime_lane_cooldowns ALTER COLUMN runtime_namespace SET NOT NULL;`);
+  await adapter.query(`ALTER TABLE runtime_lane_cooldowns ALTER COLUMN team_id SET NOT NULL;`);
+  await adapter.query(`
+    DO $$
+    DECLARE
+      existing_primary_key text;
+    BEGIN
+      SELECT constraint_name
+      INTO existing_primary_key
+      FROM information_schema.table_constraints
+      WHERE table_schema = 'public'
+        AND table_name = 'runtime_lane_cooldowns'
+        AND constraint_type = 'PRIMARY KEY'
+      LIMIT 1;
+
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint AS constraint_row
+        WHERE constraint_row.conrelid = 'runtime_lane_cooldowns'::regclass
+          AND constraint_row.contype = 'p'
+          AND (
+            SELECT array_agg(attribute_row.attname::text ORDER BY key_column.ordinality)
+            FROM unnest(constraint_row.conkey) WITH ORDINALITY
+              AS key_column(attribute_number, ordinality)
+            JOIN pg_attribute AS attribute_row
+              ON attribute_row.attrelid = constraint_row.conrelid
+             AND attribute_row.attnum = key_column.attribute_number
+          ) = ARRAY['team_id', 'runtime_namespace', 'lane_id']::text[]
+      ) THEN
+        IF existing_primary_key IS NOT NULL THEN
+          EXECUTE format(
+            'ALTER TABLE runtime_lane_cooldowns DROP CONSTRAINT %I',
+            existing_primary_key
+          );
+        END IF;
+        ALTER TABLE runtime_lane_cooldowns
+          ADD PRIMARY KEY (team_id, runtime_namespace, lane_id);
+      END IF;
+    END $$;
   `);
   await adapter.query(`CREATE INDEX IF NOT EXISTS runtime_lane_cooldowns_until_idx ON runtime_lane_cooldowns(cooling_until_ms);`);
 

@@ -21,6 +21,25 @@ import { terminateChildProcessTree } from './claude-code-cli.js';
 import { detectClaudeCliRateLimit } from './rate-limit.js';
 import { resolveExecutable } from '../lib/executable-resolution.js';
 import { portableSpawn, portableSpawnSync } from '../lib/portable-spawn.js';
+import {
+  atomicWritePrivateFile,
+  ensurePrivateDirectory,
+  lstatIfExists,
+  stableProfileOwnerKey,
+} from '../lib/profile-storage.js';
+import {
+  materializeCodexProviderEntry,
+  captureCodexAuthReconciliation,
+  linkCodexProfileSessionDirectory,
+  migrateExactLegacyCodexSession,
+  reconcileCodexAuthAfterRun,
+  removeCodexRunHomeNoFollow,
+  removeMaterializedCodexProviderFile,
+  type CodexAuthReconciliation,
+  type ProviderEntryMaterialization,
+  type ProviderSharingMode,
+} from './codex-profile-storage.js';
+import { randomBytes } from 'node:crypto';
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -37,6 +56,11 @@ export function codexPermissionArgs(input: {
   resumeId?: string;
   executionPolicy?: HarnessOptions['executionPolicy'];
 }): { args: string[]; label: string } {
+  if (input.executionPolicy === 'external-text-only') {
+    throw new Error(
+      'Codex CLI cannot guarantee a zero-local-tool text-only execution policy; refusing to run external content',
+    );
+  }
   if (input.executionPolicy === 'control-plane-readonly') {
     return {
       args: ['-c', 'sandbox_mode="read-only"', '-c', 'approval_policy="never"'],
@@ -219,7 +243,32 @@ function resolveCodexModelForCli(model: string | undefined, command: string): { 
 
 /** TOML-encode a string scalar. */
 function tomlStr(s: string): string {
-  return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  let encoded = '"';
+  for (const character of s) {
+    const codePoint = character.codePointAt(0)!;
+    if (codePoint >= 0xd800 && codePoint <= 0xdfff) {
+      throw new Error('Codex MCP configuration contains an invalid Unicode surrogate');
+    }
+    switch (character) {
+      case '"': encoded += '\\"'; break;
+      case '\\': encoded += '\\\\'; break;
+      case '\b': encoded += '\\b'; break;
+      case '\t': encoded += '\\t'; break;
+      case '\n': encoded += '\\n'; break;
+      case '\f': encoded += '\\f'; break;
+      case '\r': encoded += '\\r'; break;
+      default:
+        if (
+          codePoint <= 0x1f
+          || (codePoint >= 0x7f && codePoint <= 0x9f)
+        ) {
+          encoded += `\\u${codePoint.toString(16).padStart(4, '0')}`;
+        } else {
+          encoded += character;
+        }
+    }
+  }
+  return `${encoded}"`;
 }
 /** Bare TOML key (no quoting needed). */
 function bareKey(k: string): boolean {
@@ -241,6 +290,12 @@ function renderMcpServersToml(servers: McpServerSpec[] | undefined): string {
   const blocks: string[] = [];
   for (const s of servers) {
     if (!s?.name) continue;
+    if (s.transport === 'sse') {
+      throw new Error(
+        `Codex MCP server "${s.name}" uses legacy SSE transport, which is not `
+        + 'supported by this Codex runtime; configure a streamable HTTP endpoint',
+      );
+    }
     const key = bareKey(s.name) ? s.name : tomlStr(s.name);
     const lines: string[] = [`[mcp_servers.${key}]`];
     if (s.command) {
@@ -253,7 +308,13 @@ function renderMcpServersToml(servers: McpServerSpec[] | undefined): string {
         }
       }
     } else if (s.url) {
-      lines.push(`url = ${tomlStr(s.url)}`); // remote (http/sse) MCP server
+      lines.push(`url = ${tomlStr(s.url)}`); // streamable HTTP MCP server
+      if (s.headers && Object.keys(s.headers).length) {
+        lines.push(`[mcp_servers.${key}.http_headers]`);
+        for (const [header, value] of Object.entries(s.headers)) {
+          lines.push(`${bareKey(header) ? header : tomlStr(header)} = ${tomlStr(String(value))}`);
+        }
+      }
     } else {
       continue;
     }
@@ -264,59 +325,290 @@ function renderMcpServersToml(servers: McpServerSpec[] | undefined): string {
 
 /**
  * Build a per-agent CODEX_HOME so attached MCP servers can be configured via a
- * PRIVATE config.toml (0600) instead of the command line. Auth and sessions are
- * SHARED with the operator's real ~/.codex via symlinks, so ChatGPT OAuth login
- * and `codex exec resume <id>` keep working exactly as before — only config.toml
- * is per-agent (and is the sole place secret MCP env lives).
+ * PRIVATE config.toml (0600) instead of the command line. Only provider login
+ * auth is deliberately bridged from the operator's real ~/.codex. Sessions and
+ * all IDACC-generated config, MCP secret env, goals, memories and other local
+ * state remain inside the selected IDACC profile and stable agent boundary.
  *
- * Returns the home dir path, or undefined if it can't be prepared (caller then
- * falls back to the default home with no MCP servers — never to argv secrets).
+ * Managed IDACC runs throw if the profile-owned overlay cannot be prepared.
+ * Standalone runs retain the legacy undefined fallback (no MCP argv secrets).
  */
-function prepareCodexHome(servers: McpServerSpec[], agentKey: string): string | undefined {
-  try {
-    const realHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
-    const safeKey = (agentKey || 'agent').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 120);
-    const home = path.join(os.homedir(), '.codex-idagents', safeKey);
-    fs.mkdirSync(home, { recursive: true, mode: 0o700 });
-    try { fs.chmodSync(home, 0o700); } catch { /* best effort */ }
+export interface CodexOverlayContext {
+  env?: NodeJS.ProcessEnv;
+  homeDirectory?: string;
+  /** An explicitly configured agent workspace, not an implicit process.cwd(). */
+  workingDirectory?: string;
+  /** Deterministic copy fallback used by tests and locked-down installations. */
+  providerSharing?: ProviderSharingMode;
+  /** Test/telemetry seam for bounded provider fallback copying. */
+  providerCopyObserver?: (chunkBytes: number, bufferCapacity: number) => void;
+  /** Deterministic run identity for focused tests; production always generates one. */
+  runId?: string;
+  /** Exact previously-minted runtime id requested for this invocation. */
+  resumeId?: string;
+  /** Provenance assertion from this exact agent's profile-owned session map. */
+  resumeAuthorization?: 'agent-owned';
+}
 
-    // Mirror every real-home entry EXCEPT config.toml as a symlink → auth.json,
-    // sessions/, caches, skills/, memories/ are all shared with the real codex.
-    let entries: string[] = [];
-    try { entries = fs.readdirSync(realHome); } catch { /* real home not created yet */ }
-    for (const name of entries) {
-      if (name === 'config.toml') continue;
-      const link = path.join(home, name);
-      const target = path.join(realHome, name);
-      try {
-        const st = fs.lstatSync(link);
-        if (st.isSymbolicLink()) {
-          if (fs.readlinkSync(link) === target) continue; // already correct
-          fs.rmSync(link, { force: true });
-        } else {
-          // codex wrote a real file over our symlink (e.g. an OAuth token refresh
-          // of auth.json). Push it back to the shared home, then restore the link
-          // so every agent keeps using one auth source.
-          if (name === 'auth.json') { try { fs.copyFileSync(link, target); } catch { /* best effort */ } }
-          fs.rmSync(link, { recursive: true, force: true });
-        }
-      } catch { /* link absent — create below */ }
-      try { fs.symlinkSync(target, link); } catch { /* ignore individual link failures */ }
+/** The sole provider-owned file shared intentionally for subscription login. */
+export const CODEX_SHARED_PROVIDER_ENTRIES = Object.freeze([
+  'auth.json',
+]);
+const CODEX_PROVIDER_MANIFEST_VERSION = 1;
+const CODEX_PROVIDER_MANIFEST_NAME = '.idacc-provider-sharing-v1.json';
+const CODEX_REVOCABLE_PROVIDER_ENTRIES = new Set(['auth.json']);
+const CODEX_RUN_PREFIX = 'run-';
+const CODEX_RUN_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const CODEX_RUN_HARD_CAP = 128;
+
+interface PreparedCodexHome {
+  home: string;
+  runsRoot: string;
+  authReconciliation?: CodexAuthReconciliation;
+}
+
+export function resolveCodexOverlayRoot(context: CodexOverlayContext = {}): string {
+  const env = context.env ?? process.env;
+  const profileRoot = env.IDACC_DATA_DIR?.trim();
+  if (profileRoot) {
+    return path.join(path.resolve(profileRoot), 'manager', 'codex-overlays');
+  }
+
+  const configuredWorkspace = context.workingDirectory?.trim();
+  if (configuredWorkspace) {
+    return path.join(path.resolve(configuredWorkspace), '.idacc', 'codex-overlays');
+  }
+
+  if (env.IDACC_MANAGED_SERVICE === '1') {
+    throw new Error(
+      'Codex MCP overlay storage is not configured for this IDACC profile; '
+      + 'set IDACC_DATA_DIR or an explicit workingDirectory',
+    );
+  }
+
+  // Deliberate standalone compatibility for existing non-IDACC installations.
+  return path.join(context.homeDirectory ?? os.homedir(), '.codex-idagents');
+}
+
+function resolveCodexOverlayBoundary(context: CodexOverlayContext = {}): string {
+  const env = context.env ?? process.env;
+  const profileRoot = env.IDACC_DATA_DIR?.trim();
+  if (profileRoot) return path.resolve(profileRoot);
+  const configuredWorkspace = context.workingDirectory?.trim();
+  if (configuredWorkspace) return path.resolve(configuredWorkspace);
+  if (env.IDACC_MANAGED_SERVICE === '1') {
+    throw new Error('Codex profile boundary is unavailable in managed mode');
+  }
+  return path.resolve(context.homeDirectory ?? os.homedir());
+}
+
+function codexRunDirectoryName(runId?: string): string {
+  if (!runId) {
+    return `${CODEX_RUN_PREFIX}${Date.now().toString(36)}-${randomBytes(12).toString('hex')}`;
+  }
+  return `${CODEX_RUN_PREFIX}${stableProfileOwnerKey(undefined, runId, false)}`;
+}
+
+function pruneRetainedCodexRuns(runsRoot: string): void {
+  const now = Date.now();
+  for (const entry of fs.readdirSync(runsRoot, { withFileTypes: true })) {
+    if (!entry.name.startsWith(CODEX_RUN_PREFIX)) continue;
+    const candidate = path.join(runsRoot, entry.name);
+    const stat = fs.lstatSync(candidate);
+    if (now - stat.mtimeMs > CODEX_RUN_RETENTION_MS) {
+      removeCodexRunHomeNoFollow(runsRoot, candidate);
+    }
+  }
+  const retained = fs.readdirSync(runsRoot)
+    .filter((name) => name.startsWith(CODEX_RUN_PREFIX));
+  if (retained.length >= CODEX_RUN_HARD_CAP) {
+    throw new Error(
+      `Codex retained-run safety cap (${CODEX_RUN_HARD_CAP}) was reached; `
+      + 'refusing to create another secret-bearing runtime home',
+    );
+  }
+}
+
+function prepareCodexRunHome(
+  servers: McpServerSpec[],
+  agentKey: string,
+  context: CodexOverlayContext = {},
+): PreparedCodexHome | undefined {
+  const env = context.env ?? process.env;
+  const homeDirectory = context.homeDirectory ?? os.homedir();
+  let runHome: string | undefined;
+  let runsRoot: string | undefined;
+  try {
+    const realHome = env.CODEX_HOME || path.join(homeDirectory, '.codex');
+    const providerHomePresent = Boolean(lstatIfExists(realHome));
+    const safeKey = stableProfileOwnerKey(
+      env.ID_AGENT_ID,
+      agentKey,
+      env.IDACC_MANAGED_SERVICE === '1',
+    );
+    const overlayRoot = resolveCodexOverlayRoot({
+      env,
+      homeDirectory,
+      workingDirectory: context.workingDirectory,
+    });
+    const overlayBoundary = resolveCodexOverlayBoundary({
+      env,
+      homeDirectory,
+      workingDirectory: context.workingDirectory,
+    });
+    const ownerRoot = path.join(overlayRoot, safeKey);
+    ensurePrivateDirectory(overlayBoundary, ownerRoot);
+    const stableStateHome = path.join(ownerRoot, 'state');
+    runsRoot = path.join(ownerRoot, 'runs');
+    ensurePrivateDirectory(ownerRoot, stableStateHome);
+    ensurePrivateDirectory(ownerRoot, runsRoot);
+    pruneRetainedCodexRuns(runsRoot);
+
+    if (
+      context.resumeId
+      && context.resumeAuthorization === 'agent-owned'
+      && providerHomePresent
+    ) {
+      migrateExactLegacyCodexSession(
+        realHome,
+        ownerRoot,
+        stableStateHome,
+        context.resumeId,
+        context.resumeAuthorization,
+        { onChunk: context.providerCopyObserver },
+      );
     }
 
-    // Private config = operator's config.toml (trust levels, plugins, …) + the
-    // MCP server tables. 0600 so only this user can read the secret env.
-    let base = '';
-    try { base = fs.readFileSync(path.join(realHome, 'config.toml'), 'utf8'); } catch { /* none yet */ }
+    runHome = path.join(runsRoot, codexRunDirectoryName(context.runId));
+    if (lstatIfExists(runHome)) {
+      throw new Error(`Codex run identity already exists: ${path.basename(runHome)}`);
+    }
+    ensurePrivateDirectory(runsRoot, runHome);
+
+    // Sessions belong to this exact profile/agent. Per-run homes bridge only
+    // those stable directories, never the operator's provider-wide history.
+    linkCodexProfileSessionDirectory(
+      ownerRoot,
+      stableStateHome,
+      runHome,
+      'sessions',
+    );
+    linkCodexProfileSessionDirectory(
+      ownerRoot,
+      stableStateHome,
+      runHome,
+      'archived_sessions',
+    );
+
+    // Share only subscription auth. Never mirror provider configuration,
+    // sessions, goals, memories, databases, skills, plugins, or arbitrary future
+    // CODEX_HOME entries into an IDACC profile implicitly.
+    const manifestPath = path.join(runHome, CODEX_PROVIDER_MANIFEST_NAME);
+    const currentManifestEntries: Record<string, ProviderEntryMaterialization> = {};
+    for (const name of CODEX_SHARED_PROVIDER_ENTRIES) {
+      const materialization = providerHomePresent
+        ? materializeCodexProviderEntry(
+          realHome,
+          name,
+          runsRoot,
+          runHome,
+          context.providerSharing,
+          { onChunk: context.providerCopyObserver },
+        )
+        : null;
+      if (materialization) {
+        currentManifestEntries[name] = materialization;
+      } else if (
+        env.IDACC_MANAGED_SERVICE === '1'
+        && CODEX_REVOCABLE_PROVIDER_ENTRIES.has(name)
+      ) {
+        removeMaterializedCodexProviderFile(runsRoot, runHome, name);
+        delete currentManifestEntries[name];
+      }
+    }
+    atomicWritePrivateFile(
+      runsRoot,
+      manifestPath,
+      `${JSON.stringify({
+        version: CODEX_PROVIDER_MANIFEST_VERSION,
+        entries: currentManifestEntries,
+      }, null, 2)}\n`,
+    );
+
+    // Exact per-dispatch config. Provider-global MCP commands, plugins, feature
+    // flags and personal settings are deliberately excluded so a neutral app
+    // cannot gain hidden capabilities or produce duplicate TOML tables.
     const mcp = renderMcpServersToml(servers);
-    const cfgPath = path.join(home, 'config.toml');
-    fs.writeFileSync(cfgPath, `${base.trimEnd()}\n\n${mcp}\n`, { mode: 0o600 });
-    try { fs.chmodSync(cfgPath, 0o600); } catch { /* best effort */ }
-    return home;
+    const cfgPath = path.join(runHome, 'config.toml');
+    atomicWritePrivateFile(
+      runsRoot,
+      cfgPath,
+      mcp ? `${mcp}\n` : '',
+    );
+    return {
+      home: runHome,
+      runsRoot,
+      authReconciliation: providerHomePresent
+        ? captureCodexAuthReconciliation(
+          realHome,
+          runsRoot,
+          runHome,
+          { onChunk: context.providerCopyObserver },
+        )
+        : undefined,
+    };
   } catch (e) {
+    if (runHome && runsRoot) {
+      try { removeCodexRunHomeNoFollow(runsRoot, runHome); } catch { /* retained for startup recovery */ }
+    }
+    if (env.IDACC_MANAGED_SERVICE === '1') {
+      throw new Error(`Codex profile-owned MCP overlay setup failed: ${(e as Error).message}`);
+    }
     console.error(`[Codex] prepareCodexHome failed (${(e as Error).message}) — running without attached MCP servers rather than risk leaking secrets on argv`);
     return undefined;
   }
+}
+
+export function prepareCodexHome(
+  servers: McpServerSpec[],
+  agentKey: string,
+  context: CodexOverlayContext = {},
+): string | undefined {
+  return prepareCodexRunHome(servers, agentKey, context)?.home;
+}
+
+export interface PreparedCodexRuntimeEnvironment {
+  env: NodeJS.ProcessEnv;
+  codexHome?: string;
+  lifecycle?: PreparedCodexHome;
+}
+
+/**
+ * Build the exact environment used by a Codex run. Managed workers always
+ * receive a profile-owned CODEX_HOME, even when they have no attached modules;
+ * standalone callers retain their historical default unless modules require an
+ * overlay.
+ */
+export function prepareCodexRuntimeEnvironment(
+  options: HarnessOptions,
+  workingDirectory: string,
+  baseEnv: NodeJS.ProcessEnv = process.env,
+): PreparedCodexRuntimeEnvironment {
+  const env = { ...baseEnv, ...(options.env || {}) } as NodeJS.ProcessEnv;
+  const servers = options.mcpServers ?? [];
+  const managed = env.IDACC_MANAGED_SERVICE === '1';
+  if (!managed && servers.length === 0) return { env };
+
+  const agentKey = `${env.ID_AGENT_TEAM || 'default'}__${env.ID_AGENT_NAME || path.basename(workingDirectory)}`;
+  const lifecycle = prepareCodexRunHome(servers, agentKey, {
+    env,
+    workingDirectory,
+    resumeId: options.resume,
+    resumeAuthorization: options.resumeAuthorization,
+  });
+  const codexHome = lifecycle?.home;
+  if (codexHome) env.CODEX_HOME = codexHome;
+  return { env, codexHome, lifecycle };
 }
 
 // Fail-closed safeguard: a codex agent's argv is world-readable via `ps`, so a
@@ -351,14 +643,86 @@ function redactForLog(s: string): string {
     .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----/g, '-----BEGIN PRIVATE KEY (redacted)-----');
 }
 
+export interface CodexHarnessDependencies {
+  spawn?: typeof portableSpawn;
+  terminate?: typeof terminateChildProcessTree;
+}
+
+interface CodexRunFinalizationState {
+  lifecycle?: PreparedCodexHome;
+  process?: ChildProcess;
+  processClosed?: Promise<void>;
+  closed: boolean;
+}
+
+const codexResumeTails = new Map<string, Promise<void>>();
+
+function codexResumeSerializationKey(options: HarnessOptions): string | undefined {
+  const resumeId = options.resume?.trim();
+  if (!resumeId) return undefined;
+  const env = { ...process.env, ...(options.env || {}) };
+  const storageBoundary = env.IDACC_DATA_DIR?.trim()
+    || options.workingDirectory?.trim()
+    || env.CODEX_HOME?.trim()
+    || os.homedir();
+  const agentIdentity = env.ID_AGENT_ID?.trim()
+    || `${env.ID_AGENT_TEAM || 'default'}:${env.ID_AGENT_NAME || 'agent'}`;
+  return `${path.resolve(storageBoundary)}\0${agentIdentity}\0${resumeId}`;
+}
+
+async function acquireCodexResumeSerialization(
+  options: HarnessOptions,
+): Promise<() => void> {
+  const key = codexResumeSerializationKey(options);
+  if (!key) return () => {};
+  const previous = codexResumeTails.get(key) ?? Promise.resolve();
+  let releaseGate!: () => void;
+  const gate = new Promise<void>((resolve) => { releaseGate = resolve; });
+  const tail = previous.then(() => gate);
+  codexResumeTails.set(key, tail);
+  await previous;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    releaseGate();
+    if (codexResumeTails.get(key) === tail) codexResumeTails.delete(key);
+  };
+}
+
 export class CodexHarness implements AgentHarness {
   readonly type: HarnessType = 'codex' as HarnessType;
 
   private currentProcess: ChildProcess | null = null;
   private cancelled = false;
   private currentQueryId: string | undefined;
+  private readonly spawnOverride?: typeof portableSpawn;
+  private readonly terminateProcessTree: typeof terminateChildProcessTree;
+
+  constructor(dependencies: CodexHarnessDependencies = {}) {
+    this.spawnOverride = dependencies.spawn;
+    this.terminateProcessTree = dependencies.terminate ?? terminateChildProcessTree;
+  }
 
   async *run(prompt: string, options: HarnessOptions = {}): AsyncGenerator<HarnessMessage> {
+    const finalization: CodexRunFinalizationState = { closed: false };
+    const releaseResume = await acquireCodexResumeSerialization(options);
+    try {
+      yield* this.runInvocation(prompt, options, finalization);
+    } finally {
+      try {
+        await this.finalizeRun(finalization);
+      } finally {
+        releaseResume();
+      }
+    }
+  }
+
+  private async *runInvocation(
+    prompt: string,
+    options: HarnessOptions,
+    finalization: CodexRunFinalizationState,
+  ): AsyncGenerator<HarnessMessage> {
     const workingDir = options.workingDirectory || process.cwd();
     this.currentQueryId = options.queryId;
 
@@ -418,17 +782,18 @@ export class CodexHarness implements AgentHarness {
       console.log(`[Codex] Reasoning effort: ${eff}`);
     }
 
-    // Attach external MCP servers (Modules view) via a PRIVATE, per-agent config
-    // file — NOT `-c …env={…}` on argv (which is world-readable via `ps` and leaked
-    // the operator's tokens). prepareCodexHome shares auth + sessions with the real
-    // ~/.codex so OAuth and resume are unaffected; only config.toml is per-agent.
-    let codexHome: string | undefined;
-    if (options.mcpServers?.length) {
-      const agentKey = `${process.env.ID_AGENT_TEAM || 'default'}__${process.env.ID_AGENT_NAME || path.basename(workingDir)}`;
-      codexHome = prepareCodexHome(options.mcpServers, agentKey);
-      if (codexHome) {
-        console.log(`[Codex] Attached ${options.mcpServers.length} MCP server(s) via private config (CODEX_HOME=${codexHome})`);
-      }
+    // Managed workers always use a profile-owned CODEX_HOME, including agents
+    // with zero modules. Standalone callers only need an overlay for modules.
+    const preparedRuntime = prepareCodexRuntimeEnvironment(options, workingDir);
+    finalization.lifecycle = preparedRuntime.lifecycle;
+    const codexHome = preparedRuntime.codexHome;
+    if (codexHome) {
+      const moduleCount = options.mcpServers?.length ?? 0;
+      console.log(
+        moduleCount > 0
+          ? `[Codex] Attached ${moduleCount} MCP server(s) via private profile config (CODEX_HOME=${codexHome})`
+          : `[Codex] Using profile-owned runtime home (CODEX_HOME=${codexHome})`,
+      );
     }
 
     if (resumeId) {
@@ -447,23 +812,31 @@ export class CodexHarness implements AgentHarness {
 
     this.cancelled = false;
 
-    // Issue 4: Merge options.env WITH process.env instead of replacing
-    const mergedEnv = { ...process.env, ...(options.env || {}) } as NodeJS.ProcessEnv;
-    // Point codex at the per-agent home (private config.toml with the MCP servers).
-    if (codexHome) mergedEnv.CODEX_HOME = codexHome;
+    // Issue 4: Merge options.env WITH process.env instead of replacing.
+    const mergedEnv = preparedRuntime.env;
     if (codexExecutable.managedPackageRoot) {
       mergedEnv.CODEX_MANAGED_BY_NPM ||= '1';
       mergedEnv.CODEX_MANAGED_PACKAGE_ROOT ||= codexExecutable.managedPackageRoot;
     }
 
-    const proc = portableSpawn(codexExecutable.command, invocation.args, {
+    const spawnOptions = {
       cwd: workingDir,
       env: mergedEnv,
-      stdio: ['pipe', 'pipe', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe'] as ['pipe', 'pipe', 'pipe'],
       detached: process.platform !== 'win32',
-    });
+    };
+    const proc = this.spawnOverride
+      ? this.spawnOverride(codexExecutable.command, invocation.args, spawnOptions)
+      : portableSpawn(codexExecutable.command, invocation.args, spawnOptions);
 
     this.currentProcess = proc;
+    finalization.process = proc;
+    finalization.processClosed = new Promise<void>((resolve) => {
+      proc.once('close', () => {
+        finalization.closed = true;
+        resolve();
+      });
+    });
 
     // Issue 4: Handle spawn errors
     let spawnError: Error | null = null;
@@ -546,10 +919,15 @@ export class CodexHarness implements AgentHarness {
         processedLines.add(i);
         const line = lines[i];
 
+        let event: any;
         try {
-          const event = JSON.parse(line);
+          event = JSON.parse(line);
+        } catch {
+          // Not valid JSON — skip.
+          continue;
+        }
 
-          switch (event.type) {
+        switch (event.type) {
             case 'thread.started': {
               sessionId = event.thread_id;
               yield {
@@ -800,21 +1178,24 @@ export class CodexHarness implements AgentHarness {
               console.log(`[Codex] Unknown event type: ${event.type}`);
               break;
             }
-          }
-        } catch {
-          // Not valid JSON — skip
         }
       }
 
       if (this.cancelled) {
-        terminateChildProcessTree(proc, 'SIGTERM');
+        this.terminateProcessTree(proc, 'SIGTERM');
         yield { type: 'error', content: 'Cancelled' };
         break;
       }
     }
 
-    // Issue 3: Wait for both stdout end AND process exit
-    await completionPromise;
+    // A cancellation may target a child that ignores the first termination
+    // request. Do not wait forever here: the outer lifecycle finalizer owns the
+    // bounded TERM/KILL/quiescence sequence and deliberately retains the run
+    // home if the child never confirms close.
+    if (!this.cancelled) {
+      // Issue 3: Wait for both stdout end AND process exit.
+      await completionPromise;
+    }
 
     // Issue 4: If spawn failed, yield error
     if (spawnError) {
@@ -834,20 +1215,64 @@ export class CodexHarness implements AgentHarness {
       };
     }
 
-    this.currentProcess = null;
+  }
+
+  private async finalizeRun(finalization: CodexRunFinalizationState): Promise<void> {
+    const proc = finalization.process;
+    if (proc && !finalization.closed) {
+      if (proc.exitCode === null && proc.signalCode === null) {
+        this.terminateProcessTree(proc, 'SIGTERM');
+      }
+      const forceTimer = setTimeout(() => {
+        if (!finalization.closed && proc.exitCode === null && proc.signalCode === null) {
+          this.terminateProcessTree(proc, 'SIGKILL');
+        }
+      }, 2_000);
+      forceTimer.unref?.();
+
+      const quiescent = await Promise.race([
+        finalization.processClosed!.then(() => true),
+        new Promise<boolean>((resolve) => {
+          const timer = setTimeout(() => resolve(false), 5_000);
+          timer.unref?.();
+        }),
+      ]);
+      clearTimeout(forceTimer);
+      if (!quiescent) {
+        // Do not read auth or remove the run home while a child might still be
+        // writing it. Retention pruning can recover it after the strict age cap.
+        throw new Error(
+          'Codex child did not confirm termination; retained its private run home for safe recovery',
+        );
+      }
+    }
+
+    if (this.currentProcess === proc) this.currentProcess = null;
+    const lifecycle = finalization.lifecycle;
+    if (!lifecycle) return;
+
+    try {
+      if (lifecycle.authReconciliation) {
+        const result = reconcileCodexAuthAfterRun(lifecycle.authReconciliation);
+        if (result === 'provider-conflict') {
+          console.warn('[Codex] Provider auth changed during the run; preserved the provider generation');
+        }
+      }
+    } finally {
+      removeCodexRunHomeNoFollow(lifecycle.runsRoot, lifecycle.home);
+    }
   }
 
   cancel(): boolean {
     if (this.currentProcess && this.currentProcess.exitCode === null && this.currentProcess.signalCode === null) {
       this.cancelled = true;
       const proc = this.currentProcess;
-      terminateChildProcessTree(proc, 'SIGTERM');
+      this.terminateProcessTree(proc, 'SIGTERM');
       setTimeout(() => {
         if (proc.exitCode === null && proc.signalCode === null) {
-          terminateChildProcessTree(proc, 'SIGKILL');
+          this.terminateProcessTree(proc, 'SIGKILL');
         }
       }, 2000).unref?.();
-      this.currentProcess = null;
       return true;
     }
     return false;

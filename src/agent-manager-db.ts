@@ -7,7 +7,8 @@
  *
  * Wallet management: agents no longer have individual wallets stored in the DB.
  * Onchain operations use either an OWS wallet (OWS_REGISTRAR_WALLET) or raw key (PRIVATE_KEY).
- * Per-agent keys can be provided via .env.<agent_id> files in the repo root.
+ * Application-specific per-agent variables come from validated team config;
+ * wallet and registrar signing material remain Manager-owned.
  */
 
 import express from 'express';
@@ -20,7 +21,7 @@ import {
   type Server as HttpServer,
 } from 'http';
 import { createServer as createNetServer } from 'net';
-import { chmodSync, existsSync, ftruncateSync, lstatSync, mkdirSync, rmSync, readFileSync, readSync, writeFileSync, writeSync, readdirSync, copyFileSync, statSync, openSync, closeSync } from 'fs';
+import { chmodSync, existsSync, ftruncateSync, lstatSync, mkdirSync, rmSync, readFileSync, readSync, writeFileSync, writeSync, readdirSync, statSync, openSync, closeSync, unlinkSync } from 'fs';
 import { execFileSync, spawn, type ChildProcess, type SpawnOptions } from 'child_process';
 import { fileURLToPath } from 'url';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -32,9 +33,37 @@ import { registerOnIdChain, createSubnameOnIdChain, setMultiChainAddresses } fro
 import { defaultDeliverFn, redactSshTarget, type DeliverFn } from './lib/ssh-deliver.js';
 import { probeRemoteAgent, defaultHealthProbeFn, type HealthProbeFn } from './lib/remote-heartbeat.js';
 import { filterClaudeEnvVars } from './lib/env-hygiene.js';
+import {
+  MANAGER_AGENT_TOKEN_ENV,
+  MANAGER_BRAIN_SERVICE,
+  MANAGER_TASK_RECEIPT_HEADER,
+  captureManagerServiceToken,
+  deriveManagerAgentToken,
+  issueManagerTaskReceipt,
+  managerAgentBearerMatches,
+  managerServiceBearerMatches,
+} from './manager-worker-auth.js';
+import {
+  AGENT_ENV_KEY_PATTERN,
+  isReservedRuntimeCredentialLaneEnvironmentKey,
+  resolveAgentEnvironment,
+  sanitizeAgentEnvironment,
+} from './agent-env.js';
 import { LocalModelGate, isLocalModelRuntime } from './lib/local-model-gate.js';
 import { managerHealthAttestation } from './lib/service-labels.js';
 import { withDesktopResourceLimits } from './lib/resource-limits.js';
+import {
+  isPortablePathSegment,
+  portablePathSegmentKey,
+  portableRelativePathKey,
+} from './lib/portable-path-segment.js';
+import {
+  reconcileManagedOverlay,
+  validatePortableOverlaySegment,
+  type ManagedOverlayFile,
+  type ManagedOverlayMarkerBlock,
+  type ManagedOverlayReconcileResult,
+} from './lib/managed-overlay-reconciler.js';
 import {
   signalOwnedProcessTree,
   terminateOwnedProcessTree,
@@ -51,14 +80,9 @@ import { loadMasterKey, deriveKeyAtIndex } from './lib/skillmesh-key-manager.js'
 import { type Db } from './db/db-service.js';
 import type { AgentRow, CheckinPriority, QueryRow, ScheduleDefinitionRow, TaskRow, TeamRow } from './db/types.js';
 import fetch from 'node-fetch';
-import type { PluginConfig, DeployConfig, HeartbeatConfig, CalendarSpec, ScheduleDeliveryMode, OrgConfig, RuntimeCredentialPoolConfig } from './config-parser.js';
+import type { AgentSpec, PluginConfig, DeployConfig, HeartbeatConfig, CalendarSpec, ScheduleDeliveryMode, OrgConfig, RuntimeCredentialPoolConfig } from './config-parser.js';
 import {
   processConfig,
-  copyAgentDirOverlay,
-  copyHeartbeatMd,
-  copyLibraryAgentOverlay,
-  appendLibraryPersonaToAgentsMd,
-  writePersonalityFile,
   INSTRUCTIONS_SIDECAR,
 } from './config-parser.js';
 import {
@@ -79,9 +103,18 @@ import {
   installLibraryTeam,
   parseSelector,
 } from './lib/library-install.js';
-import { getLibraryPaths } from './lib/agent-library.js';
+import { enumerateLibraryAgents, getLibraryPaths } from './lib/agent-library.js';
 import { PROTOCOL_DEFAULTS } from './protocol-defaults.js';
-import { computeSyncPlan, formatSyncSummary, formatSyncVerbose } from './sync.js';
+import {
+  ensIdentityForDomain,
+  normalizeEnsIdentity,
+} from './identity-validation.js';
+import {
+  computeSyncPlan,
+  formatSyncSummary,
+  formatSyncVerbose,
+  resolveAgentSpecIdentity,
+} from './sync.js';
 import { validateName } from './name-validation.js';
 import {
   detectDefaultCoderRuntimeDrift,
@@ -143,7 +176,17 @@ import {
 } from './core/learning-loop-capture.js';
 import { appendSpecialistRoutingNote, inferSpecialistOwnerTeam } from './core/specialist-routing.js';
 import type { HarnessType, McpServerSpec } from './harness/types.js';
-import { brainMcpProcessEnv, parseBrainMcpArgs, sameMcpServerSnapshot } from './harness/mcp.js';
+import {
+  brainMcpProcessEnv,
+  exactWholeToolNames,
+  isNamespacedMcpTool,
+  parseBrainMcpArgs,
+  sameMcpServerSnapshot,
+} from './harness/mcp.js';
+import {
+  normalizeProviderRuntimePolicy,
+  type ProviderRuntimePolicyInput,
+} from './provider-runtime-policy.js';
 import { SchedulerService } from './scheduling/scheduler-service.js';
 import type { DispatchResult, DispatchTarget, DueRun } from './scheduling/schedule-types.js';
 import { heartbeatToSchedule, calendarToSchedule, validateIntervalSeconds, HEARTBEAT_GENERIC_MESSAGE } from './scheduling/schedule-config.js';
@@ -151,6 +194,7 @@ import {
   getAvailableRuntimes,
   getDefaultModelForRuntime,
   getDefaultRuntime,
+  getRuntimeProfile,
   getRuntimePaths,
   isRemoteEndpointRuntime,
   isProviderRuntimeSpecifier,
@@ -178,6 +222,8 @@ const DEFAULT_MAX_ACTIVE_QUERIES_PER_AGENT = 1;
 const DEFAULT_MAX_ACTIVE_QUERIES_PER_LEAD = Number.POSITIVE_INFINITY;
 const DEFAULT_TASK_BOARD_OPEN_LIMIT = 250;
 const DEFAULT_TASK_BOARD_DONE_LIMIT = 25;
+const INSTRUCTIONS_SIDECAR_BLOCK_BEGIN = '<!-- BEGIN idacc instructions sidecar -->';
+const INSTRUCTIONS_SIDECAR_BLOCK_END = '<!-- END idacc instructions sidecar -->';
 
 interface StalledProbeState {
   lastAt: number;
@@ -531,7 +577,10 @@ const ACTIVITY_RING: { items: ActivityItem[]; seq: number } = { items: [], seq: 
  * @param baseEndpoint The agent's base endpoint (e.g., http://localhost:4101)
  * @returns The discovered endpoints or defaults if catalog unavailable
  */
-export async function discoverRestAPEndpoints(baseEndpoint: string): Promise<{ talk: string; news: string; schedule?: string | null }> {
+export async function discoverRestAPEndpoints(
+  baseEndpoint: string,
+  requestHeaders: Record<string, string> = {},
+): Promise<{ talk: string; news: string; schedule?: string | null }> {
   // After the manager-collapse refactor, "interactive" agents (e.g. manager-<team> rows)
   // have endpoint='' and port=0. A few caller paths fall back to `http://localhost:${port}`
   // which produces `http://localhost:0`, then catalog discovery fails noisily. Those rows
@@ -569,7 +618,11 @@ export async function discoverRestAPEndpoints(baseEndpoint: string): Promise<{ t
       try {
         const response = await fetch(catalogUrl, {
           signal: controller.signal,
-          headers: { Accept: 'application/json', Connection: 'close' },
+          headers: {
+            ...requestHeaders,
+            Accept: 'application/json',
+            Connection: 'close',
+          },
         });
 
         if (response.ok) {
@@ -610,10 +663,110 @@ type AgentMetadata = Record<string, any> & {
   primaryLead?: boolean;
 };
 
+const MANAGER_OWNED_LAUNCH_INTENT_KEY = 'managerOwnedLaunchIntent';
+const MANAGER_RESTART_REQUESTED_KEY = 'managerRestartRequested';
+const MANAGER_PROCESS_GENERATION_KEY = 'processGeneration';
+const MANAGER_PROCESS_RUNTIME_KEY = 'processRuntime';
+const MANAGER_PROCESS_RUNTIME_LANE_KEY = 'processRuntimeLane';
+const MANAGER_INTERNAL_AGENT_METADATA_KEYS = new Set([
+  'managerownedlaunchintent',
+  'managerrestartrequested',
+  'processgeneration',
+  'processruntime',
+  'processruntimelane',
+]);
+
 function objectRecord(value: unknown): Record<string, any> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, any>
     : null;
+}
+
+function normalizedMetadataMutationKey(key: string): string {
+  return key.replace(/[_-]/g, '').toLowerCase();
+}
+
+function attemptsIdentityKeyMutation(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  return Object.keys(value as Record<string, unknown>).some((key) => (
+    normalizedMetadataMutationKey(key) === 'identitykey'
+  ));
+}
+
+function attemptsManagerInternalMetadataMutation(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  return Object.keys(value as Record<string, unknown>).some((key) => (
+    MANAGER_INTERNAL_AGENT_METADATA_KEYS.has(normalizedMetadataMutationKey(key))
+  ));
+}
+
+function isYamlManagedLocalAgentRow(row: AgentRow): boolean {
+  const metadata = (row.metadata || {}) as Record<string, unknown>;
+  if (
+    (row.type !== 'claude' && row.type !== 'automator')
+    || metadata.local !== true
+  ) {
+    return false;
+  }
+  if (metadata.yamlManaged === true) return true;
+
+  // Stable-identity builds predated the yamlManaged provenance bit. An
+  // existing valid identityKey is a conservative explicit ownership marker.
+  if (
+    typeof metadata.identityKey === 'string'
+    && /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/.test(metadata.identityKey)
+  ) {
+    return true;
+  }
+
+  // Legacy unkeyed YAML workers carried this complete local deployment
+  // contract. GUI-created rows lacked `alias`; interactive/virtual/public
+  // rows have a different type/runtime/endpoint shape. Requiring every field
+  // avoids adopting an API-only or remote identity by name alone.
+  const alias = typeof metadata.alias === 'string' && metadata.alias.trim();
+  const runtime = typeof (row.runtime || metadata.runtime) === 'string'
+    ? String(row.runtime || metadata.runtime)
+    : '';
+  const localEndpoint = typeof (row.endpoint || metadata.endpoint) === 'string'
+    && /^http:\/\/(?:127\.0\.0\.1|localhost):\d+(?:\/|$)/i.test(
+      String(row.endpoint || metadata.endpoint),
+    );
+  const hasLocalWorkspace = typeof row.working_directory === 'string'
+    && path.isAbsolute(row.working_directory)
+    && row.working_directory.trim().length > 1;
+  const typeContract = row.type === 'automator'
+    ? metadata.isAutomator === true
+    : metadata.service_type === 'REST-AP';
+  return Boolean(
+    alias
+    && runtime
+    && !isRemoteEndpointRuntime(runtime)
+    && localEndpoint
+    && hasLocalWorkspace
+    && reusableYamlDeployPort(row.port)
+    && typeContract
+  );
+}
+
+function yamlSpecCollidesWithRow(spec: AgentSpec, row: AgentRow): boolean {
+  const desired = new Set(
+    [spec.name, spec.domain]
+      .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+      .map((value) => value.trim().toLowerCase()),
+  );
+  const metadata = (row.metadata || {}) as Record<string, unknown>;
+  const nameCollision = [
+    row.name,
+    row.domain,
+    metadata.name,
+    metadata.alias,
+    metadata.idchain_domain,
+  ].some((value) => (
+    typeof value === 'string' && desired.has(value.trim().toLowerCase())
+  ));
+  const keyCollision = typeof spec.identityKey === 'string'
+    && metadata.identityKey === spec.identityKey;
+  return nameCollision || keyCollision;
 }
 
 export function mergeCatalogSeed(
@@ -628,6 +781,302 @@ export function mergeCatalogSeed(
   if (!live) return { ...seed };
 
   return { ...seed, ...live };
+}
+
+/** A same-team/name YAML redeploy is an update, not a new storage identity. */
+export function stableYamlRedeployAgentId(
+  existing: Pick<AgentRow, 'id'> | null | undefined,
+  generatedId: string,
+): string {
+  return existing?.id || generatedId;
+}
+
+function resolveYamlAgentIdentities(
+  specs: AgentSpec[],
+  rows: AgentRow[],
+): {
+  assignments: Map<AgentSpec, AgentRow | null>;
+  error?: string;
+} {
+  const assignments = new Map<AgentSpec, AgentRow | null>();
+  const claims = new Map<string, string>();
+  const desiredIdentities = new Map<string, AgentSpec>();
+  const identityKeys = new Map<string, AgentSpec>();
+  const yamlManagedRows = rows.filter(isYamlManagedLocalAgentRow);
+
+  for (const spec of specs) {
+    try {
+      const normalizedIdentity = normalizeEnsIdentity(spec.domain, spec.tokenId);
+      if (normalizedIdentity.domain) spec.domain = normalizedIdentity.domain;
+      if (normalizedIdentity.tokenId) spec.tokenId = normalizedIdentity.tokenId;
+    } catch (error: any) {
+      return {
+        assignments,
+        error: `${spec.domain || spec.name}: ${error?.message || String(error)}`,
+      };
+    }
+    const label = spec.domain || spec.name;
+    const foreignCollision = rows.find((row) => (
+      !isYamlManagedLocalAgentRow(row) && yamlSpecCollidesWithRow(spec, row)
+    ));
+    if (foreignCollision) {
+      return {
+        assignments,
+        error: `${label}: declarative identity collides with non-YAML agent ${foreignCollision.id} (type "${foreignCollision.type}")`,
+      };
+    }
+    for (const value of [spec.name, spec.domain]) {
+      if (typeof value !== 'string' || !value.trim()) continue;
+      const normalized = value.trim().toLowerCase();
+      const prior = desiredIdentities.get(normalized);
+      if (prior && prior !== spec) {
+        return {
+          assignments,
+          error: `Agents "${prior.domain || prior.name}" and "${label}" claim the same effective identity "${value}"`,
+        };
+      }
+      desiredIdentities.set(normalized, spec);
+    }
+    if (spec.identityKey) {
+      const prior = identityKeys.get(spec.identityKey);
+      if (prior) {
+        return {
+          assignments,
+          error: `Agents "${prior.domain || prior.name}" and "${label}" both declare identityKey "${spec.identityKey}"`,
+        };
+      }
+      identityKeys.set(spec.identityKey, spec);
+    }
+    const resolution = resolveAgentSpecIdentity(spec, yamlManagedRows);
+    if (resolution.error) {
+      return {
+        assignments,
+        error: `${label}: ${resolution.error}`,
+      };
+    }
+
+    const row = resolution.row;
+    if (row) {
+      const priorClaim = claims.get(row.id);
+      if (priorClaim) {
+        return {
+          assignments,
+          error: `Agents "${priorClaim}" and "${label}" both resolve to existing row ${row.id}`,
+        };
+      }
+      claims.set(row.id, label);
+      if (spec.domain !== undefined) {
+        const metadata = (row.metadata || {}) as Record<string, unknown>;
+        const previousDomain = typeof row.domain === 'string' && row.domain.trim()
+          ? row.domain
+          : typeof metadata.idchain_domain === 'string' && metadata.idchain_domain.trim()
+            ? metadata.idchain_domain
+            : null;
+        const domainChanged = previousDomain === null
+          || previousDomain.trim().toLowerCase() !== spec.domain.trim().toLowerCase();
+        if (domainChanged && !spec.tokenId) {
+          return {
+            assignments,
+            error: `${label}: changing domain from "${previousDomain || '(none)'}" to "${spec.domain}" requires an explicit matching tokenId`,
+          };
+        }
+        if (domainChanged && row.token_id && spec.tokenId === row.token_id) {
+          return {
+            assignments,
+            error: `${label}: domain changed but tokenId still matches the previous identity`,
+          };
+        }
+      }
+    }
+    assignments.set(spec, row);
+  }
+
+  return { assignments };
+}
+
+function postDeployLeadAutomatorError(
+  specs: AgentSpec[],
+  rows: AgentRow[],
+  assignments: Map<AgentSpec, AgentRow | null>,
+): string | undefined {
+  const assignedRows = new Set(
+    [...assignments.values()]
+      .filter((row): row is AgentRow => row !== null)
+      .map((row) => row.id),
+  );
+  const automatorNames = specs
+    .filter((spec) => spec.type === 'automator')
+    .map((spec) => spec.name.trim().toLowerCase());
+  for (const row of rows) {
+    if (!isYamlManagedLocalAgentRow(row)) continue;
+    if (assignedRows.has(row.id) || row.type !== 'automator') continue;
+    const metadata = (row.metadata || {}) as Record<string, unknown>;
+    const alias = typeof metadata.alias === 'string' && metadata.alias.trim()
+      ? metadata.alias
+      : typeof metadata.name === 'string' && metadata.name.trim()
+        ? metadata.name
+        : row.name;
+    automatorNames.push(alias.trim().toLowerCase());
+  }
+  if (
+    automatorNames.length > 0
+    && !automatorNames.includes('lead-automator')
+  ) {
+    return 'The post-deploy team would contain automators without a "lead-automator"';
+  }
+  return undefined;
+}
+
+function postSyncLeadAutomatorError(specs: AgentSpec[]): string | undefined {
+  const automators = specs.filter((spec) => spec.type === 'automator');
+  if (
+    automators.length > 0
+    && !automators.some((spec) => spec.name.trim().toLowerCase() === 'lead-automator')
+  ) {
+    return 'The post-sync team would contain automators without a "lead-automator"';
+  }
+  return undefined;
+}
+
+const LEGACY_MANAGED_PLUGIN_MANIFEST_RELATIVE = path.join(
+  '.idacc',
+  'plugin-materialization-v1.json',
+);
+
+interface AgentManagedOverlayInput {
+  workingDirectory: string;
+  runtime: HarnessType | string;
+  templateName: string;
+  teamName: string;
+  displayName: string;
+  plugins: PluginConfig[];
+  skills: string[];
+  agentOverlay?: string;
+  roleBody?: string;
+  orgContext?: string;
+  onchainIdentity?: string;
+  hasWallet?: boolean;
+  skillsRoot?: string;
+  preflightOnly?: boolean;
+}
+
+interface AgentManagedOverlayOutput {
+  localPlugins: PluginConfig[];
+  result: ManagedOverlayReconcileResult;
+}
+
+export function reusableYamlDeployPort(value: unknown): number | null {
+  return typeof value === 'number'
+    && Number.isInteger(value)
+    && value > 0
+    && value <= 65_535
+    ? value
+    : null;
+}
+
+const RUNTIME_LANE_RESERVED_ENV = new Set([
+  'APPDATA',
+  'ANTIGRAVITY_CLI_PATH',
+  'BASH_ENV',
+  'CLAUDE_AGENT_SDK_VERSION',
+  'CLAUDE_CODE_ENTRYPOINT',
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
+  'CLAUDE_CONFIG_DIR',
+  'CLAUDE_MODEL',
+  'CLAUDE_PATH',
+  'CODEX_BIN',
+  'CODEX_EXECUTABLE',
+  'CODEX_HOME',
+  'COMSPEC',
+  'COPILOT_CLI_PATH',
+  'CURSOR_AGENT_PATH',
+  'DATABASE_URL',
+  'ELECTRON_RUN_AS_NODE',
+  'ENV',
+  'GROK_CLI_PATH',
+  'HOME',
+  'ID_HARNESS',
+  'ID_PLUGINS',
+  'ID_TEAM',
+  'ID_WORKSPACE_DIR',
+  'KIRO_CLI_PATH',
+  'KIMI_CLI_PATH',
+  'LANG',
+  'LD_PRELOAD',
+  'LOCALAPPDATA',
+  'MANAGER_URL',
+  'NODE_OPTIONS',
+  'NODE_PATH',
+  'NVM_DIR',
+  'NVM_HOME',
+  'NVM_SYMLINK',
+  'OWS_WALLET',
+  'PATH',
+  'PATHEXT',
+  'PNPM_HOME',
+  'PRIVATE_KEY',
+  'PROGRAMFILES',
+  'PROGRAMFILES(X86)',
+  'SHELL',
+  'SQLITE_PATH',
+  'SYSTEMROOT',
+  'TEMP',
+  'TERM',
+  'TMP',
+  'TMPDIR',
+  'USER',
+  'USERPROFILE',
+  'VOLTA_HOME',
+  'WORKSPACE_DIR',
+  'XDG_CONFIG_HOME',
+  'ZDOTDIR',
+  'BUN_INSTALL',
+]);
+
+function runtimeLaneEnvIsReserved(
+  key: string,
+  runtime?: HarnessType | string,
+  kind?: RuntimeCredentialLane['kind'],
+): boolean {
+  const normalizedKey = key.toUpperCase();
+  return RUNTIME_LANE_RESERVED_ENV.has(normalizedKey)
+    || isReservedRuntimeCredentialLaneEnvironmentKey(
+      key,
+      runtime,
+      kind,
+    );
+}
+
+const YAML_OWNED_AGENT_METADATA_KEYS = [
+  'agent',
+  'alias',
+  'allowed_tools',
+  'catalog',
+  'dangerouslySkipPermissions',
+  'description',
+  'endpoint',
+  'env',
+  'heartbeat',
+  'isAutomator',
+  'local',
+  'mcpServers',
+  'name',
+  'openMode',
+  'plugins',
+  'primaryLead',
+  'runtime',
+  'service_type',
+  'skills',
+  'yamlManaged',
+] as const;
+
+function retainRuntimeOwnedAgentMetadata(metadata: AgentMetadata): AgentMetadata {
+  const retained = { ...metadata };
+  for (const key of YAML_OWNED_AGENT_METADATA_KEYS) {
+    delete retained[key];
+  }
+  return retained;
 }
 
 function envFlagEnabled(value: string | undefined): boolean {
@@ -806,6 +1255,7 @@ interface OwnedAgentProcess {
   agentId: string;
   agentName: string;
   port: number;
+  processGeneration: string;
 }
 
 interface LocalAgentIdentityProbe {
@@ -837,14 +1287,7 @@ interface RuntimeSubscriptionFallback {
   laneId: string;
 }
 
-interface ProviderRuntimeAssignment {
-  lane: string;
-  name: string;
-  kind?: string;
-  baseUrl: string;
-  keyEnv?: string;
-  apiKey?: string;
-}
+interface ProviderRuntimeAssignment extends ProviderRuntimePolicyInput {}
 
 interface ForwardToAgentRetryOptions {
   attempts?: number;
@@ -853,7 +1296,35 @@ interface ForwardToAgentRetryOptions {
 }
 
 function providerRuntimeErrorStatus(message: string): number {
-  return /provider runtime lane|requires baseUrl/i.test(message) ? 400 : 500;
+  return /provider runtime|keyEnv|baseUrl|apiKey/i.test(message) ? 400 : 500;
+}
+
+function normalizeExactAllowedTools(
+  raw: unknown,
+  runtime: HarnessType | string | undefined,
+): string[] {
+  if (!Array.isArray(raw)) {
+    throw new Error('allowedTools must be an array of exact whole tool names');
+  }
+  let tools: string[];
+  try {
+    tools = exactWholeToolNames(raw as string[]);
+  } catch {
+    throw new Error('allowedTools must be an array of exact whole tool names');
+  }
+  if (new Set(tools).size !== tools.length) {
+    throw new Error('allowedTools must not contain duplicate tool names');
+  }
+  const resolved = resolveRuntime(runtime);
+  if (
+    (resolved === 'claude-code-cli' || resolved === 'claude-code-local')
+    && tools.some(isNamespacedMcpTool)
+  ) {
+    throw new Error(
+      `runtime "${resolved}" cannot enforce an exact named MCP tool boundary; use claude-agent-sdk`,
+    );
+  }
+  return tools;
 }
 
 interface RuntimeLaneCooldown {
@@ -869,6 +1340,37 @@ interface RuntimeLaneCooldown {
   queryId?: string;
   resetText?: string;
   message?: string;
+}
+
+const MANAGED_RATE_LIMIT_MAX_COOLDOWN_MS = 8 * 24 * 60 * 60_000;
+const MANAGED_RATE_LIMIT_MAX_MESSAGE_CHARS = 2_000;
+const MANAGED_RATE_LIMIT_MAX_RESET_TEXT_CHARS = 500;
+const MANAGED_RATE_LIMIT_REASONS = new Set([
+  'subscription_session_cap_unknown_window',
+  'subscription_daily_cap',
+  'subscription_weekly_cap',
+  'subscription_monthly_cap',
+  'api_rate_limit',
+  'api_overloaded',
+  'model_capacity',
+  'unknown_rate_limit',
+]);
+const MANAGED_RATE_LIMIT_SOURCES = new Set([
+  'cli-json-result',
+  'cli-stream-event',
+  'anthropic-api-headers',
+  'text-fallback',
+]);
+
+function runtimeLaneCooldownKey(
+  teamId: string,
+  runtime: HarnessType | string | undefined,
+  laneId: string,
+): string {
+  const canonicalRuntime = getRuntimeProfile(runtime).canonicalId;
+  // JSON tuple encoding avoids delimiter collisions without changing the raw
+  // lane id exposed through metadata and the management API.
+  return JSON.stringify([teamId, canonicalRuntime, laneId]);
 }
 
 interface ValidatorRecommendationLoopConfig {
@@ -964,10 +1466,12 @@ export class AgentManagerDb {
   private runtimeFallbackRestoreInFlight: Promise<void> | null = null;
   private lastRuntimeFallbackRestoreSweepAt = 0;
   private agentLifecycleLocks: Map<string, Promise<void>> = new Map();
+  private yamlReconcileTail: Promise<void> = Promise.resolve();
   private ownedAgentProcesses: Map<number, OwnedAgentProcess> = new Map();
   private pendingAgentPorts: Set<number> = new Set();
   private agentLogRetentionInterval: NodeJS.Timeout | null = null;
   private shuttingDown = false;
+  private startupReady = false;
   private validatorRecommendationLoopLocks: Map<string, Promise<void>> = new Map();
   private taskOwnerWakeAttempts: Map<string, number> = new Map();
   private scheduleTargetWakeAttempts: Map<string, number> = new Map();
@@ -1012,6 +1516,8 @@ export class AgentManagerDb {
   private libraryRoot: string | null;
   /** Supervisor credential captured and removed from process.env before any agent spawn. */
   private readonly idaccAdminToken: string;
+  /** Manager/Brain service root captured and removed before worker inheritance. */
+  private readonly idaccManagerServiceToken: string;
 
   /** Log a manager activity message to the ring buffer (not stdout) */
   private managerLog(msg: string) {
@@ -3644,7 +4150,6 @@ export class AgentManagerDb {
       return { status: 'failed', reason: spawnResult.error || 'spawn_failed' };
     }
 
-    await this.db.agents.updateStatus(owner.id, 'running');
     await this.db.events.insert({
       team_id: teamId,
       topic: 'agent:started',
@@ -3827,6 +4332,11 @@ Return this JSON shape:
     },
   ) {
     this.idaccAdminToken = captureAdminToken();
+    this.idaccManagerServiceToken = captureManagerServiceToken(
+      process.env,
+      Boolean(this.idaccAdminToken),
+      this.idaccAdminToken,
+    );
     this.baseWorkDir = baseWorkDir;
     this.db = db;
     if (opts?.deliverFn) this.deliverFn = opts.deliverFn;
@@ -3942,12 +4452,18 @@ Return this JSON shape:
     teamName: string;
     calendarCount: number;
   }> {
-    const { agents, calendar, errors, teamName: configTeam } = processConfig(absolutePath, this.baseWorkDir, deployArgs);
+    const {
+      agents,
+      calendar,
+      errors,
+      teamName: configTeam,
+      org,
+    } = processConfig(absolutePath, this.baseWorkDir, deployArgs);
 
-    let effectiveTeamId = teamId;
+    let effectiveTeamId: string | null = teamId;
     let effectiveTeamName = teamName;
     if (configTeam && configTeam !== teamName) {
-      effectiveTeamId = await this.db.teams.getOrCreateTeamId(configTeam);
+      effectiveTeamId = (await this.db.teams.getTeamByName(configTeam))?.id || null;
       effectiveTeamName = configTeam;
     }
 
@@ -3958,6 +4474,26 @@ Return this JSON shape:
     if (agents.length === 0) {
       throw new Error('No agents defined in config');
     }
+
+    const currentAgents = effectiveTeamId
+      ? await this.db.agents.listAllActive(effectiveTeamId)
+      : [];
+    const identityPreflight = resolveYamlAgentIdentities(agents, currentAgents);
+    if (identityPreflight.error) {
+      throw new Error(`Deploy identity conflict: ${identityPreflight.error}`);
+    }
+    const leadError = postDeployLeadAutomatorError(
+      agents,
+      currentAgents,
+      identityPreflight.assignments,
+    );
+    if (leadError) throw new Error(leadError);
+    await this.preflightTeamManagedOverlays(
+      agents,
+      identityPreflight.assignments,
+      effectiveTeamName,
+      org,
+    );
 
     const summarizedAgents = agents.map((agentConfig, index) => {
       const effectiveRuntime = resolveRuntime(agentConfig.runtime) as HarnessType;
@@ -3988,18 +4524,101 @@ Return this JSON shape:
   }
 
   /**
+   * Validate the complete declarative runtime overlay for every configured
+   * agent before a team-level transaction mutates org/pool state, deletes a
+   * row, or stops a healthy worker. This enumerates every plugin/library/skill
+   * source and checks existing receipt ownership without publishing files.
+   */
+  private async preflightTeamManagedOverlays(
+    agents: AgentSpec[],
+    assignments: Map<AgentSpec, AgentRow | null>,
+    teamName: string,
+    org?: OrgConfig,
+  ): Promise<void> {
+    for (const [index, spec] of agents.entries()) {
+      const row = assignments.get(spec) || null;
+      const effectiveRuntime = resolveRuntime(spec.runtime) as HarnessType;
+      const effectiveModel = spec.model
+        || getDefaultModelForRuntime(effectiveRuntime, this.defaultConfig?.model);
+      this.ensureRuntimeReady(effectiveRuntime, effectiveModel);
+
+      const workingDirectory = spec.workingDirectory && path.isAbsolute(spec.workingDirectory)
+        ? spec.workingDirectory
+        : row?.working_directory
+          || path.join(
+            this.baseWorkDir,
+            'agents',
+            `.overlay-preflight-${index}-${crypto.randomUUID()}`,
+          );
+      let orgContext = '';
+      if (org?.groups) {
+        const { generateAgentOrgContext } = await import('./org-chart.js');
+        orgContext = generateAgentOrgContext(spec.name, org);
+      }
+      const metadata = (row?.metadata || {}) as AgentMetadata;
+      this.reconcileAgentManagedOverlay({
+        workingDirectory,
+        runtime: effectiveRuntime,
+        templateName: spec.name,
+        teamName,
+        displayName: spec.domain || spec.name,
+        plugins: spec.plugins || [],
+        skills: spec.skills || [],
+        ...(spec.agent && { agentOverlay: spec.agent }),
+        ...(spec.roleBody && { roleBody: spec.roleBody }),
+        ...(orgContext && { orgContext }),
+        onchainIdentity: spec.domain
+          ? `Your onchain identity is your ENS domain: **${spec.domain}**`
+          : '',
+        hasWallet: spec.wallet === true || !!metadata.ows_wallet,
+        preflightOnly: true,
+      });
+
+      if (spec.heartbeat) {
+        heartbeatToSchedule(
+          row?.id || `overlay-preflight-${index}`,
+          spec.name,
+          spec.heartbeat,
+        );
+      }
+    }
+  }
+
+  /**
    * Build environment variables for worker agent
    */
   private buildWorkerEnv(teamId: string, teamName: string, agent: AgentRow): Record<string, string> {
-    const plugins = agent.metadata?.plugins || [];
+    const metadata = (agent.metadata || {}) as AgentMetadata;
+    const plugins = Array.isArray(metadata.plugins)
+      ? metadata.plugins.filter((plugin: unknown) => {
+        if (!plugin || typeof plugin !== 'object') return false;
+        const record = plugin as Record<string, unknown>;
+        return typeof record.name === 'string' && typeof record.path === 'string';
+      })
+      : [];
+    const customEnv = sanitizeAgentEnvironment(metadata.env);
+    const hasAllowedTools = Object.prototype.hasOwnProperty.call(metadata, 'allowed_tools');
+    const runtime = resolveRuntime(
+      (agent.runtime || agent.metadata?.runtime) as string | undefined,
+    );
+    const allowedTools = hasAllowedTools
+      ? normalizeExactAllowedTools(metadata.allowed_tools, runtime)
+      : [];
     // After registration, agent.name is the ENS domain; the original local
     // alias is stored in metadata.alias.  Use that for ID_AGENT_ALIAS so
     // normalizeAlias() doesn't mangle the ENS domain.
-    const agentAlias = (agent.metadata as any)?.alias || agent.name;
-    const domain = (agent.metadata as any)?.idchain_domain;
+    const agentAlias = typeof metadata.alias === 'string' && metadata.alias.trim()
+      ? metadata.alias.trim()
+      : typeof metadata.name === 'string' && metadata.name.trim()
+        ? metadata.name.trim()
+        : agent.name;
+    const domain = typeof metadata.idchain_domain === 'string' && metadata.idchain_domain.trim()
+      ? metadata.idchain_domain.trim()
+      : agent.domain || undefined;
     // After registration, name is the ENS domain; before registration, just the local alias
     const fullName = domain || agentAlias;
     const env: Record<string, string> = {
+      ...customEnv,
       ID_AGENT_NAME: fullName,
       ID_AGENT_ALIAS: agentAlias,
       ID_AGENT_TOKEN_ID: agent.token_id || '',
@@ -4009,8 +4628,12 @@ Return this JSON shape:
       ID_SHARED_DIR: `${this.baseWorkDir}/teams/${teamName}`,
       ID_DB_TEAM_ID: teamId,
       ID_DB_AGENT_ID: agent.id,
-      ID_HARNESS: resolveRuntime((agent.runtime || agent.metadata?.runtime) as string | undefined),
-      ID_PLUGINS: JSON.stringify(plugins)
+      ID_HARNESS: runtime,
+      ...(plugins.length > 0 && { ID_PLUGINS: JSON.stringify(plugins) }),
+      ...(hasAllowedTools && { ID_AGENT_ALLOWED_TOOLS: JSON.stringify(allowedTools) }),
+      ...(typeof metadata.openMode === 'boolean' && {
+        XMTP_OPEN_MODE: String(metadata.openMode),
+      }),
     };
 
     // Add talkTimeout setting from metadata (default timeout for /talk-to requests)
@@ -4041,122 +4664,436 @@ Return this JSON shape:
   }
 
   /**
-   * Copy a plugin to an agent's working directory
-   * Returns the new local path for the plugin
+   * Add or replace one exact file in the aggregate overlay plan. Later
+   * declarative sources win only when they address the exact same portable
+   * path; case-only aliases are rejected on every host OS.
    */
-  private copyPluginToAgent(plugin: PluginConfig, agentWorkDir: string): string {
-    const pluginsDir = path.join(agentWorkDir, 'plugins');
-    const targetDir = path.join(pluginsDir, plugin.name);
-
-    // Create plugins directory if it doesn't exist
-    if (!existsSync(pluginsDir)) {
-      mkdirSync(pluginsDir, { recursive: true });
+  private putManagedOverlayFile(
+    plan: Map<string, { file: ManagedOverlayFile; source: string }>,
+    file: ManagedOverlayFile,
+    source: string,
+  ): void {
+    const portable = file.destination.replaceAll('\\', '/');
+    const segments = portable.split('/');
+    if (!portable || segments.some((segment) => !segment)) {
+      throw new Error(`Invalid managed overlay destination from ${source}: ${file.destination}`);
     }
+    for (const segment of segments) validatePortableOverlaySegment(segment);
+    const folded = portableRelativePathKey(portable);
+    const previous = plan.get(folded);
+    if (previous && previous.file.destination !== portable) {
+      throw new Error(
+        `Managed overlay case collision between ${previous.file.destination} (${previous.source}) and ${portable} (${source})`,
+      );
+    }
+    plan.set(folded, {
+      file: { ...file, destination: portable },
+      source,
+    });
+  }
 
-    // Resolve source path (handle both absolute and relative paths)
-    let sourcePath = plugin.path;
-    if (!path.isAbsolute(sourcePath)) {
-      // Try multiple possible locations
-      const possiblePaths = [
-        path.join('/app', sourcePath),
-        path.join(process.cwd(), sourcePath),
-        path.join(__dirname, '..', sourcePath)
-      ];
-      for (const p of possiblePaths) {
-        if (existsSync(p)) {
-          sourcePath = p;
-          break;
+  private collectManagedOverlayTree(
+    plan: Map<string, { file: ManagedOverlayFile; source: string }>,
+    sourceRoot: string,
+    destinationRoot: string,
+    sourceLabel: string,
+    options: {
+      skip?: (relativePath: string) => boolean;
+      claimExisting?: boolean;
+    } = {},
+  ): void {
+    const rootStat = lstatSync(sourceRoot);
+    if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+      throw new Error(`Managed overlay source must be a real directory: ${sourceRoot}`);
+    }
+    const visit = (directory: string, prefix: string): void => {
+      const names = readdirSync(directory).sort((left, right) => left.localeCompare(right));
+      const folded = new Set<string>();
+      for (const name of names) {
+        validatePortableOverlaySegment(name);
+        const key = portablePathSegmentKey(name);
+        if (folded.has(key)) {
+          throw new Error(`Managed overlay source contains a case-fold duplicate: ${directory}`);
+        }
+        folded.add(key);
+        const sourcePath = path.join(directory, name);
+        const stat = lstatSync(sourcePath);
+        if (stat.isSymbolicLink()) {
+          throw new Error(`Managed overlay source must not contain symlinks: ${sourcePath}`);
+        }
+        const relativePath = prefix ? `${prefix}/${name}` : name;
+        if (options.skip?.(relativePath)) continue;
+        if (stat.isDirectory()) {
+          visit(sourcePath, relativePath);
+        } else if (stat.isFile()) {
+          const destination = destinationRoot
+            ? path.posix.join(destinationRoot, relativePath)
+            : relativePath;
+          this.putManagedOverlayFile(plan, {
+            destination,
+            content: readFileSync(sourcePath),
+            mode: stat.mode,
+            ...(options.claimExisting === false && { claimExisting: false }),
+          }, sourceLabel);
+        } else {
+          throw new Error(`Managed overlay source contains an unsupported entry: ${sourcePath}`);
         }
       }
-    }
-
-    if (!existsSync(sourcePath)) {
-      console.warn(`[AgentManager] Plugin source not found: ${plugin.path}`);
-      return plugin.path; // Return original path if source not found
-    }
-
-    // Copy plugin directory recursively
-    this.copyDirRecursive(sourcePath, targetDir);
-    this.mirrorPluginSkillsToAgent(plugin.name, targetDir, agentWorkDir);
-    console.log(`[AgentManager] Copied plugin ${plugin.name} to ${targetDir}`);
-
-    return targetDir;
+    };
+    visit(sourceRoot, '');
   }
 
-  private runtimeNeutralSkillRoots(agentWorkDir: string): string[] {
-    return [
-      path.join(agentWorkDir, '.claude', 'skills'),
-      path.join(agentWorkDir, '.agents', 'skills'),
-      path.join(agentWorkDir, '.cursor', 'skills'),
-    ];
+  private putManagedOverlaySourceFile(
+    plan: Map<string, { file: ManagedOverlayFile; source: string }>,
+    sourcePath: string,
+    destination: string,
+    sourceLabel: string,
+    transform?: (contents: string) => string,
+  ): void {
+    const stat = lstatSync(sourcePath);
+    if (stat.isSymbolicLink() || !stat.isFile()) {
+      throw new Error(`Managed overlay source must be a real regular file: ${sourcePath}`);
+    }
+    const content = transform
+      ? transform(readFileSync(sourcePath, 'utf8'))
+      : readFileSync(sourcePath);
+    this.putManagedOverlayFile(plan, {
+      destination,
+      content,
+      mode: stat.mode,
+    }, sourceLabel);
   }
 
-  private mirrorSkillDirToRuntimeRoots(skillName: string, sourceDir: string, agentWorkDir: string): number {
-    if (!/^[a-z0-9][a-z0-9._-]*$/i.test(skillName)) return 0;
-    if (!existsSync(path.join(sourceDir, 'SKILL.md'))) return 0;
-    let copied = 0;
-    for (const root of this.runtimeNeutralSkillRoots(agentWorkDir)) {
-      const target = path.join(root, skillName);
-      this.copyDirRecursive(sourceDir, target);
-      copied++;
+  private resolveManagedPluginSource(
+    plugin: PluginConfig,
+    workingDirectory: string,
+  ): { directory: string; managedSelfSource: boolean } {
+    const candidates = path.isAbsolute(plugin.path)
+      ? [plugin.path]
+      : [
+          path.join('/app', plugin.path),
+          path.join(process.cwd(), plugin.path),
+          path.join(__dirname, '..', plugin.path),
+        ];
+    const sourcePath = candidates.find((candidate) => existsSync(candidate));
+    if (!sourcePath) throw new Error(`Plugin source not found: ${plugin.path}`);
+    const stat = lstatSync(sourcePath);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error(`Plugin source must be a real directory: ${sourcePath}`);
     }
-    return copied;
+
+    const resolvedSource = path.resolve(sourcePath);
+    const managedTarget = path.resolve(workingDirectory, 'plugins', plugin.name);
+    const managedRoot = path.resolve(workingDirectory, 'plugins');
+    const relativeToManagedRoot = path.relative(managedRoot, resolvedSource);
+    const insideManagedRoot = relativeToManagedRoot === ''
+      || (
+        !path.isAbsolute(relativeToManagedRoot)
+        && relativeToManagedRoot !== '..'
+        && !relativeToManagedRoot.startsWith(`..${path.sep}`)
+      );
+    // Persisted runtime metadata points at the exact local materialization.
+    // That one self-source is handled as retain-only by the reconciler; no
+    // sibling/ancestor app-managed directory may be used as a plugin source.
+    if (insideManagedRoot && resolvedSource !== managedTarget) {
+      throw new Error(`Plugin source must not be an app-managed destination: ${sourcePath}`);
+    }
+    return {
+      directory: resolvedSource,
+      managedSelfSource: resolvedSource === managedTarget,
+    };
   }
 
-  private mirrorPluginSkillsToAgent(pluginName: string, pluginDir: string, agentWorkDir: string): void {
-    try {
-      let mirrored = 0;
-      if (existsSync(path.join(pluginDir, 'SKILL.md'))) {
-        mirrored += this.mirrorSkillDirToRuntimeRoots(pluginName, pluginDir, agentWorkDir);
+  private managedPluginSkillSources(
+    pluginName: string,
+    pluginDirectory: string,
+  ): Array<{ name: string; sourceDirectory: string }> {
+    const result: Array<{ name: string; sourceDirectory: string }> = [];
+    const rootSkill = path.join(pluginDirectory, 'SKILL.md');
+    if (existsSync(rootSkill)) {
+      const stat = lstatSync(rootSkill);
+      if (stat.isSymbolicLink() || !stat.isFile()) {
+        throw new Error(`Plugin skill must be a real regular file: ${rootSkill}`);
       }
-
-      const nestedSkillsDir = path.join(pluginDir, 'skills');
-      if (existsSync(nestedSkillsDir) && statSync(nestedSkillsDir).isDirectory()) {
-        for (const name of readdirSync(nestedSkillsDir)) {
-          const sourceDir = path.join(nestedSkillsDir, name);
-          if (!statSync(sourceDir).isDirectory()) continue;
-          mirrored += this.mirrorSkillDirToRuntimeRoots(name, sourceDir, agentWorkDir);
-        }
-      }
-
-      if (mirrored > 0) {
-        console.log(`[AgentManager] Mirrored plugin ${pluginName} skills to runtime skill folders (${mirrored} copies)`);
-      }
-    } catch (err: any) {
-      console.warn(`[AgentManager] Could not mirror plugin skills for ${pluginName}: ${err?.message || err}`);
+      result.push({ name: pluginName, sourceDirectory: pluginDirectory });
     }
+    const nestedRoot = path.join(pluginDirectory, 'skills');
+    if (!existsSync(nestedRoot)) return result;
+    const rootStat = lstatSync(nestedRoot);
+    if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+      throw new Error(`Plugin skills directory must be a real directory: ${nestedRoot}`);
+    }
+    for (const entry of readdirSync(nestedRoot, { withFileTypes: true })) {
+      if (entry.isSymbolicLink()) {
+        throw new Error(`Plugin skill source must not be a symlink: ${path.join(nestedRoot, entry.name)}`);
+      }
+      if (!entry.isDirectory() || !isPortablePathSegment(entry.name)) continue;
+      const sourceDirectory = path.join(nestedRoot, entry.name);
+      const skillFile = path.join(sourceDirectory, 'SKILL.md');
+      if (!existsSync(skillFile)) continue;
+      const skillStat = lstatSync(skillFile);
+      if (skillStat.isSymbolicLink() || !skillStat.isFile()) {
+        throw new Error(`Plugin skill must be a real regular file: ${skillFile}`);
+      }
+      result.push({ name: entry.name, sourceDirectory });
+    }
+    return result;
+  }
+
+  private managedPersonalityBody(roleBody?: string): string {
+    const parts = [PROTOCOL_DEFAULTS];
+    if (roleBody) parts.push(roleBody);
+    return parts.join('\n\n');
   }
 
   /**
-   * Recursively copy a directory
+   * Materialize every declarative runtime asset in one exact-file ownership
+   * transaction. Precedence is deterministic:
+   * plugin fallback < library agent < explicit skill < local template <
+   * heartbeat/personality.
    */
-  private copyDirRecursive(src: string, dest: string): void {
-    if (!existsSync(dest)) {
-      mkdirSync(dest, { recursive: true });
+  private reconcileAgentManagedOverlay(
+    input: AgentManagedOverlayInput,
+  ): AgentManagedOverlayOutput {
+    const {
+      workingDirectory,
+      runtime,
+      templateName,
+      plugins,
+      skills,
+    } = input;
+    if (!existsSync(workingDirectory) && !input.preflightOnly) {
+      mkdirSync(workingDirectory, { recursive: true });
+    }
+    if (existsSync(workingDirectory)) {
+      const workspaceStat = lstatSync(workingDirectory);
+      if (workspaceStat.isSymbolicLink() || !workspaceStat.isDirectory()) {
+        throw new Error(`Agent workspace must be a real directory: ${workingDirectory}`);
+      }
     }
 
-    const entries = readdirSync(src);
-    for (const entry of entries) {
-      const srcPath = path.join(src, entry);
-      const destPath = path.join(dest, entry);
+    const plan = new Map<string, { file: ManagedOverlayFile; source: string }>();
+    const rp = getRuntimePaths(runtime);
+    const explicitSkills = new Set<string>();
+    for (const skillName of skills) {
+      if (!isPortablePathSegment(skillName)) {
+        throw new Error(`Invalid skill name "${skillName}"`);
+      }
+      const key = portablePathSegmentKey(skillName);
+      if (explicitSkills.has(key)) throw new Error(`Duplicate skill name "${skillName}"`);
+      explicitSkills.add(key);
+    }
 
-      const stat = statSync(srcPath);
-      if (stat.isDirectory()) {
-        this.copyDirRecursive(srcPath, destPath);
+    const pluginNames = new Set<string>();
+    const pluginSkillOwners = new Map<string, string>();
+    const localPlugins: PluginConfig[] = [];
+    for (const plugin of plugins) {
+      if (!isPortablePathSegment(plugin.name)) {
+        throw new Error(`Invalid plugin name "${plugin.name}"`);
+      }
+      const pluginKey = portablePathSegmentKey(plugin.name);
+      if (pluginNames.has(pluginKey)) throw new Error(`Duplicate plugin name "${plugin.name}"`);
+      pluginNames.add(pluginKey);
+      const {
+        directory: sourceDirectory,
+        managedSelfSource,
+      } = this.resolveManagedPluginSource(plugin, workingDirectory);
+      const pluginDestination = path.posix.join('plugins', plugin.name);
+      this.collectManagedOverlayTree(
+        plan,
+        sourceDirectory,
+        pluginDestination,
+        `plugin:${plugin.name}`,
+        {
+          // Persisted runtime metadata points at the agent-owned local copy.
+          // It remains a source for projected skills, but its own bytes must
+          // never be re-adopted after the agent edits them.
+          claimExisting: !managedSelfSource,
+        },
+      );
+      localPlugins.push({
+        name: plugin.name,
+        path: path.join(workingDirectory, 'plugins', plugin.name),
+      });
+
+      for (const skill of this.managedPluginSkillSources(plugin.name, sourceDirectory)) {
+        const skillKey = portablePathSegmentKey(skill.name);
+        const priorOwner = pluginSkillOwners.get(skillKey);
+        if (priorOwner && !explicitSkills.has(skillKey)) {
+          throw new Error(
+            `Plugins "${priorOwner}" and "${plugin.name}" both provide skill "${skill.name}"`,
+          );
+        }
+        pluginSkillOwners.set(skillKey, plugin.name);
+        if (explicitSkills.has(skillKey)) continue;
+        for (const rootName of ['.claude', '.agents', '.cursor']) {
+          this.collectManagedOverlayTree(
+            plan,
+            skill.sourceDirectory,
+            path.posix.join(rootName, 'skills', skill.name),
+            `plugin-skill:${plugin.name}:${skill.name}`,
+          );
+        }
+      }
+    }
+
+    let libraryPersona: { id: string; content: string } | null = null;
+    if (input.agentOverlay) {
+      if (!isPortablePathSegment(input.agentOverlay)) {
+        throw new Error(`Invalid agent library name "${input.agentOverlay}"`);
+      }
+      if (!this.libraryRoot) {
+        throw new Error(`Agent library is not configured; cannot resolve "${input.agentOverlay}"`);
+      }
+      const scan = enumerateLibraryAgents(getLibraryPaths(this.libraryRoot).agents);
+      const scanError = scan.errors.find((error) => error.name === input.agentOverlay);
+      if (scanError) throw new Error(scanError.message);
+      const entry = scan.entries.find((candidate) => candidate.name === input.agentOverlay);
+      if (!entry) throw new Error(`Agent library entry not found: ${input.agentOverlay}`);
+
+      const isClaude = rp.overlayTarget === '.claude';
+      this.collectManagedOverlayTree(
+        plan,
+        entry.dirPath,
+        rp.overlayTarget,
+        `agent-library:${entry.name}`,
+        {
+          skip: (relativePath) => relativePath === 'CLAUDE.md',
+        },
+      );
+      const personaContent = readFileSync(entry.memoryFile, 'utf8');
+      if (isClaude) {
+        this.putManagedOverlaySourceFile(
+          plan,
+          entry.memoryFile,
+          path.posix.join('.claude', 'rules', `agent-${entry.name}.md`),
+          `agent-persona:${entry.name}`,
+        );
       } else {
-        copyFileSync(srcPath, destPath);
+        libraryPersona = {
+          id: `agent:${entry.name}`,
+          content: personaContent,
+        };
       }
     }
-  }
 
-  /**
-   * Copy plugins to agent's working directory and return updated plugin configs with local paths
-   */
-  private copyPluginsToAgent(plugins: PluginConfig[], agentWorkDir: string): PluginConfig[] {
-    return plugins.map(plugin => ({
-      name: plugin.name,
-      path: this.copyPluginToAgent(plugin, agentWorkDir)
-    }));
+    const skillsRoot = input.skillsRoot
+      || (this.libraryRoot
+        ? getLibraryPaths(this.libraryRoot).skills
+        : path.resolve(__dirname, '..', 'skills'));
+    const substitutions: Record<string, string> = {
+      DISPLAY_NAME: input.displayName,
+      TEAM: input.teamName,
+      ONCHAIN_IDENTITY: input.onchainIdentity || '',
+      ORG_CONTEXT: input.orgContext
+        ? `\n## Your Role\n\n${input.orgContext}\n\nSee the full org chart at the shared team folder for details on all groups.`
+        : '',
+    };
+    for (const skillName of skills) {
+      if (skillName === 'wallet' && !input.hasWallet) continue;
+      const sourceDirectory = path.join(skillsRoot, skillName);
+      const skillFile = path.join(sourceDirectory, 'SKILL.md');
+      if (!existsSync(skillFile)) {
+        throw new Error(`Skill "${skillName}" not found at ${skillFile}`);
+      }
+      this.collectManagedOverlayTree(
+        plan,
+        sourceDirectory,
+        path.posix.join(rp.skillsDir, skillName),
+        `explicit-skill:${skillName}`,
+      );
+      this.putManagedOverlaySourceFile(
+        plan,
+        skillFile,
+        path.posix.join(rp.skillsDir, skillName, 'SKILL.md'),
+        `explicit-skill:${skillName}:templated`,
+        (raw) => {
+          let content = raw;
+          for (const [key, value] of Object.entries(substitutions)) {
+            content = content.replace(new RegExp(`\\{\\{${key}\\}\\}`, 'g'), value);
+          }
+          return content;
+        },
+      );
+    }
+
+    const localTemplateDirectory = path.join(
+      workingDirectory,
+      rp.templateDir,
+      templateName,
+    );
+    if (existsSync(localTemplateDirectory)) {
+      this.collectManagedOverlayTree(
+        plan,
+        localTemplateDirectory,
+        rp.overlayTarget,
+        `local-template:${templateName}`,
+      );
+      const heartbeatSource = path.join(localTemplateDirectory, 'HEARTBEAT.md');
+      if (existsSync(heartbeatSource)) {
+        this.putManagedOverlaySourceFile(
+          plan,
+          heartbeatSource,
+          'HEARTBEAT.md',
+          `heartbeat:${templateName}`,
+        );
+      }
+    }
+
+    let personality = this.managedPersonalityBody(input.roleBody);
+    const instructions = this.readManagedInstructionsSidecar(workingDirectory);
+    if (instructions) {
+      personality = [
+        personality,
+        INSTRUCTIONS_SIDECAR_BLOCK_BEGIN,
+        instructions,
+        INSTRUCTIONS_SIDECAR_BLOCK_END,
+      ].join('\n\n');
+    }
+
+    const markerBlocks: ManagedOverlayMarkerBlock[] = [];
+    if (rp.overlayTarget === '.claude') {
+      this.putManagedOverlayFile(plan, {
+        destination: rp.personalityFile,
+        content: personality,
+      }, 'framework-personality');
+    } else {
+      markerBlocks.push({ id: 'framework', content: personality });
+      if (libraryPersona) markerBlocks.push(libraryPersona);
+    }
+
+    const result = reconcileManagedOverlay({
+      workspaceRoot: workingDirectory,
+      files: [...plan.values()].map((entry) => entry.file),
+      // Always include AGENTS.md as a marker host so a runtime/persona
+      // transition retires old app-owned blocks without touching user text.
+      markerFiles: [{
+        destination: 'AGENTS.md',
+        blocks: markerBlocks,
+      }],
+      preflightOnly: input.preflightOnly,
+    });
+
+    if (input.preflightOnly) return { localPlugins, result };
+
+    const legacyManifest = path.join(
+      workingDirectory,
+      LEGACY_MANAGED_PLUGIN_MANIFEST_RELATIVE,
+    );
+    if (existsSync(legacyManifest)) {
+      const stat = lstatSync(legacyManifest);
+      if (stat.isFile() && !stat.isSymbolicLink()) {
+        unlinkSync(legacyManifest);
+      } else {
+        console.warn(`[AgentManager] Preserved unsafe legacy plugin manifest: ${legacyManifest}`);
+      }
+    }
+    if (result.preserved.length > 0) {
+      console.warn(
+        `[AgentManager] Preserved user-modified managed overlay paths: ${result.preserved.join(', ')}`,
+      );
+    }
+    return { localPlugins, result };
   }
 
   private getTeamName(req: express.Request): string {
@@ -4177,9 +5114,9 @@ Return this JSON shape:
       process.env.ID_PROJECT ||
       'default'
     ).toString();
-    // Validate team name to prevent path traversal
-    if (!/^[a-zA-Z0-9_.-]+$/.test(resolved)) {
-      throw new Error(`Invalid team name: "${resolved}". Only letters, numbers, hyphens, dots, and underscores allowed.`);
+    const nameCheck = validateName(resolved, 'team');
+    if (!nameCheck.valid) {
+      throw new Error(nameCheck.error || `Invalid team name: "${resolved}"`);
     }
     return resolved;
   }
@@ -5954,14 +6891,55 @@ Return this JSON shape:
    */
   private static readonly SENSITIVE_META_KEYS = new Set([
     'auth_key_ref',
+    'authentication',
+    'authorization',
+    'credentials',
+    'credential',
+    'env',
+    'headers',
     'ows_wallet_seed',
+    'skillmesh_creator_key',
+    'skillmesh_private_key',
     'ssh_private_key',
     'ssh_target',
     'internal_endpoint_url',
-    'runtimeCredentialPool',
+    'runtime_credential_pool',
   ]);
 
-  private static readonly SENSITIVE_META_REGEX = /private_?key|secret/i;
+  private static readonly SAFE_PUBLIC_IDENTITY_META_KEYS = new Set([
+    'identity_key',
+    'public_key',
+    'skillmesh_key_index',
+    'skillmesh_key_path',
+    'token_id',
+  ]);
+
+  private static normalizeMetadataKey(key: string): string {
+    return key
+      .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+      .replace(/[-\s]+/g, '_')
+      .toLowerCase();
+  }
+
+  private static isSensitiveMetadataKey(key: string): boolean {
+    const normalized = AgentManagerDb.normalizeMetadataKey(key);
+    if (AgentManagerDb.SENSITIVE_META_KEYS.has(normalized)) return true;
+    if (AgentManagerDb.SAFE_PUBLIC_IDENTITY_META_KEYS.has(normalized)) return false;
+    return /(?:^|_)(?:api_?key|auth|authorization|credential|key|password|passwd|private_?key|secret|token)(?:_|$)/.test(normalized);
+  }
+
+  private static redactMetadataValue(value: unknown): unknown {
+    if (Array.isArray(value)) {
+      return value.map((entry) => AgentManagerDb.redactMetadataValue(entry));
+    }
+    if (!value || typeof value !== 'object') return value;
+    const redacted: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      if (AgentManagerDb.isSensitiveMetadataKey(key)) continue;
+      redacted[key] = AgentManagerDb.redactMetadataValue(entry);
+    }
+    return redacted;
+  }
 
   private redactForNonAdmin<T extends Record<string, any>>(resp: T): T {
     // Remove top-level sensitive fields
@@ -5971,26 +6949,7 @@ Return this JSON shape:
 
     // Deep-copy and strip sensitive metadata keys
     if (out.metadata && typeof out.metadata === 'object') {
-      const meta: any = { ...out.metadata };
-      for (const key of Object.keys(meta)) {
-        if (
-          AgentManagerDb.SENSITIVE_META_KEYS.has(key) ||
-          AgentManagerDb.SENSITIVE_META_REGEX.test(key)
-        ) {
-          delete meta[key];
-        }
-      }
-      // MCP server definitions can carry secrets in nested `env` (stdio) and
-      // `headers` (http/sse) — the key-name scan above never sees them. Keep
-      // the server list visible (name/transport/command/url) but drop creds.
-      if (Array.isArray(meta.mcpServers)) {
-        meta.mcpServers = meta.mcpServers.map((srv: any) => {
-          if (!srv || typeof srv !== 'object') return srv;
-          const { env, headers, ...rest } = srv;
-          return rest;
-        });
-      }
-      out.metadata = meta;
+      out.metadata = AgentManagerDb.redactMetadataValue(out.metadata);
     }
 
     return out as T;
@@ -6039,6 +6998,9 @@ Return this JSON shape:
       delete metadata.processOwner;
       delete metadata.processParentPid;
       delete metadata.processInspectedAt;
+      delete metadata[MANAGER_PROCESS_GENERATION_KEY];
+      delete metadata[MANAGER_PROCESS_RUNTIME_KEY];
+      delete metadata[MANAGER_PROCESS_RUNTIME_LANE_KEY];
     }
 
     const localHealthFields = this.getHealthForAgent(a);
@@ -6124,35 +7086,210 @@ Return this JSON shape:
     return this.db.agents.list(teamId, includeAutomator);
   }
 
+  private async findAgentPortableNameCollision(
+    teamId: string,
+    candidate: string,
+    excludeAgentId?: string,
+  ): Promise<AgentRow | null> {
+    const key = portablePathSegmentKey(candidate);
+    const rows = await this.db.agents.listAllActive(teamId);
+    for (const row of rows) {
+      if (row.id === excludeAgentId) continue;
+      const metadata = (row.metadata || {}) as Record<string, unknown>;
+      const identities = [
+        row.name,
+        row.domain,
+        typeof metadata.alias === 'string' ? metadata.alias : undefined,
+        typeof metadata.name === 'string' ? metadata.name : undefined,
+      ];
+      if (identities.some((value) => (
+        typeof value === 'string'
+        && isPortablePathSegment(value)
+        && portablePathSegmentKey(value) === key
+      ))) {
+        return row;
+      }
+    }
+    return null;
+  }
+
   private async rebuildLocalClaudeAgent(
     teamId: string,
     teamName: string,
     agent: AgentRow,
   ): Promise<{ success: boolean; pid?: number; logFile?: string; error?: string }> {
-    await this.cancelPendingQueriesForAgent(teamId, agent.id);
-    await this.killAgentProcess(agent.port, agent.id);
+    return this.withAgentLifecycleLock(
+      this.agentLifecycleKey(teamId, agent),
+      () => this.rebuildLocalClaudeAgentUnlocked(teamId, teamName, agent),
+    );
+  }
+
+  private async rebuildLocalClaudeAgentUnlocked(
+    teamId: string,
+    teamName: string,
+    agent: AgentRow,
+  ): Promise<{ success: boolean; pid?: number; logFile?: string; error?: string }> {
+    const current = await this.dbQueryAgentById(teamId, agent.id);
+    if (!current) return { success: false, error: 'Agent not found' };
+    // Reconcile every declared runtime asset while the existing worker is
+    // still healthy. Invalid sources, drift, or ownership conflicts must not
+    // turn a rebuild request into avoidable downtime.
+    await this.refreshManagedOverlayForRebuild(teamId, teamName, current);
+    await this.markManagerOwnedAgentAwaitingRestart(current.id);
+    await this.cancelPendingQueriesForAgent(teamId, current.id);
+    await this.killAgentProcess(current.port, current.id);
     await new Promise(r => setTimeout(r, 1000));
-    this.refreshPersonalityFileForRebuild(agent);
-    const spawnResult = await this.spawnLocalAgentProcess(teamId, teamName, {
-      name: agent.name, id: agent.id, port: agent.port,
-      model: agent.model, workingDirectory: agent.working_directory ?? undefined,
-      tokenId: agent.token_id ?? undefined
+    const spawnResult = await this.spawnLocalAgentProcessUnlocked(teamId, teamName, {
+      name: current.name, id: current.id, port: current.port,
+      model: current.model, workingDirectory: current.working_directory ?? undefined,
+      tokenId: current.token_id ?? undefined
     });
-    if (spawnResult.success) {
-      await this.db.agents.updateStatus(agent.id, 'running');
-    }
     return spawnResult;
   }
 
-  private refreshPersonalityFileForRebuild(agent: AgentRow): void {
+  private async stopLocalAgentExplicitly(
+    teamId: string,
+    agent: AgentRow,
+  ): Promise<{ killed: boolean; pids: number[]; queriesCancelled: number }> {
+    return this.withAgentLifecycleLock(
+      this.agentLifecycleKey(teamId, agent),
+      async () => {
+        const current = await this.dbQueryAgentById(teamId, agent.id);
+        if (!current) throw new Error('Agent not found');
+        const killResult = await this.killAgentProcess(current.port, current.id);
+        const queriesCancelled = await this.cancelPendingQueriesForAgent(
+          teamId,
+          current.id,
+        );
+        await this.persistExplicitLocalStop(current);
+        return { ...killResult, queriesCancelled };
+      },
+    );
+  }
+
+  private async deleteAgentExplicitly(
+    teamId: string,
+    agent: AgentRow,
+  ): Promise<void> {
+    await this.withAgentLifecycleLock(
+      this.agentLifecycleKey(teamId, agent),
+      async () => {
+        const current = await this.dbQueryAgentById(teamId, agent.id);
+        if (!current) return;
+        const serverKey = this.key(teamId, current.id);
+        const server = this.runningServers.get(serverKey);
+        if (server) {
+          try {
+            await server.stop();
+          } catch (error) {
+            console.error(`⚠️ Failed to stop agent server ${current.name} (${current.id}):`, error);
+          }
+          this.runningServers.delete(serverKey);
+        }
+        if (!isRemoteEndpointRuntime(current.runtime) && current.type === 'claude') {
+          await this.killAgentProcess(current.port, current.id).catch(() => ({
+            killed: false,
+            pids: [],
+          }));
+        }
+        if (current.type === 'claude' && current.working_directory) {
+          try {
+            const expectedDir = `${this.baseWorkDir}/agents/${current.id}`;
+            if (current.working_directory === expectedDir) {
+              rmSync(current.working_directory, { recursive: true, force: true });
+            }
+          } catch (error) {
+            console.error(`⚠️ Failed to delete workspace for ${current.name} (${current.id}):`, error);
+          }
+        }
+        this.providerRuntimeAssignments.delete(current.id);
+        await this.db.agents.deleteAgent(current.id);
+      },
+    );
+  }
+
+  private async refreshManagedOverlayForRebuild(
+    teamId: string,
+    teamName: string,
+    agent: AgentRow,
+  ): Promise<void> {
     const runtime = resolveRuntime(agent.runtime);
     const workingDirectory = agent.working_directory || `${this.baseWorkDir}/agents/${agent.id}`;
-    if (!existsSync(workingDirectory)) mkdirSync(workingDirectory, { recursive: true });
+    const metadata = (
+      agent.metadata
+      && typeof agent.metadata === 'object'
+      && !Array.isArray(agent.metadata)
+    ) ? agent.metadata as Record<string, unknown> : {};
+    const alias = typeof metadata.alias === 'string' && metadata.alias.trim()
+      ? metadata.alias.trim()
+      : typeof metadata.name === 'string' && metadata.name.trim()
+        ? metadata.name.trim()
+        : agent.name;
+    const pluginsValue = metadata.plugins;
+    if (pluginsValue !== undefined && !Array.isArray(pluginsValue)) {
+      throw new Error(`Agent ${alias} has invalid persisted plugins metadata`);
+    }
+    const plugins = (pluginsValue || []).map((value: unknown) => {
+      if (
+        !value
+        || typeof value !== 'object'
+        || typeof (value as any).name !== 'string'
+        || typeof (value as any).path !== 'string'
+      ) {
+        throw new Error(`Agent ${alias} has an invalid persisted plugin entry`);
+      }
+      return {
+        name: (value as any).name,
+        path: (value as any).path,
+      } satisfies PluginConfig;
+    });
+    const skillsValue = metadata.skills;
+    if (skillsValue !== undefined && !Array.isArray(skillsValue)) {
+      throw new Error(`Agent ${alias} has invalid persisted skills metadata`);
+    }
+    const skills = (skillsValue || []).map((value: unknown) => {
+      if (typeof value !== 'string') {
+        throw new Error(`Agent ${alias} has an invalid persisted skill entry`);
+      }
+      return value;
+    });
+    const roleBody = this.extractPersonalityTailForRebuild(workingDirectory, runtime);
+    let orgContext = '';
+    const teamConfig = await this.db.teams.getConfig(teamId);
+    const org = teamConfig.org;
+    if (org && typeof org === 'object' && !Array.isArray(org)) {
+      try {
+        const { generateAgentOrgContext } = await import('./org-chart.js');
+        orgContext = generateAgentOrgContext(alias, org as unknown as OrgConfig);
+      } catch (error: any) {
+        throw new Error(`Could not rebuild organization context for ${alias}: ${error?.message || error}`);
+      }
+    }
 
-    const tail = this.extractPersonalityTailForRebuild(workingDirectory, runtime);
-    const parts = [PROTOCOL_DEFAULTS];
-    if (tail) parts.push(tail);
-    writePersonalityFile(workingDirectory, runtime, parts.join('\n\n'));
+    const overlay = this.reconcileAgentManagedOverlay({
+      workingDirectory,
+      runtime,
+      templateName: alias,
+      teamName,
+      displayName: agent.domain || alias,
+      plugins,
+      skills,
+      ...(typeof metadata.agent === 'string' && metadata.agent.trim() && {
+        agentOverlay: metadata.agent.trim(),
+      }),
+      ...(roleBody && { roleBody }),
+      ...(orgContext && { orgContext }),
+      onchainIdentity: agent.domain
+        ? `Your onchain identity is your ENS domain: **${agent.domain}**`
+        : '',
+      hasWallet: !!metadata.ows_wallet || !!metadata.wallet,
+    });
+    if (pluginsValue !== undefined) {
+      await this.db.agents.updateMetadata(agent.id, {
+        ...metadata,
+        plugins: overlay.localPlugins,
+      });
+    }
   }
 
   private extractPersonalityTailForRebuild(workingDirectory: string, runtime: HarnessType | string): string {
@@ -6177,6 +7314,7 @@ Return this JSON shape:
       return '';
     }
 
+    body = this.removeManagedInstructionsSidecarBlocks(body);
     const memoryAnchor = 'Load relevant memories at the start of any non-trivial task. Verify file paths and symbols in memories are still current before acting on them.';
     let tail = '';
     const memoryIdx = body.indexOf(memoryAnchor);
@@ -6192,9 +7330,61 @@ Return this JSON shape:
       }
     }
 
-    return tail
+    let cleanedTail = tail
       .replace(/<!-- BEGIN id-agents org -->[\s\S]*?<!-- END id-agents org -->/g, '')
       .trim();
+    // Compatibility for one-pass outputs produced before sidecar sub-blocks
+    // were tagged. Remove every exact trailing copy before the reconciler
+    // appends the current sidecar once in its dedicated block.
+    const instructions = this.readManagedInstructionsSidecar(workingDirectory);
+    while (instructions) {
+      if (cleanedTail === instructions) {
+        cleanedTail = '';
+        continue;
+      }
+      const suffix = `\n\n${instructions}`;
+      if (!cleanedTail.endsWith(suffix)) break;
+      cleanedTail = cleanedTail.slice(0, -suffix.length).trim();
+    }
+    return cleanedTail;
+  }
+
+  private readManagedInstructionsSidecar(workingDirectory: string): string {
+    const sidecar = path.join(workingDirectory, INSTRUCTIONS_SIDECAR);
+    if (!existsSync(sidecar)) return '';
+    const stat = lstatSync(sidecar);
+    if (stat.isSymbolicLink() || !stat.isFile()) {
+      throw new Error(`Agent instructions sidecar must be a real file: ${sidecar}`);
+    }
+    // Legacy sidecars wrapped organization prose in a nested managed marker.
+    // The aggregate reconciler owns the outer framework block, so retain the
+    // prose while removing only that known legacy fence.
+    const instructions = readFileSync(sidecar, 'utf8')
+      .replace(/<!-- BEGIN id-agents org -->/g, '')
+      .replace(/<!-- END id-agents org -->/g, '')
+      .trim();
+    if (
+      instructions.includes(INSTRUCTIONS_SIDECAR_BLOCK_BEGIN)
+      || instructions.includes(INSTRUCTIONS_SIDECAR_BLOCK_END)
+    ) {
+      throw new Error(`Agent instructions sidecar contains a reserved framework delimiter: ${sidecar}`);
+    }
+    return instructions;
+  }
+
+  private removeManagedInstructionsSidecarBlocks(body: string): string {
+    let output = body;
+    while (true) {
+      const begin = output.indexOf(INSTRUCTIONS_SIDECAR_BLOCK_BEGIN);
+      const end = output.indexOf(INSTRUCTIONS_SIDECAR_BLOCK_END);
+      if (begin < 0 && end < 0) return output.trim();
+      if (begin < 0 || end < begin) {
+        throw new Error('Agent personality contains a malformed instructions sidecar block');
+      }
+      output = `${output.slice(0, begin)}${output.slice(
+        end + INSTRUCTIONS_SIDECAR_BLOCK_END.length,
+      )}`;
+    }
   }
 
   private async handleRuntimeRateLimitFailover(
@@ -6281,7 +7471,15 @@ Return this JSON shape:
     }
 
     const targetUrl = `http://localhost:${agent.port}`;
-    const result = await this.forwardToAgent(targetUrl, query.prompt, 'manager', query.session_id ?? undefined);
+    const result = await this.forwardToAgent(
+      targetUrl,
+      query.prompt,
+      'manager',
+      query.session_id ?? undefined,
+      undefined,
+      agent,
+      teamName,
+    );
     if (!result.ok) {
       return { attempted: true, success: false, pid: spawnResult.pid, laneId: nextLane.id, error: result.error };
     }
@@ -6374,7 +7572,15 @@ Return this JSON shape:
     if (!query?.prompt) {
       return { attempted: true, success: true, pid: spawnResult.pid, laneId: fallbackLaneId, error: 'original query not found for model-capacity replay' };
     }
-    const result = await this.forwardToAgent(`http://localhost:${agent.port}`, query.prompt, 'manager', query.session_id ?? undefined);
+    const result = await this.forwardToAgent(
+      `http://localhost:${agent.port}`,
+      query.prompt,
+      'manager',
+      query.session_id ?? undefined,
+      undefined,
+      agent,
+      teamName,
+    );
     if (!result.ok) {
       return { attempted: true, success: false, pid: spawnResult.pid, laneId: fallbackLaneId, error: result.error };
     }
@@ -6485,7 +7691,10 @@ Return this JSON shape:
   ): RuntimeSubscriptionFallback | null {
     for (const runtime of this.subscriptionFallbackRuntimeOrder(agent, currentRuntime)) {
       const lane = this.chooseRuntimeCredentialLane(runtime, undefined, teamId);
-      if (lane.kind !== 'subscription' || this.isRuntimeLaneCooling(lane.id)) continue;
+      if (
+        lane.kind !== 'subscription'
+        || this.isRuntimeLaneCooling(teamId, runtime, lane.id)
+      ) continue;
       const model = this.subscriptionFallbackModel(agent, runtime);
       if (!this.isSubscriptionRuntimeActive(runtime, model)) continue;
       return { runtime, model, laneId: lane.id };
@@ -6557,7 +7766,15 @@ Return this JSON shape:
     if (!query?.prompt) {
       return { attempted: true, success: true, pid: spawnResult.pid, laneId: fallback.laneId, error: 'original query not found for subscription-runtime replay' };
     }
-    const result = await this.forwardToAgent(`http://localhost:${agent.port}`, query.prompt, 'manager', query.session_id ?? undefined);
+    const result = await this.forwardToAgent(
+      `http://localhost:${agent.port}`,
+      query.prompt,
+      'manager',
+      query.session_id ?? undefined,
+      undefined,
+      agent,
+      teamName,
+    );
     if (!result.ok) {
       return { attempted: true, success: false, pid: spawnResult.pid, laneId: fallback.laneId, error: result.error };
     }
@@ -6784,7 +8001,15 @@ Return this JSON shape:
     }
 
     const targetUrl = `http://localhost:${agent.port}`;
-    const result = await this.forwardToAgent(targetUrl, query.prompt, 'manager', query.session_id ?? undefined);
+    const result = await this.forwardToAgent(
+      targetUrl,
+      query.prompt,
+      'manager',
+      query.session_id ?? undefined,
+      undefined,
+      agent,
+      teamName,
+    );
     if (!result.ok) {
       return { attempted: true, success: false, pid: spawnResult.pid, laneId: fallback.laneId, error: result.error };
     }
@@ -6832,10 +8057,25 @@ Return this JSON shape:
     return { attempted: true, success: true, pid: spawnResult.pid, retryQueryId: retryQueryId ? String(retryQueryId) : undefined, laneId: fallback.laneId };
   }
 
-  private isRuntimeLaneCooling(laneId: string | undefined, now: number = Date.now()): boolean {
+  private isRuntimeLaneCooling(
+    teamId: string,
+    runtime: HarnessType | string | undefined,
+    laneId: string | undefined,
+    now: number = Date.now(),
+  ): boolean {
     if (!laneId) return false;
-    const cooldown = this.runtimeLaneCooldowns.get(laneId);
+    const cooldown = this.runtimeLaneCooldowns.get(
+      this.runtimeLaneCooldownKey(teamId, runtime, laneId),
+    );
     return Boolean(cooldown && cooldown.coolingUntilMs > now);
+  }
+
+  private runtimeLaneCooldownKey(
+    teamId: string,
+    runtime: HarnessType | string | undefined,
+    laneId: string,
+  ): string {
+    return runtimeLaneCooldownKey(teamId, runtime, laneId);
   }
 
   private async sweepRuntimeRateLimitFallbackRestores(force: boolean = false): Promise<void> {
@@ -6878,7 +8118,7 @@ Return this JSON shape:
   ): Promise<boolean> {
     const recordedFromLaneId = typeof failover.fromLaneId === 'string' ? failover.fromLaneId : undefined;
     const fromLaneId = this.preferredRuntimeLaneForRestore(agent.runtime, teamId, recordedFromLaneId);
-    if (this.isRuntimeLaneCooling(fromLaneId, now)) return false;
+    if (this.isRuntimeLaneCooling(teamId, agent.runtime, fromLaneId, now)) return false;
 
     const currentLaneId = typeof metadata.runtimeCredentialLane === 'string'
       ? metadata.runtimeCredentialLane
@@ -6972,7 +8212,7 @@ Return this JSON shape:
         await this.db.agents.updateMetadata(agent.id, cleanMetadata).catch(() => {});
         return false;
       }
-      if (this.isRuntimeLaneCooling(fromLaneId, now)) return false;
+      if (this.isRuntimeLaneCooling(teamId, agent.runtime, fromLaneId, now)) return false;
 
       const nextMetadata: Record<string, unknown> = {
         ...metadata,
@@ -7051,7 +8291,7 @@ Return this JSON shape:
       typeof failover.fromLaneId === 'string' ? failover.fromLaneId : undefined,
     );
     if (!fromRuntime || !fromModel) return false;
-    if (this.isRuntimeLaneCooling(fromLaneId, now)) return false;
+    if (this.isRuntimeLaneCooling(teamId, fromRuntime, fromLaneId, now)) return false;
 
     const nextMetadata: Record<string, unknown> = {
       ...metadata,
@@ -7374,14 +8614,13 @@ Return this JSON shape:
     //   id-cli set-agent-endpoints <domain> --a2a <url>
     // Skipped by default for private/local systems.
 
-    // Use the label as tokenId for backward compat; domain is the primary identifier
-    const tokenId = result.label;
-
     // Update metadata – preserve the original local alias so the agent
     // can still be found by its pre-registration name after `name` is
     // changed to the full ENS domain.
     let metadata = (agent.metadata || {}) as AgentMetadata;
-    const newName = result.domain; // Already includes sublabel (e.g., x.agent-8.xid.eth)
+    const registeredIdentity = ensIdentityForDomain(result.domain);
+    const newName = registeredIdentity.domain;
+    const tokenId = registeredIdentity.tokenId;
     metadata = {
       ...metadata,
       idchain_domain: newName,
@@ -7451,7 +8690,12 @@ Return this JSON shape:
           const agentUrl = isLocalAgent
             ? (agent.endpoint || `http://localhost:${agent.port}`)
             : `http://id-agent-${agent.id}:4100`;
-          const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+          const teamRow = await this.db.teams.getTeam(teamId).catch(() => null);
+          const headers = await this.managerTargetWorkerHeaders(
+            { ...agent, metadata },
+            teamRow?.name || 'default',
+            { 'Content-Type': 'application/json' },
+          );
           const identityRes = await fetch(`${agentUrl}/identity`, {
             method: 'PATCH',
             headers,
@@ -7622,17 +8866,66 @@ Return this JSON shape:
     if (entry.agent && this.localGateByAgent.get(entry.agent) === queryId) this.localGateByAgent.delete(entry.agent);
   }
 
+  /**
+   * Authenticate Manager-to-worker traffic with the target's exact
+   * generation-bound credential. Remote/virtual rows and standalone mode keep
+   * their historical headers; a managed local row without a current
+   * generation fails closed instead of being contacted anonymously.
+   */
+  private async managerTargetWorkerHeaders(
+    agent: AgentRow,
+    teamName: string,
+    headers: Record<string, string> = {},
+  ): Promise<Record<string, string>> {
+    if (!this.idaccAdminToken) return { ...headers };
+
+    const current = await this.dbQueryAgentById(agent.team_id, agent.id)
+      .catch(() => null);
+    const target = current || agent;
+    const metadata = (
+      target.metadata
+      && typeof target.metadata === 'object'
+      && !Array.isArray(target.metadata)
+    ) ? target.metadata as Record<string, unknown> : {};
+    const managedLocal = (
+      metadata.local === true
+      || metadata[MANAGER_OWNED_LAUNCH_INTENT_KEY] === true
+    );
+    if (!managedLocal) return { ...headers };
+
+    const processGeneration = typeof metadata[MANAGER_PROCESS_GENERATION_KEY] === 'string'
+      ? metadata[MANAGER_PROCESS_GENERATION_KEY].trim()
+      : '';
+    if (!processGeneration) {
+      throw new Error(`managed worker credential unavailable for ${target.id}`);
+    }
+    return {
+      ...headers,
+      'X-Id-Service': 'manager',
+      'X-Id-Agent': target.id,
+      'X-Id-Team': teamName,
+      Authorization: `Bearer ${deriveManagerAgentToken(
+        this.idaccAdminToken,
+        target.team_id,
+        target.id,
+        processGeneration,
+      )}`,
+    };
+  }
+
   private async forwardToAgent(
     targetUrl: string,
     message: string,
     from: string,
     session_id?: string,
     retryOptions?: ForwardToAgentRetryOptions,
+    targetAgent?: AgentRow,
+    targetTeamName?: string,
   ): Promise<{
     ok: true;
     data: any;
   } | { ok: false; status: number; error: string }> {
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    const baseHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
     const attempts = Math.max(1, Math.floor(retryOptions?.attempts ?? 1));
     const initialDelayMs = Math.max(0, Math.floor(retryOptions?.initialDelayMs ?? 0));
     const label = retryOptions?.label || targetUrl;
@@ -7642,6 +8935,13 @@ Return this JSON shape:
 
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       try {
+        const headers = targetAgent && targetTeamName
+          ? await this.managerTargetWorkerHeaders(
+              targetAgent,
+              targetTeamName,
+              baseHeaders,
+            )
+          : baseHeaders;
         const talkRes = await fetch(`${targetUrl}/talk`, {
           method: 'POST',
           headers,
@@ -7752,20 +9052,27 @@ Return this JSON shape:
     const body = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
     const lane = runtime.startsWith('provider:') ? runtime : String(body.lane || body.id || '').trim();
     if (!isProviderRuntimeSpecifier(lane)) throw new Error('provider runtime lane must be provider:<name>');
-    const decoded = decodeURIComponent(lane.slice('provider:'.length));
+    let decoded = '';
+    try {
+      decoded = decodeURIComponent(lane.slice('provider:'.length));
+    } catch {
+      throw new Error('provider runtime lane must contain a valid encoded name');
+    }
     const name = String(body.name || decoded || 'provider').trim();
-    const baseUrl = String(body.baseUrl || '').trim().replace(/\/+$/, '');
-    if (!baseUrl) throw new Error('provider runtime lane requires baseUrl');
-    const keyEnv = typeof body.keyEnv === 'string' && body.keyEnv.trim() ? body.keyEnv.trim() : undefined;
-    const apiKey = typeof body.apiKey === 'string' && body.apiKey.trim() ? body.apiKey.trim() : undefined;
-    return {
+    const inlineApiKey = typeof body.apiKey === 'string' && body.apiKey
+      ? body.apiKey
+      : undefined;
+    return normalizeProviderRuntimePolicy({
       lane,
       name,
       kind: typeof body.kind === 'string' ? body.kind : undefined,
-      baseUrl,
-      keyEnv,
-      apiKey,
-    };
+      baseUrl: String(body.baseUrl || ''),
+      // A privileged inline handoff is process-local and authoritative. Do
+      // not retain or even consult a caller-supplied environment fallback in
+      // that case (the desktop's encrypted settings vault uses this path).
+      keyEnv: inlineApiKey ? undefined : body.keyEnv as string | undefined,
+      apiKey: inlineApiKey,
+    }, { allowInlineApiKey: true });
   }
 
   private providerRuntimeMetadata(a: ProviderRuntimeAssignment): Record<string, unknown> {
@@ -7786,32 +9093,159 @@ Return this JSON shape:
     const remembered = this.providerRuntimeAssignments.get(agent.id);
     const safe = (metadata as any)?.providerRuntime;
     if (remembered) {
-      return { ...remembered, ...(safe && typeof safe === 'object' ? safe : {}) };
+      // The process-local assignment was validated at the privileged route.
+      // Never merge durable metadata back over it: old or manually modified
+      // rows must not replace the reviewed destination or credential source.
+      return { ...remembered };
     }
     if (!safe || typeof safe !== 'object') return null;
     const lane = typeof safe.lane === 'string' ? safe.lane : typeof (metadata as any)?.runtime === 'string' ? (metadata as any).runtime : '';
-    const name = typeof safe.name === 'string' ? safe.name : lane.startsWith('provider:') ? decodeURIComponent(lane.slice('provider:'.length)) : 'provider';
+    let decodedLaneName = 'provider';
+    if (lane.startsWith('provider:')) {
+      try {
+        decodedLaneName = decodeURIComponent(lane.slice('provider:'.length)) || 'provider';
+      } catch {
+        return null;
+      }
+    }
+    const name = typeof safe.name === 'string' ? safe.name : decodedLaneName;
     const baseUrl = typeof safe.baseUrl === 'string' ? safe.baseUrl : '';
     const keyEnv = typeof safe.keyEnv === 'string' ? safe.keyEnv : undefined;
     if (!lane || !baseUrl) return null;
-    return { lane, name, kind: typeof safe.kind === 'string' ? safe.kind : undefined, baseUrl, keyEnv };
+    try {
+      // Inline credentials are deliberately process-local and never trusted
+      // from persisted metadata. This also quarantines legacy rows that point
+      // at Manager/internal environment variables or unsafe destinations.
+      return normalizeProviderRuntimePolicy({
+        lane,
+        name,
+        kind: typeof safe.kind === 'string' ? safe.kind : undefined,
+        baseUrl,
+        keyEnv,
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Provider credentials handed over by the desktop are intentionally
+   * process-local. After a Manager restart, a durable providerRuntime record
+   * describes only the lane and destination; it is not authority to launch a
+   * worker. A reviewed static keyEnv may be re-read from this Manager's own
+   * environment, otherwise an authenticated control-plane rebind is required.
+   */
+  private providerRuntimeHasLaunchBinding(agent: AgentRow | null, metadata: AgentMetadata): boolean {
+    if (!agent) return false;
+    const runtime = agent.runtime || (metadata as any)?.runtime;
+    if (resolveRuntime(runtime as string | undefined) !== 'provider-api') return true;
+
+    const remembered = this.providerRuntimeAssignments.get(agent.id);
+    if (remembered) {
+      if (remembered.apiKey) return true;
+      if (remembered.keyEnv) return Boolean(process.env[remembered.keyEnv]);
+      // An authenticated, process-local assignment with no credential is an
+      // explicit no-auth provider binding (for example a loopback service).
+      return true;
+    }
+
+    const persisted = this.providerRuntimeForAgent(agent, metadata);
+    return Boolean(
+      persisted?.keyEnv
+      && process.env[persisted.keyEnv],
+    );
+  }
+
+  private providerRuntimeHasDurableEnvironmentBinding(agent: AgentRow, metadata: AgentMetadata): boolean {
+    const runtime = agent.runtime || metadata.runtime;
+    if (resolveRuntime(runtime) !== 'provider-api') return true;
+    const persisted = metadata.providerRuntime;
+    if (!persisted || typeof persisted !== 'object') return false;
+    const keyEnv = typeof (persisted as Record<string, unknown>).keyEnv === 'string'
+      ? (persisted as Record<string, unknown>).keyEnv as string
+      : undefined;
+    if (!keyEnv) return false;
+    try {
+      const safe = normalizeProviderRuntimePolicy({
+        lane: typeof (persisted as Record<string, unknown>).lane === 'string'
+          ? (persisted as Record<string, unknown>).lane as string
+          : typeof metadata.runtime === 'string'
+            ? metadata.runtime
+            : '',
+        name: typeof (persisted as Record<string, unknown>).name === 'string'
+          ? (persisted as Record<string, unknown>).name as string
+          : 'provider',
+        kind: typeof (persisted as Record<string, unknown>).kind === 'string'
+          ? (persisted as Record<string, unknown>).kind as string
+          : undefined,
+        baseUrl: typeof (persisted as Record<string, unknown>).baseUrl === 'string'
+          ? (persisted as Record<string, unknown>).baseUrl as string
+          : '',
+        keyEnv,
+      });
+      return Boolean(safe.keyEnv && process.env[safe.keyEnv]);
+    } catch {
+      return false;
+    }
+  }
+
+  private providerRuntimeRebindRequiredError(): string {
+    return 'Provider runtime access is paused until the authenticated IDACC control plane rebinds this agent after Manager restart';
   }
 
   private parseRuntimeCredentialPool(raw: unknown, runtime: HarnessType | string | undefined): RuntimeCredentialLane[] {
     const resolved = resolveRuntime(runtime) as HarnessType;
     const lanesRaw = Array.isArray(raw) ? raw : (raw as any)?.lanes || (raw as any)?.runtimeCredentialPool?.lanes;
     if (!Array.isArray(lanesRaw)) return [];
+    const namespaceOwners = new Map<string, number>();
+    for (const [index, lane] of lanesRaw.entries()) {
+      if (
+        !lane
+        || typeof lane !== 'object'
+        || typeof lane.id !== 'string'
+        || !lane.id.trim()
+        || (lane.kind !== 'subscription' && lane.kind !== 'metered-api')
+      ) continue;
+      const laneRuntime = resolveRuntime(lane.runtime || resolved) as HarnessType;
+      const namespace = this.runtimeLaneCooldownKey('', laneRuntime, lane.id);
+      const prior = namespaceOwners.get(namespace);
+      if (prior !== undefined) {
+        throw new Error(
+          `duplicate runtime credential lane id "${lane.id}" for canonical runtime `
+          + `"${getRuntimeProfile(laneRuntime).canonicalId}" at lanes[${prior}] and lanes[${index}]`,
+        );
+      }
+      namespaceOwners.set(namespace, index);
+    }
+
     return lanesRaw
       .map((lane: any): RuntimeCredentialLane | null => {
         const laneRuntime = resolveRuntime(lane?.runtime || resolved) as HarnessType;
         if (laneRuntime !== resolved) return null;
         if (lane?.kind !== 'subscription' && lane?.kind !== 'metered-api') return null;
         if (typeof lane?.id !== 'string' || !lane.id.trim()) return null;
+        const safeEnv: Record<string, string> | undefined = lane.env
+          && typeof lane.env === 'object'
+          && !Array.isArray(lane.env)
+          ? Object.entries(lane.env).reduce<Record<string, string>>(
+              (result, [key, value]) => {
+                if (
+                  AGENT_ENV_KEY_PATTERN.test(key)
+                  && typeof value === 'string'
+                  && !runtimeLaneEnvIsReserved(key, laneRuntime, lane.kind)
+                ) {
+                  result[key] = value;
+                }
+                return result;
+              },
+              {},
+            )
+          : undefined;
         return {
           id: lane.id,
           runtime: laneRuntime,
           kind: lane.kind,
-          env: lane.env && typeof lane.env === 'object' ? lane.env : undefined,
+          env: safeEnv && Object.keys(safeEnv).length > 0 ? safeEnv : undefined,
         };
       })
       .filter((lane): lane is RuntimeCredentialLane => Boolean(lane));
@@ -7843,7 +9277,9 @@ Return this JSON shape:
     const now = Date.now();
     const healthy = lanes.filter((lane) => {
       if (excludeCurrentLane && currentLaneId && lane.id === currentLaneId) return false;
-      const cooldown = this.runtimeLaneCooldowns.get(lane.id);
+      const cooldown = teamId
+        ? this.runtimeLaneCooldowns.get(this.runtimeLaneCooldownKey(teamId, resolved, lane.id))
+        : undefined;
       return !cooldown || cooldown.coolingUntilMs <= now;
     });
     const current = currentLaneId && !excludeCurrentLane ? healthy.find((lane) => lane.id === currentLaneId) : undefined;
@@ -7866,6 +9302,69 @@ Return this JSON shape:
       return Math.max(60_000, Number(process.env.ID_RATE_LIMIT_UNKNOWN_COOLDOWN_MS || 5 * 60_000) || 5 * 60_000);
     }
     return Math.max(5 * 60_000, Number(process.env.ID_RATE_LIMIT_CAP_COOLDOWN_MS || 5 * 60 * 60_000) || 5 * 60 * 60_000);
+  }
+
+  private normalizeManagedRuntimeRateLimit(rateLimit: unknown): Record<string, unknown> {
+    if (!rateLimit || typeof rateLimit !== 'object' || Array.isArray(rateLimit)) {
+      return {};
+    }
+    const input = rateLimit as Record<string, unknown>;
+    const now = Date.now();
+    const maxUntil = now + MANAGED_RATE_LIMIT_MAX_COOLDOWN_MS;
+    const boundedText = (value: unknown, limit: number): string | undefined => {
+      if (typeof value !== 'string') return undefined;
+      const text = value
+        .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
+        .trim()
+        .slice(0, limit);
+      return text || undefined;
+    };
+    const reason = (
+      typeof input.reason === 'string'
+      && MANAGED_RATE_LIMIT_REASONS.has(input.reason)
+    ) ? input.reason : 'unknown_rate_limit';
+    const source = (
+      typeof input.source === 'string'
+      && MANAGED_RATE_LIMIT_SOURCES.has(input.source)
+    ) ? input.source : 'text-fallback';
+    const status = typeof input.status === 'number'
+      && Number.isInteger(input.status)
+      && input.status >= 100
+      && input.status <= 599
+      ? input.status
+      : undefined;
+    const retryAfterSeconds = typeof input.retryAfterSeconds === 'number'
+      && Number.isFinite(input.retryAfterSeconds)
+      ? Math.min(
+          MANAGED_RATE_LIMIT_MAX_COOLDOWN_MS / 1000,
+          Math.max(1, input.retryAfterSeconds),
+        )
+      : undefined;
+    let resetAt: string | undefined;
+    if (retryAfterSeconds === undefined && typeof input.resetAt === 'string') {
+      const parsed = Date.parse(input.resetAt);
+      if (Number.isFinite(parsed)) {
+        resetAt = new Date(Math.min(maxUntil, Math.max(now + 1_000, parsed))).toISOString();
+      }
+    }
+    const resetText = boundedText(
+      input.resetText,
+      MANAGED_RATE_LIMIT_MAX_RESET_TEXT_CHARS,
+    );
+    const message = boundedText(
+      input.message,
+      MANAGED_RATE_LIMIT_MAX_MESSAGE_CHARS,
+    );
+    return {
+      isRateLimit: input.isRateLimit === true,
+      source,
+      reason,
+      ...(status !== undefined && { status }),
+      ...(retryAfterSeconds !== undefined && { retryAfterSeconds }),
+      ...(resetAt && { resetAt }),
+      ...(resetText && { resetText }),
+      ...(message && { message }),
+    };
   }
 
   private parseCooldownUntilMs(rateLimit: any): number {
@@ -7905,15 +9404,20 @@ Return this JSON shape:
       resetText: typeof input.rateLimit?.resetText === 'string' ? input.rateLimit.resetText : undefined,
       message: typeof input.rateLimit?.message === 'string' ? input.rateLimit.message : undefined,
     };
-    this.runtimeLaneCooldowns.set(laneId, cooldown);
+    const runtimeNamespace = getRuntimeProfile(runtime).canonicalId;
+    this.runtimeLaneCooldowns.set(
+      this.runtimeLaneCooldownKey(teamId, runtimeNamespace, laneId),
+      cooldown,
+    );
     await this.db.runtimeLaneCooldowns.upsert({
       lane_id: cooldown.laneId,
       runtime: cooldown.runtime,
+      runtime_namespace: runtimeNamespace,
       kind: cooldown.kind,
       cooling_until_ms: cooldown.coolingUntilMs,
       observed_at_ms: cooldown.observedAtMs,
       reason: cooldown.reason,
-      team_id: cooldown.teamId || null,
+      team_id: cooldown.teamId || teamId,
       agent_id: cooldown.agentId || null,
       agent_name: cooldown.agentName || null,
       query_id: cooldown.queryId || null,
@@ -7958,6 +9462,12 @@ Return this JSON shape:
     this.runtimeLaneCooldowns.clear();
     const activeCooldowns = await cooldownRepo.listActive(now);
     for (const row of activeCooldowns) {
+      if (!row.team_id) {
+        this.managerLog(
+          `Ignoring unowned legacy runtime credential-lane cooldown for ${row.runtime}/${row.lane_id}`,
+        );
+        continue;
+      }
       const reason = row.reason || 'unknown_rate_limit';
       const observedAtMs = Number(row.observed_at_ms);
       const persistedUntilMs = Number(row.cooling_until_ms);
@@ -7967,12 +9477,17 @@ Return this JSON shape:
         ? Math.min(persistedUntilMs, observedAtMs + this.defaultRuntimeRateLimitCooldownMs(reason))
         : persistedUntilMs;
       if (coolingUntilMs !== persistedUntilMs) {
-        await cooldownRepo.upsert({ ...row, cooling_until_ms: coolingUntilMs });
+        await cooldownRepo.upsert({
+          ...row,
+          runtime_namespace: getRuntimeProfile(row.runtime_namespace || row.runtime).canonicalId,
+          cooling_until_ms: coolingUntilMs,
+        });
       }
       if (coolingUntilMs <= now) continue;
-      this.runtimeLaneCooldowns.set(row.lane_id, {
+      const runtime = resolveRuntime(row.runtime) as HarnessType;
+      this.runtimeLaneCooldowns.set(this.runtimeLaneCooldownKey(row.team_id, runtime, row.lane_id), {
         laneId: row.lane_id,
-        runtime: resolveRuntime(row.runtime) as HarnessType,
+        runtime,
         kind: row.kind === 'metered-api' ? 'metered-api' : 'subscription',
         coolingUntilMs,
         observedAtMs,
@@ -8708,6 +10223,237 @@ Return this JSON shape:
     return rows.find((row) => this.learnRoutingDedupKey(row.prompt || '', params.agentId) === params.dedupKey) || null;
   }
 
+  private async handleManagedAgentNewsTo(
+    req: express.Request,
+    res: express.Response,
+  ): Promise<express.Response> {
+    const ctx = (req as any).ctx as {
+      principal?: string;
+      teamId?: string;
+      teamName?: string;
+      agentId?: string;
+    } | undefined;
+    if (
+      ctx?.principal !== 'agent'
+      || !ctx.teamId
+      || !ctx.teamName
+      || !ctx.agentId
+    ) {
+      return res.status(401).json({ error: 'authentication_required' });
+    }
+
+    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body)
+      ? req.body as Record<string, any>
+      : {};
+    const targetRef = body.to || body.agent;
+    const message = body.message;
+    const data = body.data;
+    const task = body.task;
+    const receiptHeader = req.headers[MANAGER_TASK_RECEIPT_HEADER.toLowerCase()];
+    const receipt = Array.isArray(receiptHeader) ? receiptHeader[0] : receiptHeader;
+    if (
+      typeof targetRef !== 'string'
+      || !targetRef.trim()
+      || (!message && data === undefined)
+    ) {
+      return res.status(400).json({ error: 'Missing "to" or "message"/"data"' });
+    }
+    if (
+      task !== undefined
+      && (!task || typeof task !== 'object' || Array.isArray(task))
+    ) {
+      return res.status(400).json({ error: 'Invalid "task" delegation object' });
+    }
+    if (
+      receipt !== undefined
+      && (
+        typeof receipt !== 'string'
+        || receipt.length < 1
+        || Buffer.byteLength(receipt, 'utf8') > 4096
+        || task === undefined
+      )
+    ) {
+      return res.status(400).json({ error: 'invalid_task_receipt' });
+    }
+
+    const from = typeof body.from === 'string' && body.from.trim()
+      ? body.from.trim()
+      : ctx.agentId;
+    if (targetRef.trim().toLowerCase() === 'manager') {
+      if (task !== undefined || receipt !== undefined) {
+        return res.status(400).json({
+          error: 'Task delegation requires a same-team agent target',
+        });
+      }
+      const managerInbox = this.getManagerInboxRef(ctx.teamId, ctx.teamName);
+      const timestamp = Date.now();
+      await this.db.news.add(ctx.teamId, null, {
+        timestamp,
+        type: 'message',
+        message: typeof message === 'string' ? message : 'Notification received',
+        data: {
+          ...(data && typeof data === 'object' && !Array.isArray(data) ? data : {}),
+          from,
+          message,
+        },
+        kind: 'notify',
+        reply_expected: false,
+        owner_kind: managerInbox.ownerKind,
+        owner_id: managerInbox.ownerId,
+      });
+      return res.status(202).json({
+        success: true,
+        delivered_to: 'manager',
+        status: 'delivered',
+      });
+    }
+
+    const resolved = await this.resolveTargetAgent(ctx.teamId, targetRef);
+    if ('error' in resolved) {
+      return res.status(resolved.status).json({ error: resolved.error });
+    }
+    const { targetAgent, targetUrl, targetDisplayId } = resolved;
+    if ((targetAgent.metadata as any)?.mesh_member === false) {
+      return res.status(403).json({
+        error: 'not_mesh_reachable',
+        message: 'Target agent is not part of the inter-agent mesh.',
+      });
+    }
+
+    try {
+      let deliveryTarget = targetAgent;
+      let deliveryUrl = targetUrl;
+      let deliveryTask = task as Record<string, unknown> | undefined;
+      let headers: Record<string, string>;
+      if (receipt !== undefined) {
+        const taskName = typeof task?.name === 'string' ? task.name.trim() : '';
+        const canonicalTask = taskName
+          ? await this.db.tasks.getByNameForTeam(taskName, ctx.teamId).catch(() => null)
+          : null;
+        const acceptedUuid = typeof task?.uuid === 'string' ? task.uuid : '';
+        const acceptedAssignmentId = typeof task?.assignmentId === 'string'
+          ? task.assignmentId
+          : typeof task?.assignment_id === 'string'
+            ? task.assignment_id
+            : '';
+        if (
+          !canonicalTask
+          || canonicalTask.team_id !== ctx.teamId
+          || canonicalTask.owner !== targetAgent.id
+          || canonicalTask.created_by !== ctx.agentId
+          || canonicalTask.status !== 'doing'
+          || !canonicalTask.assignment_id
+          || canonicalTask.uuid !== acceptedUuid
+          || canonicalTask.assignment_id !== acceptedAssignmentId
+        ) {
+          return res.status(409).json({
+            error: 'delegated_task_authority_stale',
+          });
+        }
+
+        // Re-read once at relay time and derive both transport authentication
+        // and the task receipt from this exact generation. A worker restart
+        // between POST /tasks and POST /news-to therefore remints safely.
+        const currentTarget = await this.dbQueryAgentById(
+          ctx.teamId,
+          targetAgent.id,
+        ).catch(() => null);
+        const currentMetadata = (
+          currentTarget?.metadata
+          && typeof currentTarget.metadata === 'object'
+          && !Array.isArray(currentTarget.metadata)
+        ) ? currentTarget.metadata as Record<string, unknown> : {};
+        const processGeneration = typeof currentMetadata[MANAGER_PROCESS_GENERATION_KEY] === 'string'
+          ? currentMetadata[MANAGER_PROCESS_GENERATION_KEY].trim()
+          : '';
+        if (
+          !currentTarget
+          || !processGeneration
+          || !(await this.hasCurrentManagedWorkerAssignment(
+            currentTarget,
+            processGeneration,
+          ))
+        ) {
+          return res.status(409).json({
+            error: 'task_receipt_target_not_managed',
+          });
+        }
+        const targetWorkerBearer = deriveManagerAgentToken(
+          this.idaccAdminToken,
+          ctx.teamId,
+          currentTarget.id,
+          processGeneration,
+        );
+        headers = {
+          'Content-Type': 'application/json',
+          'X-Id-Service': 'manager',
+          'X-Id-Agent': currentTarget.id,
+          'X-Id-Team': ctx.teamName,
+          Authorization: `Bearer ${targetWorkerBearer}`,
+          [MANAGER_TASK_RECEIPT_HEADER]: issueManagerTaskReceipt(
+            targetWorkerBearer,
+            {
+              team_id: ctx.teamId,
+              owner_agent_id: currentTarget.id,
+              task_name: canonicalTask.name,
+              task_uuid: canonicalTask.uuid,
+              assignment_id: canonicalTask.assignment_id,
+            },
+          ),
+        };
+        deliveryTarget = currentTarget;
+        deliveryUrl = currentTarget.endpoint || `http://localhost:${currentTarget.port}`;
+        deliveryTask = await this.buildTaskResult(canonicalTask, ctx.teamId);
+      } else {
+        headers = await this.managerTargetWorkerHeaders(
+          deliveryTarget,
+          ctx.teamName,
+          { 'Content-Type': 'application/json' },
+        );
+      }
+
+      const payload: Record<string, unknown> = {
+        type: 'notify',
+        from,
+        message: message ?? undefined,
+        data: deliveryTask
+          ? {
+              ...(data && typeof data === 'object' && !Array.isArray(data)
+                ? data
+                : data !== undefined
+                  ? { payload: data }
+                  : {}),
+              task: deliveryTask,
+            }
+          : data ?? undefined,
+        ...(deliveryTask ? { task: deliveryTask } : {}),
+        reply_expected: false,
+        ...(body.trigger === true ? { trigger: true } : {}),
+      };
+      const targetRes = await fetch(`${deliveryUrl}/news`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(TALK_TO_DELIVERY_TIMEOUT_MS),
+      });
+      const responseText = await targetRes.text();
+      res.status(targetRes.status);
+      if ((targetRes.headers.get('content-type') || '').includes('json')) {
+        try {
+          return res.json(JSON.parse(responseText));
+        } catch {
+          // Return bounded text below.
+        }
+      }
+      return res.send(responseText.slice(0, 16 * 1024));
+    } catch (error: any) {
+      this.managerLog(
+        `/news-to delivery to ${targetDisplayId} failed: ${error?.message || error}`,
+      );
+      return res.status(502).json({ error: 'news_delivery_failed' });
+    }
+  }
+
   private async handleMessage(req: express.Request, res: express.Response) {
     try {
       const { id: teamId, name: teamName } = await this.getTeam(req);
@@ -8896,7 +10642,15 @@ Return this JSON shape:
             label: targetDisplayId,
           }
         : undefined;
-      const result = await this.forwardToAgent(targetUrl, outgoingMessage, from || 'manager', session_id, deliveryRetry);
+      const result = await this.forwardToAgent(
+        targetUrl,
+        outgoingMessage,
+        from || 'manager',
+        session_id,
+        deliveryRetry,
+        targetAgent,
+        teamName,
+      );
       if (!result.ok) {
         this.bindLocalGate(lmgToken); // dispatch failed → release the slot now
         console.error(`[Manager] Failed to deliver message to ${targetDisplayId}: ${result.status}`);
@@ -9331,13 +11085,72 @@ Return this JSON shape:
   }
 
   /**
+   * A generation-bound bearer is necessary but not sufficient: its durable
+   * process assignment must still be current and live. The in-memory child
+   * registry is the fast path for this Manager's own children. An attested
+   * persisted PID is the restart-recovery path for a surviving adopted child.
+   */
+  private async hasCurrentManagedWorkerAssignment(
+    agent: AgentRow,
+    processGeneration: string,
+    opts: { allowOfflineStatus?: boolean } = {},
+  ): Promise<boolean> {
+    if (
+      agent.status !== 'running'
+      && agent.status !== 'starting'
+      && !(opts.allowOfflineStatus === true && agent.status === 'offline')
+    ) {
+      return false;
+    }
+    const metadata = (
+      agent.metadata
+      && typeof agent.metadata === 'object'
+      && !Array.isArray(agent.metadata)
+    ) ? agent.metadata as Record<string, unknown> : {};
+    if (
+      metadata[MANAGER_OWNED_LAUNCH_INTENT_KEY] !== true
+      || typeof metadata[MANAGER_PROCESS_RUNTIME_KEY] !== 'string'
+      || !metadata[MANAGER_PROCESS_RUNTIME_KEY].trim()
+      || typeof metadata[MANAGER_PROCESS_RUNTIME_LANE_KEY] !== 'string'
+      || !metadata[MANAGER_PROCESS_RUNTIME_LANE_KEY].trim()
+    ) {
+      return false;
+    }
+
+    for (const owned of this.ownedAgentProcesses.values()) {
+      if (
+        owned.agentId === agent.id
+        && owned.port === agent.port
+        && owned.processGeneration === processGeneration
+        && owned.proc.pid
+        && owned.proc.exitCode == null
+        && owned.proc.signalCode == null
+      ) {
+        return true;
+      }
+    }
+
+    const pid = Number(metadata.pid);
+    const owner = localProcessOwnerValue(metadata.processOwner);
+    if (
+      !Number.isSafeInteger(pid)
+      || pid <= 0
+      || (owner !== 'manager-child' && owner !== 'adopted')
+    ) {
+      return false;
+    }
+    return this.verifyLocalAgentProcessOwnership(pid, agent.port, agent);
+  }
+
+  /**
    * Team/principal context middleware.
    * Resolves once per request and attaches:
    *   (req as any).ctx = { principal, teamName, teamId }
    *
    * principal:
    *   'admin'  — loopback IP + X-Id-Admin: 1 + configured IDACC bearer
-   *   'agent'  — X-Id-Agent: <id> present and the agent belongs to the resolved team
+   *   'brain'  — managed Brain service bearer on its exact read-only allowlist
+   *   'agent'  — managed mode: X-Id-Agent plus its team-bound derived bearer
    *   'anon'   — all other callers
    *
    * teamId resolution:
@@ -9348,10 +11161,88 @@ Return this JSON shape:
     return async (req: express.Request, res: express.Response, next: express.NextFunction) => {
       try {
         const teamName = this.getTeamName(req);
-        const principal = this.isAdminRequest(req) ? 'admin' : 'anon';
+        const isAdmin = this.isAdminRequest(req);
+        const managed = Boolean(this.idaccAdminToken);
+        const agentHeader = req.headers['x-id-agent'];
+        const serviceHeader = req.headers['x-id-service'];
+        let managedPrincipal: 'brain' | 'agent' | null = null;
+        let authenticatedAgent: AgentRow | null = null;
+
+        // Authenticate managed callers before resolving the requested team.
+        // This keeps an anonymous probe from using 404/200 differences as a
+        // team-existence oracle.
+        if (managed && !isAdmin) {
+          if (serviceHeader !== undefined) {
+            const validBrainService = (
+              serviceHeader === MANAGER_BRAIN_SERVICE
+              && managerServiceBearerMatches(
+                req.headers.authorization,
+                this.idaccManagerServiceToken,
+              )
+            );
+            if (!validBrainService) {
+              res.status(401).json({ error: 'authentication_required' });
+              return;
+            }
+            const brainPathAllowed = (
+              (req.method === 'GET' || req.method === 'HEAD')
+              && (
+                req.path === '/teams'
+                || req.path === '/agents'
+                || req.path === '/events'
+              )
+            );
+            if (!brainPathAllowed) {
+              res.status(403).json({ error: 'service_route_forbidden' });
+              return;
+            }
+            managedPrincipal = 'brain';
+          } else {
+            if (typeof agentHeader !== 'string' || !agentHeader) {
+              res.status(401).json({ error: 'authentication_required' });
+              return;
+            }
+            authenticatedAgent = await this.db.agents.getById(agentHeader);
+            const processGeneration = typeof authenticatedAgent?.metadata?.[
+              MANAGER_PROCESS_GENERATION_KEY
+            ] === 'string'
+              ? authenticatedAgent.metadata[MANAGER_PROCESS_GENERATION_KEY].trim()
+              : '';
+            if (
+              !authenticatedAgent
+              || !processGeneration
+              || !managerAgentBearerMatches(
+                req.headers.authorization,
+                this.idaccAdminToken,
+                authenticatedAgent.team_id,
+                authenticatedAgent.id,
+                processGeneration,
+              )
+              || !(await this.hasCurrentManagedWorkerAssignment(
+                authenticatedAgent,
+                processGeneration,
+              ))
+            ) {
+              res.status(401).json({ error: 'authentication_required' });
+              return;
+            }
+            managedPrincipal = 'agent';
+          }
+        }
+
+        // `/teams` is the Brain service's one global inventory route. It does
+        // not consume team context, so a valid service principal must not
+        // depend on an arbitrary/default team already existing. Authentication
+        // above still happens before this branch, preserving the anonymous
+        // no-oracle boundary.
+        if (managed && managedPrincipal === 'brain' && req.path === '/teams') {
+          (req as any).ctx = { principal: 'brain', teamName };
+          next();
+          return;
+        }
 
         let teamId: string;
-        if (principal === 'admin') {
+        if (isAdmin) {
           // Admin principals may create teams on the fly (legacy behaviour)
           teamId = await this.db.teams.getOrCreateTeamId(teamName);
           // Ensure per-team directory exists
@@ -9370,10 +11261,53 @@ Return this JSON shape:
           if (!existsSync(teamDir)) mkdirSync(teamDir, { recursive: true });
         }
 
-        // Check agent principal claim
-        let resolvedPrincipal: 'admin' | 'agent' | 'anon' = principal === 'admin' ? 'admin' : 'anon';
-        const agentHeader = req.headers['x-id-agent'];
-        if (agentHeader && typeof agentHeader === 'string' && resolvedPrincipal !== 'admin') {
+        if (isAdmin) {
+          (req as any).ctx = { principal: 'admin', teamName, teamId };
+          next();
+          return;
+        }
+
+        if (managed) {
+          if (managedPrincipal === 'brain') {
+            (req as any).ctx = { principal: 'brain', teamName, teamId };
+            next();
+            return;
+          }
+
+          if (managedPrincipal !== 'agent' || !authenticatedAgent) {
+            res.status(401).json({ error: 'authentication_required' });
+            return;
+          }
+          if (authenticatedAgent.team_id !== teamId) {
+            res.status(403).json({ error: 'agent_team_mismatch' });
+            return;
+          }
+          const metadata = (authenticatedAgent.metadata || {}) as Record<string, unknown>;
+          const refs = [
+            authenticatedAgent.id,
+            authenticatedAgent.name,
+            authenticatedAgent.domain,
+            metadata.alias,
+            metadata.name,
+            metadata.idchain_domain,
+          ].filter((value): value is string => (
+            typeof value === 'string' && value.trim().length > 0
+          ));
+          (req as any).ctx = {
+            principal: 'agent',
+            teamName,
+            teamId,
+            agentId: authenticatedAgent.id,
+            agentRefs: [...new Set(refs)],
+          };
+          next();
+          return;
+        }
+
+        // Standalone compatibility: retain the historical header-only agent
+        // claim exactly when the desktop supervisor token is absent.
+        let resolvedPrincipal: 'agent' | 'anon' = 'anon';
+        if (agentHeader && typeof agentHeader === 'string') {
           const agentRow = await this.db.agents.getById(agentHeader);
           if (agentRow && agentRow.team_id === teamId) {
             resolvedPrincipal = 'agent';
@@ -9391,6 +11325,259 @@ Return this JSON shape:
         // Invalid team name or other error
         res.status(400).json({ error: err?.message || 'Invalid request context' });
       }
+    };
+  }
+
+  /**
+   * Managed workers are application principals, not local administrators.
+   * Admit only the callbacks and same-team coordination operations shipped by
+   * the worker runtime, and bind every caller-controlled identity to the
+   * authenticated immutable agent id before a route handler can run.
+   */
+  private managedPrincipalRouteMiddleware(): express.RequestHandler {
+    return async (req: express.Request, res: express.Response, next: express.NextFunction) => {
+      if (!this.idaccAdminToken) {
+        next();
+        return;
+      }
+      const ctx = (req as any).ctx as {
+        principal?: 'admin' | 'brain' | 'agent';
+        teamName?: string;
+        teamId?: string;
+        agentId?: string;
+        agentRefs?: string[];
+      } | undefined;
+      if (ctx?.principal === 'admin' || ctx?.principal === 'brain') {
+        next();
+        return;
+      }
+      if (
+        ctx?.principal !== 'agent'
+        || !ctx.agentId
+        || !ctx.teamName
+        || !ctx.teamId
+      ) {
+        res.status(401).json({ error: 'authentication_required' });
+        return;
+      }
+
+      const method = req.method;
+      const pathname = req.path;
+      const refs = new Set([ctx.agentId, ...(ctx.agentRefs || [])]);
+      const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body)
+        ? req.body as Record<string, any>
+        : {};
+      const matchesRef = (value: unknown): boolean => (
+        typeof value === 'string'
+        && value.trim().length > 0
+        && refs.has(value.trim())
+      );
+      const rejectIdentity = () => {
+        res.status(403).json({ error: 'agent_identity_mismatch' });
+      };
+      const canonicalName = [...refs].find((ref) => ref !== ctx.agentId) || ctx.agentId;
+
+      if (method === 'GET' && pathname === '/agents') {
+        if (req.query.all === '1' || req.query.all === 'true') {
+          res.status(403).json({ error: 'agent_route_forbidden' });
+          return;
+        }
+        next();
+        return;
+      }
+
+      const selfDetail = pathname.match(/^\/agents\/([^/]+)$/);
+      if (method === 'GET' && selfDetail) {
+        let requestedId = '';
+        try {
+          requestedId = decodeURIComponent(selfDetail[1]);
+        } catch {
+          res.status(400).json({ error: 'invalid_agent_id' });
+          return;
+        }
+        if (requestedId !== ctx.agentId) {
+          rejectIdentity();
+          return;
+        }
+        next();
+        return;
+      }
+
+      const selfMetadata = pathname.match(/^\/agents\/([^/]+)\/metadata$/);
+      if (method === 'POST' && selfMetadata) {
+        let requestedId = '';
+        try {
+          requestedId = decodeURIComponent(selfMetadata[1]);
+        } catch {
+          res.status(400).json({ error: 'invalid_agent_id' });
+          return;
+        }
+        if (requestedId !== ctx.agentId) {
+          rejectIdentity();
+          return;
+        }
+        next();
+        return;
+      }
+
+      if (method === 'POST' && pathname === '/agents/register') {
+        if (
+          body.id !== ctx.agentId
+          || !matchesRef(body.name)
+        ) {
+          rejectIdentity();
+          return;
+        }
+        next();
+        return;
+      }
+
+      if (
+        method === 'POST'
+        && (
+          pathname === '/talk'
+          || pathname === '/news'
+          || pathname === '/talk-to'
+          || pathname === '/news-to'
+        )
+      ) {
+        if (body.from !== undefined && !matchesRef(body.from)) {
+          rejectIdentity();
+          return;
+        }
+        body.from = canonicalName;
+        next();
+        return;
+      }
+
+      if (method === 'POST' && pathname === '/runtime/rate-limit') {
+        if (
+          (body.agent_id !== undefined && body.agent_id !== ctx.agentId)
+          || (body.agent_name !== undefined && !matchesRef(body.agent_name))
+        ) {
+          rejectIdentity();
+          return;
+        }
+        body.agent_id = ctx.agentId;
+        body.agent_name = canonicalName;
+
+        // Runtime telemetry is allowed to describe only this authenticated
+        // worker's durable assignment. Never let a child select a peer query,
+        // another provider namespace, or a credential lane to cool down.
+        const authenticatedAgent = await this.dbQueryAgentById(
+          ctx.teamId,
+          ctx.agentId,
+        ).catch(() => null);
+        if (!authenticatedAgent) {
+          res.status(401).json({ error: 'agent_auth_stale' });
+          return;
+        }
+        const metadata = (
+          authenticatedAgent.metadata
+          && typeof authenticatedAgent.metadata === 'object'
+          && !Array.isArray(authenticatedAgent.metadata)
+        ) ? authenticatedAgent.metadata as Record<string, unknown> : {};
+        const issuedRuntime = typeof metadata[MANAGER_PROCESS_RUNTIME_KEY] === 'string'
+          ? String(metadata[MANAGER_PROCESS_RUNTIME_KEY]).trim()
+          : '';
+        const laneId = typeof metadata[MANAGER_PROCESS_RUNTIME_LANE_KEY] === 'string'
+          ? String(metadata[MANAGER_PROCESS_RUNTIME_LANE_KEY]).trim()
+          : '';
+        if (!issuedRuntime || !laneId) {
+          res.status(409).json({ error: 'agent_runtime_assignment_unavailable' });
+          return;
+        }
+        const runtime = resolveRuntime(issuedRuntime) as HarnessType;
+        if (runtime !== resolveRuntime(authenticatedAgent.runtime)) {
+          res.status(409).json({ error: 'agent_runtime_assignment_stale' });
+          return;
+        }
+        body.runtime = runtime;
+
+        if (body.query_id !== undefined) {
+          const queryId = typeof body.query_id === 'string'
+            ? body.query_id.trim()
+            : '';
+          if (
+            !queryId
+            || queryId.length > 240
+            || /[\u0000-\u001f\u007f]/.test(queryId)
+          ) {
+            res.status(400).json({ error: 'invalid_query_id' });
+            return;
+          }
+          const query = await this.db.queries
+            .getByQueryIdForTeam(ctx.teamId, queryId)
+            .catch(() => null);
+          if (
+            !query
+            || query.agent_id !== ctx.agentId
+            || query.owner_kind !== 'agent'
+            || query.owner_id !== ctx.agentId
+          ) {
+            res.status(403).json({ error: 'query_agent_mismatch' });
+            return;
+          }
+          body.query_id = query.query_id;
+        }
+
+        const rawRateLimit = body.rateLimit ?? body.rate_limit;
+        body.rateLimit = this.normalizeManagedRuntimeRateLimit(rawRateLimit);
+        body.lane_id = (
+          runtime === 'codex'
+          && body.rateLimit.reason === 'model_capacity'
+        )
+          ? `codex:model:${authenticatedAgent.model}`
+          : laneId;
+        delete body.rate_limit;
+        next();
+        return;
+      }
+
+      if (
+        method === 'POST'
+        && (pathname === '/usage/record' || pathname === '/activity/record')
+      ) {
+        if (
+          (body.agent !== undefined && !matchesRef(body.agent))
+          || (body.team !== undefined && body.team !== ctx.teamName)
+        ) {
+          rejectIdentity();
+          return;
+        }
+        body.agent = canonicalName;
+        body.team = ctx.teamName;
+        next();
+        return;
+      }
+
+      if (method === 'POST' && pathname === '/tasks') {
+        if (body.from !== undefined && !matchesRef(body.from)) {
+          rejectIdentity();
+          return;
+        }
+        body.from = canonicalName;
+        next();
+        return;
+      }
+
+      if (
+        method === 'POST'
+        && /^\/tasks\/[^/]+\/(?:claim|done)$/.test(pathname)
+      ) {
+        if (
+          (body.agent_id !== undefined && !matchesRef(body.agent_id))
+          || (body.from !== undefined && !matchesRef(body.from))
+        ) {
+          rejectIdentity();
+          return;
+        }
+        body.agent_id = ctx.agentId;
+        next();
+        return;
+      }
+
+      res.status(403).json({ error: 'agent_route_forbidden' });
     };
   }
 
@@ -9488,8 +11675,27 @@ Return this JSON shape:
       });
     });
 
+    // The desktop supervisor needs one unauthenticated readiness probe before
+    // it can hand credentials to clients. In managed mode expose only service
+    // attestation and readiness; never profile, team, agent, or query counts.
+    // Standalone mode falls through to the historical rich health route below.
+    this.managementApp.get('/health', (_req, res, next) => {
+      if (!this.idaccAdminToken) {
+        next();
+        return;
+      }
+      const ready = this.startupReady;
+      res.status(ready ? 200 : 503).json({
+        status: ready ? 'ok' : 'starting',
+        ready,
+        ...managerHealthAttestation(),
+        timestamp: Date.now(),
+      });
+    });
+
     // Install team/principal context middleware for all remaining routes
     this.managementApp.use(this.teamContextMiddleware());
+    this.managementApp.use(this.managedPrincipalRouteMiddleware());
 
     // Existing config routes become Brain-visible without duplicating event calls in every
     // handler. Only successful, allowlisted mutations are journaled; request data is redacted
@@ -9519,6 +11725,14 @@ Return this JSON shape:
     });
 
     this.managementApp.get('/health', async (req, res) => {
+      if (!this.startupReady) {
+        return res.status(503).json({
+          status: 'starting',
+          ready: false,
+          ...managerHealthAttestation(),
+          timestamp: Date.now(),
+        });
+      }
       const { id: teamId, name: teamName } = await this.getTeam(req);
       const [count, activeQueries] = await Promise.all([
         this.db.agents.count(teamId),
@@ -9658,7 +11872,7 @@ Return this JSON shape:
         }
         // Strict skill-name charset — `skill` flows into path.join below, so
         // reject any traversal / separators before touching the filesystem.
-        if (!/^[a-z0-9][a-z0-9._-]*$/i.test(skill)) {
+        if (!isPortablePathSegment(skill)) {
           return res.status(400).json({ error: 'invalid skill name' });
         }
         if (!agentRef || typeof agentRef !== 'string') {
@@ -9697,22 +11911,47 @@ Return this JSON shape:
           || (agent.metadata as any)?.workingDirectory
           || path.join(this.baseWorkDir, 'agents', agent.name);
         const hasWallet = !!(agent.metadata as any)?.ows_wallet || !!(agent.metadata as any)?.wallet;
-        this.deploySkillsToAgent(workingDirectory, [skill], {
-          DISPLAY_NAME: agent.domain || agent.name,
-          TEAM: teamName,
-          ONCHAIN_IDENTITY: agent.domain ? `Your onchain identity is your ENS domain: **${agent.domain}**` : '',
-          ORG_CONTEXT: '',
-        }, { hasWallet, runtime: agent.runtime || undefined, skillsRoot });
-
-        // Persist to metadata.skills (deduped) so the skill survives rebuilds.
         const cur = (agent.metadata as Record<string, unknown>) || {};
         const existing = Array.isArray((cur as any).skills) ? ((cur as any).skills as string[]) : [];
         const skills = existing.includes(skill) ? existing : [...existing, skill];
+        const persistedPlugins = Array.isArray((cur as any).plugins)
+          ? (cur as any).plugins.filter((plugin: unknown): plugin is PluginConfig => (
+              !!plugin
+              && typeof plugin === 'object'
+              && typeof (plugin as any).name === 'string'
+              && typeof (plugin as any).path === 'string'
+            ))
+          : [];
+        const runtime = resolveRuntime(agent.runtime);
+        const roleBody = this.extractPersonalityTailForRebuild(workingDirectory, runtime);
+        const overlay = this.reconcileAgentManagedOverlay({
+          workingDirectory,
+          runtime,
+          templateName: String((cur as any).alias || (cur as any).name || agent.name),
+          teamName,
+          displayName: agent.domain || agent.name,
+          plugins: persistedPlugins,
+          skills,
+          ...((cur as any).agent && { agentOverlay: String((cur as any).agent) }),
+          ...(roleBody && { roleBody }),
+          onchainIdentity: agent.domain
+            ? `Your onchain identity is your ENS domain: **${agent.domain}**`
+            : '',
+          hasWallet,
+          skillsRoot,
+        });
+
+        // Persist to metadata.skills (deduped) so the skill survives rebuilds.
         const capabilityIntake = {
           ...(((cur as any).capability_intake && typeof (cur as any).capability_intake === 'object') ? (cur as any).capability_intake : {}),
           [`skill:${skill}`]: intake,
         };
-        await this.db.agents.updateMetadata(agent.id, { ...cur, skills, capability_intake: capabilityIntake });
+        await this.db.agents.updateMetadata(agent.id, {
+          ...cur,
+          plugins: overlay.localPlugins,
+          skills,
+          capability_intake: capabilityIntake,
+        });
 
         res.json({ installed: skill, agent: agent.name, skills, intake });
       } catch (e: any) {
@@ -9758,40 +11997,84 @@ Return this JSON shape:
           return res.status(403).json({ error: 'admin_required' });
         }
         const { skill, agent: agentRef } = req.body || {};
-        if (!skill || typeof skill !== 'string' || !/^[a-z0-9][a-z0-9._-]*$/i.test(skill)) {
+        if (!isPortablePathSegment(skill)) {
           return res.status(400).json({ error: 'invalid skill name' });
         }
         if (!agentRef || typeof agentRef !== 'string') {
           return res.status(400).json({ error: 'Missing agent in request body' });
         }
-        const { id: teamId } = await this.getTeam(req);
+        const { id: teamId, name: teamName } = await this.getTeam(req);
         const agent = await this.dbQueryAgentById(teamId, agentRef)
           ?? await this.dbQueryAgentByNameMostRecent(teamId, agentRef);
         if (!agent) return res.status(404).json({ error: 'Agent not found', name: agentRef });
 
-        // Remove the deployed skill dir from every known runtime layout
-        // (whichever exists). Install is runtime-aware via getRuntimePaths();
-        // uninstall must be broader so switching runtimes cannot leave stale
-        // SKILL.md copies active in a previous harness directory.
         const workingDirectory = agent.working_directory
           || (agent.metadata as any)?.workingDirectory
           || path.join(this.baseWorkDir, 'agents', agent.name);
-        for (const rel of ['.claude/skills', '.agents/skills', '.cursor/skills']) {
-          const p = path.join(workingDirectory, rel, skill);
-          if (existsSync(p)) {
-            try { rmSync(p, { recursive: true, force: true }); } catch { /* best-effort */ }
-          }
-        }
-
-        // Persist metadata.skills without the removed skill.
         const cur = (agent.metadata as Record<string, unknown>) || {};
         const existing = Array.isArray((cur as any).skills) ? ((cur as any).skills as string[]) : [];
-        const skills = existing.filter((s) => s !== skill);
+        const skillKey = portablePathSegmentKey(skill);
+        const skills = existing.filter((s) => (
+          typeof s !== 'string' || portablePathSegmentKey(s) !== skillKey
+        ));
+        const persistedPlugins = Array.isArray((cur as any).plugins)
+          ? (cur as any).plugins.map((plugin: unknown) => {
+              if (
+                !plugin
+                || typeof plugin !== 'object'
+                || typeof (plugin as any).name !== 'string'
+                || typeof (plugin as any).path !== 'string'
+              ) {
+                throw new Error(`Agent ${agent.name} has an invalid persisted plugin entry`);
+              }
+              return {
+                name: (plugin as any).name,
+                path: (plugin as any).path,
+              } satisfies PluginConfig;
+            })
+          : [];
+        const runtime = resolveRuntime(agent.runtime);
+        const roleBody = this.extractPersonalityTailForRebuild(workingDirectory, runtime);
+        let orgContext = '';
+        const teamConfig = await this.db.teams.getConfig(teamId);
+        const org = teamConfig.org;
+        if (org && typeof org === 'object' && !Array.isArray(org)) {
+          const { generateAgentOrgContext } = await import('./org-chart.js');
+          orgContext = generateAgentOrgContext(
+            String((cur as any).alias || (cur as any).name || agent.name),
+            org as unknown as OrgConfig,
+          );
+        }
+        const overlay = this.reconcileAgentManagedOverlay({
+          workingDirectory,
+          runtime,
+          templateName: String((cur as any).alias || (cur as any).name || agent.name),
+          teamName,
+          displayName: agent.domain || agent.name,
+          plugins: persistedPlugins,
+          skills,
+          ...((cur as any).agent && { agentOverlay: String((cur as any).agent) }),
+          ...(roleBody && { roleBody }),
+          ...(orgContext && { orgContext }),
+          onchainIdentity: agent.domain
+            ? `Your onchain identity is your ENS domain: **${agent.domain}**`
+            : '',
+          hasWallet: !!(cur as any).ows_wallet || !!(cur as any).wallet,
+        });
+
+        // Persist only after the aggregate ownership transaction succeeds.
+        // This removes exact receipt-owned files and never recursively deletes
+        // a user's same-named skill directory.
         const capabilityIntake = {
           ...(((cur as any).capability_intake && typeof (cur as any).capability_intake === 'object') ? (cur as any).capability_intake : {}),
         };
         delete (capabilityIntake as any)[`skill:${skill}`];
-        await this.db.agents.updateMetadata(agent.id, { ...cur, skills, capability_intake: capabilityIntake });
+        await this.db.agents.updateMetadata(agent.id, {
+          ...cur,
+          plugins: overlay.localPlugins,
+          skills,
+          capability_intake: capabilityIntake,
+        });
 
         res.json({ uninstalled: skill, agent: agent.name, skills });
       } catch (e: any) {
@@ -10039,7 +12322,7 @@ Return this JSON shape:
       if (!this.isAdminRequest(req)) return res.status(403).json({ error: 'admin_required' });
       const scope = controlScope(req.params.scope);
       if (!scope) return res.status(400).json({ error: 'invalid_control_scope' });
-      const { id: teamId } = await this.getTeam(req);
+      const { id: teamId, name: teamName } = await this.getTeam(req);
       return res.json({ items: await this.db.controlState.list(teamId, scope) });
     });
 
@@ -10618,7 +12901,7 @@ Return this JSON shape:
 
     // GET /agents/status - check health of all agents (server-side ping)
     this.managementApp.get('/agents/status', async (req, res) => {
-      const { id: teamId } = await this.getTeam(req);
+      const { id: teamId, name: teamName } = await this.getTeam(req);
       const includeAll = req.query.all === 'true' || req.query.all === '1';
       const includeNewsRaw = Array.isArray(req.query.include_news) ? req.query.include_news[0] : req.query.include_news;
       const newsRaw = Array.isArray(req.query.news) ? req.query.news[0] : req.query.news;
@@ -10643,6 +12926,7 @@ Return this JSON shape:
           const isInteractive = agent.type === 'interactive';
           let isResponding = false;
           let newsItems: any[] = [];
+          let workerHeaders: Record<string, string> = {};
           const newsSummary = {
             mode: includeFullNews ? 'full' : includeNews ? 'summary' : 'none',
             included: false,
@@ -10654,7 +12938,12 @@ Return this JSON shape:
             isResponding = true;
           } else {
             try {
+              workerHeaders = await this.managerTargetWorkerHeaders(
+                agent,
+                teamName,
+              );
               const catalogResp = await fetch(`${agentUrl}/.well-known/restap.json`, {
+                headers: workerHeaders,
                 signal: AbortSignal.timeout(3000)
               });
               isResponding = catalogResp.ok;
@@ -10665,6 +12954,7 @@ Return this JSON shape:
             try {
               if (includeFullNews) {
                 const newsResp = await fetch(`${agentUrl}/news?since=0&limit=${newsLimit}`, {
+                  headers: workerHeaders,
                   signal: AbortSignal.timeout(2000)
                 });
                 if (newsResp.ok) {
@@ -10734,7 +13024,7 @@ Return this JSON shape:
     // GET /agents/:name/news - proxy news feed from a specific agent (for remote CLI)
     this.managementApp.get('/agents/:name/news', async (req, res) => {
       try {
-        const { id: teamId } = await this.getTeam(req);
+        const { id: teamId, name: teamName } = await this.getTeam(req);
         const agentName = req.params.name;
         const agent = await this.dbQueryAgentByNameMostRecent(teamId, agentName);
 
@@ -10747,6 +13037,7 @@ Return this JSON shape:
         const limit = req.query.limit || '50';
 
         const newsResp = await fetch(`${agentUrl}/news?since=${since}&limit=${limit}`, {
+          headers: await this.managerTargetWorkerHeaders(agent, teamName),
           signal: AbortSignal.timeout(5000)
         });
 
@@ -10764,7 +13055,7 @@ Return this JSON shape:
     // POST /agents/:name/cancel - proxy cancel request to a specific agent (for remote CLI)
     this.managementApp.post('/agents/:name/cancel', async (req, res) => {
       try {
-        const { id: teamId } = await this.getTeam(req);
+        const { id: teamId, name: teamName } = await this.getTeam(req);
         const agentName = req.params.name;
         const agent = await this.dbQueryAgentByNameMostRecent(teamId, agentName);
 
@@ -10776,7 +13067,11 @@ Return this JSON shape:
         const cancelResp = await fetch(`${agentUrl}/cancel`, {
           method: 'POST',
           signal: AbortSignal.timeout(5000),
-          headers: { 'Content-Type': 'application/json' }
+          headers: await this.managerTargetWorkerHeaders(
+            agent,
+            teamName,
+            { 'Content-Type': 'application/json' },
+          )
         });
 
         if (!cancelResp.ok) {
@@ -11000,6 +13295,13 @@ Return this JSON shape:
       if (req.body) {
         req.body.wait = false;
       }
+      if (
+        this.idaccAdminToken
+        && (req as any).ctx?.principal === 'agent'
+      ) {
+        this.handleManagedAgentNewsTo(req, res).catch(next);
+        return;
+      }
       this.handleMessage(req, res).catch(next);
     });
 
@@ -11050,7 +13352,12 @@ Return this JSON shape:
         timestamp: ts,
       });
       this.postBrain('/memory/manager', {
-        key: `runtime-cooldown:${cooldown.laneId}`,
+        key: [
+          'runtime-cooldown',
+          teamId,
+          getRuntimeProfile(cooldown.runtime).canonicalId,
+          cooldown.laneId,
+        ].map(encodeURIComponent).join(':'),
         content: JSON.stringify(cooldown),
         shared: true,
         project: teamName,
@@ -11066,7 +13373,12 @@ Return this JSON shape:
     this.managementApp.post('/news', async (req, res) => {
       try {
         let { id: teamId, name: teamName } = await this.getTeam(req);
-        const { type, from, message, data } = req.body || {};
+        const { type, message, data } = req.body || {};
+        let { from } = req.body || {};
+        const requestContext = (req as any).ctx as {
+          principal?: string;
+          agentId?: string;
+        } | undefined;
         // `in_reply_to` is the query_id this row is replying to. Some clients
         // put it at the top level; agent-server `broadcastToManager` started
         // doing so deliberately, but older paths (and the original message
@@ -11089,14 +13401,9 @@ Return this JSON shape:
         }
 
         // If this is a reply to a query, look up the original query's team.
-        // Design-doc delta (Phase 1): the queries table does not track which agent
-        // endpoint received the original query, so we cannot verify the reply path
-        // fully. Instead we apply a lighter constraint: only admin principals are
-        // allowed to swing teams via in_reply_to. Non-admin callers (agents, anon)
-        // may reply to queries within their own team only. If the query belongs to
-        // a different team and the caller is not admin, we still deliver the news
-        // to the caller's own team (the reply will be visible there) but we do NOT
-        // follow the query across the team boundary.
+        // Admin retains the historical cross-team completion behavior. A
+        // managed worker remains pinned to its authenticated team and, below,
+        // must match the query's durable recipient agent_id exactly.
         if (in_reply_to) {
           const queryTeamIds = await this.db.queries.findTeams(in_reply_to);
           const queryTeamId = queryTeamIds.includes(teamId)
@@ -11117,6 +13424,28 @@ Return this JSON shape:
           }
         }
 
+        let authenticatedQueryRow: QueryRow | null = null;
+        if (
+          in_reply_to
+          && requestContext?.principal === 'agent'
+          && requestContext.agentId
+        ) {
+          authenticatedQueryRow = await this.db.queries
+            .getByQueryIdForTeam(teamId, in_reply_to)
+            .catch(() => null);
+          if (
+            !authenticatedQueryRow
+            || authenticatedQueryRow.agent_id !== requestContext.agentId
+          ) {
+            return res.status(403).json({ error: 'query_agent_mismatch' });
+          }
+          // The route middleware replaced caller-controlled `from` with the
+          // authenticated worker's canonical display identity.
+          from = req.body.from;
+        }
+        const authenticatedAgentId = requestContext?.principal === 'agent'
+          ? requestContext.agentId
+          : undefined;
         const newsType = type || (in_reply_to ? 'reply' : 'message');
         const newsMessage = message || data?.message || `${newsType} from ${from || 'unknown'}`;
         const ts = Date.now();
@@ -11141,7 +13470,15 @@ Return this JSON shape:
             timestamp: ts,
             type: newsType,
             message: newsMessage,
-            data: { from, in_reply_to, message, ...data },
+            data: {
+              ...data,
+              from,
+              in_reply_to,
+              message,
+              ...(authenticatedAgentId && {
+                authenticated_agent_id: authenticatedAgentId,
+              }),
+            },
             query_id: in_reply_to || undefined,
             kind: 'notify',
             reply_expected: false,
@@ -11165,9 +13502,35 @@ Return this JSON shape:
         const isQueryReply = newsType === 'reply' || newsType === 'reply.error';
         const isQueryFailure = newsType === 'reply.error';
         if (in_reply_to && isQueryReply) {
-          const queryRow = await this.db.queries.getByQueryIdForTeam(teamId, in_reply_to).catch(() => null);
-          const retryOf = this.runtimeFailoverRetryOf.get(in_reply_to)
+          const queryRow = authenticatedQueryRow
+            || await this.db.queries.getByQueryIdForTeam(teamId, in_reply_to).catch(() => null);
+          const retryOfCandidate = this.runtimeFailoverRetryOf.get(in_reply_to)
             || (typeof (queryRow?.metadata as any)?.retry_of === 'string' ? (queryRow?.metadata as any).retry_of : undefined);
+          let retryOf: string | undefined;
+          if (retryOfCandidate && retryOfCandidate !== in_reply_to && queryRow?.agent_id) {
+            // A retry row is not authority to complete an arbitrary original
+            // query. Re-read both durable owners immediately before applying
+            // the propagated transition and require the same worker owner.
+            const originalQuery = await this.db.queries
+              .getByQueryIdForTeam(teamId, retryOfCandidate)
+              .catch(() => null);
+            const expectedAgentId = authenticatedAgentId || queryRow.agent_id;
+            if (
+              queryRow.owner_kind === 'agent'
+              && queryRow.owner_id === queryRow.agent_id
+              && queryRow.agent_id === expectedAgentId
+              && originalQuery?.owner_kind === 'agent'
+              && originalQuery.owner_id === expectedAgentId
+              && originalQuery.agent_id === expectedAgentId
+            ) {
+              retryOf = retryOfCandidate;
+            } else {
+              this.managerLog(
+                `Ignored invalid runtime retry lineage ${in_reply_to} -> ${retryOfCandidate}: durable owners differ`,
+              );
+              this.runtimeFailoverRetryOf.delete(in_reply_to);
+            }
+          }
           if (isQueryFailure) {
             const errorText =
               typeof message === 'string' && message.length > 0
@@ -11235,7 +13598,14 @@ Return this JSON shape:
               teamId,
               queryId: in_reply_to,
               occurredAt: ts,
-              resultPayload: { from, message, ...data },
+              resultPayload: {
+                ...data,
+                from,
+                message,
+                ...(authenticatedAgentId && {
+                  authenticated_agent_id: authenticatedAgentId,
+                }),
+              },
               waiterReply: { from: from || 'unknown', message: message || '' },
               messagePreview: typeof message === 'string' ? message : null,
             });
@@ -11244,7 +13614,15 @@ Return this JSON shape:
                 teamId,
                 queryId: retryOf,
                 occurredAt: ts,
-                resultPayload: { from, message, ...data, failover_retry_query_id: in_reply_to },
+                resultPayload: {
+                  ...data,
+                  from,
+                  message,
+                  failover_retry_query_id: in_reply_to,
+                  ...(authenticatedAgentId && {
+                    authenticated_agent_id: authenticatedAgentId,
+                  }),
+                },
                 waiterReply: { from: from || 'unknown', message: message || '' },
                 messagePreview: typeof message === 'string' ? message : null,
                 recoverFailedRateLimit: true,
@@ -11262,7 +13640,13 @@ Return this JSON shape:
           from,
           message,
           in_reply_to,
-          data: { ...data, sessionId: data?.sessionId },
+          data: {
+            ...data,
+            sessionId: data?.sessionId,
+            ...(authenticatedAgentId && {
+              authenticated_agent_id: authenticatedAgentId,
+            }),
+          },
           timestamp: ts
         });
 
@@ -11279,15 +13663,22 @@ Return this JSON shape:
             try {
               const forwardRes = await fetch(`${recipient.endpoint}/news`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: await this.managerTargetWorkerHeaders(
+                  recipient,
+                  resolvedTeamName,
+                  { 'Content-Type': 'application/json' },
+                ),
                 body: JSON.stringify({
+                  ...data,
                   type: newsType,
                   from,
                   message,
                   in_reply_to,
                   trigger,
                   session_id: data?.sessionId,
-                  ...data
+                  ...(authenticatedAgentId && {
+                    authenticated_agent_id: authenticatedAgentId,
+                  }),
                 }),
                 signal: AbortSignal.timeout(5000)
               });
@@ -12097,19 +14488,123 @@ Return this JSON shape:
     });
 
     this.managementApp.post('/agents/spawn', async (req, res) => {
+      if (this.idaccAdminToken && !this.isAdminRequest(req)) {
+        return res.status(403).json({ error: 'admin_required' });
+      }
       let teamId = '';
       let teamName = '';
       let id = '';
       try {
-        const team = await this.getTeam(req);
-        teamId = team.id;
-        teamName = team.name;
-
-        const { name, type: agentType, model, runtime, allowedTools, mcpServers, pluginPath, plugins, skills, metadata: reqMetadata, local, agent, roleBody, heartbeat, openMode, workingDirectory: configWorkDir, verbose, dangerouslySkipPermissions, domain, tokenId, address, start } = req.body || {};
+        teamName = this.getTeamName(req);
+        const body = objectRecord(req.body);
+        if (!body) return res.status(400).json({ error: 'Request body must be an object' });
+        const { name, type: agentType, model, runtime, allowedTools, mcpServers, plugins, skills, metadata: reqMetadata, local, agent, roleBody, heartbeat, openMode, workingDirectory: configWorkDir, dangerouslySkipPermissions, domain: rawDomain, tokenId: rawTokenId, address, start } = body;
         const agentOverlay = agent;
-        if (!name) return res.status(400).json({ error: 'Missing name' });
+        if (typeof name !== 'string' || !name) {
+          return res.status(400).json({ error: 'Missing name' });
+        }
         const agentNameCheck = validateName(name, 'agent');
         if (!agentNameCheck.valid) return res.status(400).json({ error: agentNameCheck.error });
+        if (agentType !== undefined && agentType !== 'claude' && agentType !== 'automator') {
+          return res.status(400).json({ error: 'type must be exactly "claude" or "automator"' });
+        }
+        if (model !== undefined && typeof model !== 'string') {
+          return res.status(400).json({ error: 'model must be a string' });
+        }
+        if (
+          configWorkDir !== undefined
+          && (
+            typeof configWorkDir !== 'string'
+            || !path.isAbsolute(configWorkDir)
+            || path.resolve(configWorkDir) === path.parse(path.resolve(configWorkDir)).root
+          )
+        ) {
+          return res.status(400).json({
+            error: 'workingDirectory must be an absolute non-root directory',
+          });
+        }
+        if (reqMetadata !== undefined && !objectRecord(reqMetadata)) {
+          return res.status(400).json({ error: 'metadata must be an object' });
+        }
+        if (agentOverlay !== undefined && !isPortablePathSegment(agentOverlay)) {
+          return res.status(400).json({ error: 'agent must be a portable library name' });
+        }
+        if (roleBody !== undefined && typeof roleBody !== 'string') {
+          return res.status(400).json({ error: 'roleBody must be a string' });
+        }
+        for (const [key, value] of Object.entries({
+          local,
+          openMode,
+          dangerouslySkipPermissions,
+          start,
+        })) {
+          if (
+            value !== undefined
+            && typeof value !== 'boolean'
+            && value !== 'true'
+            && value !== 'false'
+          ) {
+            return res.status(400).json({
+              error: `${key} must be a boolean`,
+            });
+          }
+        }
+        if (plugins !== undefined && !Array.isArray(plugins)) {
+          return res.status(400).json({ error: 'plugins must be an array' });
+        }
+        const userPlugins: PluginConfig[] = [];
+        const userPluginNames = new Set<string>();
+        for (const plugin of plugins || []) {
+          if (
+            !plugin
+            || typeof plugin !== 'object'
+            || !isPortablePathSegment((plugin as any).name)
+            || typeof (plugin as any).path !== 'string'
+            || !(plugin as any).path.trim()
+          ) {
+            return res.status(400).json({
+              error: 'Each plugin needs a portable name and non-empty path',
+            });
+          }
+          const pluginKey = portablePathSegmentKey((plugin as any).name);
+          if (userPluginNames.has(pluginKey)) {
+            return res.status(400).json({
+              error: `Duplicate plugin name "${(plugin as any).name}"`,
+            });
+          }
+          userPluginNames.add(pluginKey);
+          userPlugins.push({
+            name: (plugin as any).name,
+            path: (plugin as any).path,
+          });
+        }
+        if (skills !== undefined && !Array.isArray(skills)) {
+          return res.status(400).json({ error: 'skills must be an array' });
+        }
+        const explicitSkills: string[] = [];
+        const explicitSkillNames = new Set<string>();
+        for (const skill of skills || []) {
+          if (!isPortablePathSegment(skill)) {
+            return res.status(400).json({ error: 'Each skill must be a portable name' });
+          }
+          const skillKey = portablePathSegmentKey(skill);
+          if (explicitSkillNames.has(skillKey)) {
+            return res.status(400).json({ error: `Duplicate skill name "${skill}"` });
+          }
+          explicitSkillNames.add(skillKey);
+          explicitSkills.push(skill);
+        }
+        if (mcpServers !== undefined && !Array.isArray(mcpServers)) {
+          return res.status(400).json({ error: 'mcpServers must be an array' });
+        }
+        let identity: ReturnType<typeof normalizeEnsIdentity>;
+        try {
+          identity = normalizeEnsIdentity(rawDomain, rawTokenId);
+        } catch (error: any) {
+          return res.status(400).json({ error: error?.message || String(error) });
+        }
+        const domain = identity.domain;
+        const tokenId = identity.tokenId;
 
         // Local agent: runs locally using the selected runtime's auth flow
         const isLocalAgent = local === true || local === 'true';
@@ -12136,6 +14631,24 @@ Return this JSON shape:
 
         const selection = resolveSpawnRuntimeModel(runtime, model, this.defaultConfig);
         const effectiveRuntime = selection.runtime;
+        let normalizedAllowedTools: string[] | undefined;
+        if (allowedTools !== undefined) {
+          try {
+            normalizedAllowedTools = normalizeExactAllowedTools(allowedTools, effectiveRuntime);
+          } catch (error: any) {
+            return res.status(400).json({
+              error: error?.message || 'allowedTools must be an array of exact whole tool names',
+            });
+          }
+        }
+        if (
+          allowedTools !== undefined
+          && !getRuntimeProfile(effectiveRuntime).capabilities.supportsAllowedTools
+        ) {
+          return res.status(400).json({
+            error: `runtime "${effectiveRuntime}" cannot enforce an exact allowedTools boundary`,
+          });
+        }
 
         id = `agent_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
         // Use config-specified working directory if provided, otherwise use workspace
@@ -12144,12 +14657,13 @@ Return this JSON shape:
         // Get default plugins from config
         const defaultPlugins = this.getDefaultPlugins();
 
-        // Merge user plugins with defaults (user plugins take precedence for same name)
-        const userPlugins = plugins || [];
-        const userPluginNames = new Set(userPlugins.map((p: any) => p.name));
+        // Merge user plugins with defaults (user plugins take precedence for
+        // the same portable, case-folded name).
         const mergedPlugins = [
           ...userPlugins,
-          ...defaultPlugins.filter(p => !userPluginNames.has(p.name))
+          ...defaultPlugins.filter(p => (
+            !userPluginNames.has(portablePathSegmentKey(p.name))
+          )),
         ];
 
         const effectiveModel = selection.model;
@@ -12161,51 +14675,35 @@ Return this JSON shape:
           return res.status(400).json({ error: detail, code: 'runtime_preflight_failed', issues: runtimeIssues });
         }
 
+        const team = await this.getTeam(req);
+        teamId = team.id;
+        teamName = team.name;
+        const collision = await this.findAgentPortableNameCollision(teamId, name);
+        if (collision) {
+          return res.status(409).json({
+            error: 'name_conflict',
+            message: `Agent name "${name}" conflicts with existing "${collision.name}"`,
+          });
+        }
+
         // Create workspace directory first (needed for plugin copy)
         mkdirSync(workingDirectory, { recursive: true });
 
-        // 1. Deploy library-backed agent overlay into the runtime overlay target, if configured
-        if (agentOverlay) {
-          copyLibraryAgentOverlay(workingDirectory, agentOverlay, effectiveRuntime);
-        }
-
-        // 2. Deploy team-level skills (runtime-aware: .claude/skills/ or .agents/skills/)
-        if (skills && Array.isArray(skills) && skills.length > 0) {
-          this.deploySkillsToAgent(workingDirectory, skills, {
-            DISPLAY_NAME: domain || name,
-            TEAM: teamName,
-            ONCHAIN_IDENTITY: domain
-              ? `Your onchain identity is your ENS domain: **${domain}**`
-              : '',
-            ORG_CONTEXT: '',
-          }, { hasWallet: false, runtime: effectiveRuntime });
-        }
-
-        // 3. Overlay working-directory template files (runtime-aware)
-        copyAgentDirOverlay(workingDirectory, name, effectiveRuntime);
-        // Copy HEARTBEAT.md from template to working directory root
-        copyHeartbeatMd(workingDirectory, name, effectiveRuntime);
-
-        // 4. Write personality file: protocol defaults + agent role body.
-        // For Codex/Cursor this is a marker-fenced framework block inside
-        // workspace-root AGENTS.md so user edits and the agent persona block
-        // (step 5) survive deploy/sync/rebuild refreshes.
-        {
-          const parts = [PROTOCOL_DEFAULTS];
-          if (roleBody) parts.push(roleBody);
-          writePersonalityFile(workingDirectory, effectiveRuntime, parts.join('\n\n'));
-        }
-
-        // 5. For Codex/Cursor, append the library persona to AGENTS.md
-        // between marker fences (no-op for Claude; persona lives in
-        // .claude/rules/ sidecar). Runs AFTER the framework write so the
-        // marker block sits below the framework section.
-        if (agentOverlay) {
-          appendLibraryPersonaToAgentsMd(workingDirectory, agentOverlay, effectiveRuntime);
-        }
-
-        // Copy plugins to agent's working directory (agent owns its plugins)
-        const localPlugins = this.copyPluginsToAgent(mergedPlugins, workingDirectory);
+        const { localPlugins } = this.reconcileAgentManagedOverlay({
+          workingDirectory,
+          runtime: effectiveRuntime,
+          templateName: name,
+          teamName,
+          displayName: domain || name,
+          plugins: mergedPlugins,
+          skills: explicitSkills,
+          ...(typeof agentOverlay === 'string' && { agentOverlay }),
+          ...(typeof roleBody === 'string' && { roleBody }),
+          onchainIdentity: domain
+            ? `Your onchain identity is your ENS domain: **${domain}**`
+            : '',
+          hasWallet: false,
+        });
 
         // Determine effective agent type (default to 'claude')
         const effectiveAgentType = agentType || 'claude';
@@ -12224,7 +14722,7 @@ Return this JSON shape:
           plugins: localPlugins, // Use local paths (agent owns its plugins)
           ...(agentOverlay && { agent: agentOverlay }),
           ...(normalizedSkills && { skills: normalizedSkills }),
-          ...(allowedTools && { allowed_tools: allowedTools }),
+          ...(normalizedAllowedTools !== undefined && { allowed_tools: normalizedAllowedTools }),
           ...(Array.isArray(mcpServers) && { mcpServers }),
           ...(isAutomator && { isAutomator: true }),
           // Flag that heartbeat is enabled (actual config read from HEARTBEAT.yaml)
@@ -12289,8 +14787,13 @@ Return this JSON shape:
         // SkillMesh stays a bundled optional provider. Neutral agents do not get
         // SkillMesh keys just because a master key exists in the environment.
         const providerMeta = await this.maybeAssignSkillmeshKey(id, teamName, finalMeta);
-        // Strip private key before sending in API response (stays in DB for worker env injection)
-        const { skillmesh_private_key: _smKey, ...providerMetaPublic } = providerMeta as any;
+        // Spawn responses are consumer-facing even when the caller can create
+        // agents. Apply the same recursive secret classifier used by non-admin
+        // list/detail endpoints; both SkillMesh keys and arbitrary token/key
+        // shaped provider metadata stay server-side.
+        const providerMetaPublic = this.redactForNonAdmin({
+          metadata: providerMeta,
+        }).metadata;
         await this.db.agents.updateStatus(id, 'pending', {
           port: allocatedPort,
           endpoint: url,
@@ -12333,7 +14836,6 @@ Return this JSON shape:
               port: allocatedPort,
             });
           }
-          await this.db.agents.updateStatus(id, 'running').catch(() => {});
         }
 
         res.status(201).json({
@@ -12344,7 +14846,7 @@ Return this JSON shape:
           port: allocatedPort,
           status: localSpawnResult?.success ? 'running' : 'pending',
           ...(localSpawnResult?.pid ? { pid: localSpawnResult.pid } : {}),
-          type: 'claude',
+          type: effectiveAgentType,
           local: true,
           url,
           restap: `${url}/.well-known/restap.json`,
@@ -12371,7 +14873,58 @@ Return this JSON shape:
     });
 
     this.managementApp.post('/agents/register', async (req, res) => {
+      const registrationPrincipal = (req as any).ctx as {
+        principal?: string;
+        agentId?: string;
+      } | undefined;
+      if (
+        this.idaccAdminToken
+        && !this.isAdminRequest(req)
+        && (
+          registrationPrincipal?.principal !== 'agent'
+          || req.body?.id !== registrationPrincipal.agentId
+        )
+      ) {
+        return res.status(403).json({ error: 'admin_required' });
+      }
       const { id: teamId } = await this.getTeam(req);
+      if (
+        this.idaccAdminToken
+        && registrationPrincipal?.principal === 'agent'
+        && registrationPrincipal.agentId
+      ) {
+        const existing = await this.dbQueryAgentById(
+          teamId,
+          registrationPrincipal.agentId,
+        );
+        if (!existing) return res.status(404).json({ error: 'Agent not found' });
+        let endpoint: URL;
+        try {
+          endpoint = new URL(String(req.body?.endpoint || ''));
+        } catch {
+          return res.status(400).json({ error: 'invalid_worker_endpoint' });
+        }
+        const endpointPort = Number(endpoint.port);
+        const loopbackHost = (
+          endpoint.hostname === 'localhost'
+          || endpoint.hostname === '127.0.0.1'
+          || endpoint.hostname === '::1'
+        );
+        if (
+          endpoint.protocol !== 'http:'
+          || !loopbackHost
+          || !Number.isInteger(endpointPort)
+          || endpointPort !== existing.port
+        ) {
+          return res.status(403).json({ error: 'worker_endpoint_mismatch' });
+        }
+        // Managed workers are pre-registered. Treat their startup registration
+        // as an idempotent assertion and never let it replace Manager-owned
+        // runtime, identity, port, endpoint, or metadata fields.
+        return res.status(200).json(
+          this.agentToResponse(existing, { isAdmin: false }),
+        );
+      }
 
       // Branch: public-agent-remote registration (Phase 2)
       // A request with runtime==='public-agent-remote' registers an externally-deployed
@@ -12407,7 +14960,7 @@ Return this JSON shape:
         }
 
         // Reject if name already exists in team
-        const existing = await this.dbQueryAgentByNameMostRecent(teamId, remoteName);
+        const existing = await this.findAgentPortableNameCollision(teamId, remoteName);
         if (existing) {
           return res.status(409).json({ error: 'name_conflict', message: `Agent "${remoteName}" already exists in this team` });
         }
@@ -12455,12 +15008,33 @@ Return this JSON shape:
 
       const { id: requestedIdRaw, name, endpoint, metadata, type: requestedTypeRaw } = req.body || {};
       if (!name || !endpoint) return res.status(400).json({ error: 'Missing name or endpoint' });
+      if (attemptsIdentityKeyMutation(metadata)) {
+        return res.status(403).json({
+          error: 'identityKey is reserved for validated declarative reconciliation',
+        });
+      }
+      if (attemptsManagerInternalMetadataMutation(metadata)) {
+        return res.status(403).json({
+          error: 'Manager lifecycle metadata is reserved for the local process supervisor',
+        });
+      }
       const regNameCheck = validateName(name, 'agent');
       if (!regNameCheck.valid) return res.status(400).json({ error: regNameCheck.error });
 
       const requestedId = typeof requestedIdRaw === 'string' ? requestedIdRaw.trim() : undefined;
       if (requestedId && !/^[a-zA-Z0-9_:-]{1,200}$/.test(requestedId)) {
         return res.status(400).json({ error: 'Invalid id format' });
+      }
+      const portableCollision = await this.findAgentPortableNameCollision(
+        teamId,
+        name,
+        requestedId,
+      );
+      if (portableCollision && portableCollision.name !== name) {
+        return res.status(409).json({
+          error: 'name_conflict',
+          message: `Agent name "${name}" conflicts with existing "${portableCollision.name}"`,
+        });
       }
 
       const requestedType =
@@ -12492,6 +15066,9 @@ Return this JSON shape:
       // `pid` onto the row's metadata. Merge over the existing row so the pid
       // (and anything else a spawn-time path set) survives registration.
       const priorRow = await this.db.agents.getById(id).catch(() => null);
+      if (priorRow && priorRow.team_id !== teamId) {
+        return res.status(409).json({ error: 'agent id is already owned by another team' });
+      }
       const priorMeta = (priorRow?.metadata as Record<string, unknown>) || {};
       const meta: AgentMetadata = {
         ...priorMeta,
@@ -12532,7 +15109,7 @@ Return this JSON shape:
         }
       }
 
-      res.status(201).json({
+      const response = {
         id,
         name,
         type,
@@ -12541,7 +15118,10 @@ Return this JSON shape:
         restap: `${endpoint}/.well-known/restap.json`,
         domain: reqDomain,
         metadata: nextMeta
-      });
+      };
+      res.status(201).json(
+        this.isAdminRequest(req) ? response : this.redactForNonAdmin(response),
+      );
     });
 
     this.managementApp.post('/agents/:id/metadata', async (req, res) => {
@@ -12550,36 +15130,128 @@ Return this JSON shape:
       if (!agent) return res.status(404).json({ error: 'Agent not found' });
 
       const { metadata } = req.body || {};
-      const nextMetadata = metadata ? { ...(agent.metadata || {}), ...(metadata || {}) } : agent.metadata;
-
-      await this.db.agents.updateMetadata(agent.id, nextMetadata);
-
-      // Agent self-publishing a pid is proof of life — flip status to running.
-      // Without this, SQLite-mode deploys leave agents stuck on 'pending'
-      // (the db-direct updateStatus path only runs when DATABASE_URL is set).
-      const incomingPid = (metadata as { pid?: unknown } | undefined)?.pid;
-      if (typeof incomingPid === 'number' && agent.status !== 'running') {
-        await this.db.agents.updateStatus(agent.id, 'running');
+      const metadataRecord = objectRecord(metadata);
+      const metadataKeys = metadataRecord ? Object.keys(metadataRecord) : [];
+      const incomingPid = metadataRecord?.pid;
+      const exactWorkerPidPublish = (
+        Object.keys(objectRecord(req.body) || {}).length === 1
+        && metadataKeys.length === 1
+        && metadataKeys[0] === 'pid'
+        && typeof incomingPid === 'number'
+        && Number.isInteger(incomingPid)
+        && incomingPid > 0
+      );
+      let verifiedWorkerPidPublish = false;
+      if (this.idaccAdminToken && !this.isAdminRequest(req)) {
+        const ctx = (req as any).ctx as { principal?: string } | undefined;
+        const authenticatedAgentId = typeof req.headers['x-id-agent'] === 'string'
+          ? req.headers['x-id-agent']
+          : '';
+        if (
+          exactWorkerPidPublish
+          && ctx?.principal === 'agent'
+          && authenticatedAgentId === agent.id
+        ) {
+          const owned = this.ownedAgentProcesses.get(incomingPid as number);
+          if (
+            owned
+            && owned.agentId === agent.id
+            && owned.port === agent.port
+            && owned.proc.pid === incomingPid
+            && owned.proc.exitCode == null
+            && owned.proc.signalCode == null
+          ) {
+            const identity = await this.probeLocalAgentIdentity(
+              agent.port,
+              { id: agent.id, name: agent.name, pid: incomingPid as number },
+              { requireAttestation: true },
+            );
+            verifiedWorkerPidPublish = identity.ok && identity.attested;
+          }
+        }
+        if (!verifiedWorkerPidPublish) {
+          return res.status(403).json({ error: 'admin_required' });
+        }
       }
-
-      const server = this.runningServers.get(this.key(teamId, agent.id));
-      if (server && agent.type === 'claude') {
-        server.setIdentity({
-          name: agent.name,
-          metadata: nextMetadata,
-          tokenId: agent.token_id || undefined,
-          domain: agent.domain || undefined
+      if (attemptsIdentityKeyMutation(metadata)) {
+        return res.status(403).json({
+          error: 'identityKey is reserved for validated declarative reconciliation',
+        });
+      }
+      if (attemptsManagerInternalMetadataMutation(metadata)) {
+        return res.status(403).json({
+          error: 'Manager lifecycle metadata is reserved for the local process supervisor',
         });
       }
 
-      res.json({ id: agent.id, name: agent.name, metadata: nextMetadata });
+      const nextMetadata = await this.withAgentLifecycleLock(
+        this.agentLifecycleKey(teamId, agent),
+        async () => {
+          const current = await this.dbQueryAgentById(teamId, agent.id);
+          if (!current) throw new Error('Agent not found');
+          if (verifiedWorkerPidPublish) {
+            const owned = this.ownedAgentProcesses.get(incomingPid as number);
+            if (
+              !owned
+              || owned.agentId !== current.id
+              || owned.port !== current.port
+              || owned.proc.pid !== incomingPid
+              || owned.proc.exitCode != null
+              || owned.proc.signalCode != null
+            ) {
+              throw new Error('worker pid publication is no longer current');
+            }
+          }
+          const next = metadataRecord
+            ? { ...(current.metadata || {}), ...metadataRecord }
+            : current.metadata;
+          // An attested Manager-owned child may publish only its pid. The
+          // verified spawn path persists generation/ownership/launch intent.
+          if (verifiedWorkerPidPublish && current.status !== 'running') {
+            await this.db.agents.updateStatus(current.id, 'running', {
+              metadata: next as Record<string, unknown>,
+            });
+          } else {
+            await this.db.agents.updateMetadata(current.id, next as Record<string, unknown>);
+          }
+          const server = this.runningServers.get(this.key(teamId, current.id));
+          if (server && current.type === 'claude') {
+            server.setIdentity({
+              name: current.name,
+              metadata: next,
+              tokenId: current.token_id || undefined,
+              domain: current.domain || undefined
+            });
+          }
+          return next;
+        },
+      ).catch((error: any) => {
+        if (error?.message === 'worker pid publication is no longer current') return null;
+        throw error;
+      });
+      if (!nextMetadata) return res.status(409).json({ error: 'stale_worker_generation' });
+      const response = { id: agent.id, name: agent.name, metadata: nextMetadata };
+      res.json(this.isAdminRequest(req) ? response : this.redactForNonAdmin(response));
     });
 
     this.managementApp.post('/agents/by-name/:name/metadata', async (req, res) => {
+      if (this.idaccAdminToken && !this.isAdminRequest(req)) {
+        return res.status(403).json({ error: 'admin_required' });
+      }
       const { id: teamId } = await this.getTeam(req);
       const agent = await this.dbQueryAgentByNameMostRecent(teamId, req.params.name);
       if (!agent) return res.status(404).json({ error: 'Agent not found' });
       const { metadata } = req.body || {};
+      if (attemptsIdentityKeyMutation(metadata)) {
+        return res.status(403).json({
+          error: 'identityKey is reserved for validated declarative reconciliation',
+        });
+      }
+      if (attemptsManagerInternalMetadataMutation(metadata)) {
+        return res.status(403).json({
+          error: 'Manager lifecycle metadata is reserved for the local process supervisor',
+        });
+      }
       const nextMetadata = metadata ? { ...(agent.metadata || {}), ...(metadata || {}) } : agent.metadata;
 
       await this.db.agents.updateMetadata(agent.id, nextMetadata);
@@ -12594,7 +15266,8 @@ Return this JSON shape:
         });
       }
 
-      res.json({ id: agent.id, name: agent.name, metadata: nextMetadata });
+      const response = { id: agent.id, name: agent.name, metadata: nextMetadata };
+      res.json(this.isAdminRequest(req) ? response : this.redactForNonAdmin(response));
     });
 
     // Note: Agent catalogs are managed by agents themselves via their /catalog endpoint
@@ -12696,7 +15369,10 @@ Return this JSON shape:
     });
 
     this.managementApp.post('/agents/:id/model', async (req, res) => {
-      const { id: teamId, name: teamName } = await this.getTeam(req);
+      if (!this.isAdminRequest(req)) {
+        return res.status(403).json({ error: 'admin_required' });
+      }
+      const { id: teamId } = await this.getTeam(req);
       const { model } = req.body;
 
       if (!model) {
@@ -12711,18 +15387,32 @@ Return this JSON shape:
       }
 
       try {
-        // Update model in database - agent needs restart to pick up new model
-        await this.db.agents.updateStatus(agent.id, 'pending', { model });
-
-        console.log(`[Manager] Updated model for ${agent.name} to ${model} - restart required`);
-
-        res.json({
-          id: agent.id,
-          name: agent.name,
-          model: model,
-          status: 'pending',
-          message: 'Model updated. Restart the agent to apply the new model.'
-        });
+        const mutation = await this.withAgentLifecycleLock(
+          this.agentLifecycleKey(teamId, agent),
+          async (): Promise<{ status: number; body: Record<string, unknown> }> => {
+            const current = await this.dbQueryAgentById(teamId, agent.id);
+            if (!current) return { status: 404, body: { error: 'Agent not found' } };
+            if (current.type !== 'claude') {
+              return {
+                status: 400,
+                body: { error: 'Only local runtime-backed agents have models' },
+              };
+            }
+            await this.db.agents.updateStatus(current.id, 'pending', { model });
+            console.log(`[Manager] Updated model for ${current.name} to ${model} - restart required`);
+            return {
+              status: 200,
+              body: {
+                id: current.id,
+                name: current.name,
+                model,
+                status: 'pending',
+                message: 'Model updated. Restart the agent to apply the new model.',
+              },
+            };
+          },
+        );
+        return res.status(mutation.status).json(mutation.body);
       } catch (e: any) {
         res.status(500).json({ error: e?.message || String(e) });
       }
@@ -12732,7 +15422,10 @@ Return this JSON shape:
     // /model, this updates the row and requires a rebuild to apply (the new
     // runtime changes the harness, skills dir, and spawn env).
     this.managementApp.post('/agents/:id/runtime', async (req, res) => {
-      const { id: teamId } = await this.getTeam(req);
+      if (!this.isAdminRequest(req)) {
+        return res.status(403).json({ error: 'admin_required' });
+      }
+      const { id: teamId, name: teamName } = await this.getTeam(req);
       const { runtime } = req.body || {};
       if (!runtime || typeof runtime !== 'string') {
         return res.status(400).json({ error: 'Missing runtime in request body' });
@@ -12746,35 +15439,145 @@ Return this JSON shape:
         return res.status(400).json({ error: 'Only local runtime-backed agents have a switchable runtime' });
       }
       try {
-        const metadataBase = { ...((agent.metadata || {}) as AgentMetadata) };
-        const providerAssignment = isProviderRuntimeSpecifier(runtime)
-          ? this.normalizeProviderRuntimeAssignment(runtime, (req.body || {}).provider)
-          : null;
-        const resolved = providerAssignment ? 'provider-api' : resolveRuntime(runtime);
-        const metadata = providerAssignment
-          ? {
-              ...metadataBase,
-              runtime: providerAssignment.lane,
-              providerRuntime: this.providerRuntimeMetadata(providerAssignment),
+        const mutation = await this.withAgentLifecycleLock(
+          this.agentLifecycleKey(teamId, agent),
+          async (): Promise<{ status: number; body: Record<string, unknown> }> => {
+            const current = await this.dbQueryAgentById(teamId, agent.id);
+            if (!current) return { status: 404, body: { error: 'Agent not found' } };
+            if (current.type !== 'claude') {
+              return {
+                status: 400,
+                body: { error: 'Only local runtime-backed agents have a switchable runtime' },
+              };
             }
-          : {
-              ...metadataBase,
-              runtime: resolved,
-              providerRuntime: undefined,
+            const metadataBase = { ...((current.metadata || {}) as AgentMetadata) };
+            const providerAssignment = isProviderRuntimeSpecifier(runtime)
+              ? this.normalizeProviderRuntimeAssignment(runtime, (req.body || {}).provider)
+              : null;
+            const resumeAfterManagerRestart = (req.body || {}).resumeAfterManagerRestart === true;
+            if (resumeAfterManagerRestart && !providerAssignment) {
+              return {
+                status: 400,
+                body: { error: 'resumeAfterManagerRestart is available only for provider runtime rebinds' },
+              };
+            }
+            if (
+              resumeAfterManagerRestart
+              && metadataBase[MANAGER_RESTART_REQUESTED_KEY] !== true
+            ) {
+              return {
+                status: 409,
+                body: { error: 'agent was not awaiting restoration after Manager restart' },
+              };
+            }
+            if (
+              resumeAfterManagerRestart
+              && (
+                resolveRuntime(current.runtime || metadataBase.runtime) !== 'provider-api'
+                || metadataBase.runtime !== runtime
+              )
+            ) {
+              return {
+                status: 409,
+                body: { error: 'agent was not awaiting restoration for this provider runtime' },
+              };
+            }
+
+            const resolved = providerAssignment ? 'provider-api' : resolveRuntime(runtime);
+            const metadata = providerAssignment
+              ? {
+                  ...metadataBase,
+                  runtime: providerAssignment.lane,
+                  providerRuntime: this.providerRuntimeMetadata(providerAssignment),
+                }
+              : {
+                  ...metadataBase,
+                  runtime: resolved,
+                  providerRuntime: undefined,
+                };
+            const hadPriorAssignment = this.providerRuntimeAssignments.has(current.id);
+            const priorAssignment = this.providerRuntimeAssignments.get(current.id);
+            let durableMutationCommitted = false;
+            let processAssignmentCommitted = false;
+            const rollback = async () => {
+              if (processAssignmentCommitted) {
+                if (hadPriorAssignment && priorAssignment) {
+                  this.providerRuntimeAssignments.set(current.id, priorAssignment);
+                } else {
+                  this.providerRuntimeAssignments.delete(current.id);
+                }
+              }
+              if (durableMutationCommitted) {
+                await this.db.agents.updateStatus(current.id, current.status, {
+                  runtime: current.runtime,
+                  metadata: metadataBase,
+                }).catch(() => {});
+              }
             };
-        if (providerAssignment) this.providerRuntimeAssignments.set(agent.id, providerAssignment);
-        else this.providerRuntimeAssignments.delete(agent.id);
-        await this.db.agents.updateStatus(agent.id, 'pending', { runtime: resolved, metadata });
-        console.log(`[Manager] Updated runtime for ${agent.name} to ${providerAssignment?.lane ?? resolved} - rebuild required`);
-        res.json({
-          id: agent.id,
-          name: agent.name,
-          runtime: providerAssignment?.lane ?? resolved,
-          executionRuntime: resolved,
-          status: 'pending',
-          needsRebuild: true,
-          message: 'Runtime updated. Rebuild the agent to apply.',
-        });
+
+            try {
+              await this.db.agents.updateStatus(current.id, 'pending', {
+                runtime: resolved,
+                metadata,
+              });
+              durableMutationCommitted = true;
+              if (providerAssignment) {
+                this.providerRuntimeAssignments.set(current.id, providerAssignment);
+              } else {
+                this.providerRuntimeAssignments.delete(current.id);
+              }
+              processAssignmentCommitted = true;
+              console.log(`[Manager] Updated runtime for ${current.name} to ${providerAssignment?.lane ?? resolved} - rebuild required`);
+
+              if (resumeAfterManagerRestart) {
+                const rebound = await this.resumeProviderAgentAfterManagerRestartUnlocked(
+                  teamId,
+                  teamName,
+                  current.id,
+                );
+                if (!rebound.success) {
+                  await rollback();
+                  return {
+                    status: rebound.status,
+                    body: {
+                      error: rebound.error,
+                      resumed: false,
+                      status: 'offline',
+                    },
+                  };
+                }
+                return {
+                  status: 200,
+                  body: {
+                    id: current.id,
+                    name: current.name,
+                    runtime: providerAssignment!.lane,
+                    executionRuntime: resolved,
+                    status: 'running',
+                    resumed: true,
+                    message: 'Provider access rebound and agent restored after Manager restart.',
+                  },
+                };
+              }
+              return {
+                status: 200,
+                body: {
+                  id: current.id,
+                  name: current.name,
+                  runtime: providerAssignment?.lane ?? resolved,
+                  executionRuntime: resolved,
+                  status: 'pending',
+                  needsRebuild: true,
+                  message: 'Runtime updated. Rebuild the agent to apply.',
+                },
+              };
+            } catch (error) {
+              await rollback();
+              throw error;
+            }
+          },
+        );
+        return res.status(mutation.status).json(mutation.body);
       } catch (e: any) {
         const msg = e?.message || String(e);
         res.status(providerRuntimeErrorStatus(msg)).json({ error: msg });
@@ -12813,54 +15616,101 @@ Return this JSON shape:
           return res.status(400).json({ error: 'Only local runtime-backed agents can be moved between teams' });
         }
 
-        const collision = await this.db.agents.getByName(targetTeam.id, agent.name);
-        if (collision && collision.id !== agent.id) {
-          return res.status(409).json({ error: `Target team already has an agent named "${agent.name}"` });
+        const mutation = await this.withAgentLifecycleLock(
+          this.agentLifecycleKey(sourceTeamId, agent),
+          async (): Promise<{ status: number; body: Record<string, unknown>; moved: boolean }> => {
+            const current = await this.dbQueryAgentById(sourceTeamId, agent.id);
+            if (!current) {
+              return { status: 409, body: { error: 'Agent changed teams; refresh and retry' }, moved: false };
+            }
+            if (isRemoteEndpointRuntime(current.runtime)) {
+              return { status: 400, body: { error: 'team_move_not_supported_for_remote' }, moved: false };
+            }
+            if (current.type !== 'claude') {
+              return {
+                status: 400,
+                body: { error: 'Only local runtime-backed agents can be moved between teams' },
+                moved: false,
+              };
+            }
+            const collision = await this.findAgentPortableNameCollision(
+              targetTeam!.id,
+              current.name,
+              current.id,
+            );
+            if (collision && collision.id !== current.id) {
+              return {
+                status: 409,
+                body: { error: `Target team already has an agent named "${current.name}"` },
+                moved: false,
+              };
+            }
+
+            const oldServerKey = this.key(sourceTeamId, current.id);
+            const oldServer = this.runningServers.get(oldServerKey);
+            if (oldServer) {
+              try {
+                await oldServer.stop();
+              } catch (error) {
+                console.error(`⚠️ Failed to stop moved agent server ${current.name} (${current.id}):`, error);
+              }
+              this.runningServers.delete(oldServerKey);
+            }
+
+            const shouldRebuild = (
+              current.status === 'running'
+              || current.status === 'starting'
+              || Boolean(oldServer)
+            );
+            await this.db.agents.moveToTeam(
+              current.id,
+              targetTeam!.id,
+              shouldRebuild ? 'pending' : undefined,
+            );
+            if (shouldRebuild) {
+              const spawnResult = await this.rebuildLocalClaudeAgentUnlocked(
+                targetTeam!.id,
+                targetTeam!.name,
+                {
+                  ...current,
+                  team_id: targetTeam!.id,
+                  status: 'pending',
+                },
+              );
+              if (!spawnResult.success) {
+                await this.db.agents.moveToTeam(current.id, sourceTeamId, 'offline');
+                return {
+                  status: 503,
+                  body: {
+                    error: 'team_move_rebuild_failed',
+                    message: `Agent stayed with ${sourceTeamName}; verified rebuild for ${targetTeam!.name} failed.`,
+                  },
+                  moved: false,
+                };
+              }
+            }
+            return {
+              status: 200,
+              moved: true,
+              body: {
+                ok: true,
+                agent: current.name,
+                id: current.id,
+                from: sourceTeamName,
+                team: targetTeam!.name,
+                rebuilt: shouldRebuild,
+                ...(!shouldRebuild && {
+                  warning: `moved while ${current.status || 'not running'}; start or rebuild when ready`,
+                }),
+              },
+            };
+          },
+        );
+        if (mutation.moved) {
+          this.broadcastAgentsChanged(sourceTeamId, { reason: 'remove', removed: [agent.name] });
+          this.broadcastAgentsChanged(targetTeam.id, { reason: 'spawn', added: [agent.name] });
         }
-
-        const oldServerKey = this.key(sourceTeamId, agent.id);
-        const oldServer = this.runningServers.get(oldServerKey);
-        if (oldServer) {
-          try {
-            await oldServer.stop();
-          } catch (e) {
-            console.error(`⚠️ Failed to stop moved agent server ${agent.name} (${agent.id}):`, e);
-          }
-          this.runningServers.delete(oldServerKey);
-        }
-
-        const shouldRebuild = agent.status === 'running' || agent.status === 'starting' || Boolean(oldServer);
-        await this.db.agents.moveToTeam(agent.id, targetTeam.id, shouldRebuild ? 'pending' : undefined);
-
-        let rebuilt = false;
-        let warning: string | undefined;
-        if (shouldRebuild) {
-          const spawnResult = await this.rebuildLocalClaudeAgent(targetTeam.id, targetTeam.name, {
-            ...agent,
-            team_id: targetTeam.id,
-            status: 'pending',
-          });
-          if (spawnResult.success) {
-            rebuilt = true;
-          } else {
-            warning = `moved but rebuild failed: ${spawnResult.error || 'unknown error'}`;
-            await this.db.agents.updateStatus(agent.id, 'error').catch(() => {});
-          }
-        } else {
-          warning = `moved while ${agent.status || 'not running'}; start or rebuild when ready`;
-        }
-
-        this.broadcastAgentsChanged(sourceTeamId, { reason: 'remove', removed: [agent.name] });
-        this.broadcastAgentsChanged(targetTeam.id, { reason: 'spawn', added: [agent.name] });
-        return res.json({
-          ok: true,
-          agent: agent.name,
-          id: agent.id,
-          from: sourceTeamName,
-          team: targetTeam.name,
-          rebuilt,
-          warning,
-        });
+        return res.status(mutation.status).json(mutation.body);
       } catch (e: any) {
         return res.status(500).json({ error: e?.message || String(e) });
       }
@@ -12901,6 +15751,9 @@ Return this JSON shape:
     // PATCH /agents/:id/metadata — update agent properties (wallet, name, etc.)
     this.managementApp.patch('/agents/:id/metadata', async (req, res) => {
       try {
+        if (this.idaccAdminToken && !this.isAdminRequest(req)) {
+          return res.status(403).json({ error: 'admin_required' });
+        }
         const { id: teamId } = await this.getTeam(req);
         const agent = await this.dbQueryAgentById(teamId, req.params.id);
         if (!agent) return res.status(404).json({ error: 'Agent not found' });
@@ -12917,6 +15770,16 @@ Return this JSON shape:
         if (newName) {
           const nameCheck = validateName(newName, 'agent');
           if (!nameCheck.valid) return res.status(400).json({ error: nameCheck.error });
+          const collision = await this.findAgentPortableNameCollision(
+            teamId,
+            newName,
+            agent.id,
+          );
+          if (collision) {
+            return res.status(409).json({
+              error: `Agent name "${newName}" conflicts with existing "${collision.name}"`,
+            });
+          }
           await this.db.agents.updateIdentity(agent.id, { name: newName });
         }
 
@@ -12927,59 +15790,25 @@ Return this JSON shape:
     });
 
     this.managementApp.delete('/agents/:id', async (req, res) => {
+      if (this.idaccAdminToken && !this.isAdminRequest(req)) {
+        return res.status(403).json({ error: 'admin_required' });
+      }
       const { id: teamId } = await this.getTeam(req);
       const agent = await this.dbQueryAgentById(teamId, req.params.id);
       if (!agent) return res.status(404).json({ error: 'Agent not found' });
-
-      // Stop runtime server if running
-      const serverKey = this.key(teamId, agent.id);
-      const server = this.runningServers.get(serverKey);
-      if (server) {
-        try {
-          await server.stop();
-        } catch (e) {
-          console.error(`⚠️ Failed to stop agent server ${agent.name} (${agent.id}):`, e);
-        }
-        this.runningServers.delete(serverKey);
-      }
-
-      // Best-effort delete workspace for claude agents
-      if (agent.type === 'claude' && agent.working_directory) {
-        try {
-          const expectedDir = `${this.baseWorkDir}/agents/${agent.id}`;
-          if (agent.working_directory === expectedDir) {
-            rmSync(agent.working_directory, { recursive: true, force: true });
-          }
-        } catch (e) {
-          console.error(`⚠️ Failed to delete workspace for ${agent.name} (${agent.id}):`, e);
-        }
-      }
-
-      // Delete record (cascades wallets/news/queries)
-      await this.db.agents.deleteAgent(agent.id);
+      await this.deleteAgentExplicitly(teamId, agent);
       res.json({ message: 'Agent deleted', id: agent.id, name: agent.name });
       this.broadcastAgentsChanged(teamId, { reason: 'remove', removed: [agent.name] });
     });
 
     this.managementApp.delete('/agents/by-name/:name', async (req, res) => {
+      if (this.idaccAdminToken && !this.isAdminRequest(req)) {
+        return res.status(403).json({ error: 'admin_required' });
+      }
       const { id: teamId } = await this.getTeam(req);
       const agent = await this.dbQueryAgentByNameMostRecent(teamId, req.params.name);
       if (!agent) return res.status(404).json({ error: 'Agent not found' });
-      const serverKey = this.key(teamId, agent.id);
-      const server = this.runningServers.get(serverKey);
-      if (server) {
-        try {
-          await server.stop();
-        } catch {}
-        this.runningServers.delete(serverKey);
-      }
-      if (agent.type === 'claude' && agent.working_directory) {
-        try {
-          const expectedDir = `${this.baseWorkDir}/agents/${agent.id}`;
-          if (agent.working_directory === expectedDir) rmSync(agent.working_directory, { recursive: true, force: true });
-        } catch {}
-      }
-      await this.db.agents.deleteAgent(agent.id);
+      await this.deleteAgentExplicitly(teamId, agent);
       res.json({ message: 'Agent deleted', id: agent.id, name: agent.name });
       this.broadcastAgentsChanged(teamId, { reason: 'remove', removed: [agent.name] });
     });
@@ -13240,7 +16069,36 @@ Return this JSON shape:
             if (existingClaudeAgent && existingClaudeAgent.type === 'claude') {
               const a = existingClaudeAgent;
               const key = this.key(teamId, a.id);
-              if (!this.runningServers.get(key)) {
+              if (this.idaccAdminToken) {
+                try {
+                  const workingDirectory = a.working_directory || `${this.baseWorkDir}/agents/${a.id}`;
+                  if (!existsSync(workingDirectory)) mkdirSync(workingDirectory, { recursive: true });
+                  const metadata = (a.metadata || {}) as Record<string, unknown>;
+                  const persistedPid = Number(metadata.pid);
+                  const alreadyOwned = Number.isSafeInteger(persistedPid)
+                    && persistedPid > 0
+                    && await this.verifyLocalAgentProcessOwnership(
+                      persistedPid,
+                      a.port,
+                      a,
+                    );
+                  if (!alreadyOwned) {
+                    const spawnResult = await this.spawnLocalAgentProcess(teamId, teamName, {
+                      name: a.name,
+                      id: a.id,
+                      port: a.port,
+                      model: a.model || defaultModel,
+                      workingDirectory,
+                      tokenId,
+                    });
+                    if (!spawnResult.success) {
+                      throw new Error(spawnResult.error || 'managed worker startup failed');
+                    }
+                  }
+                } catch (e: any) {
+                  discovery.errors.push(`start-${tokenId}: ${e?.message || String(e)}`);
+                }
+              } else if (!this.runningServers.get(key)) {
                 try {
                   const workingDirectory = a.working_directory || `${this.baseWorkDir}/agents/${a.id}`;
                   if (!existsSync(workingDirectory)) mkdirSync(workingDirectory, { recursive: true });
@@ -13304,16 +16162,31 @@ Return this JSON shape:
               await this.db.agents.updateMetadata(claudeId, finalMeta);
             }
 
-            const server = new AgentRestServer({
-              model: defaultModel,
-              workingDirectory,
-              sharedDirectory,
-              agentName: handle,
-              agentIdentity: { name: handle, network: teamName, tokenId, metadata: finalMeta },
-              db: { db: this.db, teamId: teamId, agentId: claudeId }
-            });
-            await server.start(port);
-            this.runningServers.set(this.key(teamId, claudeId), server);
+            if (this.idaccAdminToken) {
+              const spawnResult = await this.spawnLocalAgentProcess(teamId, teamName, {
+                name: handle,
+                id: claudeId,
+                port,
+                model: defaultModel,
+                workingDirectory,
+                tokenId,
+              });
+              if (!spawnResult.success) {
+                await this.db.agents.updateStatus(claudeId, 'error').catch(() => {});
+                throw new Error(spawnResult.error || 'managed worker startup failed');
+              }
+            } else {
+              const server = new AgentRestServer({
+                model: defaultModel,
+                workingDirectory,
+                sharedDirectory,
+                agentName: handle,
+                agentIdentity: { name: handle, network: teamName, tokenId, metadata: finalMeta },
+                db: { db: this.db, teamId: teamId, agentId: claudeId }
+              });
+              await server.start(port);
+              this.runningServers.set(this.key(teamId, claudeId), server);
+            }
             await this.db.agents.updateStatus(claudeId, 'running');
 
             spawned++;
@@ -13485,7 +16358,7 @@ Return this JSON shape:
     this.managementApp.all(/^\/(\d+)\/(.+)$/, async (req, res) => {
       const tokenIdParam = req.params[0]; // First capture group is tokenId
 
-      const { id: teamId } = await this.getTeam(req);
+      const { id: teamId, name: teamName } = await this.getTeam(req);
 
       // Find agent by tokenId
       const agents = await this.dbListAgents(teamId, true);
@@ -13511,12 +16384,50 @@ Return this JSON shape:
       const targetUrl = `${internalUrl.replace(/\/+$/, '')}/${pathAfterTokenId}`;
 
       try {
+        if (this.idaccAdminToken) {
+          const managedProxyRouteAllowed = (
+            ((req.method === 'GET' || req.method === 'HEAD')
+              && (
+                pathAfterTokenId === 'health'
+                || pathAfterTokenId === '.well-known/restap.json'
+                || pathAfterTokenId === 'catalog'
+                || pathAfterTokenId === 'news'
+                || pathAfterTokenId === 'files'
+                || pathAfterTokenId === 'files/list'
+                || pathAfterTokenId.startsWith('files/')
+                || pathAfterTokenId === 'xmtp/status'
+                || /^query\/[^/]+$/.test(pathAfterTokenId)
+              ))
+            || (req.method === 'POST'
+              && (
+                pathAfterTokenId === 'talk'
+                || pathAfterTokenId === 'news'
+                || pathAfterTokenId === 'cancel'
+                || pathAfterTokenId === 'clear'
+                || pathAfterTokenId === 'files/upload'
+                || pathAfterTokenId === 'xmtp/send'
+              ))
+            || (req.method === 'PATCH'
+              && (
+                pathAfterTokenId === 'catalog'
+                || pathAfterTokenId === 'identity'
+              ))
+          );
+          if (!managedProxyRouteAllowed) {
+            return res.status(403).json({ error: 'managed_agent_proxy_route_forbidden' });
+          }
+        }
+        const proxyHeaders = await this.managerTargetWorkerHeaders(
+          agent,
+          teamName,
+          {
+            'Content-Type': req.headers['content-type'] || 'application/json',
+            'Accept': req.headers['accept'] || 'application/json',
+          },
+        );
         const proxyRes = await fetch(targetUrl, {
           method: req.method,
-          headers: {
-            'Content-Type': req.headers['content-type'] || 'application/json',
-            'Accept': req.headers['accept'] || 'application/json'
-          },
+          headers: proxyHeaders,
           body: ['GET', 'HEAD'].includes(req.method) ? undefined : JSON.stringify(req.body)
         });
 
@@ -13601,6 +16512,26 @@ Return this JSON shape:
             }
           }
         }
+        let explicitWorkerOwner: AgentRow | null = null;
+        if (
+          principal === 'agent'
+          && this.idaccAdminToken
+          && body.owner !== undefined
+        ) {
+          if (typeof body.owner !== 'string' || !body.owner.trim()) {
+            return res.status(400).json({ error: 'invalid_task_owner' });
+          }
+          const resolvedOwner = await this.resolveSingleAgentForCommand(
+            taskTeamId,
+            body.owner,
+          );
+          if (!resolvedOwner.agent) {
+            return res.status(404).json({
+              error: resolvedOwner.error || `Agent "${body.owner}" not found`,
+            });
+          }
+          explicitWorkerOwner = resolvedOwner.agent;
+        }
         const brief = this.validateIncomingTaskBrief({
           ...body,
           title,
@@ -13621,6 +16552,7 @@ Return this JSON shape:
             description: taskDescription,
           },
           fromAgent: callerAgent,
+          targetAgent: explicitWorkerOwner || undefined,
         });
         if (validatorGuard) {
           return res.status(validatorGuard.status).json({
@@ -13646,10 +16578,38 @@ Return this JSON shape:
           });
         }
 
-        const defaultOwner = await this.defaultLeadOwnerForTaskCreation({
-          teamId: taskTeamId,
-          teamName: taskTeamName,
-        });
+        let defaultOwner: { owner: AgentRow | null; warning?: string };
+        let ownerRoutingReason = 'configured_team_lead';
+        if (explicitWorkerOwner) {
+          if (!(await this.hasDoingTaskRoom(taskTeamId))) {
+            return res.status(409).json({
+              error: 'doing_task_limit_reached',
+              message: await this.doingTaskLimitMessage(taskTeamId),
+            });
+          }
+          const capacityBlock = await this.leadCapacityGuard({
+            teamId: taskTeamId,
+            teamName: taskTeamName,
+            owner: explicitWorkerOwner,
+          });
+          if (capacityBlock) {
+            return res.status(409).json({
+              error: capacityBlock.error,
+              message: capacityBlock.message,
+              blocking_tasks: capacityBlock.blocking_tasks,
+              ...(capacityBlock.triage !== undefined
+                ? { triage: capacityBlock.triage }
+                : {}),
+            });
+          }
+          defaultOwner = { owner: explicitWorkerOwner };
+          ownerRoutingReason = 'managed_worker_explicit_same_team_owner';
+        } else {
+          defaultOwner = await this.defaultLeadOwnerForTaskCreation({
+            teamId: taskTeamId,
+            teamName: taskTeamName,
+          });
+        }
 
         // Generate or validate name slug, scoped to (team_id, name) uniqueness
         let name = rawName ? normalizeAlias(rawName) : normalizeAlias(title);
@@ -13695,7 +16655,7 @@ Return this JSON shape:
           from_agent_id: createdBy,
           to_agent_id: defaultOwner.owner.id,
           team_id: taskTeamId,
-          route: 'configured_team_lead',
+          route: ownerRoutingReason,
           reason: dispatchReady ? 'dispatch_contract_complete' : 'triage_owner_for_incomplete_contract',
           occurred_at: nowMs,
         } : null;
@@ -13766,15 +16726,68 @@ Return this JSON shape:
           });
         }
         const taskResult = await this.buildTaskResult(taskRow, taskTeamId);
+        (taskResult as any).lifecycle = {
+          claim: `/tasks/${encodeURIComponent(taskRow.name)}/claim`,
+          done: `/tasks/${encodeURIComponent(taskRow.name)}/done`,
+        };
         if (brainContext) (taskResult as any).brain_context = this.brainContextResponse(brainContext);
+        let taskReceipt: string | undefined;
+        if (
+          principal === 'agent'
+          && this.idaccAdminToken
+          && defaultOwner.owner
+          && taskRow.owner === defaultOwner.owner.id
+          && taskRow.status === 'doing'
+          && taskRow.assignment_id
+        ) {
+          // wakeAssignedTaskOwner() may have started or replaced the target
+          // process. Re-read its exact durable row so the receipt is keyed to
+          // the generation that is current after that lifecycle transition.
+          const receiptOwner = await this.db.agents
+            .getById(defaultOwner.owner.id)
+            .catch(() => null);
+          const ownerMetadata = (
+            receiptOwner?.metadata
+            && typeof receiptOwner.metadata === 'object'
+            && !Array.isArray(receiptOwner.metadata)
+          ) ? receiptOwner.metadata as Record<string, unknown> : {};
+          const processGeneration = typeof ownerMetadata[MANAGER_PROCESS_GENERATION_KEY] === 'string'
+            ? ownerMetadata[MANAGER_PROCESS_GENERATION_KEY].trim()
+            : '';
+          if (
+            receiptOwner
+            && receiptOwner.team_id === taskTeamId
+            && (receiptOwner.status === 'running' || receiptOwner.status === 'starting')
+            && processGeneration
+            && await this.hasCurrentManagedWorkerAssignment(
+              receiptOwner,
+              processGeneration,
+            )
+          ) {
+            const targetWorkerBearer = deriveManagerAgentToken(
+              this.idaccAdminToken,
+              taskTeamId,
+              receiptOwner.id,
+              processGeneration,
+            );
+            taskReceipt = issueManagerTaskReceipt(targetWorkerBearer, {
+              team_id: taskTeamId,
+              owner_agent_id: receiptOwner.id,
+              task_name: taskRow.name,
+              task_uuid: taskRow.uuid,
+              assignment_id: taskRow.assignment_id,
+            });
+          }
+        }
         res.status(201).json({
           ok: true,
           task: taskResult,
+          ...(taskReceipt ? { task_receipt: taskReceipt } : {}),
           owner_wake: ownerWake,
           default_owner_routing: defaultOwner.owner
             ? {
                 owner: defaultOwner.owner.name,
-                reason: 'configured_team_lead',
+                reason: ownerRoutingReason,
               }
             : defaultOwner.warning
               ? { warning: defaultOwner.warning }
@@ -14119,6 +17132,25 @@ Return this JSON shape:
           return res.status(409).json({
             error: 'task_brief_not_dispatch_ready',
             brief_validation: claimBrief.validation,
+          });
+        }
+
+        // A managed async delegation is created directly in `doing` with the
+        // authenticated same-team recipient as owner. Task-discipline still
+        // performs the documented claim call, so make that exact-owner retry
+        // idempotent instead of forcing the worker to special-case dispatch
+        // origin. Different owners and terminal tasks remain rejected below.
+        if (task.status === 'doing' && task.owner === agent.id) {
+          const taskResult = await this.buildTaskResult(task, teamId);
+          (taskResult as any).lifecycle = {
+            claim: `/tasks/${encodeURIComponent(task.name)}/claim`,
+            done: `/tasks/${encodeURIComponent(task.name)}/done`,
+          };
+          (taskResult as any).brief_validation = claimBrief.validation;
+          return res.json({
+            ok: true,
+            task: taskResult,
+            already_claimed: true,
           });
         }
 
@@ -15071,9 +18103,14 @@ Return this JSON shape:
       const talkUrl = `${base}/talk`;
 
       try {
+        const workerHeaders = await this.managerTargetWorkerHeaders(
+          agent,
+          teamName,
+          { 'Content-Type': 'application/json' },
+        );
         const talkResp = await fetch(talkUrl, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: workerHeaders,
           body: JSON.stringify({ message: 'reply with OK', from: 'probe' }),
           signal: AbortSignal.timeout(Math.max(1, remainingMs())),
         });
@@ -15120,6 +18157,7 @@ Return this JSON shape:
         while (remainingMs() > 0) {
           const queryResp = await fetch(queryUrl, {
             method: 'GET',
+            headers: workerHeaders,
             signal: AbortSignal.timeout(Math.max(1, Math.min(remainingMs(), 1_000))),
           });
 
@@ -15597,6 +18635,23 @@ Return this JSON shape:
   /**
    * Execute a CLI-style command and return the result
    */
+  private async withYamlReconcileLock<T>(work: () => Promise<T>): Promise<T> {
+    const previous = this.yamlReconcileTail;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const tail = previous.catch(() => {}).then(() => gate);
+    this.yamlReconcileTail = tail;
+    await previous.catch(() => {});
+    try {
+      return await work();
+    } finally {
+      release();
+      if (this.yamlReconcileTail === tail) {
+        this.yamlReconcileTail = Promise.resolve();
+      }
+    }
+  }
+
   private async executeRemoteCommand(
     command: string,
     teamId: string,
@@ -15604,12 +18659,28 @@ Return this JSON shape:
     callerFrom?: string,
     callerSessionId?: string,
     callerContext?: RemoteDispatchContext,
+    yamlReconcileLockHeld = false,
   ): Promise<{ ok: boolean; result?: any; error?: string }> {
     // Remove leading slash if present
     const cmd = command.startsWith('/') ? command.slice(1) : command;
     const parts = tokenizeCommand(cmd);
     const action = parts[0]?.toLowerCase();
     const args = parts.slice(1);
+
+    if (
+      !yamlReconcileLockHeld
+      && (action === 'deploy' || action === 'sync')
+    ) {
+      return this.withYamlReconcileLock(() => this.executeRemoteCommand(
+        command,
+        teamId,
+        teamName,
+        callerFrom,
+        callerSessionId,
+        callerContext,
+        true,
+      ));
+    }
 
     switch (action) {
       case 'tasks': {
@@ -16037,7 +19108,7 @@ Return this JSON shape:
             const newMetadata = { ...agent.metadata, heartbeat: false };
             await this.db.agents.updateMetadata(agent.id, newMetadata);
             if (this.schedulerService) {
-              await this.schedulerService.removeAgentSchedules(agent.id);
+              await this.schedulerService.removeYamlHeartbeatSchedule(agent.id);
             }
             return { ok: true, result: { message: `Heartbeat disabled for ${agent.name}` } };
           }
@@ -16154,7 +19225,7 @@ Return this JSON shape:
               await this.killAgentProcess(agent.port, agent.id);
             }
             if (this.schedulerService) {
-              await this.schedulerService.removeAgentSchedules(agent.id);
+              await this.schedulerService.removeYamlHeartbeatSchedule(agent.id);
             }
             await this.cancelPendingQueriesForAgent(bulkTeamId, agent.id);
             const deleted = await this.dbDeleteAgentRow(bulkTeamId, agent.id);
@@ -16225,7 +19296,7 @@ Return this JSON shape:
 
         // Remove any schedules for this agent
         if (this.schedulerService) {
-          await this.schedulerService.removeAgentSchedules(a.id);
+          await this.schedulerService.removeYamlHeartbeatSchedule(a.id);
         }
 
         // Cancel any pending queries so they don't show as orphaned
@@ -16424,8 +19495,13 @@ Return this JSON shape:
         // Use endpoint if set, otherwise construct from port using localhost
         const baseEndpoint = a.endpoint || `http://localhost:${a.port}`;
 
+        const talkHeaders = await this.managerTargetWorkerHeaders(
+          a,
+          targetTeamName,
+          { 'Content-Type': 'application/json' },
+        );
         // Discover REST-AP endpoints from the agent's catalog
-        const endpoints = await discoverRestAPEndpoints(baseEndpoint);
+        const endpoints = await discoverRestAPEndpoints(baseEndpoint, talkHeaders);
         const talkUrl = `${baseEndpoint.replace(/\/+$/, '')}${endpoints.talk}`;
         const brainRequiredIntent = this.brainContextRequiredIntent(messageForDispatch);
         const brainContext = this.shouldAttachBrainContext(messageForDispatch)
@@ -16440,7 +19516,6 @@ Return this JSON shape:
         const outgoingMessage = this.withBrainContextAppendix(messageForDispatch, brainContext, brainRequiredIntent);
 
         // Send message to agent's /talk endpoint
-        const talkHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
         // Serialize local-model dispatch (#7).
         let askGate: string | undefined;
         try {
@@ -16607,11 +19682,15 @@ Return this JSON shape:
 
         const baseEndpoint = a.endpoint;
 
+        const newsHeaders = await this.managerTargetWorkerHeaders(
+          a,
+          teamName,
+        );
         // Discover REST-AP endpoints from the agent's catalog
-        const endpoints = await discoverRestAPEndpoints(baseEndpoint);
+        const endpoints = await discoverRestAPEndpoints(baseEndpoint, newsHeaders);
         const newsUrl = `${baseEndpoint.replace(/\/+$/, '')}${endpoints.news}`;
 
-        const newsResp = await fetch(newsUrl);
+        const newsResp = await fetch(newsUrl, { headers: newsHeaders });
         if (!newsResp.ok) {
           return { ok: false, error: 'Failed to fetch news' };
         }
@@ -16730,13 +19809,14 @@ Return this JSON shape:
         const { agents: syncAgents, errors: syncErrors, teamName: syncConfigTeam, org: syncOrg, calendar: syncCalendar, runtimeCredentialPool: syncRuntimeCredentialPool } =
           processConfig(syncAbsolutePath, this.baseWorkDir, syncDeployArgs);
 
-        let syncTeamId = teamId;
+        let syncTeamId: string | null = teamId;
         let syncTeamName = teamName;
         if (syncConfigTeam && syncConfigTeam !== teamName) {
-          syncTeamId = await this.db.teams.getOrCreateTeamId(syncConfigTeam);
           syncTeamName = syncConfigTeam;
-          const syncTeamDir = `${this.baseWorkDir}/teams/${syncConfigTeam}`;
-          if (!existsSync(syncTeamDir)) mkdirSync(syncTeamDir, { recursive: true });
+          // Resolve the target read-only until parsing, identity checks,
+          // dry-run, and the explicit removal guard have all passed. A typo or
+          // preview must not create durable team state or filesystem folders.
+          syncTeamId = (await this.db.teams.getTeamByName(syncConfigTeam))?.id || null;
         }
 
         if (syncErrors.length > 0) {
@@ -16746,17 +19826,47 @@ Return this JSON shape:
           return { ok: false, error: 'No agents defined in config' };
         }
 
-        await this.db.teams.setOrg(syncTeamId, syncOrg ? syncOrg as unknown as Record<string, unknown> : null);
-        await this.db.teams.setRuntimeCredentialPool(syncTeamId, syncRuntimeCredentialPool ? syncRuntimeCredentialPool as unknown as Record<string, unknown> : null);
-        if (syncRuntimeCredentialPool) this.runtimeCredentialPoolByTeam.set(syncTeamId, syncRuntimeCredentialPool);
-        else this.runtimeCredentialPoolByTeam.delete(syncTeamId);
-
         // Get running agents for this team (include automators)
-        const runningAgents = await this.db.agents.list(syncTeamId, true);
-        // Filter to claude/automator types only — skip interactive agents
-        const syncableRunning = runningAgents.filter(a => a.type === 'claude' || a.type === 'automator');
+        const runningAgents = syncTeamId
+          ? await this.db.agents.listAllActive(syncTeamId)
+          : [];
+        // Only explicitly YAML-managed local rows participate in the diff.
+        // Identity preflight still sees every row so a same-name/key
+        // interactive, virtual, or remote identity fails closed.
+        const syncableRunning = runningAgents.filter(isYamlManagedLocalAgentRow);
+        const syncIdentities = resolveYamlAgentIdentities(syncAgents, runningAgents);
+        if (syncIdentities.error) {
+          return {
+            ok: false,
+            error: `Sync identity conflict: ${syncIdentities.error}`,
+          };
+        }
+        const syncLeadError = postSyncLeadAutomatorError(syncAgents);
+        if (syncLeadError) {
+          return { ok: false, error: syncLeadError };
+        }
 
         const plan = computeSyncPlan(syncAgents, syncableRunning, this.defaultConfig?.model);
+        if (plan.conflicts.length > 0) {
+          return {
+            ok: false,
+            error: `Sync identity conflict: ${plan.conflicts.map((conflict) => `${conflict.name}: ${conflict.message}`).join('; ')}`,
+          };
+        }
+
+        try {
+          await this.preflightTeamManagedOverlays(
+            syncAgents,
+            syncIdentities.assignments,
+            syncTeamName,
+            syncOrg,
+          );
+        } catch (error: any) {
+          return {
+            ok: false,
+            error: `Sync preflight failed: ${error?.message || String(error)}`,
+          };
+        }
 
         if (syncDryRun) {
           return {
@@ -16786,7 +19896,35 @@ Return this JSON shape:
           };
         }
 
-        const syncResult = { added: [] as string[], updated: [] as string[], removed: [] as string[], unchanged: [] as string[] };
+        if (!syncTeamId) {
+          syncTeamId = await this.db.teams.getOrCreateTeamId(syncTeamName);
+          const syncTeamDir = `${this.baseWorkDir}/teams/${syncTeamName}`;
+          if (!existsSync(syncTeamDir)) mkdirSync(syncTeamDir, { recursive: true });
+
+          // Another writer may have populated the team between the read-only
+          // preflight and this commit point. Force a fresh review rather than
+          // applying a plan computed against an empty target.
+          const racedRows = await this.db.agents.listAllActive(syncTeamId);
+          if (racedRows.length > 0) {
+            return {
+              ok: false,
+              error: 'Sync target changed during preflight; run --dry-run again before applying the config.',
+            };
+          }
+        }
+
+        await this.db.teams.setOrg(syncTeamId, syncOrg ? syncOrg as unknown as Record<string, unknown> : null);
+        await this.db.teams.setRuntimeCredentialPool(syncTeamId, syncRuntimeCredentialPool ? syncRuntimeCredentialPool as unknown as Record<string, unknown> : null);
+        if (syncRuntimeCredentialPool) this.runtimeCredentialPoolByTeam.set(syncTeamId, syncRuntimeCredentialPool);
+        else this.runtimeCredentialPoolByTeam.delete(syncTeamId);
+
+        const syncResult = {
+          added: [] as string[],
+          updated: [] as string[],
+          removed: [] as string[],
+          unchanged: [] as string[],
+          failed: [] as Array<{ name: string; error: string }>,
+        };
 
         // --- REMOVED agents: kill process, hard-delete DB row ---
         for (const item of plan.removed) {
@@ -16802,156 +19940,258 @@ Return this JSON shape:
           syncResult.removed.push(item.name);
         }
 
-        // --- UNCHANGED agents: skip ---
+        // --- UNCHANGED agents: reconcile source content without restarting ---
+        // A plugin/skill/library entry can change under the same declarative
+        // name, so metadata equality alone is not a filesystem equality proof.
         for (const item of plan.unchanged) {
-          syncResult.unchanged.push(item.name);
+          const spec = syncAgents.find((candidate) => (
+            (candidate.domain || candidate.name) === item.name
+          ));
+          const row = spec ? syncIdentities.assignments.get(spec) : null;
+          if (!spec || !row) {
+            syncResult.failed.push({
+              name: item.name,
+              error: 'unchanged sync plan no longer matches an existing identity',
+            });
+            continue;
+          }
+          try {
+            const workingDirectory = spec.workingDirectory && path.isAbsolute(spec.workingDirectory)
+              ? spec.workingDirectory
+              : row.working_directory || `${this.baseWorkDir}/agents/${row.id}`;
+            const effectiveRuntime = resolveRuntime(spec.runtime) as HarnessType;
+            let orgContext = '';
+            if (syncOrg?.groups) {
+              try {
+                const { generateAgentOrgContext } = await import('./org-chart.js');
+                orgContext = generateAgentOrgContext(spec.name, syncOrg);
+              } catch { /* optional org presentation */ }
+            }
+            this.reconcileAgentManagedOverlay({
+              workingDirectory,
+              runtime: effectiveRuntime,
+              templateName: spec.name,
+              teamName: syncTeamName,
+              displayName: spec.domain || spec.name,
+              plugins: spec.plugins || [],
+              skills: spec.skills || [],
+              ...(spec.agent && { agentOverlay: spec.agent }),
+              ...(spec.roleBody && { roleBody: spec.roleBody }),
+              orgContext,
+              onchainIdentity: spec.domain
+                ? `Your onchain identity is your ENS domain: **${spec.domain}**`
+                : '',
+              hasWallet: !!(row.metadata as AgentMetadata | null)?.ows_wallet,
+            });
+            syncResult.unchanged.push(item.name);
+          } catch (error: any) {
+            syncResult.failed.push({
+              name: item.name,
+              error: error?.message || String(error),
+            });
+          }
         }
 
         // --- CHANGED agents: in-place rebuild with same ID/port ---
         for (const item of plan.changed) {
-          const row = syncableRunning.find(r => r.name === item.name)!;
-          const spec = syncAgents.find(a => (a.domain || a.name) === item.name)!;
-
-          // If workingDirectory changed, treat as destroy + recreate
-          const wdChanged = item.changes?.includes('workingDirectory');
-          if (wdChanged) {
-            if (row.port) {
-              await this.killAgentProcess(row.port, row.id);
-              await new Promise(r => setTimeout(r, 500));
-            }
-            await this.db.agents.deleteAgent(row.id);
-            plan.added.push({ name: item.name, category: 'new' });
-            syncResult.updated.push(item.name);
+          const spec = syncAgents.find(a => (a.domain || a.name) === item.name);
+          if (!spec) {
+            syncResult.failed.push({
+              name: item.name,
+              error: 'sync plan no longer matches a configured agent',
+            });
+            continue;
+          }
+          const identityResolution = resolveAgentSpecIdentity(spec, syncableRunning);
+          if (identityResolution.error) {
+            syncResult.failed.push({
+              name: item.name,
+              error: identityResolution.error,
+            });
+            continue;
+          }
+          const row = identityResolution.row;
+          if (!row) {
+            syncResult.failed.push({
+              name: item.name,
+              error: 'sync plan no longer matches an existing agent row',
+            });
             continue;
           }
 
-          // Kill old process on existing port
-          if (row.port) {
-            await this.killAgentProcess(row.port, row.id);
-            await new Promise(r => setTimeout(r, 500));
+          let workerStopped = false;
+          try {
+            const existingPort = reusableYamlDeployPort(row.port);
+            const port = existingPort || await this.dbNextPort(syncTeamId);
+            // Update config on disk (skills, plugins, heartbeat)
+            const workingDirectory = spec.workingDirectory && path.isAbsolute(spec.workingDirectory)
+              ? spec.workingDirectory
+              : row.working_directory || `${this.baseWorkDir}/agents/${row.id}`;
+            if (!existsSync(workingDirectory)) mkdirSync(workingDirectory, { recursive: true });
+
+            const effectiveRuntime = resolveRuntime(spec.runtime) as HarnessType;
+            const effectiveModel = spec.model || getDefaultModelForRuntime(effectiveRuntime, this.defaultConfig?.model);
+            this.ensureRuntimeReady(effectiveRuntime, effectiveModel);
+
+            const mergedPlugins = spec.plugins || [];
+            const existingMetadata = (row.metadata as AgentMetadata | null) || {};
+            const agentSkills: string[] = spec.skills || [];
+
+            let orgContext = '';
+            if (syncOrg?.groups) {
+              try {
+                const { generateAgentOrgContext } = await import('./org-chart.js');
+                orgContext = generateAgentOrgContext(spec.name, syncOrg);
+              } catch { /* ignore */ }
+            }
+
+            const configDomain = spec.domain;
+            const normalizedSkills = normalizeConfigSkills(agentSkills);
+            const retainedMetadata = retainRuntimeOwnedAgentMetadata(existingMetadata);
+            const mergedCatalog = mergeCatalogSeed(spec.catalog, existingMetadata.catalog);
+            const declaredEnv = resolveAgentEnvironment(spec);
+
+            const isAutomator = spec.type === 'automator';
+            const url = `http://localhost:${port}`;
+            const walletMeta = this.resolveWalletMetadata(syncTeamName, spec.name, {
+              ...retainedMetadata,
+              name: spec.name,
+              alias: spec.name,
+              ...(spec.identityKey && { identityKey: spec.identityKey }),
+              service_type: isAutomator ? undefined : 'REST-AP',
+              endpoint: isAutomator ? undefined : url,
+              runtime: effectiveRuntime,
+              plugins: [],
+              agent: spec.agent,
+              skills: normalizedSkills,
+              allowed_tools: spec.allowedTools,
+              ...(Object.keys(declaredEnv).length > 0 && { env: declaredEnv }),
+              ...(spec.mcpServers && { mcpServers: spec.mcpServers }),
+              description: spec.description,
+              ...(spec.lead === true && { primaryLead: true }),
+              ...(isAutomator && { isAutomator: true }),
+              ...(spec.heartbeat && { heartbeat: true }),
+              ...(spec.openMode !== undefined && { openMode: spec.openMode }),
+              ...(spec.dangerouslySkipPermissions !== undefined && { dangerouslySkipPermissions: spec.dangerouslySkipPermissions }),
+              // YAML catalog is a seed floor; live PATCHed catalog keys win.
+              ...(mergedCatalog && { catalog: mergedCatalog }),
+              local: true,
+              yamlManaged: true,
+            }, spec.wallet);
+
+            const effectiveIdentityDomain = configDomain || row.domain || null;
+            if (effectiveIdentityDomain) {
+              walletMeta.metadata.idchain_domain = effectiveIdentityDomain;
+              walletMeta.metadata.alias = spec.name;
+            }
+
+            const overlay = this.reconcileAgentManagedOverlay({
+              workingDirectory,
+              runtime: effectiveRuntime,
+              templateName: spec.name,
+              teamName: syncTeamName,
+              displayName: configDomain || spec.name,
+              plugins: mergedPlugins,
+              skills: agentSkills,
+              ...(spec.agent && { agentOverlay: spec.agent }),
+              ...(spec.roleBody && { roleBody: spec.roleBody }),
+              orgContext,
+              onchainIdentity: configDomain
+                ? `Your onchain identity is your ENS domain: **${configDomain}**`
+                : '',
+              hasWallet: !!walletMeta.metadata.ows_wallet,
+            });
+            walletMeta.metadata.plugins = overlay.localPlugins;
+
+            const updatedMeta: AgentMetadata = walletMeta.metadata;
+            const retainedTokenId = spec.tokenId || row.token_id || null;
+            const retainedDomain = effectiveIdentityDomain;
+            const persistedAgentName = configDomain
+              || row.domain
+              || (spec.identityKey ? spec.name : row.name);
+
+            // Preflight and materialize the complete filesystem policy before
+            // stopping the healthy worker. A rejected plugin/skill/overlay
+            // must not turn a validation error into downtime.
+            if (existingPort) {
+              await this.killAgentProcess(existingPort, row.id);
+              await new Promise(r => setTimeout(r, 500));
+              workerStopped = true;
+            }
+
+            await this.db.agents.redeploy(row.id, {
+              name: persistedAgentName,
+              type: spec.type || 'claude',
+              model: effectiveModel,
+              port,
+              endpoint: url,
+              working_directory: workingDirectory,
+              status: 'pending',
+              metadata: updatedMeta,
+              runtime: effectiveRuntime,
+              token_id: retainedTokenId,
+              domain: retainedDomain,
+            });
+
+            // Respawn on the same port with the durable onchain token even
+            // when a newer YAML intentionally omits tokenId.
+            const spawnResult = await this.spawnLocalAgentProcess(syncTeamId, syncTeamName, {
+              name: spec.name,
+              id: row.id,
+              port,
+              model: effectiveModel,
+              workingDirectory,
+              tokenId: retainedTokenId || undefined,
+            });
+
+            if (spawnResult.success) {
+              console.log(`[Sync] Updated agent: ${item.name} (changes: ${item.changes?.join(', ')})`);
+              syncResult.updated.push(item.name);
+            } else {
+              const error = spawnResult.error || 'worker spawn failed';
+              await this.db.agents.updateStatus(row.id, 'error');
+              console.error(`[Sync] Failed to restart ${item.name}: ${error}`);
+              syncResult.failed.push({ name: item.name, error });
+            }
+
+            // Re-seed heartbeat if needed. A scheduling error must not turn a
+            // successfully restarted worker into a deleted/orphaned identity.
+            if (spawnResult.success && this.schedulerService) {
+              try {
+                if (spec.heartbeat) {
+                  const { definition, agentIds } = heartbeatToSchedule(row.id, spec.name, spec.heartbeat);
+                  await this.schedulerService.seedSchedule(definition, agentIds);
+                } else {
+                  await this.schedulerService.removeYamlHeartbeatSchedule(row.id);
+                }
+              } catch (scheduleErr: any) {
+                console.warn(`[Sync] Failed to reconcile heartbeat for ${item.name}: ${scheduleErr.message}`);
+              }
+            }
+          } catch (err: any) {
+            if (workerStopped) {
+              try {
+                await this.db.agents.updateStatus(row.id, 'error');
+              } catch (statusErr: any) {
+                console.warn(`[Sync] Failed to mark ${item.name} error: ${statusErr.message}`);
+              }
+            }
+            const error = err?.message || String(err);
+            console.error(`[Sync] Error updating ${item.name}: ${error}`);
+            syncResult.failed.push({ name: item.name, error });
           }
-
-          // Update config on disk (skills, plugins, heartbeat)
-          const workingDirectory = row.working_directory || `${this.baseWorkDir}/agents/${row.id}`;
-          if (!existsSync(workingDirectory)) mkdirSync(workingDirectory, { recursive: true });
-
-          const effectiveRuntime = resolveRuntime(spec.runtime) as HarnessType;
-          const effectiveModel = spec.model || getDefaultModelForRuntime(effectiveRuntime, this.defaultConfig?.model);
-          this.ensureRuntimeReady(effectiveRuntime, effectiveModel);
-
-          const mergedPlugins = spec.plugins || [];
-          const localPlugins = this.copyPluginsToAgent(mergedPlugins, workingDirectory);
-
-          const agentSkills: string[] = spec.skills || [];
-          let orgContext = '';
-          if (syncOrg?.groups) {
-            try {
-              const { generateAgentOrgContext } = await import('./org-chart.js');
-              orgContext = generateAgentOrgContext(spec.name, syncOrg);
-            } catch { /* ignore */ }
-          }
-
-          const configDomain = spec.domain;
-          const normalizedSkills = normalizeConfigSkills(agentSkills);
-          const existingMetadata = (row.metadata as AgentMetadata | null) || {};
-          const mergedCatalog = mergeCatalogSeed(spec.catalog, existingMetadata.catalog);
-
-          // 1. Deploy library-backed agent overlay into the runtime overlay target, if configured
-          if (spec.agent) {
-            copyLibraryAgentOverlay(workingDirectory, spec.agent, effectiveRuntime);
-          }
-
-          // 2. Deploy team-level skills (runtime-aware)
-          const isAutomator = spec.type === 'automator';
-          const walletMeta = this.resolveWalletMetadata(syncTeamName, spec.name, {
-            ...(row.metadata as AgentMetadata || {}),
-            name: spec.name,
-            service_type: isAutomator ? undefined : 'REST-AP',
-            endpoint: isAutomator ? undefined : `http://localhost:${row.port}`,
-            runtime: effectiveRuntime,
-            plugins: localPlugins,
-            agent: spec.agent,
-            skills: normalizedSkills,
-            allowed_tools: spec.allowedTools,
-            ...(spec.mcpServers && { mcpServers: spec.mcpServers }),
-            description: spec.description,
-            ...(spec.lead === true && { primaryLead: true }),
-            ...(isAutomator && { isAutomator: true }),
-            ...(spec.heartbeat && { heartbeat: true }),
-            ...(spec.dangerouslySkipPermissions !== undefined && { dangerouslySkipPermissions: spec.dangerouslySkipPermissions }),
-            // YAML catalog is a seed floor; live PATCHed catalog keys win.
-            ...(mergedCatalog && { catalog: mergedCatalog }),
-          }, spec.wallet);
-
-          this.deploySkillsToAgent(workingDirectory, agentSkills, {
-            DISPLAY_NAME: configDomain || spec.name,
-            TEAM: syncTeamName,
-            ONCHAIN_IDENTITY: configDomain ? `Your onchain identity is your ENS domain: **${configDomain}**` : '',
-            ORG_CONTEXT: orgContext
-              ? `\n## Your Role\n\n${orgContext}\n\nSee the full org chart at the shared team folder for details on all groups.`
-              : '',
-          }, { hasWallet: !!walletMeta.wallet, runtime: effectiveRuntime });
-
-          // 3. Overlay working-directory template files (runtime-aware)
-          copyAgentDirOverlay(workingDirectory, spec.name, effectiveRuntime);
-          copyHeartbeatMd(workingDirectory, spec.name, effectiveRuntime);
-
-          // 4. Write personality file: framework block (marker-fenced for
-          // Codex/Cursor; full overwrite for Claude). Preserves user edits
-          // outside the markers on Codex/Cursor refresh paths.
-          {
-            const parts = [PROTOCOL_DEFAULTS];
-            if (spec.roleBody) parts.push(spec.roleBody);
-            writePersonalityFile(workingDirectory, effectiveRuntime, parts.join('\n\n'));
-          }
-
-          // 5. Codex/Cursor: append library persona to AGENTS.md inside
-          // marker fences (no-op for Claude).
-          if (spec.agent) {
-            appendLibraryPersonaToAgentsMd(workingDirectory, spec.agent, effectiveRuntime);
-          }
-
-          const updatedMeta: AgentMetadata = walletMeta.metadata;
-
-          await this.db.agents.updateStatus(row.id, 'starting', {
-            model: effectiveModel,
-            runtime: effectiveRuntime,
-            metadata: updatedMeta,
-          });
-
-          // Respawn on same port
-          const spawnResult = await this.spawnLocalAgentProcess(syncTeamId, syncTeamName, {
-            name: spec.name,
-            id: row.id,
-            port: row.port,
-            model: effectiveModel,
-            workingDirectory,
-            tokenId: spec.tokenId || row.token_id || undefined,
-          });
-
-          if (spawnResult.success) {
-            await this.db.agents.updateStatus(row.id, 'running');
-            console.log(`[Sync] Updated agent: ${item.name} (changes: ${item.changes?.join(', ')})`);
-          } else {
-            await this.db.agents.updateStatus(row.id, 'error');
-            console.error(`[Sync] Failed to restart ${item.name}: ${spawnResult.error}`);
-          }
-
-          // Re-seed heartbeat if needed
-          if (spec.heartbeat && this.schedulerService) {
-            const { definition, agentIds } = heartbeatToSchedule(row.id, spec.name, spec.heartbeat);
-            await this.schedulerService.seedSchedule(definition, agentIds);
-          }
-
-          syncResult.updated.push(item.name);
         }
 
         // --- NEW agents: spawn fresh (reuse deploy logic) ---
         for (const item of plan.added) {
           const spec = syncAgents.find(a => (a.domain || a.name) === item.name)!;
           const agentId = `agent_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+          let createdNewAgentRecord = false;
+          let spawnedNewAgent = false;
+          let allocatedPort: number | null = null;
           try {
             const port = await this.dbNextPort(syncTeamId);
+            allocatedPort = port;
             const workingDirectory = spec.workingDirectory && path.isAbsolute(spec.workingDirectory)
               ? spec.workingDirectory
               : `${this.baseWorkDir}/agents/${agentId}`;
@@ -16961,16 +20201,16 @@ Return this JSON shape:
             const effectiveModel = spec.model || getDefaultModelForRuntime(effectiveRuntime, this.defaultConfig?.model);
             this.ensureRuntimeReady(effectiveRuntime, effectiveModel);
 
-            const localPlugins = this.copyPluginsToAgent(spec.plugins || [], workingDirectory);
+            const agentSkills: string[] = spec.skills || [];
             const isAutomator = spec.type === 'automator';
             const agentType = spec.type || 'claude';
             const configDomain = spec.domain;
             const configTokenId = spec.tokenId;
             const agentName = configDomain || spec.name;
 
-            const agentSkills: string[] = spec.skills || [];
             const normalizedSkills = normalizeConfigSkills(agentSkills);
             const mergedCatalog = mergeCatalogSeed(spec.catalog, undefined);
+            const declaredEnv = resolveAgentEnvironment(spec);
             let orgContext = '';
             if (syncOrg?.groups) {
               try {
@@ -16980,13 +20220,16 @@ Return this JSON shape:
             }
             const walletMeta = this.resolveWalletMetadata(syncTeamName, spec.name, {
               name: spec.name,
+              alias: spec.name,
+              ...(spec.identityKey && { identityKey: spec.identityKey }),
               service_type: isAutomator ? undefined : 'REST-AP',
               endpoint: isAutomator ? undefined : `http://localhost:${port}`,
               runtime: effectiveRuntime,
-              plugins: localPlugins,
+              plugins: [],
               ...(spec.agent && { agent: spec.agent }),
               skills: normalizedSkills,
               allowed_tools: spec.allowedTools,
+              ...(Object.keys(declaredEnv).length > 0 && { env: declaredEnv }),
               ...(spec.mcpServers && { mcpServers: spec.mcpServers }),
               description: spec.description,
               ...(spec.lead === true && { primaryLead: true }),
@@ -16998,38 +20241,23 @@ Return this JSON shape:
               ...(mergedCatalog && { catalog: mergedCatalog }),
             }, spec.wallet);
 
-            // 1. Deploy library-backed agent overlay into the runtime overlay target, if configured
-            if (spec.agent) {
-              copyLibraryAgentOverlay(workingDirectory, spec.agent, effectiveRuntime);
-            }
-
-            // 2. Deploy team-level skills (runtime-aware)
-            this.deploySkillsToAgent(workingDirectory, agentSkills, {
-              DISPLAY_NAME: configDomain || spec.name,
-              TEAM: syncTeamName,
-              ONCHAIN_IDENTITY: configDomain ? `Your onchain identity is your ENS domain: **${configDomain}**` : '',
-              ORG_CONTEXT: orgContext
-                ? `\n## Your Role\n\n${orgContext}\n\nSee the full org chart at the shared team folder for details on all groups.`
+            const overlay = this.reconcileAgentManagedOverlay({
+              workingDirectory,
+              runtime: effectiveRuntime,
+              templateName: spec.name,
+              teamName: syncTeamName,
+              displayName: configDomain || spec.name,
+              plugins: spec.plugins || [],
+              skills: agentSkills,
+              ...(spec.agent && { agentOverlay: spec.agent }),
+              ...(spec.roleBody && { roleBody: spec.roleBody }),
+              orgContext,
+              onchainIdentity: configDomain
+                ? `Your onchain identity is your ENS domain: **${configDomain}**`
                 : '',
-            }, { hasWallet: !!walletMeta.wallet, runtime: effectiveRuntime });
-
-            // 3. Overlay working-directory template files (runtime-aware)
-            copyAgentDirOverlay(workingDirectory, spec.name, effectiveRuntime);
-            copyHeartbeatMd(workingDirectory, spec.name, effectiveRuntime);
-
-            // 4. Write personality file: framework block (marker-fenced for
-            // Codex/Cursor; full overwrite for Claude).
-            {
-              const parts = [PROTOCOL_DEFAULTS];
-              if (spec.roleBody) parts.push(spec.roleBody);
-              writePersonalityFile(workingDirectory, effectiveRuntime, parts.join('\n\n'));
-            }
-
-            // 5. Codex/Cursor: append library persona to AGENTS.md inside
-            // marker fences (no-op for Claude).
-            if (spec.agent) {
-              appendLibraryPersonaToAgentsMd(workingDirectory, spec.agent, effectiveRuntime);
-            }
+              hasWallet: !!walletMeta.metadata.ows_wallet,
+            });
+            walletMeta.metadata.plugins = overlay.localPlugins;
 
             const metadata: AgentMetadata = walletMeta.metadata;
 
@@ -17054,10 +20282,18 @@ Return this JSON shape:
               token_id: configTokenId || null,
               domain: configDomain || null,
             });
+            createdNewAgentRecord = true;
 
             const url = `http://localhost:${port}`;
             await this.db.agents.updateStatus(agentId, 'pending', {
-              port, endpoint: url, metadata: { ...metadata, endpoint: url, local: true },
+              port,
+              endpoint: url,
+              metadata: {
+                ...metadata,
+                endpoint: url,
+                local: true,
+                yamlManaged: true,
+              },
             });
 
             const spawnResult = await this.spawnLocalAgentProcess(syncTeamId, syncTeamName, {
@@ -17066,21 +20302,45 @@ Return this JSON shape:
             });
 
             if (spawnResult.success) {
-              await this.db.agents.updateStatus(agentId, 'running');
+              spawnedNewAgent = true;
               console.log(`[Sync] Added agent: ${item.name} (port ${port})`);
+              syncResult.added.push(item.name);
             } else {
-              await this.db.agents.updateStatus(agentId, 'error');
-              console.error(`[Sync] Failed to spawn ${item.name}: ${spawnResult.error}`);
+              const error = spawnResult.error || 'worker spawn failed';
+              // The spawn helper has completed its failed-child cleanup.
+              // Remove only this brand-new row so the next sync retries it.
+              await this.db.agents.deleteAgent(agentId);
+              createdNewAgentRecord = false;
+              console.error(`[Sync] Failed to spawn ${item.name}: ${error}`);
+              syncResult.failed.push({ name: item.name, error });
             }
 
-            if (spec.heartbeat && this.schedulerService) {
-              const { definition, agentIds } = heartbeatToSchedule(agentId, spec.name, spec.heartbeat);
-              await this.schedulerService.seedSchedule(definition, agentIds);
+            if (spawnResult.success && spec.heartbeat && this.schedulerService) {
+              try {
+                const { definition, agentIds } = heartbeatToSchedule(agentId, spec.name, spec.heartbeat);
+                await this.schedulerService.seedSchedule(definition, agentIds);
+              } catch (scheduleErr: any) {
+                console.warn(`[Sync] Failed to seed heartbeat for ${item.name}: ${scheduleErr.message}`);
+              }
             }
-
-            syncResult.added.push(item.name);
           } catch (err: any) {
-            console.error(`[Sync] Error adding ${item.name}: ${err.message}`);
+            const error = err?.message || String(err);
+            if (spawnedNewAgent && allocatedPort) {
+              try {
+                await this.killAgentProcess(allocatedPort, agentId);
+              } catch (killErr: any) {
+                console.warn(`[Sync] Failed to stop partially added ${item.name}: ${killErr.message}`);
+              }
+            }
+            if (createdNewAgentRecord) {
+              try {
+                await this.db.agents.deleteAgent(agentId);
+              } catch (cleanupErr: any) {
+                console.warn(`[Sync] Failed to clean up new agent ${item.name}: ${cleanupErr.message}`);
+              }
+            }
+            console.error(`[Sync] Error adding ${item.name}: ${error}`);
+            syncResult.failed.push({ name: item.name, error });
           }
         }
 
@@ -17199,15 +20459,11 @@ Return this JSON shape:
         const { agents, calendar, errors, onchain, teamName: configTeam, org, runtimeCredentialPool } = processConfig(absolutePath, this.baseWorkDir, deployArgs);
 
         // If config specifies a team, use that instead of the request's team
-        let effectiveTeamId = teamId;
+        let effectiveTeamId: string | null = teamId;
         let effectiveTeamName = teamName;
         if (configTeam && configTeam !== teamName) {
-          effectiveTeamId = await this.db.teams.getOrCreateTeamId(configTeam);
           effectiveTeamName = configTeam;
-          // Ensure team directory exists
-          const configTeamDir = `${this.baseWorkDir}/teams/${configTeam}`;
-          if (!existsSync(configTeamDir)) mkdirSync(configTeamDir, { recursive: true });
-          console.log(`[Deploy] Using team from config: ${configTeam}`);
+          effectiveTeamId = (await this.db.teams.getTeamByName(configTeam))?.id || null;
         }
 
         if (errors.length > 0) {
@@ -17219,6 +20475,53 @@ Return this JSON shape:
 
         if (agents.length === 0) {
           return { ok: false, error: 'No agents defined in config' };
+        }
+
+        const currentDeployAgents = effectiveTeamId
+          ? await this.db.agents.listAllActive(effectiveTeamId)
+          : [];
+        const deployIdentities = resolveYamlAgentIdentities(agents, currentDeployAgents);
+        if (deployIdentities.error) {
+          return {
+            ok: false,
+            error: `Deploy identity conflict: ${deployIdentities.error}`,
+          };
+        }
+        const deployLeadError = postDeployLeadAutomatorError(
+          agents,
+          currentDeployAgents,
+          deployIdentities.assignments,
+        );
+        if (deployLeadError) {
+          return { ok: false, error: deployLeadError };
+        }
+
+        try {
+          await this.preflightTeamManagedOverlays(
+            agents,
+            deployIdentities.assignments,
+            effectiveTeamName,
+            org,
+          );
+        } catch (error: any) {
+          return {
+            ok: false,
+            error: `Deploy preflight failed: ${error?.message || String(error)}`,
+          };
+        }
+
+        if (!effectiveTeamId) {
+          effectiveTeamId = await this.db.teams.getOrCreateTeamId(effectiveTeamName);
+          const racedRows = await this.db.agents.listAllActive(effectiveTeamId);
+          if (racedRows.length > 0) {
+            return {
+              ok: false,
+              error: 'Deploy target changed during preflight; run --dry-run again before applying the config.',
+            };
+          }
+          const configTeamDir = `${this.baseWorkDir}/teams/${effectiveTeamName}`;
+          if (!existsSync(configTeamDir)) mkdirSync(configTeamDir, { recursive: true });
+          console.log(`[Deploy] Using team from config: ${effectiveTeamName}`);
         }
 
         await this.db.teams.setOrg(effectiveTeamId, org ? org as unknown as Record<string, unknown> : null);
@@ -17250,23 +20553,6 @@ Return this JSON shape:
           }
         }
 
-        // Validate automator naming: first automator must be named "lead-automator"
-        const automatorAgents = agents.filter(a => a.type === 'automator');
-        if (automatorAgents.length > 0) {
-          const existingLeadAutomator = await this.db.agents.getByName(effectiveTeamId, 'lead-automator');
-          const hasLeadAutomator = existingLeadAutomator !== null && existingLeadAutomator.type === 'automator';
-
-          if (!hasLeadAutomator) {
-            const hasLeadAutomatorInConfig = automatorAgents.some(a => a.name === 'lead-automator');
-            if (!hasLeadAutomatorInConfig) {
-              return {
-                ok: false,
-                error: 'First automator must be named "lead-automator". Rename the team-local automator and re-deploy.'
-              };
-            }
-          }
-        }
-
         // Deploy each agent
         const results: { name: string; id?: string; port?: number; success: boolean; error?: string; tokenId?: string }[] = [];
 
@@ -17276,13 +20562,21 @@ Return this JSON shape:
         }
 
         for (const agentConfig of agents) {
-          // Generate unique agent ID outside try so it's available for cleanup
-          const agentId = `agent_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+          // Generate a candidate only for a genuinely new logical agent.
+          let agentId = `agent_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+          let existing: AgentRow | null = null;
+          let createdNewAgentRecord = false;
+          let spawnedNewAgentPort: number | null = null;
           try {
-            const port = await this.dbNextPort(effectiveTeamId);
+            const configDomain = agentConfig.domain;
+            const agentName = configDomain || agentConfig.name;
+            existing = deployIdentities.assignments.get(agentConfig) || null;
+            agentId = stableYamlRedeployAgentId(existing, agentId);
+            const existingPort = reusableYamlDeployPort(existing?.port);
+            const port = existingPort || await this.dbNextPort(effectiveTeamId);
             const workingDirectory = agentConfig.workingDirectory && path.isAbsolute(agentConfig.workingDirectory)
               ? agentConfig.workingDirectory
-              : `${this.baseWorkDir}/agents/${agentId}`;
+              : existing?.working_directory || `${this.baseWorkDir}/agents/${agentId}`;
 
             if (!existsSync(workingDirectory)) {
               mkdirSync(workingDirectory, { recursive: true });
@@ -17293,34 +20587,35 @@ Return this JSON shape:
             const effectiveModel = agentConfig.model || getDefaultModelForRuntime(effectiveRuntime, this.defaultConfig?.model);
             this.ensureRuntimeReady(effectiveRuntime, effectiveModel);
             const mergedPlugins = agentConfig.plugins || [];
-
-            // Copy plugins to agent's working directory
-            const localPlugins = this.copyPluginsToAgent(mergedPlugins, workingDirectory);
+            const existingMetadata = (existing?.metadata as AgentMetadata | null) || {};
+            const agentSkills: string[] = agentConfig.skills || [];
 
             // Automator agents are team-local planning workers; they don't have REST-AP endpoints
             console.log(`[Deploy] Agent ${agentConfig.name}: type=${agentConfig.type}, isAutomator=${agentConfig.type === 'automator'}`);
             const isAutomator = agentConfig.type === 'automator';
             const agentType = agentConfig.type || 'claude';
             const normalizedSkills = normalizeConfigSkills(agentConfig.skills);
-            const configDomain = agentConfig.domain;
             const configTokenId = agentConfig.tokenId;
-            const agentName = configDomain || agentConfig.name;
-            const existing = await this.db.agents.getByName(effectiveTeamId, agentName);
-            const existingMetadata = (existing?.metadata as AgentMetadata | null) || {};
+            const retainedMetadata = retainRuntimeOwnedAgentMetadata(existingMetadata);
             const mergedCatalog = mergeCatalogSeed(agentConfig.catalog, existingMetadata.catalog);
+            const declaredEnv = resolveAgentEnvironment(agentConfig);
 
             // Get heartbeat config
             const heartbeatConfig = agentConfig.heartbeat;
 
             const metadata: AgentMetadata = {
+              ...retainedMetadata,
               name: agentConfig.name,
+              alias: agentConfig.name,
+              ...(agentConfig.identityKey && { identityKey: agentConfig.identityKey }),
               service_type: isAutomator ? undefined : 'REST-AP',
               endpoint: isAutomator ? undefined : `http://localhost:${port}`,
               runtime: effectiveRuntime,
-              plugins: localPlugins,
+              plugins: [],
               ...(agentConfig.agent && { agent: agentConfig.agent }),
               ...(normalizedSkills && { skills: normalizedSkills }),
               allowed_tools: agentConfig.allowedTools,
+              ...(Object.keys(declaredEnv).length > 0 && { env: declaredEnv }),
               ...(agentConfig.mcpServers && { mcpServers: agentConfig.mcpServers }),
               description: agentConfig.description,
               ...(agentConfig.lead === true && { primaryLead: true }),
@@ -17330,12 +20625,15 @@ Return this JSON shape:
               ...(agentConfig.openMode !== undefined && { openMode: agentConfig.openMode }),
               ...(agentConfig.dangerouslySkipPermissions !== undefined && { dangerouslySkipPermissions: agentConfig.dangerouslySkipPermissions }),
               // YAML catalog is a seed floor; live PATCHed catalog keys win.
-              ...(mergedCatalog && { catalog: mergedCatalog })
+              ...(mergedCatalog && { catalog: mergedCatalog }),
+              local: true,
+              yamlManaged: true,
             };
 
             // Use ENS domain from config if available (preserves registration across redeploys)
-            if (configDomain) {
-              metadata.idchain_domain = configDomain;
+            const effectiveIdentityDomain = configDomain || existing?.domain || null;
+            if (effectiveIdentityDomain) {
+              metadata.idchain_domain = effectiveIdentityDomain;
               metadata.alias = agentConfig.name;
             }
 
@@ -17343,24 +20641,13 @@ Return this JSON shape:
             // metadata so the on-demand provisioning command and the
             // onchain auto-provision gate can read it. Only call the `ows`
             // CLI when `wallet: true`.
-            if (agentConfig.wallet !== undefined) {
-              metadata.wallet = agentConfig.wallet;
-            }
-            const owsWallet = agentConfig.wallet === true
-              ? this.getOrCreateAgentWallet(effectiveTeamName, agentConfig.name)
-              : null;
-            if (owsWallet) {
-              metadata.ows_wallet = owsWallet.walletName;
-              metadata.ows_address = owsWallet.address;
-            }
+            const walletMeta = this.resolveWalletMetadata(
+              effectiveTeamName,
+              agentConfig.name,
+              metadata,
+              agentConfig.wallet,
+            );
 
-            // 1. Deploy library-backed agent overlay into the runtime overlay target, if configured
-            if (agentConfig.agent) {
-              copyLibraryAgentOverlay(workingDirectory, agentConfig.agent, effectiveRuntime);
-            }
-
-            // 2. Deploy skills (runtime-aware)
-            const agentSkills: string[] = agentConfig.skills || [];
             let orgContext = '';
             if (org?.groups) {
               try {
@@ -17368,71 +20655,82 @@ Return this JSON shape:
                 orgContext = generateAgentOrgContext(agentConfig.name, org);
               } catch { /* ignore */ }
             }
-            this.deploySkillsToAgent(workingDirectory, agentSkills, {
-              DISPLAY_NAME: configDomain || agentConfig.name,
-              TEAM: effectiveTeamName,
-              ONCHAIN_IDENTITY: configDomain
+            const overlay = this.reconcileAgentManagedOverlay({
+              workingDirectory,
+              runtime: effectiveRuntime,
+              templateName: agentConfig.name,
+              teamName: effectiveTeamName,
+              displayName: configDomain || agentConfig.name,
+              plugins: mergedPlugins,
+              skills: agentSkills,
+              ...(agentConfig.agent && { agentOverlay: agentConfig.agent }),
+              ...(agentConfig.roleBody && { roleBody: agentConfig.roleBody }),
+              orgContext,
+              onchainIdentity: configDomain
                 ? `Your onchain identity is your ENS domain: **${configDomain}**`
                 : '',
-              ORG_CONTEXT: orgContext
-                ? `\n## Your Role\n\n${orgContext}\n\nSee the full org chart at the shared team folder for details on all groups.`
-                : '',
-            }, { hasWallet: !!owsWallet, runtime: effectiveRuntime });
+              hasWallet: !!walletMeta.metadata.ows_wallet,
+            });
+            walletMeta.metadata.plugins = overlay.localPlugins;
 
-            // 3. Overlay working-directory template files (runtime-aware)
-            copyAgentDirOverlay(workingDirectory, agentConfig.name, effectiveRuntime);
-            copyHeartbeatMd(workingDirectory, agentConfig.name, effectiveRuntime);
-
-            // 4. Write personality file: protocol defaults + agent role body (runtime-aware)
-            {
-              const parts = [PROTOCOL_DEFAULTS];
-              if (agentConfig.roleBody) parts.push(agentConfig.roleBody);
-              writePersonalityFile(workingDirectory, effectiveRuntime, parts.join('\n\n'));
-            }
-
-            // 5. Codex/Cursor: append library persona to AGENTS.md inside
-            // marker fences (no-op for Claude).
-            if (agentConfig.agent) {
-              appendLibraryPersonaToAgentsMd(workingDirectory, agentConfig.agent, effectiveRuntime);
-            }
-
-            // Remove any existing agent with this name to avoid duplicates on redeploy
+            // Stop the old worker, but retain the database row and every
+            // foreign-key-owned wallet/query/news/schedule record.
             if (existing) {
-              // Kill the old process before deleting the DB row to prevent orphans
-              if (existing.port) {
-                await this.killAgentProcess(existing.port, existing.id);
+              if (existingPort) {
+                await this.killAgentProcess(existingPort, existing.id);
                 await new Promise(r => setTimeout(r, 500));
               }
-              await this.db.agents.deleteAgent(existing.id);
             }
 
-            // Insert into database
-            console.log(`[Deploy] Storing agent: name=${agentName}, type=${agentType}, configType=${agentConfig.type}`);
-            await this.db.agents.create({
-              team_id: effectiveTeamId,
-              id: agentId,
-              name: agentName,
-              type: agentType,
-              model: effectiveModel,
-              port,
-              endpoint: null,
-              working_directory: workingDirectory,
-              status: 'starting',
-              created_at: Date.now(),
-              metadata,
-              runtime: effectiveRuntime,
-              token_id: configTokenId || null,
-              domain: configDomain || null,
-            });
-
-            // All agents run locally - set up database and let CLI spawn the process
             const url = `http://localhost:${port}`;
-            const finalMeta = { ...metadata, endpoint: url, local: true };
-            await this.db.agents.updateStatus(agentId, 'pending', {
-              port,
+            const finalMeta = {
+              ...walletMeta.metadata,
               endpoint: url,
-              metadata: finalMeta,
-            });
+              local: true,
+              yamlManaged: true,
+            };
+            const retainedTokenId = configTokenId || existing?.token_id || null;
+            const retainedDomain = effectiveIdentityDomain;
+            const persistedAgentName = configDomain
+              || existing?.domain
+              || (agentConfig.identityKey ? agentConfig.name : existing?.name)
+              || agentName;
+
+            // Insert a new identity or update the existing deployment in place.
+            console.log(`[Deploy] Storing agent: name=${persistedAgentName}, type=${agentType}, configType=${agentConfig.type}`);
+            if (existing) {
+              await this.db.agents.redeploy(agentId, {
+                name: persistedAgentName,
+                type: agentType,
+                model: effectiveModel,
+                port,
+                endpoint: url,
+                working_directory: workingDirectory,
+                status: 'pending',
+                metadata: finalMeta,
+                runtime: effectiveRuntime,
+                token_id: retainedTokenId,
+                domain: retainedDomain,
+              });
+            } else {
+              await this.db.agents.create({
+                team_id: effectiveTeamId,
+                id: agentId,
+                name: persistedAgentName,
+                type: agentType,
+                model: effectiveModel,
+                port,
+                endpoint: url,
+                working_directory: workingDirectory,
+                status: 'pending',
+                created_at: Date.now(),
+                metadata: finalMeta,
+                runtime: effectiveRuntime,
+                token_id: retainedTokenId,
+                domain: retainedDomain,
+              });
+              createdNewAgentRecord = true;
+            }
 
             // Spawn the agent process
             const spawnResult = await this.spawnLocalAgentProcess(effectiveTeamId, effectiveTeamName, {
@@ -17441,17 +20739,29 @@ Return this JSON shape:
               port,
               model: effectiveModel,
               workingDirectory,
-              tokenId: configTokenId || undefined,
+              tokenId: retainedTokenId || undefined,
               address: (agentConfig as any).address || undefined
             });
 
-            // Seed heartbeat schedule if config specified
-            if (heartbeatConfig && this.schedulerService) {
-              const { definition, agentIds } = heartbeatToSchedule(agentId, agentConfig.name, heartbeatConfig);
-              await this.schedulerService.seedSchedule(definition, agentIds);
+            // Reconcile only this identity's YAML heartbeat after a successful
+            // restart. Manual and calendar schedules have different sources
+            // and are preserved.
+            if (spawnResult.success && this.schedulerService) {
+              try {
+                if (heartbeatConfig) {
+                  const { definition, agentIds } = heartbeatToSchedule(agentId, agentConfig.name, heartbeatConfig);
+                  await this.schedulerService.seedSchedule(definition, agentIds);
+                } else if (existing) {
+                  await this.schedulerService.removeYamlHeartbeatSchedule(agentId);
+                }
+              } catch (scheduleErr: any) {
+                // A scheduler refresh is ancillary to the already-started
+                // worker. Do not delete a new row and orphan that process.
+                console.warn(`[Deploy] Failed to reconcile heartbeat for ${agentConfig.name}: ${scheduleErr.message}`);
+              }
             }
 
-            const result: { name: string; id: string; port: number; success: boolean; tokenId?: string; domain?: string; txHash?: string; local: boolean; workingDirectory: string; pid?: number; logFile?: string } = {
+            const result: { name: string; id: string; port: number; success: boolean; error?: string; tokenId?: string; domain?: string; txHash?: string; local: boolean; workingDirectory: string; pid?: number; logFile?: string } = {
               name: agentConfig.name,
               id: agentId,
               port,
@@ -17461,15 +20771,26 @@ Return this JSON shape:
             };
 
             if (spawnResult.success) {
+              if (!existing) spawnedNewAgentPort = port;
               result.pid = spawnResult.pid;
               result.logFile = spawnResult.logFile;
-              // Update status to running
-              await this.db.agents.updateStatus(agentId, 'running');
+            } else {
+              result.success = false;
+              result.error = spawnResult.error || 'worker spawn failed';
+              if (existing) {
+                await this.db.agents.updateStatus(agentId, 'error');
+              } else {
+                // spawnLocalAgentProcess returns only after its failed child
+                // cleanup path completes. Remove a never-started new identity
+                // so a later deploy/sync can retry it.
+                await this.db.agents.deleteAgent(agentId);
+                createdNewAgentRecord = false;
+              }
             }
 
             // Auto-register onchain if enabled (automators never register)
             const shouldRegister = !isAutomator && (agentConfig.register !== undefined ? agentConfig.register : onchain?.register);
-            if (shouldRegister) {
+            if (spawnResult.success && shouldRegister) {
               try {
                 // Fetch the agent row for registration
                 const agentRow = await this.db.agents.getById(agentId);
@@ -17504,8 +20825,22 @@ Return this JSON shape:
 
             results.push(result);
           } catch (err: any) {
-            // Clean up the database record if deployment failed
-            if (agentId) {
+            // Never delete an existing identity on redeploy failure: doing so
+            // cascades its durable history and strands profile-owned storage.
+            if (existing) {
+              try {
+                await this.db.agents.updateStatus(existing.id, 'error');
+              } catch (cleanupErr) {
+                console.warn(`[Deploy] Failed to mark existing agent error: ${cleanupErr}`);
+              }
+            } else if (createdNewAgentRecord && agentId) {
+              if (spawnedNewAgentPort) {
+                try {
+                  await this.killAgentProcess(spawnedNewAgentPort, agentId);
+                } catch (killErr) {
+                  console.warn(`[Deploy] Failed to stop partially deployed agent: ${killErr}`);
+                }
+              }
               try {
                 await this.db.agents.deleteAgent(agentId);
                 console.log(`[Deploy] Cleaned up failed agent record: ${agentId}`);
@@ -17643,18 +20978,14 @@ Return this JSON shape:
                 tokenId: agent.token_id ?? undefined
               });
               if (spawnResult.success) {
-                await this.db.agents.updateStatus(agent.id, 'running');
                 return { ok: true, result: { action: 'started', name: agent.name, pid: spawnResult.pid, logFile: spawnResult.logFile } };
               } else {
                 return { ok: false, error: `Failed to start ${agent.name}: ${spawnResult.error}` };
               }
             }
             case 'stop': {
-              const killResult = await this.killAgentProcess(agent.port, agent.id);
-              const cancelled = await this.cancelPendingQueriesForAgent(teamId, agent.id);
-              await this.db.agents.updateStatus(agent.id, 'stopped');
-              await this.clearAgentPid(agent.id);
-              return { ok: true, result: { action: 'stopped', name: agent.name, ...killResult, queriesCancelled: cancelled } };
+              const stopped = await this.stopLocalAgentExplicitly(teamId, agent);
+              return { ok: true, result: { action: 'stopped', name: agent.name, ...stopped } };
             }
             case 'rebuild': {
               const spawnResult = await this.rebuildLocalClaudeAgent(teamId, teamName, agent);
@@ -17688,7 +21019,11 @@ Return this JSON shape:
                 try {
                   await fetch(`${agent.endpoint}/talk`, {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: await this.managerTargetWorkerHeaders(
+                      agent,
+                      teamName,
+                      { 'Content-Type': 'application/json' },
+                    ),
                     body: JSON.stringify({ from: 'schedule', message: config.message }),
                   });
                 } catch { /* ignore */ }
@@ -17923,6 +21258,18 @@ Return this JSON shape:
           if (!agentName || !key) {
             return { ok: false, error: 'Usage: /meta set <agent> <key> <value>' };
           }
+          if (normalizedMetadataMutationKey(key) === 'identitykey') {
+            return {
+              ok: false,
+              error: 'identityKey is reserved for validated declarative reconciliation',
+            };
+          }
+          if (MANAGER_INTERNAL_AGENT_METADATA_KEYS.has(normalizedMetadataMutationKey(key))) {
+            return {
+              ok: false,
+              error: 'Manager lifecycle metadata is reserved for the local process supervisor',
+            };
+          }
           const agent = await this.dbQueryAgentByNameMostRecent(teamId, agentName);
           if (!agent) {
             return { ok: false, error: `Agent "${agentName}" not found` };
@@ -17937,7 +21284,10 @@ Return this JSON shape:
           } else {
             await this.db.agents.updateMetadata(agent.id, newMetadata);
           }
-          return { ok: true, result: { name: agent.name, metadata: newMetadata } };
+          return {
+            ok: true,
+            result: this.redactForNonAdmin({ name: agent.name, metadata: newMetadata }),
+          };
         }
 
         if (subCmd === 'setid') {
@@ -17951,11 +21301,41 @@ Return this JSON shape:
           if (!agent) {
             return { ok: false, error: `Agent "${agentName}" not found` };
           }
+          let normalizedDomain: string;
+          let suppliedTokenId: string | undefined;
+          try {
+            const suppliedIdentity = normalizeEnsIdentity(domainArg, tokenIdArg);
+            normalizedDomain = suppliedIdentity.domain!;
+            suppliedTokenId = suppliedIdentity.tokenId;
+          } catch (error: any) {
+            return { ok: false, error: `Invalid identity: ${error.message}` };
+          }
+          let currentDomain: string | undefined;
+          try {
+            currentDomain = normalizeEnsIdentity(agent.domain, undefined).domain;
+          } catch {
+            currentDomain = agent.domain || undefined;
+          }
+          const domainChanged = currentDomain !== normalizedDomain;
+          if (domainChanged && !suppliedTokenId) {
+            return {
+              ok: false,
+              error: `A matching ENS namehash tokenId is required when changing domain to "${normalizedDomain}"`,
+            };
+          }
+          const effectiveTokenId = suppliedTokenId || agent.token_id || undefined;
           await this.db.agents.updateIdentity(agent.id, {
-            domain: domainArg,
-            token_id: tokenIdArg || undefined,
+            domain: normalizedDomain,
+            token_id: effectiveTokenId,
           });
-          return { ok: true, result: { name: agent.name, domain: domainArg, tokenId: tokenIdArg || null } };
+          return {
+            ok: true,
+            result: {
+              name: agent.name,
+              domain: normalizedDomain,
+              tokenId: effectiveTokenId || null,
+            },
+          };
         }
 
         // /meta <agent> - show metadata
@@ -17969,13 +21349,13 @@ Return this JSON shape:
         }
         return {
           ok: true,
-          result: {
+          result: this.redactForNonAdmin({
             name: agent.name,
             id: agent.id,
             tokenId: agent.token_id,
             domain: agent.domain,
             metadata: agent.metadata
-          }
+          }),
         };
       }
 
@@ -18030,7 +21410,11 @@ Return this JSON shape:
         try {
           const cancelResp = await fetch(`${baseEndpoint}/cancel`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' }
+            headers: await this.managerTargetWorkerHeaders(
+              agent,
+              teamName,
+              { 'Content-Type': 'application/json' },
+            )
           });
 
           if (!cancelResp.ok) {
@@ -18066,7 +21450,11 @@ Return this JSON shape:
         try {
           const clearResp = await fetch(`${baseEndpoint}/clear`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' }
+            headers: await this.managerTargetWorkerHeaders(
+              agent,
+              teamName,
+              { 'Content-Type': 'application/json' },
+            )
           });
 
           if (!clearResp.ok) {
@@ -18127,6 +21515,17 @@ Return this JSON shape:
             const newName = args[i + 1];
             const nameCheck = validateName(newName, 'agent');
             if (!nameCheck.valid) return { ok: false, error: nameCheck.error };
+            const collision = await this.findAgentPortableNameCollision(
+              teamId,
+              newName,
+              agent.id,
+            );
+            if (collision) {
+              return {
+                ok: false,
+                error: `Agent name "${newName}" conflicts with existing "${collision.name}"`,
+              };
+            }
             await this.db.agents.updateIdentity(agent.id, { name: newName });
             newMetadata.alias = newMetadata.alias || agent.name;
             updates.push(`name → ${newName}`);
@@ -23006,10 +26405,15 @@ Return this JSON shape:
       if (!endpoint) return;
 
       try {
+        const team = await this.db.teams.getTeam(row.team_id).catch(() => null);
         const resp = await fetch(`${endpoint}/cancel`, {
           method: 'POST',
           signal: AbortSignal.timeout(2500),
-          headers: { 'Content-Type': 'application/json' },
+          headers: await this.managerTargetWorkerHeaders(
+            agent,
+            team?.name || 'default',
+            { 'Content-Type': 'application/json' },
+          ),
         });
         if (!resp.ok) {
           console.warn(`[Manager] Stale query cancellation failed for ${agent.name} (${row.query_id}): ${resp.status} ${resp.statusText}`);
@@ -23035,6 +26439,45 @@ Return this JSON shape:
    * The isRemoteEndpointRuntime() guard below is the canonical firewall.
    * It MUST remain the first runtime check inside the per-agent loop body.
    */
+  private async persistLocalHealthOffline(agent: AgentRow): Promise<void> {
+    const metadata = (
+      agent.metadata
+      && typeof agent.metadata === 'object'
+      && !Array.isArray(agent.metadata)
+    ) ? agent.metadata as Record<string, unknown> : {};
+    const processGeneration = typeof metadata[MANAGER_PROCESS_GENERATION_KEY] === 'string'
+      ? metadata[MANAGER_PROCESS_GENERATION_KEY].trim()
+      : '';
+    if (this.idaccAdminToken && processGeneration) {
+      if (await this.hasCurrentManagedWorkerAssignment(
+        agent,
+        processGeneration,
+        { allowOfflineStatus: true },
+      )) {
+        // A single HTTP timeout/non-200 is not process-death evidence. Deny
+        // callbacks while health is offline, but retain the exact live
+        // assignment so a later successful probe can restore service without
+        // stranding the child on a permanently revoked bearer.
+        await this.db.agents.updateOwnedProcessState(
+          agent.id,
+          processGeneration,
+          'offline',
+        );
+        return;
+      }
+      // One atomic generation CAS both marks the exact failed assignment
+      // offline and revokes its bearer. A late health result for an old child
+      // cannot revoke a replacement generation.
+      await this.db.agents.transitionOwnedProcessExit(
+        agent.id,
+        processGeneration,
+        true,
+      );
+      return;
+    }
+    await this.db.agents.updateStatus(agent.id, 'offline');
+  }
+
   private async runHealthChecks(): Promise<void> {
     try {
       await this.sweepRuntimeRateLimitFallbackRestores().catch(() => {});
@@ -23063,8 +26506,13 @@ Return this JSON shape:
           try {
             const checkedAtMs = Date.now();
             const checkedAtSec = Math.floor(checkedAtMs / 1000);
+            const healthHeaders = await this.managerTargetWorkerHeaders(
+              agent,
+              team.name,
+              { Accept: 'application/json', Connection: 'close' },
+            );
             const resp = await fetch(`${agentUrl}/health`, {
-              headers: { Accept: 'application/json', Connection: 'close' },
+              headers: healthHeaders,
               signal: AbortSignal.timeout(3000),
             });
             const isOnline = resp.ok;
@@ -23079,10 +26527,39 @@ Return this JSON shape:
             // Update DB status if it changed. A stale local-agent shutdown can
             // leave a replacement process labeled "stopped"; a successful
             // local /health probe is authoritative for local-process liveness.
+            const rawProcessGeneration = (
+              agent.metadata as Record<string, unknown> | null | undefined
+            )?.[MANAGER_PROCESS_GENERATION_KEY];
+            const processGeneration = (
+              this.idaccAdminToken
+              && typeof rawProcessGeneration === 'string'
+            ) ? rawProcessGeneration.trim() : '';
+            const hasManagedGeneration = Boolean(processGeneration);
             if (isOnline && agent.status !== 'running') {
-              await this.db.agents.updateStatus(agent.id, 'running');
-            } else if (!isOnline && agent.status === 'running') {
-              await this.db.agents.updateStatus(agent.id, 'offline');
+              if (hasManagedGeneration) {
+                if (await this.hasCurrentManagedWorkerAssignment(
+                  agent,
+                  processGeneration,
+                  { allowOfflineStatus: true },
+                )) {
+                  await this.db.agents.updateOwnedProcessState(
+                    agent.id,
+                    processGeneration,
+                    'running',
+                  );
+                }
+              } else {
+                await this.db.agents.updateStatus(agent.id, 'running');
+              }
+            } else if (
+              !isOnline
+              && (
+                agent.status === 'running'
+                || agent.status === 'starting'
+                || hasManagedGeneration
+              )
+            ) {
+              await this.persistLocalHealthOffline(agent);
             }
           } catch (err: any) {
             const checkedAtMs = Date.now();
@@ -23096,8 +26573,18 @@ Return this JSON shape:
               last_error: lastError,
               consecutive_failures: (agent.consecutive_failures ?? 0) + 1,
             }).catch(() => {});
-            if (agent.status === 'running') {
-              await this.db.agents.updateStatus(agent.id, 'offline').catch(() => {});
+            const hasManagedGeneration = (
+              this.idaccAdminToken
+              && typeof (agent.metadata as Record<string, unknown> | null | undefined)?.[
+                MANAGER_PROCESS_GENERATION_KEY
+              ] === 'string'
+            );
+            if (
+              agent.status === 'running'
+              || agent.status === 'starting'
+              || hasManagedGeneration
+            ) {
+              await this.persistLocalHealthOffline(agent).catch(() => {});
             }
           }
         }
@@ -23170,6 +26657,7 @@ Return this JSON shape:
   }
 
   async start(port: number = 4100): Promise<void> {
+    this.startupReady = false;
     this.managementPort = port;
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -23262,7 +26750,15 @@ Return this JSON shape:
               };
             }
             if (!agent.endpoint) return null;
-            const endpoints = await discoverRestAPEndpoints(agent.endpoint);
+            const team = await this.db.teams.getTeam(agent.team_id).catch(() => null);
+            const requestHeaders = await this.managerTargetWorkerHeaders(
+              agent,
+              team?.name || 'default',
+            );
+            const endpoints = await discoverRestAPEndpoints(
+              agent.endpoint,
+              requestHeaders,
+            );
             return {
               id: agent.id,
               name: agent.name,
@@ -23270,6 +26766,7 @@ Return this JSON shape:
               talkPath: endpoints.talk || '/talk',
               schedulePath: endpoints.schedule || null,
               status: agent.status,
+              requestHeaders,
             };
           },
           {
@@ -23282,7 +26779,6 @@ Return this JSON shape:
             managedDispatch: async (target, def, run) => this.dispatchManagedSchedule(target, def, run),
           },
         );
-        this.schedulerService.start();
 
         // Seed well-known teams (idempotent — getOrCreateTeamId is safe to call repeatedly)
         await this.seedWellKnownTeams();
@@ -23296,7 +26792,7 @@ Return this JSON shape:
         // coder row only. This avoids silent recurrence after one-off repairs
         // while leaving researcher and the rest of the fleet untouched.
         await this.reconcileDefaultCoderRuntimeFromConfig();
-        await this.restoreManagerOwnedAgentsAfterRestart();
+        await this.restoreManagerOwnedAgentsAtStartup();
         this.startAgentLogRetention();
 
         // Start periodic health monitoring (every 30s)
@@ -23349,9 +26845,14 @@ Return this JSON shape:
             // Bounded timeout: fireRow awaits dispatchWake and CheckinService
             // serializes ticks, so a hung owner endpoint would stall the
             // entire due-service loop. 5s matches the /news-to forward path.
+            const ownerTeam = await this.db.teams.getTeam(owner.team_id).catch(() => null);
             const res = await fetch(url, {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json', Connection: 'close' },
+              headers: await this.managerTargetWorkerHeaders(
+                owner,
+                ownerTeam?.name || 'default',
+                { 'Content-Type': 'application/json', Connection: 'close' },
+              ),
               body: JSON.stringify({
                 from: 'checkin-service',
                 trigger: true,
@@ -23370,6 +26871,10 @@ Return this JSON shape:
         this.checkinService.start();
         console.log('[Manager] CheckinService started (wake on every eligible fire)');
 
+        // Automatic schedule dispatch must not overlap process reconciliation,
+        // credential hydration, or the sequential verified restore pass.
+        this.schedulerService.start();
+        this.startupReady = true;
         settled = true;
         resolve();
         } catch (error) {
@@ -23388,6 +26893,7 @@ Return this JSON shape:
   async shutdown(): Promise<void> {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
+    this.startupReady = false;
     if (this.checkinService) {
       this.checkinService.stop();
       this.checkinService = null;
@@ -23440,6 +26946,7 @@ Return this JSON shape:
       clearTimeout(timer);
     }
     this.leadDelegationKickoffRetryTimers.clear();
+    await this.drainAgentLifecycleLocks();
     await this.stopManagerOwnedAgentsForShutdown();
     if (this.wss) {
       try { this.wss.close(); } catch { /* swallow */ }
@@ -23470,9 +26977,61 @@ Return this JSON shape:
     const row = await this.db.agents.getById(agentId).catch(() => null);
     if (!row) return;
     const metadata = { ...((row.metadata as Record<string, unknown> | null | undefined) ?? {}) };
-    if (requested) metadata.managerRestartRequested = true;
-    else delete metadata.managerRestartRequested;
+    if (requested) metadata[MANAGER_RESTART_REQUESTED_KEY] = true;
+    else delete metadata[MANAGER_RESTART_REQUESTED_KEY];
     await this.db.agents.updateMetadata(agentId, metadata);
+  }
+
+  private metadataWithoutLocalProcess(
+    value: Record<string, unknown> | null | undefined,
+  ): Record<string, unknown> {
+    const metadata = { ...(value ?? {}) };
+    delete metadata.pid;
+    delete metadata.processOwner;
+    delete metadata.processParentPid;
+    delete metadata.processInspectedAt;
+    delete metadata[MANAGER_PROCESS_GENERATION_KEY];
+    delete metadata[MANAGER_PROCESS_RUNTIME_KEY];
+    delete metadata[MANAGER_PROCESS_RUNTIME_LANE_KEY];
+    return metadata;
+  }
+
+  private async markManagerOwnedAgentAwaitingRestart(agentId: string): Promise<void> {
+    const row = await this.db.agents.getById(agentId).catch(() => null);
+    if (!row) return;
+    const metadata = {
+      ...((row.metadata as Record<string, unknown> | null | undefined) ?? {}),
+      [MANAGER_OWNED_LAUNCH_INTENT_KEY]: true,
+      [MANAGER_RESTART_REQUESTED_KEY]: true,
+    };
+    await this.db.agents.updateMetadata(agentId, metadata);
+  }
+
+  private async persistUnexpectedManagerOwnedExit(
+    agent: AgentRow,
+    metadata: Record<string, unknown>,
+  ): Promise<void> {
+    await this.db.agents.updateStatus(agent.id, 'offline', {
+      metadata: {
+        ...this.metadataWithoutLocalProcess(metadata),
+        [MANAGER_OWNED_LAUNCH_INTENT_KEY]: true,
+        [MANAGER_RESTART_REQUESTED_KEY]: true,
+      },
+    });
+  }
+
+  private async persistExplicitLocalStop(
+    agent: AgentRow,
+    status: 'stopped' = 'stopped',
+  ): Promise<void> {
+    const current = await this.db.agents.getById(agent.id).catch(() => null);
+    const metadata = this.metadataWithoutLocalProcess(
+      (current?.metadata as Record<string, unknown> | null | undefined)
+        ?? (agent.metadata as Record<string, unknown> | null | undefined),
+    );
+    delete metadata[MANAGER_OWNED_LAUNCH_INTENT_KEY];
+    delete metadata[MANAGER_RESTART_REQUESTED_KEY];
+    await this.db.agents.updateStatus(agent.id, status, { metadata });
   }
 
   private async stopManagerOwnedAgentsForShutdown(): Promise<void> {
@@ -23506,7 +27065,7 @@ Return this JSON shape:
     if (targets.size === 0) return;
 
     for (const { agent } of targets.values()) {
-      await this.updateManagerRestartRequest(agent.id, true).catch(() => {});
+      await this.markManagerOwnedAgentAwaitingRestart(agent.id).catch(() => {});
     }
     for (const { agent } of targets.values()) {
       await this.killAgentProcess(agent.port, agent.id).catch(() => ({ killed: false, pids: [] }));
@@ -23550,45 +27109,190 @@ Return this JSON shape:
     const teams = await this.db.teams.listTeams().catch(() => []);
     for (const team of teams) {
       const agents = await this.dbListAgents(team.id, true).catch(() => []);
-      for (const agent of agents) {
-        const metadata = (agent.metadata as Record<string, unknown> | null | undefined) ?? {};
-        if (metadata.managerRestartRequested !== true) continue;
-        if (isRemoteEndpointRuntime(agent.runtime) || agent.type === 'virtual') {
-          await this.updateManagerRestartRequest(agent.id, false).catch(() => {});
-          continue;
-        }
+      for (const initialAgent of agents) {
+        const initialMetadata = (
+          initialAgent.metadata as Record<string, unknown> | null | undefined
+        ) ?? {};
+        if (
+          initialMetadata[MANAGER_OWNED_LAUNCH_INTENT_KEY] !== true
+          && initialMetadata[MANAGER_RESTART_REQUESTED_KEY] !== true
+        ) continue;
+        await this.withAgentLifecycleLock(
+          this.agentLifecycleKey(team.id, initialAgent),
+          async () => {
+            const agent = await this.dbQueryAgentById(team.id, initialAgent.id);
+            if (!agent) return;
+            const metadata = (
+              agent.metadata as Record<string, unknown> | null | undefined
+            ) ?? {};
+            if (
+              metadata[MANAGER_OWNED_LAUNCH_INTENT_KEY] !== true
+              && metadata[MANAGER_RESTART_REQUESTED_KEY] !== true
+            ) return;
+            if (isRemoteEndpointRuntime(agent.runtime) || agent.type === 'virtual') {
+              const cleared = { ...metadata };
+              delete cleared[MANAGER_OWNED_LAUNCH_INTENT_KEY];
+              delete cleared[MANAGER_RESTART_REQUESTED_KEY];
+              await this.db.agents.updateMetadata(agent.id, cleared);
+              return;
+            }
 
-        const pid = Number(metadata.pid);
-        if (agent.status === 'running' && Number.isInteger(pid) && pid > 0) {
-          const identity = await this.probeLocalAgentIdentity(
-            agent.port,
-            { id: agent.id, name: agent.name, pid },
-            { requireAttestation: false },
-          );
-          if (identity.ok) {
-            await this.updateManagerRestartRequest(agent.id, false).catch(() => {});
-            continue;
-          }
-        }
+            const pid = Number(metadata.pid);
+            if (agent.status === 'running' && Number.isInteger(pid) && pid > 0) {
+              const identity = await this.probeLocalAgentIdentity(
+                agent.port,
+                { id: agent.id, name: agent.name, pid },
+                { requireAttestation: true },
+              );
+              if (identity.ok && identity.attested) {
+                const runningMetadata: Record<string, unknown> = {
+                  ...metadata,
+                  [MANAGER_OWNED_LAUNCH_INTENT_KEY]: true,
+                };
+                delete runningMetadata[MANAGER_RESTART_REQUESTED_KEY];
+                await this.db.agents.updateStatus(agent.id, 'running', {
+                  metadata: runningMetadata,
+                });
+                return;
+              }
+            }
 
-        const result = await this.spawnLocalAgentProcess(team.id, team.name, {
-          name: agent.name,
-          id: agent.id,
-          port: agent.port,
-          model: agent.model,
-          workingDirectory: agent.working_directory ?? undefined,
-          tokenId: agent.token_id ?? undefined,
-        });
-        if (result.success) {
-          await this.db.agents.updateStatus(agent.id, 'running').catch(() => {});
-          await this.updateManagerRestartRequest(agent.id, false).catch(() => {});
-          console.log(`[Manager] Restored ${agent.name} after Manager restart`);
-        } else {
-          await this.db.agents.updateStatus(agent.id, 'offline').catch(() => {});
-          console.warn(`[Manager] Could not restore ${agent.name} after Manager restart: ${result.error || 'spawn failed'}`);
-        }
+            // Desktop-owned provider credentials are deliberately absent from
+            // durable metadata. Process-local IDACC rebind authority never
+            // authorizes this startup scan to spawn a duplicate worker.
+            const providerMetadata = metadata as AgentMetadata;
+            if (
+              resolveRuntime(agent.runtime || providerMetadata.runtime) === 'provider-api'
+              && !this.providerRuntimeHasDurableEnvironmentBinding(agent, providerMetadata)
+            ) {
+              await this.db.agents.updateStatus(agent.id, 'offline', {
+                metadata: {
+                  ...this.metadataWithoutLocalProcess(metadata),
+                  [MANAGER_OWNED_LAUNCH_INTENT_KEY]: true,
+                  [MANAGER_RESTART_REQUESTED_KEY]: true,
+                },
+              });
+              console.warn(`[Manager] Provider access for ${agent.name} is awaiting authenticated IDACC rebind after Manager restart`);
+              return;
+            }
+
+            const result = await this.spawnLocalAgentProcessUnlocked(team.id, team.name, {
+              name: agent.name,
+              id: agent.id,
+              port: agent.port,
+              model: agent.model,
+              workingDirectory: agent.working_directory ?? undefined,
+              tokenId: agent.token_id ?? undefined,
+            });
+            const refreshed = await this.db.agents.getById(agent.id).catch(() => null);
+            const refreshedMetadata = {
+              ...((refreshed?.metadata as Record<string, unknown> | null | undefined) ?? metadata),
+            };
+            if (result.success) {
+              console.log(`[Manager] Restored ${agent.name} after Manager restart`);
+            } else {
+              refreshedMetadata[MANAGER_OWNED_LAUNCH_INTENT_KEY] = true;
+              refreshedMetadata[MANAGER_RESTART_REQUESTED_KEY] = true;
+              await this.db.agents.updateStatus(agent.id, 'offline', {
+                metadata: refreshedMetadata,
+              }).catch(() => {});
+              console.warn(`[Manager] Could not restore ${agent.name} after Manager restart: ${result.error || 'spawn failed'}`);
+            }
+          },
+        );
       }
     }
+  }
+
+  private managedRestartMarkerGraceMs(): number {
+    if (process.env.IDACC_MANAGED_SERVICE !== '1') return 0;
+    const configured = Number(
+      process.env.IDACC_MANAGER_RESTART_MARKER_GRACE_MS ?? 2_000,
+    );
+    if (!Number.isFinite(configured)) return 2_000;
+    return Math.min(5_000, Math.max(0, Math.floor(configured)));
+  }
+
+  private async restoreManagerOwnedAgentsAtStartup(): Promise<void> {
+    // Graceful Manager shutdown writes markers before exit, so restore those
+    // immediately. After an unexpected supervised crash, surviving workers
+    // discover parent death on their 1s watchdog and write the same durable
+    // marker while shutting down. A single bounded second pass covers that
+    // handoff without slowing standalone Manager startup or polling forever.
+    await this.restoreManagerOwnedAgentsAfterRestart();
+    const graceMs = this.managedRestartMarkerGraceMs();
+    if (graceMs <= 0) return;
+    await sleep(graceMs);
+    await this.restoreManagerOwnedAgentsAfterRestart();
+  }
+
+  private async resumeProviderAgentAfterManagerRestart(
+    teamId: string,
+    teamName: string,
+    agentId: string,
+  ): Promise<{ success: true } | { success: false; status: number; error: string }> {
+    const initial = await this.dbQueryAgentById(teamId, agentId);
+    if (!initial) {
+      return { success: false, status: 404, error: 'Agent not found' };
+    }
+    return this.withAgentLifecycleLock(
+      this.agentLifecycleKey(teamId, initial),
+      () => this.resumeProviderAgentAfterManagerRestartUnlocked(teamId, teamName, agentId),
+    );
+  }
+
+  private async resumeProviderAgentAfterManagerRestartUnlocked(
+    teamId: string,
+    teamName: string,
+    agentId: string,
+  ): Promise<{ success: true } | { success: false; status: number; error: string }> {
+    const agent = await this.dbQueryAgentById(teamId, agentId);
+    if (!agent) {
+      return { success: false, status: 404, error: 'Agent not found' };
+    }
+    const metadata = (agent.metadata as AgentMetadata | null | undefined) ?? {};
+    if (metadata.managerRestartRequested !== true) {
+      return {
+        success: false,
+        status: 409,
+        error: 'agent was not awaiting restoration after Manager restart',
+      };
+    }
+    if (resolveRuntime(agent.runtime || metadata.runtime) !== 'provider-api') {
+      return {
+        success: false,
+        status: 400,
+        error: 'agent is not assigned to a provider runtime',
+      };
+    }
+    if (!this.providerRuntimeHasLaunchBinding(agent, metadata)) {
+      await this.db.agents.updateStatus(agent.id, 'offline').catch(() => {});
+      return {
+        success: false,
+        status: 409,
+        error: this.providerRuntimeRebindRequiredError(),
+      };
+    }
+
+    const result = await this.spawnLocalAgentProcessUnlocked(teamId, teamName, {
+      name: agent.name,
+      id: agent.id,
+      port: agent.port,
+      model: agent.model,
+      workingDirectory: agent.working_directory ?? undefined,
+      tokenId: agent.token_id ?? undefined,
+    });
+    if (!result.success) {
+      await this.db.agents.updateStatus(agent.id, 'offline').catch(() => {});
+      return {
+        success: false,
+        status: 503,
+        error: 'Provider runtime was rebound, but verified worker startup failed; review the agent log and retry',
+      };
+    }
+
+    console.log(`[Manager] Restored ${agent.name} after authenticated provider runtime rebind`);
+    return { success: true };
   }
 
   private async initSchedules(): Promise<void> {
@@ -23644,6 +27348,16 @@ Return this JSON shape:
     const registered = this.ownedAgentProcesses.get(pid);
     if (registered) {
       if (row && registered.agentId !== row.id) return false;
+      if (
+        row
+        && registered.processGeneration !== String(
+          (row.metadata as Record<string, unknown> | null | undefined)?.[
+            MANAGER_PROCESS_GENERATION_KEY
+          ] ?? '',
+        )
+      ) {
+        return false;
+      }
       if (registered.port !== port || registered.proc.pid !== pid) return false;
       return registered.proc.exitCode == null && registered.proc.signalCode == null;
     }
@@ -23689,47 +27403,124 @@ Return this JSON shape:
         const agents = await this.dbListAgents(team.id, true);
         for (const agent of agents) {
           if (isRemoteEndpointRuntime(agent.runtime)) continue;
-          const metadata = { ...((agent.metadata as Record<string, unknown> | null | undefined) ?? {}) };
+          const metadata = {
+            ...((agent.metadata as Record<string, unknown> | null | undefined) ?? {}),
+          };
           const rawPid = metadata.pid;
           const pid = typeof rawPid === 'number' ? rawPid : Number(rawPid);
+          const validPid = Number.isSafeInteger(pid) && pid > 0;
+          const info = validPid ? this.inspectProcess(pid) : null;
+          let identity: LocalAgentIdentityProbe = { ok: false, attested: false };
+          const signatureMatches = Boolean(
+            info && this.matchesLocalAgentProcess(info, agent),
+          );
+          if (!info && validPid && this.processIsAlive(pid)) {
+            identity = await this.probeLocalAgentIdentity(
+              agent.port,
+              { id: agent.id, name: agent.name, pid },
+              { requireAttestation: true },
+            );
+          }
+          const processMatches = signatureMatches || (identity.ok && identity.attested);
+          const priorOwner = localProcessOwnerValue(metadata.processOwner);
+          const registered = validPid
+            && this.ownedAgentProcesses.get(pid)?.agentId === agent.id;
+          const managerChildEvidence = (
+            priorOwner === 'manager-child'
+            && validPid
+            && Number.isSafeInteger(Number(metadata.processParentPid))
+            && Number(metadata.processParentPid) > 0
+          );
+          // A plain stale "adopted" tag is not enough to auto-resume. It is
+          // migrated only while the actual local-agent identity is attested.
+          const adoptedEvidence = priorOwner === 'adopted' && processMatches;
+          const legacyLaunchEvidence = (
+            (agent.status === 'running' || agent.status === 'starting')
+            && (registered || managerChildEvidence || adoptedEvidence)
+          );
+          if (
+            metadata[MANAGER_OWNED_LAUNCH_INTENT_KEY] !== true
+            && legacyLaunchEvidence
+          ) {
+            metadata[MANAGER_OWNED_LAUNCH_INTENT_KEY] = true;
+            await this.db.agents.updateMetadata(agent.id, metadata);
+            updated += 1;
+          }
+
+          if (metadata[MANAGER_OWNED_LAUNCH_INTENT_KEY] === true) {
+            if (
+              (agent.status === 'running' || agent.status === 'starting')
+              && processMatches
+            ) {
+              const owner = info
+                ? this.localProcessOwnerFromInspection(info)
+                : priorOwner || 'adopted';
+              const parentPid = info?.ppid
+                ?? (Number.isInteger(Number(metadata.processParentPid))
+                  ? Number(metadata.processParentPid)
+                  : null);
+              const next = {
+                ...metadata,
+                pid,
+                processOwner: owner,
+                processParentPid: parentPid,
+                processInspectedAt: Date.now(),
+              };
+              if (
+                metadata.pid !== next.pid
+                || metadata.processOwner !== next.processOwner
+                || metadata.processParentPid !== next.processParentPid
+              ) {
+                await this.db.agents.updateMetadata(agent.id, next);
+                updated += 1;
+              }
+              continue;
+            }
+
+            // Windows KILL_ON_JOB_CLOSE can remove the worker before its
+            // parent watchdog runs. Durable intent repairs that lost marker.
+            await this.persistUnexpectedManagerOwnedExit(agent, metadata);
+            cleared += 1;
+            continue;
+          }
+
           if (agent.status !== 'running') {
-            if (!('pid' in metadata) && !('processOwner' in metadata) && !('processParentPid' in metadata) && !('processInspectedAt' in metadata)) continue;
+            if (
+              !('pid' in metadata)
+              && !('processOwner' in metadata)
+              && !('processParentPid' in metadata)
+              && !('processInspectedAt' in metadata)
+              && !(MANAGER_PROCESS_GENERATION_KEY in metadata)
+              && !(MANAGER_PROCESS_RUNTIME_KEY in metadata)
+              && !(MANAGER_PROCESS_RUNTIME_LANE_KEY in metadata)
+            ) continue;
             await this.clearAgentPid(agent.id);
             cleared += 1;
             continue;
           }
-          if (!Number.isFinite(pid) || pid <= 0) {
-            if ('processOwner' in metadata || 'processParentPid' in metadata || 'processInspectedAt' in metadata) {
+          if (!validPid) {
+            if (
+              'processOwner' in metadata
+              || 'processParentPid' in metadata
+              || 'processInspectedAt' in metadata
+              || MANAGER_PROCESS_GENERATION_KEY in metadata
+              || MANAGER_PROCESS_RUNTIME_KEY in metadata
+              || MANAGER_PROCESS_RUNTIME_LANE_KEY in metadata
+            ) {
               await this.clearAgentPid(agent.id);
               cleared += 1;
             }
             continue;
           }
-          const info = this.inspectProcess(pid);
-          if (info && !this.matchesLocalAgentProcess(info, agent)) {
+          if (!processMatches) {
             await this.clearAgentPid(agent.id, pid);
             await this.db.agents.updateStatus(agent.id, 'offline').catch(() => {});
             cleared += 1;
             continue;
           }
-          if (!info) {
-            const identity = this.processIsAlive(pid)
-              ? await this.probeLocalAgentIdentity(
-                  agent.port,
-                  { id: agent.id, name: agent.name, pid },
-                  { requireAttestation: false },
-                )
-              : { ok: false, attested: false };
-            if (!identity.ok) {
-              await this.clearAgentPid(agent.id, pid);
-              await this.db.agents.updateStatus(agent.id, 'offline').catch(() => {});
-              cleared += 1;
-              continue;
-            }
-          }
           const owner = info
             ? this.localProcessOwnerFromInspection(info)
-            : localProcessOwnerValue(metadata.processOwner) || 'adopted';
+            : priorOwner || 'adopted';
           const parentPid = info?.ppid
             ?? (Number.isInteger(Number(metadata.processParentPid)) ? Number(metadata.processParentPid) : null);
           const next = {
@@ -24023,7 +27814,8 @@ Return this JSON shape:
    * agent based on its config. Honors `walletOptIn === true` by calling
    * `getOrCreateAgentWallet` once and merging the resulting wallet name
    * and address into the metadata. Honors `walletOptIn === false` by
-   * recording the explicit opt-out flag without calling the OWS CLI.
+   * recording the explicit opt-out flag and stripping retained OWS wallet
+   * identifiers/legacy seed metadata without calling the OWS CLI.
    * `walletOptIn === undefined` leaves the metadata untouched, preserving
    * legacy behaviour for configs that pre-date the flag.
    *
@@ -24038,13 +27830,28 @@ Return this JSON shape:
     walletOptIn: boolean | undefined,
   ): { metadata: AgentMetadata; wallet: { walletName: string; address: string } | null } {
     const nextMetadata = this.withWalletConfigMetadata(metadata, walletOptIn);
-    if (walletOptIn !== true) {
+    if (walletOptIn === undefined) {
+      const retainedWallet = typeof nextMetadata.ows_wallet === 'string' && nextMetadata.ows_wallet
+        ? {
+            walletName: nextMetadata.ows_wallet,
+            address: typeof nextMetadata.ows_address === 'string' ? nextMetadata.ows_address : '',
+          }
+        : null;
+      return { metadata: nextMetadata, wallet: retainedWallet };
+    }
+    if (walletOptIn === false) {
       return { metadata: nextMetadata, wallet: null };
     }
 
     const wallet = this.getOrCreateAgentWallet(teamName, agentName);
     if (!wallet) {
-      return { metadata: nextMetadata, wallet: null };
+      const retainedWallet = typeof nextMetadata.ows_wallet === 'string' && nextMetadata.ows_wallet
+        ? {
+            walletName: nextMetadata.ows_wallet,
+            address: typeof nextMetadata.ows_address === 'string' ? nextMetadata.ows_address : '',
+          }
+        : null;
+      return { metadata: nextMetadata, wallet: retainedWallet };
     }
 
     return {
@@ -24065,16 +27872,16 @@ Return this JSON shape:
     const next = { ...metadata };
     delete next.ows_wallet;
     delete next.ows_address;
+    delete next.ows_wallet_seed;
     return next;
   }
 
   private withWalletConfigMetadata(metadata: AgentMetadata, walletOptIn: boolean | undefined): AgentMetadata {
-    const next = this.withoutProvisionedWalletMetadata(metadata);
-    if (walletOptIn !== undefined) {
-      next.wallet = walletOptIn;
-    } else {
-      delete next.wallet;
-    }
+    if (walletOptIn === undefined) return { ...metadata };
+    const next = walletOptIn === false
+      ? this.withoutProvisionedWalletMetadata(metadata)
+      : { ...metadata };
+    next.wallet = walletOptIn;
     return next;
   }
 
@@ -24186,6 +27993,36 @@ Return this JSON shape:
       : undefined;
     const metadata = (agentRow?.metadata || {}) as AgentMetadata;
     const isPrimaryLead = metadata.primaryLead === true;
+    const customAgentEnv = sanitizeAgentEnvironment(metadata.env);
+    const agentAlias = typeof metadata.alias === 'string' && metadata.alias.trim()
+      ? metadata.alias.trim()
+      : typeof metadata.name === 'string' && metadata.name.trim()
+        ? metadata.name.trim()
+        : agentRow?.name;
+    const agentIdentityName = typeof metadata.idchain_domain === 'string' && metadata.idchain_domain.trim()
+      ? metadata.idchain_domain.trim()
+      : agentRow?.domain || agentRow?.name || agentAlias;
+    const plugins = Array.isArray(metadata.plugins)
+      ? metadata.plugins.filter((plugin: unknown) => {
+        if (!plugin || typeof plugin !== 'object') return false;
+        const record = plugin as Record<string, unknown>;
+        return typeof record.name === 'string' && typeof record.path === 'string';
+      })
+      : [];
+    const pluginsEnv = plugins.length > 0
+      ? JSON.stringify(plugins)
+      : undefined;
+    const runtime = resolveRuntime((agentRow?.runtime || metadata.runtime) as string | undefined);
+    const hasAllowedTools = Object.prototype.hasOwnProperty.call(metadata, 'allowed_tools');
+    const allowedTools = hasAllowedTools
+      ? normalizeExactAllowedTools(metadata.allowed_tools, runtime)
+      : [];
+    const allowedToolsEnv = hasAllowedTools
+      ? JSON.stringify(allowedTools)
+      : undefined;
+    const openModeEnv = typeof metadata.openMode === 'boolean'
+      ? String(metadata.openMode)
+      : undefined;
 
     // Reasoning effort for cloud-subscription runtimes (codex / claude-code-cli) —
     // lower effort = fewer reasoning tokens. Read by those harnesses; n/a for ollama.
@@ -24199,7 +28036,6 @@ Return this JSON shape:
     const mcpEnv = mcpServers.length > 0
       ? JSON.stringify(mcpServers)
       : undefined;
-    const runtime = resolveRuntime((agentRow?.runtime || metadata.runtime) as string | undefined);
     // Claude Code persists fast mode globally by default. Always give managed
     // Claude Code workers an explicit per-agent standard/fast preference so one
     // person's CLI setting cannot silently change another agent's cost or model.
@@ -24216,13 +28052,24 @@ Return this JSON shape:
       : undefined;
     const runtimeLane = this.chooseRuntimeCredentialLane(runtime, previousLaneId, teamId);
     const laneEnv = runtimeLane.env || {};
-    const { ANTHROPIC_API_KEY: laneAnthropicApiKey, ...safeLaneEnv } = laneEnv;
+    const { ANTHROPIC_API_KEY: laneAnthropicApiKeyRaw, ...laneEnvWithoutAnthropic } = laneEnv;
+    const laneAnthropicApiKey = typeof laneAnthropicApiKeyRaw === 'string'
+      ? laneAnthropicApiKeyRaw
+      : undefined;
+    const safeLaneEnv = Object.fromEntries(
+      Object.entries(laneEnvWithoutAnthropic).filter(
+        ([key, value]) => (
+          typeof value === 'string'
+          && !runtimeLaneEnvIsReserved(key, runtime, runtimeLane.kind)
+        ),
+      ),
+    );
     const useMeteredOverflow = runtimeLane.kind === 'metered-api'
       && (runtime === 'claude-code-cli' || runtime === 'claude-code-local')
       && Boolean(laneAnthropicApiKey || process.env.ID_AGENT_OVERFLOW_ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY);
     const childAnthropicApiKey = useMeteredOverflow
       ? (laneAnthropicApiKey || process.env.ID_AGENT_OVERFLOW_ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY)
-      : runtime === 'claude-agent-sdk'
+      : runtime === 'claude-agent-sdk' && runtimeLane.kind === 'metered-api'
         ? (laneAnthropicApiKey || process.env.ANTHROPIC_API_KEY)
         : undefined;
     const skillmeshProviderEnabled = this.isSkillmeshProviderEnabled(teamName, metadata);
@@ -24241,8 +28088,29 @@ Return this JSON shape:
     const managerWorkspaceDir = process.env.ID_WORKSPACE_DIR?.trim()
       || process.env.WORKSPACE_DIR?.trim()
       || this.baseWorkDir;
+    const configuredCodexHome = runtime === 'codex'
+      ? process.env.CODEX_HOME?.trim()
+      : undefined;
+    const configuredXmtpEnv = /^(?:local|dev|production)$/.test(
+      process.env.XMTP_ENV?.trim() || '',
+    )
+      ? process.env.XMTP_ENV!.trim()
+      : undefined;
+    const reviewedClaudeEnv = (
+      runtime === 'claude-agent-sdk'
+      || runtime === 'claude-code-cli'
+      || runtime === 'claude-code-local'
+    )
+      ? filterClaudeEnvVars(process.env)
+      : {};
 
     return withDesktopResourceLimits({
+      // Agent env contains application-specific values only. Config validation
+      // rejects managed keys and this launch-time filter defends against stale
+      // or manually modified metadata. Runtime-lane credentials may override
+      // agent values; every Manager-owned envelope value below overrides both.
+      ...customAgentEnv,
+      ...safeLaneEnv,
       PATH: process.env.PATH || '',
       HOME: process.env.HOME || '',
       SHELL: process.env.SHELL || '',
@@ -24282,11 +28150,30 @@ Return this JSON shape:
       ...(process.env.COPILOT_CLI_PATH && { COPILOT_CLI_PATH: process.env.COPILOT_CLI_PATH }),
       ...(process.env.KIRO_CLI_PATH && { KIRO_CLI_PATH: process.env.KIRO_CLI_PATH }),
       ...(process.env.KIMI_CLI_PATH && { KIMI_CLI_PATH: process.env.KIMI_CLI_PATH }),
-      ...filterClaudeEnvVars(process.env),
+      ...reviewedClaudeEnv,
       ...(agentRow?.runtime && { ID_HARNESS: runtime }),
       ID_TEAM: teamName,
       ID_AGENT_PORT: String(port),
+      ...(agentRow?.id && { ID_AGENT_ID: agentRow.id }),
+      ...(agentIdentityName && { ID_AGENT_NAME: agentIdentityName }),
+      ...(agentAlias && { ID_AGENT_ALIAS: agentAlias }),
+      ...(pluginsEnv && { ID_PLUGINS: pluginsEnv }),
+      ...(allowedToolsEnv !== undefined && { ID_AGENT_ALLOWED_TOOLS: allowedToolsEnv }),
+      ...(openModeEnv !== undefined && { XMTP_OPEN_MODE: openModeEnv }),
       IDACC_PARENT_PID: String(process.pid),
+      // Keep generated worker state inside the same consumer profile as
+      // Manager. In particular, Codex MCP overlays and XMTP keys/databases
+      // must not silently fall back to the operator's HOME in managed mode.
+      ...(process.env.IDACC_MANAGED_SERVICE === '1' && { IDACC_MANAGED_SERVICE: '1' }),
+      ...(process.env.IDACC_DATA_DIR?.trim() && {
+        IDACC_DATA_DIR: process.env.IDACC_DATA_DIR.trim(),
+      }),
+      // CODEX_HOME is provider-source context only. The Codex harness replaces
+      // the child value with an immutable profile/run home before execution.
+      ...(configuredCodexHome && { CODEX_HOME: configuredCodexHome }),
+      // Only the documented network selector crosses the Manager boundary.
+      // Raw wallet keys and database paths are intentionally never inherited.
+      ...(configuredXmtpEnv && { XMTP_ENV: configuredXmtpEnv }),
       ID_RUNTIME_LANE_ID: runtimeLane.id,
       ID_RUNTIME_LANE_KIND: runtimeLane.kind,
       // Workers and Manager must use the same workspace and store. The desktop
@@ -24300,7 +28187,6 @@ Return this JSON shape:
       // Workers must call back to this Manager instance, not the legacy default.
       MANAGER_URL: `http://127.0.0.1:${this.managementPort}`,
       ID_AGENT_SKIP_PERMISSIONS: skipPermissions ? 'true' : 'false',
-      ...safeLaneEnv,
       ...(useMeteredOverflow && { ID_AGENT_CLAUDE_BARE: '1' }),
       ...(model && { CLAUDE_MODEL: resolveModelAlias(model) }),
       ...(tokenId && { ID_AGENT_TOKEN_ID: tokenId }),
@@ -24317,7 +28203,6 @@ Return this JSON shape:
       }),
       ...(providerApiKey && { ID_PROVIDER_API_KEY: providerApiKey }),
       ...(childAnthropicApiKey && { ANTHROPIC_API_KEY: childAnthropicApiKey }),
-      ...(process.env.OPENAI_API_KEY && { OPENAI_API_KEY: process.env.OPENAI_API_KEY }),
       // A packaged Manager runs inside Electron's executable in Node mode.
       // Its workers must inherit that mode when they reuse process.execPath.
       ...(process.env.ELECTRON_RUN_AS_NODE === '1' && { ELECTRON_RUN_AS_NODE: '1' }),
@@ -24347,62 +28232,6 @@ Return this JSON shape:
    * Plugins can also bundle skills in their own skills/ subdirectory.
    * Substitutes {{VAR}} placeholders with deploy-time values.
    */
-  private deploySkillsToAgent(
-    workDir: string,
-    skillNames: string[],
-    vars: Record<string, string>,
-    opts: { hasWallet?: boolean; runtime?: HarnessType | string; skillsRoot?: string } = {}
-  ): void {
-    if (skillNames.length === 0) return;
-    try {
-      const skillsSource = opts.skillsRoot ?? path.resolve(__dirname, '..', 'skills');
-      if (!existsSync(skillsSource)) return;
-
-      const rp = getRuntimePaths(opts.runtime);
-      let deployed = 0;
-
-      for (const skillName of skillNames) {
-        // Defense in depth: skill names also arrive from persisted
-        // metadata.skills on rebuild — never let a traversal string reach a join.
-        if (!/^[a-z0-9][a-z0-9._-]*$/i.test(skillName)) {
-          console.warn(`[Deploy] Skipping invalid skill name "${skillName}"`);
-          continue;
-        }
-        const skillFile = path.join(skillsSource, skillName, 'SKILL.md');
-        if (!existsSync(skillFile)) {
-          console.warn(`[Deploy] Skill "${skillName}" not found at ${skillFile}`);
-          continue;
-        }
-
-        // Skip wallet skill if agent has no wallet
-        if (skillName === 'wallet' && !opts.hasWallet) continue;
-
-        let content = readFileSync(skillFile, 'utf8');
-
-        // Substitute {{VAR}} placeholders
-        for (const [key, value] of Object.entries(vars)) {
-          content = content.replace(new RegExp(`\\{\\{${key}\\}\\}`, 'g'), value);
-        }
-
-        // Write to runtime-aware skills directory
-        const targetSkillDir = path.join(workDir, rp.skillsDir, skillName);
-        if (!existsSync(targetSkillDir)) mkdirSync(targetSkillDir, { recursive: true });
-        writeFileSync(path.join(targetSkillDir, 'SKILL.md'), content);
-        deployed++;
-      }
-
-      if (deployed > 0) {
-        console.log(`[Deploy] Copied ${deployed} skills to ${path.basename(workDir)}/${rp.skillsDir}/`);
-      }
-    } catch (err: any) {
-      console.warn(`[Deploy] Could not deploy skills: ${err.message}`);
-    }
-  }
-
-  /**
-   * Spawn a local agent process on the server.
-   * Used by executeRemoteCommand to start agents server-side.
-   */
   private async spawnLocalAgentProcess(
     teamId: string,
     teamName: string,
@@ -24416,10 +28245,12 @@ Return this JSON shape:
     teamId: string,
     agentData: { id?: string; name?: string; port?: number },
   ): string {
-    return `${teamId}:${agentData.id || agentData.name || 'unknown'}:${agentData.port || 'no-port'}`;
+    if (agentData.id) return `agent:${agentData.id}`;
+    return `agent-pending:${teamId}:${agentData.name || 'unknown'}:${agentData.port || 'no-port'}`;
   }
 
   private async withAgentLifecycleLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    if (this.shuttingDown) throw new Error('Manager is shutting down');
     const previous = this.agentLifecycleLocks.get(key) || Promise.resolve();
     let release!: () => void;
     const current = new Promise<void>((resolve) => { release = resolve; });
@@ -24434,6 +28265,13 @@ Return this JSON shape:
       if (this.agentLifecycleLocks.get(key) === gate) {
         this.agentLifecycleLocks.delete(key);
       }
+    }
+  }
+
+  private async drainAgentLifecycleLocks(): Promise<void> {
+    while (this.agentLifecycleLocks.size > 0) {
+      const gates = [...this.agentLifecycleLocks.values()];
+      await Promise.all(gates.map((gate) => gate.catch(() => {})));
     }
   }
 
@@ -24542,9 +28380,31 @@ Return this JSON shape:
     opts: { requireAttestation?: boolean; timeoutMs?: number } = {},
   ): Promise<LocalAgentIdentityProbe> {
     try {
+      let headers: Record<string, string> = {
+        Accept: 'application/json',
+        Connection: 'close',
+      };
+      if (this.idaccAdminToken) {
+        const target = await this.db.agents.getById(expected.id);
+        const team = target
+          ? await this.db.teams.getTeam(target.team_id)
+          : null;
+        if (!target || !team) {
+          return {
+            ok: false,
+            attested: false,
+            error: 'managed worker assignment was unavailable for health attestation',
+          };
+        }
+        headers = await this.managerTargetWorkerHeaders(
+          target,
+          team.name,
+          headers,
+        );
+      }
       const response = await fetch(`http://127.0.0.1:${port}/health`, {
         redirect: 'error',
-        headers: { Accept: 'application/json', Connection: 'close' },
+        headers,
         signal: AbortSignal.timeout(opts.timeoutMs ?? 750),
         size: 16 * 1024,
       });
@@ -24638,6 +28498,53 @@ Return this JSON shape:
     return { ok: false, error: `agent process ${pid} did not become identity-verified on port ${port} within ${timeoutMs}ms` };
   }
 
+  private async terminateNewlySpawnedAgent(
+    proc: ChildProcess,
+    agentId: string,
+    port: number,
+    processGeneration?: string,
+  ): Promise<void> {
+    const pid = proc.pid;
+    if (!pid) return;
+    if (process.platform === 'win32') {
+      await terminateOwnedProcessTree(pid, {
+        verifyOwnership: () => (
+          this.ownedAgentProcesses.get(pid)?.proc === proc
+          && proc.exitCode == null
+          && proc.signalCode == null
+        ),
+        isAlive: () => this.processIsAlive(pid),
+        graceMs: WINDOWS_AGENT_TERMINATION_GRACE_MS,
+        onError: (message, error) => {
+          console.warn(`[Manager] ${message}: ${error instanceof Error ? error.message : String(error)}`);
+        },
+      });
+    } else {
+      const target = verifiedOwnedProcess(
+        pid,
+        this.ownedAgentProcesses.get(pid)?.proc === proc,
+      );
+      if (target) {
+        signalOwnedProcessTree(target, 'SIGTERM', {
+          detachedProcessGroup: true,
+          onError: (message, error) => {
+            console.warn(`[Manager] ${message}: ${error instanceof Error ? error.message : String(error)}`);
+          },
+        });
+      }
+    }
+    this.ownedAgentProcesses.delete(pid);
+    if (this.idaccAdminToken && processGeneration) {
+      await this.db.agents.transitionOwnedProcessExit(
+        agentId,
+        processGeneration,
+        true,
+      ).catch(() => false);
+    } else {
+      await this.clearAgentPid(agentId, pid, processGeneration);
+    }
+  }
+
   private async spawnLocalAgentProcessUnlocked(
     teamId: string,
     teamName: string,
@@ -24646,10 +28553,22 @@ Return this JSON shape:
     if (this.shuttingDown) {
       return { success: false, error: 'Manager is shutting down' };
     }
+    let preparedProcessGeneration: string | undefined;
     try {
       const scriptPath = path.resolve(__dirname, 'local-agent-server.js');
       const { name, id, port, model, workingDirectory, tokenId } = agentData;
       const agentRow = await this.dbQueryAgentById(teamId, id);
+      const agentMetadata = (agentRow?.metadata as AgentMetadata | null | undefined) ?? {};
+      if (
+        agentRow
+        && resolveRuntime(agentRow.runtime || agentMetadata.runtime) === 'provider-api'
+        && !this.providerRuntimeHasLaunchBinding(agentRow, agentMetadata)
+      ) {
+        return {
+          success: false,
+          error: this.providerRuntimeRebindRequiredError(),
+        };
+      }
 
       // Stop only a verified local-agent process. A random process occupying the
       // requested port is never terminated.
@@ -24671,7 +28590,62 @@ Return this JSON shape:
 
       // Set environment
       // Look up OWS wallet name and permissions flag from agent metadata
+      const processGeneration = crypto.randomUUID();
+      preparedProcessGeneration = processGeneration;
       const localEnv = this.buildLocalAgentEnv(teamId, teamName, port, agentRow, model, tokenId);
+      const issuedRuntime = resolveRuntime(
+        localEnv.ID_HARNESS
+        || agentRow?.runtime
+        || agentMetadata.runtime,
+      );
+      const issuedRuntimeLane = localEnv.ID_RUNTIME_LANE_ID;
+      if (!issuedRuntimeLane) {
+        throw new Error('worker runtime lane assignment was not generated');
+      }
+      const current = await this.dbQueryAgentById(teamId, id);
+      if (!current) {
+        throw new Error('agent row disappeared before process generation assignment');
+      }
+      // Persist the generation before the child can publish status or make its
+      // first callback. Generation ownership protects standalone Manager
+      // children too; managed mode additionally binds the issued credential to
+      // this exact generation and records its reviewed runtime assignment.
+      await this.db.agents.updateStatus(id, 'starting', {
+        metadata: {
+          ...(current.metadata || {}),
+          [MANAGER_OWNED_LAUNCH_INTENT_KEY]: true,
+          [MANAGER_PROCESS_GENERATION_KEY]: processGeneration,
+          ...(this.idaccAdminToken && {
+            [MANAGER_PROCESS_RUNTIME_KEY]: issuedRuntime,
+            [MANAGER_PROCESS_RUNTIME_LANE_KEY]: issuedRuntimeLane,
+          }),
+        },
+      });
+      localEnv.ID_AGENT_PROCESS_GENERATION = processGeneration;
+      if (this.idaccAdminToken) {
+        localEnv[MANAGER_AGENT_TOKEN_ENV] = deriveManagerAgentToken(
+          this.idaccAdminToken,
+          teamId,
+          id,
+          processGeneration,
+        );
+      }
+      const expectedAgentName = localEnv.ID_AGENT_NAME || name;
+
+      // Shutdown may begin while kill/cleanup and the bounded port handoff are
+      // in progress. Never create a new detached child after quiesce starts.
+      if (this.shuttingDown) {
+        if (this.idaccAdminToken) {
+          await this.db.agents.transitionOwnedProcessExit(
+            id,
+            processGeneration,
+            true,
+          ).catch(() => false);
+        } else {
+          await this.clearAgentPid(id, undefined, processGeneration);
+        }
+        return { success: false, error: 'Manager is shutting down' };
+      }
 
       // Logs live inside the app-owned profile (or the Manager work directory
       // for standalone use), never in a global /tmp namespace.
@@ -24698,51 +28672,47 @@ Return this JSON shape:
 
       console.log(`[Manager] Agent ${name} spawned with PID ${proc.pid}`);
 
-      if (proc.pid) {
-        const owned: OwnedAgentProcess = { proc, agentId: id, agentName: name, port };
-        this.ownedAgentProcesses.set(proc.pid, owned);
-        proc.once('exit', () => {
-          if (this.ownedAgentProcesses.get(proc.pid!)?.proc === proc) {
-            this.ownedAgentProcesses.delete(proc.pid!);
-          }
+      let assignmentRevocationStarted = false;
+      const revokeExitedAssignment = () => {
+        if (
+          proc.pid
+          && this.ownedAgentProcesses.get(proc.pid)?.proc === proc
+        ) {
+          this.ownedAgentProcesses.delete(proc.pid);
+        }
+        if (assignmentRevocationStarted) return;
+        assignmentRevocationStarted = true;
+        void this.db.agents.transitionOwnedProcessExit(
+          id,
+          processGeneration,
+          true,
+        ).catch((error: any) => {
+          console.warn(
+            `[Manager] Could not revoke exited worker generation for ${name}: ${error?.message || error}`,
+          );
         });
+      };
+      proc.once('exit', revokeExitedAssignment);
+      proc.once('error', revokeExitedAssignment);
+
+      if (proc.pid) {
+        const owned: OwnedAgentProcess = {
+          proc,
+          agentId: id,
+          agentName: name,
+          port,
+          processGeneration,
+        };
+        this.ownedAgentProcesses.set(proc.pid, owned);
       }
       proc.unref();
 
-      const bindResult = await this.waitForAgentPortToBind(proc, port, { id, name });
+      const bindResult = await this.waitForAgentPortToBind(proc, port, {
+        id,
+        name: expectedAgentName,
+      });
       if (!bindResult.ok) {
-        if (proc.pid) {
-          const pid = proc.pid;
-          if (process.platform === 'win32') {
-            await terminateOwnedProcessTree(pid, {
-              verifyOwnership: () => (
-                this.ownedAgentProcesses.get(pid)?.proc === proc
-                && proc.exitCode == null
-                && proc.signalCode == null
-              ),
-              isAlive: () => this.processIsAlive(pid),
-              graceMs: WINDOWS_AGENT_TERMINATION_GRACE_MS,
-              onError: (message, error) => {
-                console.warn(`[Manager] ${message}: ${error instanceof Error ? error.message : String(error)}`);
-              },
-            });
-          } else {
-            const target = verifiedOwnedProcess(
-              pid,
-              this.ownedAgentProcesses.get(pid)?.proc === proc,
-            );
-            if (target) {
-              signalOwnedProcessTree(target, 'SIGTERM', {
-                detachedProcessGroup: true,
-                onError: (message, error) => {
-                  console.warn(`[Manager] ${message}: ${error instanceof Error ? error.message : String(error)}`);
-                },
-              });
-            }
-          }
-          this.ownedAgentProcesses.delete(proc.pid);
-          await this.clearAgentPid(id, proc.pid);
-        }
+        await this.terminateNewlySpawnedAgent(proc, id, port, processGeneration);
         return { success: false, pid: proc.pid, logFile, error: bindResult.error };
       }
 
@@ -24750,21 +28720,76 @@ Return this JSON shape:
       // The TUI uses this to resolve per-agent RSS via a batched `ps` call.
       if (proc.pid) {
         try {
-          const cur = (agentRow?.metadata as Record<string, unknown>) || {};
-          await this.db.agents.updateMetadata(id, {
+          const stillOwned = (
+            this.ownedAgentProcesses.get(proc.pid)?.proc === proc
+            && proc.exitCode == null
+            && proc.signalCode == null
+          );
+          if (!stillOwned) {
+            throw new Error('verified worker exited before startup commit');
+          }
+          const current = await this.dbQueryAgentById(teamId, id);
+          if (!current) throw new Error('agent row disappeared during verified startup');
+          const cur = (current.metadata as Record<string, unknown>) || {};
+          const nextMetadata: Record<string, unknown> = {
             ...cur,
             pid: proc.pid,
             processOwner: 'manager-child',
             processParentPid: process.pid,
             processInspectedAt: Date.now(),
-          });
+            [MANAGER_PROCESS_GENERATION_KEY]: processGeneration,
+            ...(this.idaccAdminToken && {
+              [MANAGER_PROCESS_RUNTIME_KEY]: issuedRuntime,
+              [MANAGER_PROCESS_RUNTIME_LANE_KEY]: issuedRuntimeLane,
+            }),
+            [MANAGER_OWNED_LAUNCH_INTENT_KEY]: true,
+          };
+          // Identity attestation and the durable generation/intent write are
+          // the commit point for restart restoration.
+          delete nextMetadata[MANAGER_RESTART_REQUESTED_KEY];
+          const committed = await this.db.agents.updateOwnedProcessState(
+            id,
+            processGeneration,
+            'running',
+            nextMetadata,
+          );
+          if (
+            !committed
+            || this.ownedAgentProcesses.get(proc.pid)?.proc !== proc
+            || proc.exitCode != null
+            || proc.signalCode != null
+          ) {
+            throw new Error('verified worker generation changed before startup commit');
+          }
         } catch (metaErr: any) {
-          console.warn(`[Manager] Failed to persist pid for ${name}: ${metaErr?.message || metaErr}`);
+          console.warn(`[Manager] Could not durably record verified launch intent for ${name}`);
+          await this.terminateNewlySpawnedAgent(proc, id, port, processGeneration);
+          return {
+            success: false,
+            pid: proc.pid,
+            logFile,
+            error: 'verified worker startup could not be committed durably',
+          };
         }
       }
 
       return { success: true, pid: proc.pid, logFile };
     } catch (err: any) {
+      if (preparedProcessGeneration) {
+        if (this.idaccAdminToken) {
+          await this.db.agents.transitionOwnedProcessExit(
+            agentData.id,
+            preparedProcessGeneration,
+            true,
+          ).catch(() => false);
+        } else {
+          await this.clearAgentPid(
+            agentData.id,
+            undefined,
+            preparedProcessGeneration,
+          );
+        }
+      }
       console.error(`[Manager] Failed to spawn agent ${agentData.name}: ${err.message}`);
       return { success: false, error: err.message };
     }
@@ -24963,7 +28988,6 @@ Return this JSON shape:
       return target;
     }
 
-    await this.db.agents.updateStatus(agent.id, 'running');
     await this.db.events.insert({
       team_id: agent.team_id,
       topic: 'agent:started',
@@ -24981,10 +29005,15 @@ Return this JSON shape:
       },
     }).catch(() => ({ seq: 0 }));
 
-    const endpoint = (agent.endpoint || `http://localhost:${agent.port}`).replace(/\/+$/, '');
+    const currentAgent = await this.db.agents.getById(agent.id).catch(() => null) || agent;
+    const endpoint = (currentAgent.endpoint || `http://localhost:${currentAgent.port}`).replace(/\/+$/, '');
+    const requestHeaders = await this.managerTargetWorkerHeaders(
+      currentAgent,
+      team.name,
+    );
     let endpoints: { talk: string; schedule?: string | null } = { talk: '/talk', schedule: null };
     try {
-      endpoints = await discoverRestAPEndpoints(endpoint);
+      endpoints = await discoverRestAPEndpoints(endpoint, requestHeaders);
     } catch {
       // The dispatcher will surface endpoint failures; waking remains useful.
     }
@@ -24996,6 +29025,7 @@ Return this JSON shape:
       talkPath: endpoints.talk || '/talk',
       schedulePath: endpoints.schedule || null,
       status: 'running',
+      requestHeaders,
     };
   }
 
@@ -25217,30 +29247,52 @@ Return this JSON shape:
         }
 
         try {
-          const freshActiveQueries = await this.countActiveQueries(agent.id);
-          if (freshActiveQueries > 0) {
-            rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: `has_${freshActiveQueries}_active_${freshActiveQueries === 1 ? 'query' : 'queries'}` });
-            continue;
-          }
-          const freshRecentActivityMs = this.parkIdleRecentActivityMs();
-          const freshRecentQueries = freshRecentActivityMs > 0
-            ? await this.countRecentQueriesForAgent(agent.id, Date.now() - freshRecentActivityMs)
-            : 0;
-          if (freshRecentQueries > 0) {
-            rows.push({ team: team.name, name: agent.name, status: 'skipped', reason: `recent_query_activity_${freshRecentQueries}_within_${Math.round(freshRecentActivityMs / 60000)}m` });
-            continue;
-          }
-          const killResult = await this.killAgentProcess(agent.port, agent.id);
-          const cancelled = await this.cancelPendingQueriesForAgent(team.id, agent.id);
-          await this.db.agents.updateStatus(agent.id, 'stopped');
-          await this.clearAgentPid(agent.id);
-          rows.push({
-            team: team.name,
-            name: agent.name,
-            status: 'parked',
-            reason: cancelled > 0 ? `idle; cancelled_${cancelled}_queries` : 'idle',
-            pids: killResult.pids,
-          });
+          const outcome = await this.withAgentLifecycleLock(
+            this.agentLifecycleKey(team.id, agent),
+            async (): Promise<{ team: string; name: string; status: 'parked' | 'skipped'; reason: string; pids?: number[] }> => {
+              const current = await this.dbQueryAgentById(team.id, agent.id);
+              if (!current || current.status !== 'running') {
+                return {
+                  team: team.name,
+                  name: agent.name,
+                  status: 'skipped',
+                  reason: 'no_longer_running',
+                };
+              }
+              const freshActiveQueries = await this.countActiveQueries(current.id);
+              if (freshActiveQueries > 0) {
+                return {
+                  team: team.name,
+                  name: current.name,
+                  status: 'skipped',
+                  reason: `has_${freshActiveQueries}_active_${freshActiveQueries === 1 ? 'query' : 'queries'}`,
+                };
+              }
+              const freshRecentActivityMs = this.parkIdleRecentActivityMs();
+              const freshRecentQueries = freshRecentActivityMs > 0
+                ? await this.countRecentQueriesForAgent(current.id, Date.now() - freshRecentActivityMs)
+                : 0;
+              if (freshRecentQueries > 0) {
+                return {
+                  team: team.name,
+                  name: current.name,
+                  status: 'skipped',
+                  reason: `recent_query_activity_${freshRecentQueries}_within_${Math.round(freshRecentActivityMs / 60000)}m`,
+                };
+              }
+              const killResult = await this.killAgentProcess(current.port, current.id);
+              const cancelled = await this.cancelPendingQueriesForAgent(team.id, current.id);
+              await this.persistExplicitLocalStop(current);
+              return {
+                team: team.name,
+                name: current.name,
+                status: 'parked',
+                reason: cancelled > 0 ? `idle; cancelled_${cancelled}_queries` : 'idle',
+                pids: killResult.pids,
+              };
+            },
+          );
+          rows.push(outcome);
         } catch (err: any) {
           rows.push({ team: team.name, name: agent.name, status: 'failed', reason: err?.message || String(err) });
         }
@@ -25426,19 +29478,17 @@ Return this JSON shape:
     return { killed: killedPids.length > 0, pids: killedPids };
   }
 
-  private async clearAgentPid(agentId: string, expectedPid?: number): Promise<void> {
+  private async clearAgentPid(
+    agentId: string,
+    expectedPid?: number,
+    expectedGeneration?: string,
+  ): Promise<void> {
     try {
-      const row = await this.db.agents.getById(agentId);
-      const metadata = { ...((row?.metadata as Record<string, unknown> | null | undefined) ?? {}) };
-      const currentPid = metadata.pid;
-      const currentPidNumber = typeof currentPid === 'number' ? currentPid : Number(currentPid);
-      if (expectedPid && currentPidNumber !== expectedPid) return;
-      if (!('pid' in metadata) && !('processOwner' in metadata) && !('processParentPid' in metadata) && !('processInspectedAt' in metadata)) return;
-      delete metadata.pid;
-      delete metadata.processOwner;
-      delete metadata.processParentPid;
-      delete metadata.processInspectedAt;
-      await this.db.agents.updateMetadata(agentId, metadata);
+      await this.db.agents.clearOwnedProcessMetadata(
+        agentId,
+        expectedPid,
+        expectedGeneration,
+      );
     } catch {
       // PID metadata is diagnostic only; lifecycle status is the source of truth.
     }

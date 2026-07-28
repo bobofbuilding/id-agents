@@ -15,6 +15,11 @@
 COMMAND="$1"
 MANAGER_URL="${MANAGER_URL:-http://127.0.0.1:4100}"
 
+if [ -n "$IDACC_MANAGER_AGENT_TOKEN" ] || [ -n "$IDACC_DATA_DIR" ]; then
+  echo "Managed IDACC workers cannot run raw Manager administration. Use the IDACC application."
+  exit 2
+fi
+
 if [ -z "$COMMAND" ]; then
   echo "Usage: $0 \"/command args\""
   echo ""

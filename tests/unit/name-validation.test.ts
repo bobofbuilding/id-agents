@@ -16,6 +16,7 @@ describe('validateName', () => {
 
     it('accepts names with dots (valid for teams)', () => {
       expect(validateName('v2.0', 'team')).toEqual({ valid: true });
+      expect(validateName('agent.xid.eth', 'agent')).toEqual({ valid: true });
     });
 
     it('accepts names with numbers', () => {
@@ -135,6 +136,21 @@ describe('validateName', () => {
     it('rejects names containing other control chars', () => {
       expect(validateName('agent\x01', 'agent').valid).toBe(false);
       expect(validateName('agent\x7f', 'agent').valid).toBe(false);
+    });
+  });
+
+  describe('portable filesystem names', () => {
+    it.each([
+      '../escape',
+      'a/b',
+      'a\\b',
+      'a:b',
+      '..',
+      'name.',
+      'CON',
+      'nul.txt',
+    ])('rejects non-portable name %j', (name) => {
+      expect(validateName(name, 'agent').valid).toBe(false);
     });
   });
 

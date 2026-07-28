@@ -13,7 +13,12 @@ import { fileURLToPath } from 'url';
 import { HarnessType, isValidHarnessType, getAvailableHarnesses } from './harness/index.js';
 import type { McpServerSpec } from './harness/types.js';
 import {
+  exactWholeToolNames,
+  isNamespacedMcpTool,
+} from './harness/mcp.js';
+import {
   getDefaultRuntime,
+  getRuntimeProfile,
   resolveRuntime,
   validateRuntimeModelCompatibility,
   getRuntimePaths,
@@ -22,6 +27,17 @@ import {
 import { validateName } from './name-validation.js';
 import { enumerateLibraryAgents } from './lib/agent-library.js';
 import { resolveDefaultLibraryRoot } from './lib/library-inventory.js';
+import {
+  portablePathSegmentError,
+  portablePathSegmentKey,
+} from './lib/portable-path-segment.js';
+import {
+  AGENT_ENV_KEY_PATTERN,
+  isReservedAgentEnvironmentKey,
+  isReservedRuntimeCredentialLaneEnvironmentKey,
+  mergeAgentEnvironmentLayers,
+} from './agent-env.js';
+import { normalizeEnsIdentity } from './identity-validation.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -67,6 +83,12 @@ export interface AgentCatalog {
 
 export interface AgentSpec {
   name: string;
+  /**
+   * Stable, agent-owned declarative identity. Unlike `name`, this key must not
+   * change during a rename; deploy/sync use it to retain the existing DB row
+   * and profile-owned runtime state.
+   */
+  identityKey?: string;
   lead?: boolean;                    // Explicit primary supervision lead marker
   agent?: string;                     // Library agent overlay name (resolves to <library-root>/agents/<agent>/)
   type?: 'claude' | 'automator';      // Agent type: 'claude' (default) or 'automator' (team-local planning worker, hidden)
@@ -80,6 +102,7 @@ export interface AgentSpec {
   skills?: string[];                  // Skills to deploy (names match skills/<name>/SKILL.md)
   allowedTools?: string[];
   mcpServers?: McpServerSpec[];       // External MCP servers exposed as tools.
+  env?: Record<string, string>;       // Preferred per-agent application environment.
   resources?: ResourceConfig;
   register?: boolean;                 // Auto-register onchain after deploy
   local?: boolean;                    // Run locally using the selected runtime's local auth flow
@@ -155,6 +178,7 @@ export interface OrgConfig {
 }
 
 export interface RuntimeCredentialLaneConfig {
+  /** Unique within one canonical runtime; distinct canonical runtimes may reuse an id. */
   id: string;
   runtime?: HarnessType;
   kind: 'subscription' | 'metered-api';
@@ -180,7 +204,9 @@ export interface DeployConfig {
     skills?: string[];                  // Default skills for all agents
     allowedTools?: string[];
     mcpServers?: McpServerSpec[];
+    env?: Record<string, string>;
     resources?: ResourceConfig;
+    openMode?: boolean;
     register?: boolean;                 // Auto-register all agents onchain (default: undefined, use onchain.register)
     local?: boolean;                    // Run all agents locally by default
     dangerouslySkipPermissions?: boolean; // Default skip-permissions for all agents
@@ -208,6 +234,73 @@ export interface TeamConfig {
 
 const RESERVED_MANAGER_CONFIG_ERROR =
   'Agent manager with type automator is no longer valid. The name manager is reserved for the control plane. Rename this agent to lead-automator (or any non-reserved name) and re-deploy.';
+const IDENTITY_KEY_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
+
+function validateAgentEnvironment(
+  value: unknown,
+  envPath: string,
+  errors: ValidationError[],
+): void {
+  if (value === undefined) return;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    errors.push({ path: envPath, message: 'env must be an object of string values' });
+    return;
+  }
+
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    const keyPath = `${envPath}.${key}`;
+    if (!AGENT_ENV_KEY_PATTERN.test(key)) {
+      errors.push({
+        path: keyPath,
+        message: 'environment variable names must match [A-Za-z_][A-Za-z0-9_]*',
+      });
+      continue;
+    }
+    if (isReservedAgentEnvironmentKey(key)) {
+      errors.push({
+        path: keyPath,
+        message: `"${key}" is owned by the Manager and cannot be set in agent env`,
+      });
+    }
+    if (typeof entry !== 'string') {
+      errors.push({
+        path: keyPath,
+        message: 'environment variable values must be strings',
+      });
+    }
+  }
+}
+
+function validatePortableNameList(
+  value: unknown,
+  valuePath: string,
+  errors: ValidationError[],
+): void {
+  if (value === undefined) return;
+  if (!Array.isArray(value)) {
+    errors.push({ path: valuePath, message: `${valuePath.split('.').pop()} must be an array` });
+    return;
+  }
+  const owners = new Map<string, number>();
+  value.forEach((entry, index) => {
+    const entryPath = `${valuePath}[${index}]`;
+    const issue = portablePathSegmentError(entry);
+    if (issue) {
+      errors.push({ path: entryPath, message: `name ${issue}` });
+      return;
+    }
+    const key = portablePathSegmentKey(entry as string);
+    const prior = owners.get(key);
+    if (prior !== undefined) {
+      errors.push({
+        path: entryPath,
+        message: `name "${entry}" duplicates ${valuePath}[${prior}] after portable case-folding`,
+      });
+    } else {
+      owners.set(key, index);
+    }
+  });
+}
 
 /**
  * Parse command line args into parameter values.
@@ -281,6 +374,87 @@ export function findUnresolvedParams(content: string): string[] {
   return matches.map(m => m.slice(2, -1)); // Remove ${ and }
 }
 
+function substituteParsedConfig<T>(
+  parsed: T,
+  params: Record<string, string>,
+  declaredParams: ReadonlySet<string>,
+): { value: T; unresolved: string[] } {
+  const unresolved = new Set<string>();
+  const seen = new WeakMap<object, unknown>();
+  const replaceString = (input: string): string => input.replace(
+    /\$\{([^}]+)\}/g,
+    (match, placeholder: string) => {
+      if (placeholder.startsWith('env:')) {
+        const envName = placeholder.slice(4);
+        if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(envName)) {
+          const envValue = process.env[envName];
+          if (envValue !== undefined) return envValue;
+        }
+        unresolved.add(placeholder);
+        return match;
+      }
+      if (
+        declaredParams.has(placeholder)
+        && Object.prototype.hasOwnProperty.call(params, placeholder)
+      ) {
+        return params[placeholder];
+      }
+      if (declaredParams.has(placeholder)) unresolved.add(placeholder);
+      return match;
+    },
+  );
+  const visit = (value: unknown): unknown => {
+    if (typeof value === 'string') {
+      const exact = /^\$\{([^}]+)\}$/.exec(value);
+      if (
+        exact
+        && !exact[1].startsWith('env:')
+        && declaredParams.has(exact[1])
+        && Object.prototype.hasOwnProperty.call(params, exact[1])
+      ) {
+        const raw = params[exact[1]];
+        // Preserve the legacy typed-field behavior for exact parameter
+        // placeholders without reparsing arbitrary YAML. Only JSON primitive
+        // spellings can become non-strings; objects/arrays/comments remain data.
+        if (/^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)$/.test(raw)) {
+          return JSON.parse(raw);
+        }
+      }
+      return replaceString(value);
+    }
+    if (Array.isArray(value)) {
+      const prior = seen.get(value);
+      if (prior) return prior;
+      const result: unknown[] = [];
+      seen.set(value, result);
+      for (const entry of value) result.push(visit(entry));
+      return result;
+    }
+    if (value && typeof value === 'object') {
+      const prototype = Object.getPrototypeOf(value);
+      if (prototype !== Object.prototype && prototype !== null) return value;
+      const prior = seen.get(value);
+      if (prior) return prior;
+      const result: Record<string, unknown> = {};
+      seen.set(value, result);
+      for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+        // Placeholders in mapping keys are deliberately unsupported. Resolving
+        // values after YAML parsing prevents env content from changing YAML
+        // types, comments, structure, or adding sibling keys.
+        for (const placeholder of findUnresolvedParams(key)) {
+          if (placeholder.startsWith('env:') || declaredParams.has(placeholder)) {
+            unresolved.add(placeholder);
+          }
+        }
+        result[key] = visit(entry);
+      }
+      return result;
+    }
+    return value;
+  };
+  return { value: visit(parsed) as T, unresolved: [...unresolved] };
+}
+
 export interface ValidationError {
   path: string;
   message: string;
@@ -302,7 +476,7 @@ export function parseConfig(filePath: string, args: string[] = []): DeployConfig
     throw new Error(`Config file not found: ${absolutePath}`);
   }
 
-  let content = fs.readFileSync(absolutePath, 'utf-8');
+  const content = fs.readFileSync(absolutePath, 'utf-8');
 
   // First pass: parse to extract parameters (before substitution)
   const initialConfig = yaml.load(content) as DeployConfig;
@@ -310,25 +484,17 @@ export function parseConfig(filePath: string, args: string[] = []): DeployConfig
     throw new Error(`Failed to parse config file: ${absolutePath}`);
   }
 
-  // If there are parameters defined, substitute them
-  if (initialConfig.parameters && initialConfig.parameters.length > 0) {
-    const paramValues = parseDeployArgs(args, initialConfig.parameters);
-    content = substituteParams(content, paramValues);
-
-    // Check for unresolved parameters
-    const unresolved = findUnresolvedParams(content);
-    if (unresolved.length > 0) {
-      throw new Error(`Unresolved parameters: ${unresolved.join(', ')}. Provide values via: /deploy config.yaml ${unresolved.map(p => `${p}=value`).join(' ')}`);
-    }
+  const paramValues = parseDeployArgs(args, initialConfig.parameters || []);
+  const declaredParams = new Set((initialConfig.parameters || []).map(({ name }) => name));
+  const substituted = substituteParsedConfig(initialConfig, paramValues, declaredParams);
+  if (substituted.unresolved.length > 0) {
+    throw new Error(
+      `Unresolved parameters: ${substituted.unresolved.join(', ')}. Provide values via: `
+      + `/deploy config.yaml ${substituted.unresolved.map(p => `${p}=value`).join(' ')}`,
+    );
   }
 
-  // Final parse with substituted values
-  const config = yaml.load(content) as DeployConfig;
-  if (!config) {
-    throw new Error(`Failed to parse config file after substitution: ${absolutePath}`);
-  }
-
-  return config;
+  return substituted.value;
 }
 
 /**
@@ -360,28 +526,20 @@ export function parseTeamConfig(filePath: string, args: string[] = []): TeamConf
     throw new Error(`Config file not found: ${absolutePath}`);
   }
 
-  let content = fs.readFileSync(absolutePath, 'utf-8');
+  const content = fs.readFileSync(absolutePath, 'utf-8');
   const initialConfig = yaml.load(content) as TeamConfig | undefined;
   if (!initialConfig) {
     throw new Error(`Failed to parse config file: ${absolutePath}`);
   }
 
-  if (initialConfig.parameters && initialConfig.parameters.length > 0) {
-    const paramValues = parseDeployArgs(args, initialConfig.parameters);
-    content = substituteParams(content, paramValues);
-
-    const unresolved = findUnresolvedParams(content);
-    if (unresolved.length > 0) {
-      throw new Error(`Unresolved parameters: ${unresolved.join(', ')}`);
-    }
+  const paramValues = parseDeployArgs(args, initialConfig.parameters || []);
+  const declaredParams = new Set((initialConfig.parameters || []).map(({ name }) => name));
+  const substituted = substituteParsedConfig(initialConfig, paramValues, declaredParams);
+  if (substituted.unresolved.length > 0) {
+    throw new Error(`Unresolved parameters: ${substituted.unresolved.join(', ')}`);
   }
 
-  const config = yaml.load(content) as TeamConfig | undefined;
-  if (!config) {
-    throw new Error(`Failed to parse config file after substitution: ${absolutePath}`);
-  }
-
-  return config;
+  return substituted.value;
 }
 
 /**
@@ -404,6 +562,32 @@ export function resolveLibraryAgentPath(filePath: string, agentName: string, lib
   return path.join(root, 'agents', agentName);
 }
 
+function exactAllowedToolsIssue(
+  value: unknown,
+  runtime?: HarnessType | string,
+): string | null {
+  if (!Array.isArray(value)) {
+    return 'allowedTools must be an array of unique exact whole tool names';
+  }
+  let tools: string[];
+  try {
+    tools = exactWholeToolNames(value as string[]);
+  } catch {
+    return 'allowedTools must be an array of unique exact whole tool names';
+  }
+  if (new Set(tools).size !== tools.length) {
+    return 'allowedTools must be an array of unique exact whole tool names';
+  }
+  const resolved = resolveRuntime(runtime);
+  if (
+    (resolved === 'claude-code-cli' || resolved === 'claude-code-local')
+    && tools.some(isNamespacedMcpTool)
+  ) {
+    return `runtime "${resolved}" cannot enforce an exact named MCP tool boundary; use claude-agent-sdk`;
+  }
+  return null;
+}
+
 /**
  * Validate a deploy config
  */
@@ -411,6 +595,8 @@ export function validateConfig(config: DeployConfig): ValidationResult {
   const validDays = new Set(['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']);
   const errors: ValidationError[] = [];
   const defaultRuntime = resolveRuntime(config.defaults?.runtime || getDefaultRuntime());
+  const identityKeyOwners = new Map<string, number>();
+  const effectiveIdentityOwners = new Map<string, { index: number; field: 'name' | 'domain' }>();
 
   // Check version
   if (!config.version) {
@@ -433,6 +619,13 @@ export function validateConfig(config: DeployConfig): ValidationResult {
 
   if (config.agents.length === 0) {
     errors.push({ path: 'agents', message: 'agents array must have at least one agent' });
+  }
+
+  if ((config.defaults as Record<string, unknown> | undefined)?.identityKey !== undefined) {
+    errors.push({
+      path: 'defaults.identityKey',
+      message: 'identityKey is agent-only and cannot be inherited from defaults',
+    });
   }
 
   if (config.calendar) {
@@ -467,6 +660,7 @@ export function validateConfig(config: DeployConfig): ValidationResult {
       errors.push({ path: 'runtimeCredentialPool.lanes', message: 'runtimeCredentialPool.lanes must be a non-empty array' });
     } else {
       const subscriptionLanesByRuntime = new Map<string, number>();
+      const laneNamespaceOwners = new Map<string, number>();
       for (const lane of lanes) {
         if (!lane || typeof lane !== 'object' || lane.kind !== 'subscription') continue;
         const runtime = resolveRuntime(typeof lane.runtime === 'string' && isValidHarnessType(lane.runtime)
@@ -490,6 +684,8 @@ export function validateConfig(config: DeployConfig): ValidationResult {
         }
         if (typeof lane.id !== 'string' || !lane.id.trim()) {
           errors.push({ path: `${lanePath}.id`, message: 'lane id is required' });
+        } else if (lane.id !== lane.id.trim()) {
+          errors.push({ path: `${lanePath}.id`, message: 'lane id must not have leading or trailing whitespace' });
         }
         if (lane.runtime !== undefined && !isValidHarnessType(lane.runtime)) {
           errors.push({ path: `${lanePath}.runtime`, message: `runtime must be one of: ${getAvailableHarnesses().join(', ')}` });
@@ -497,8 +693,53 @@ export function validateConfig(config: DeployConfig): ValidationResult {
         if (lane.kind !== 'subscription' && lane.kind !== 'metered-api') {
           errors.push({ path: `${lanePath}.kind`, message: 'kind must be subscription or metered-api' });
         }
+        const laneRuntime = typeof lane.runtime === 'string' && isValidHarnessType(lane.runtime)
+          ? resolveRuntime(lane.runtime)
+          : lane.runtime === undefined
+            ? resolveRuntime(config.defaults?.runtime || getDefaultRuntime())
+            : undefined;
+        if (typeof lane.id === 'string' && lane.id.trim() && laneRuntime) {
+          const canonicalRuntime = getRuntimeProfile(laneRuntime).canonicalId;
+          const namespace = JSON.stringify([canonicalRuntime, lane.id.trim()]);
+          const prior = laneNamespaceOwners.get(namespace);
+          if (prior !== undefined) {
+            errors.push({
+              path: `${lanePath}.id`,
+              message: `lane id "${lane.id}" duplicates runtimeCredentialPool.lanes[${prior}].id for canonical runtime "${canonicalRuntime}"`,
+            });
+          } else {
+            laneNamespaceOwners.set(namespace, index);
+          }
+        }
         if (lane.env !== undefined && (typeof lane.env !== 'object' || lane.env === null || Array.isArray(lane.env))) {
-          errors.push({ path: `${lanePath}.env`, message: 'env must be an object' });
+          errors.push({ path: `${lanePath}.env`, message: 'env must be an object of string credential values' });
+        } else if (lane.env) {
+          for (const [key, value] of Object.entries(lane.env)) {
+            const keyPath = `${lanePath}.env.${key}`;
+            if (!AGENT_ENV_KEY_PATTERN.test(key)) {
+              errors.push({
+                path: keyPath,
+                message: 'environment variable names must match [A-Za-z_][A-Za-z0-9_]*',
+              });
+              continue;
+            }
+            if (isReservedRuntimeCredentialLaneEnvironmentKey(
+              key,
+              laneRuntime,
+              lane.kind,
+            )) {
+              errors.push({
+                path: keyPath,
+                message: `"${key}" is not a reviewed credential for this runtime lane`,
+              });
+            }
+            if (typeof value !== 'string') {
+              errors.push({
+                path: keyPath,
+                message: 'runtime credential lane environment values must be strings',
+              });
+            }
+          }
         }
       });
     }
@@ -513,17 +754,68 @@ export function validateConfig(config: DeployConfig): ValidationResult {
     }
 
     if (agent.name) {
-      if (agent.name === 'manager') {
+      if (typeof agent.name === 'string' && agent.name.trim().toLowerCase() === 'manager') {
         errors.push({ path: `${agentPath}.name`, message: RESERVED_MANAGER_CONFIG_ERROR });
-      } else if (!/^[a-zA-Z0-9_-]+$/.test(agent.name)) {
+      } else if (typeof agent.name !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(agent.name)) {
         errors.push({
           path: `${agentPath}.name`,
           message: 'agent name must contain only alphanumeric characters, hyphens, and underscores'
         });
       } else {
-        const nameResult = validateName(agent.name, 'agent');
-        if (!nameResult.valid) {
-          errors.push({ path: `${agentPath}.name`, message: nameResult.error! });
+        const portableIssue = portablePathSegmentError(agent.name);
+        if (portableIssue) {
+          errors.push({ path: `${agentPath}.name`, message: `agent name ${portableIssue}` });
+        } else {
+          const nameResult = validateName(agent.name, 'agent');
+          if (!nameResult.valid) {
+            errors.push({ path: `${agentPath}.name`, message: nameResult.error! });
+          }
+        }
+      }
+    }
+
+    let normalizedDomain: string | undefined;
+    try {
+      normalizedDomain = normalizeEnsIdentity(agent.domain, agent.tokenId).domain;
+    } catch (error: any) {
+      const field = /tokenId/i.test(error?.message || '') ? 'tokenId' : 'domain';
+      errors.push({
+        path: `${agentPath}.${field}`,
+        message: error?.message || String(error),
+      });
+    }
+
+    for (const field of ['name', 'domain'] as const) {
+      const value = field === 'domain' ? normalizedDomain : agent.name;
+      if (typeof value !== 'string' || !value.trim()) continue;
+      const normalized = value.trim().toLowerCase();
+      const prior = effectiveIdentityOwners.get(normalized);
+      if (prior && prior.index !== index) {
+        const displayValue = field === 'domain' ? agent.domain : agent.name;
+        errors.push({
+          path: `${agentPath}.${field}`,
+          message: `${field} "${displayValue}" conflicts with agents[${prior.index}].${prior.field}`,
+        });
+      } else if (!prior) {
+        effectiveIdentityOwners.set(normalized, { index, field });
+      }
+    }
+
+    if (agent.identityKey !== undefined) {
+      if (typeof agent.identityKey !== 'string' || !IDENTITY_KEY_PATTERN.test(agent.identityKey)) {
+        errors.push({
+          path: `${agentPath}.identityKey`,
+          message: 'identityKey must be 1-128 lowercase letters, numbers, dots, underscores, or hyphens; it must start and end with a letter or number',
+        });
+      } else {
+        const priorOwner = identityKeyOwners.get(agent.identityKey);
+        if (priorOwner !== undefined) {
+          errors.push({
+            path: `${agentPath}.identityKey`,
+            message: `identityKey "${agent.identityKey}" is already used by agents[${priorOwner}]`,
+          });
+        } else {
+          identityKeyOwners.set(agent.identityKey, index);
         }
       }
     }
@@ -533,12 +825,54 @@ export function validateConfig(config: DeployConfig): ValidationResult {
         path: `${agentPath}.agent`,
         message: 'agent must be a string'
       });
+    } else if (agent.agent !== undefined) {
+      const issue = portablePathSegmentError(agent.agent);
+      if (issue) {
+        errors.push({
+          path: `${agentPath}.agent`,
+          message: `agent library name ${issue}`,
+        });
+      }
     }
 
     if (agent.lead !== undefined && typeof agent.lead !== 'boolean') {
       errors.push({
         path: `${agentPath}.lead`,
         message: 'lead must be a boolean'
+      });
+    }
+
+    if (agent.type !== undefined && agent.type !== 'claude' && agent.type !== 'automator') {
+      errors.push({
+        path: `${agentPath}.type`,
+        message: 'type must be exactly "claude" or "automator"',
+      });
+    }
+
+    if (agent.openMode !== undefined && typeof agent.openMode !== 'boolean') {
+      errors.push({
+        path: `${agentPath}.openMode`,
+        message: 'openMode must be a boolean',
+      });
+    }
+
+    if (
+      agent.dangerouslySkipPermissions !== undefined
+      && typeof agent.dangerouslySkipPermissions !== 'boolean'
+    ) {
+      errors.push({
+        path: `${agentPath}.dangerouslySkipPermissions`,
+        message: 'dangerouslySkipPermissions must be a boolean',
+      });
+    }
+
+    const directAllowedToolsIssue = agent.allowedTools !== undefined
+      ? exactAllowedToolsIssue(agent.allowedTools, agent.runtime || defaultRuntime)
+      : null;
+    if (directAllowedToolsIssue) {
+      errors.push({
+        path: `${agentPath}.allowedTools`,
+        message: directAllowedToolsIssue,
       });
     }
 
@@ -595,6 +929,38 @@ export function validateConfig(config: DeployConfig): ValidationResult {
 
     const effectiveRuntime = resolveRuntime(agent.runtime || defaultRuntime);
     const effectiveModel = agent.model || config.defaults?.model;
+    const effectiveAllowedTools = agent.allowedTools !== undefined
+      ? agent.allowedTools
+      : config.defaults?.allowedTools;
+    const effectiveAllowedToolsIssue = (
+      agent.allowedTools === undefined
+      && effectiveAllowedTools !== undefined
+    )
+      ? exactAllowedToolsIssue(effectiveAllowedTools, effectiveRuntime)
+      : null;
+    if (
+      effectiveAllowedToolsIssue
+      && !errors.some((error) => (
+        error.path === 'defaults.allowedTools'
+        && error.message === effectiveAllowedToolsIssue
+      ))
+    ) {
+      errors.push({
+        path: 'defaults.allowedTools',
+        message: effectiveAllowedToolsIssue,
+      });
+    }
+    if (
+      effectiveAllowedTools !== undefined
+      && !getRuntimeProfile(effectiveRuntime).capabilities.supportsAllowedTools
+    ) {
+      errors.push({
+        path: agent.allowedTools !== undefined
+          ? `${agentPath}.allowedTools`
+          : 'defaults.allowedTools',
+        message: `runtime "${effectiveRuntime}" cannot enforce an exact allowedTools boundary; omit allowedTools or choose a runtime that supports it`,
+      });
+    }
     for (const issue of validateRuntimeModelCompatibility(effectiveRuntime, effectiveModel)) {
       errors.push({
         path: agent.model ? `${agentPath}.model` : `${agentPath}.runtime`,
@@ -604,16 +970,48 @@ export function validateConfig(config: DeployConfig): ValidationResult {
 
     // Validate plugins
     if (agent.plugins) {
+      const pluginOwners = new Map<string, number>();
       agent.plugins.forEach((plugin, pIndex) => {
         const pluginPath = `${agentPath}.plugins[${pIndex}]`;
         if (!plugin.name) {
           errors.push({ path: `${pluginPath}.name`, message: 'plugin name is required' });
+        } else if (portablePathSegmentError(plugin.name)) {
+          errors.push({
+            path: `${pluginPath}.name`,
+            message: `plugin name ${portablePathSegmentError(plugin.name)}`,
+          });
+        } else {
+          const normalizedName = portablePathSegmentKey(plugin.name);
+          const prior = pluginOwners.get(normalizedName);
+          if (prior !== undefined) {
+            errors.push({
+              path: `${pluginPath}.name`,
+              message: `plugin name "${plugin.name}" duplicates ${agentPath}.plugins[${prior}].name`,
+            });
+          } else {
+            pluginOwners.set(normalizedName, pIndex);
+          }
+          const defaultPlugin = config.defaults?.plugins?.find(
+            (candidate) => (
+              typeof candidate.name === 'string'
+              && portablePathSegmentKey(candidate.name) === normalizedName
+            ),
+          );
+          if (defaultPlugin && defaultPlugin.name !== plugin.name) {
+            errors.push({
+              path: `${pluginPath}.name`,
+              message: `plugin name "${plugin.name}" differs only by case from defaults plugin "${defaultPlugin.name}"`,
+            });
+          }
         }
         if (!plugin.path) {
           errors.push({ path: `${pluginPath}.path`, message: 'plugin path is required' });
         }
       });
     }
+
+    validatePortableNameList(agent.skills, `${agentPath}.skills`, errors);
+    validateAgentEnvironment(agent.env, `${agentPath}.env`, errors);
 
     // Validate resource config
     if (agent.resources) {
@@ -629,6 +1027,7 @@ export function validateConfig(config: DeployConfig): ValidationResult {
           message: 'cpus must be a positive number'
         });
       }
+      validateAgentEnvironment(agent.resources.env, `${agentPath}.resources.env`, errors);
     }
   });
 
@@ -650,14 +1049,65 @@ export function validateConfig(config: DeployConfig): ValidationResult {
     }
 
     if (config.defaults.plugins) {
+      const pluginOwners = new Map<string, number>();
       config.defaults.plugins.forEach((plugin, pIndex) => {
         const pluginPath = `defaults.plugins[${pIndex}]`;
         if (!plugin.name) {
           errors.push({ path: `${pluginPath}.name`, message: 'plugin name is required' });
+        } else if (portablePathSegmentError(plugin.name)) {
+          errors.push({
+            path: `${pluginPath}.name`,
+            message: `plugin name ${portablePathSegmentError(plugin.name)}`,
+          });
+        } else {
+          const normalizedName = portablePathSegmentKey(plugin.name);
+          const prior = pluginOwners.get(normalizedName);
+          if (prior !== undefined) {
+            errors.push({
+              path: `${pluginPath}.name`,
+              message: `plugin name "${plugin.name}" duplicates defaults.plugins[${prior}].name`,
+            });
+          } else {
+            pluginOwners.set(normalizedName, pIndex);
+          }
         }
         if (!plugin.path) {
           errors.push({ path: `${pluginPath}.path`, message: 'plugin path is required' });
         }
+      });
+    }
+
+    validatePortableNameList(config.defaults.skills, 'defaults.skills', errors);
+    validateAgentEnvironment(config.defaults.env, 'defaults.env', errors);
+    validateAgentEnvironment(config.defaults.resources?.env, 'defaults.resources.env', errors);
+    if (config.defaults.openMode !== undefined && typeof config.defaults.openMode !== 'boolean') {
+      errors.push({
+        path: 'defaults.openMode',
+        message: 'openMode must be a boolean',
+      });
+    }
+    if (
+      config.defaults.dangerouslySkipPermissions !== undefined
+      && typeof config.defaults.dangerouslySkipPermissions !== 'boolean'
+    ) {
+      errors.push({
+        path: 'defaults.dangerouslySkipPermissions',
+        message: 'dangerouslySkipPermissions must be a boolean',
+      });
+    }
+    const defaultsAllowedToolsIssue = config.defaults.allowedTools !== undefined
+      ? exactAllowedToolsIssue(config.defaults.allowedTools, config.defaults.runtime || defaultRuntime)
+      : null;
+    if (
+      defaultsAllowedToolsIssue
+      && !errors.some((error) => (
+        error.path === 'defaults.allowedTools'
+        && error.message === defaultsAllowedToolsIssue
+      ))
+    ) {
+      errors.push({
+        path: 'defaults.allowedTools',
+        message: defaultsAllowedToolsIssue,
       });
     }
   }
@@ -1219,6 +1669,9 @@ export function mergeDefaults(agent: AgentSpec, defaults: DeployConfig['defaults
   if (!defaults) return agent;
 
   const merged: AgentSpec = { ...agent };
+  // identityKey is intentionally agent-only. A shared default would assign the
+  // same durable identity to multiple agents, so defaults must never replace it.
+  if (agent.identityKey !== undefined) merged.identityKey = agent.identityKey;
 
   // Runtime: agent overrides defaults, default to 'claude-agent-sdk'
   if (!merged.runtime && defaults.runtime) {
@@ -1232,20 +1685,32 @@ export function mergeDefaults(agent: AgentSpec, defaults: DeployConfig['defaults
 
   // Plugins: merge (agent plugins take precedence for same name)
   if (defaults.plugins && defaults.plugins.length > 0) {
-    const agentPluginNames = new Set((merged.plugins || []).map(p => p.name));
-    const defaultPluginsToAdd = defaults.plugins.filter(p => !agentPluginNames.has(p.name));
+    const agentPluginNames = new Set(
+      (merged.plugins || []).map(p => portablePathSegmentKey(p.name)),
+    );
+    const defaultPluginsToAdd = defaults.plugins.filter(
+      p => !agentPluginNames.has(portablePathSegmentKey(p.name)),
+    );
     merged.plugins = [...(merged.plugins || []), ...defaultPluginsToAdd];
   }
 
   // Skills: merge (agent skills added to defaults, deduped)
   if (defaults.skills && defaults.skills.length > 0) {
-    const allSkills = new Set([...defaults.skills, ...(merged.skills || [])]);
-    merged.skills = [...allSkills];
+    const allSkills = new Map<string, string>();
+    for (const skill of [...defaults.skills, ...(merged.skills || [])]) {
+      allSkills.set(portablePathSegmentKey(skill), skill);
+    }
+    merged.skills = [...allSkills.values()];
   }
 
   // AllowedTools: agent overrides defaults entirely
-  if (!merged.allowedTools && defaults.allowedTools) {
+  if (merged.allowedTools === undefined && defaults.allowedTools) {
     merged.allowedTools = [...defaults.allowedTools];
+  }
+
+  // Open mode: agent overrides defaults, including an explicit false.
+  if (merged.openMode === undefined && defaults.openMode !== undefined) {
+    merged.openMode = defaults.openMode;
   }
 
   // MCP servers: merge by name, agent entries override defaults.
@@ -1271,6 +1736,23 @@ export function mergeDefaults(agent: AgentSpec, defaults: DeployConfig['defaults
       },
       volumes: merged.resources?.volumes || defaults.resources.volumes
     };
+  }
+
+  // Environment: per-agent declarations override defaults regardless of
+  // whether an older config uses resources.env. Top-level env is preferred
+  // within each layer.
+  if (
+    defaults.resources?.env
+    || defaults.env
+    || agent.resources?.env
+    || agent.env
+  ) {
+    merged.env = mergeAgentEnvironmentLayers(
+      defaults.resources?.env,
+      defaults.env,
+      agent.resources?.env,
+      agent.env,
+    );
   }
 
   // Local: agent overrides defaults
@@ -1372,6 +1854,14 @@ export function processConfig(
   let agents = resolvedConfig.agents.map(agent =>
     mergeDefaults(agent, resolvedConfig.defaults)
   );
+  agents = agents.map((agent) => {
+    const identity = normalizeEnsIdentity(agent.domain, agent.tokenId);
+    return {
+      ...agent,
+      ...(identity.domain && { domain: identity.domain }),
+      ...(identity.tokenId && { tokenId: identity.tokenId }),
+    };
+  });
 
   // Load sub-agent templates (runtime-aware: .claude/agents/ for Claude, .agents/ for Codex)
   agents = agents.map(agent => {

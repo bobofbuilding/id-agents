@@ -2,6 +2,15 @@
 
 How to wait for a `/remote` query (or any in-flight agent work) to complete, the right way and the wrong way.
 
+> **Access boundary:** the raw examples in this document are for a standalone
+> Manager or an explicitly authenticated IDACC administrator client. Managed
+> workers cannot read Manager `/query`, `/events`, or `/news`; they poll their
+> own loopback
+> `http://127.0.0.1:$ID_AGENT_PORT/news?query_id=<id>&since_id=0`.
+> Brain may read only `/teams`, `/agents`, and `/events` with its separate
+> service credential. Use IDACC for managed operator polling; never copy the
+> administrator or Brain credential into a worker.
+
 ## TL;DR
 
 After dispatching a query via `POST /remote { command: "/ask <agent> ..." }`, the daemon returns `{ queryId, status: "processing" }`. To wait for completion, hit:
@@ -16,10 +25,10 @@ One call. Server holds the connection open until the query reaches a terminal st
 
 | Endpoint | Purpose | Auth |
 |---|---|---|
-| `GET /query/:id?wait=<seconds>` | Long-poll a single query's status + result | Team header (`X-Id-Team` or `?team=`) |
-| `GET /events?topics=...&since=...` | Stream wakeup-service events (heartbeats, schedules, query state) | Same |
-| `POST /news` | Append-only inbox writes (manager + agents); not for waiting | Same |
-| `GET /news` | Read inbox events (the `cursor` field paginates) | Same |
+| `GET /query/:id?wait=<seconds>` | Long-poll a single query's status + result | Standalone historical contract; managed administrator only |
+| `GET /events?topics=...&since=...` | Stream wakeup-service events (heartbeats, schedules, query state) | Managed administrator, or read-only Brain service |
+| `POST /news` | Append-only inbox writes; not for waiting | Managed administrator or authenticated worker callback |
+| `GET /news` | Read Manager inbox events (the `cursor` field paginates) | Managed administrator only |
 
 ### `GET /query/:id?wait=<seconds>`
 

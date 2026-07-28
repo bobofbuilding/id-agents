@@ -14,7 +14,9 @@ The central process running on port 4100 (configurable via `--port` or `MANAGER_
 
 **Responsibilities:**
 - Stores agent state in the database (SQLite or PostgreSQL)
-- Handles the `/remote` API for programmatic access — no auth required (supports `/deploy`, `/sync`, `/agents`, `/ask`, etc.)
+- Handles the `/remote` API for programmatic access. Historical standalone mode
+  remains loopback/header based; managed IDACC requires the supervisor
+  administrator credential.
 - Serves read-only library inventory via `/library/agents` and `/library/skills`
 - Routes fire-and-forget messages between agents via `/message`
 - Spawns and stops agent processes
@@ -28,8 +30,8 @@ The central process running on port 4100 (configurable via `--port` or `MANAGER_
 - `GET /agents` — List all agents with health status
 - `GET /library/agents` — List library agent entries from `configs/agents/`
 - `GET /library/skills` — List standalone skill entries from `configs/skills/`
-- `POST /remote` — Execute CLI commands programmatically (no auth)
-- `POST /message` — Fire-and-forget agent-to-agent messaging (no reply)
+- `POST /remote` — Execute CLI commands programmatically (administrator-only in managed mode)
+- `POST /message` — Fire-and-forget agent-to-agent messaging (administrator-only in managed mode)
 
 ### 2. Agent Processes (`src/local-agent-server.ts` + `src/agent-rest-server.ts`)
 
@@ -86,7 +88,7 @@ User types: /ask coder hello
 | `agents` | Agent state — name, port, status, registry (ENS domain), metadata |
 | `news_items` | Async message feed per agent (with timestamps for polling) |
 | `queries` | Query tracking for reply routing between agents |
-| `wallets` | Deprecated — keys now stored in per-agent .env files |
+| `wallets` | Deprecated legacy table; managed wallet keys live in the OWS vault, never in per-agent env |
 
 ## Key Source Files
 
@@ -220,15 +222,33 @@ XMTP starts automatically during agent boot when an OWS wallet is available (`OW
 
 1. Dynamic `import()` of `xmtp-messaging.ts` (avoids loading native bindings when XMTP not configured)
 2. Create `XmtpMessaging` instance with OWS wallet signer
-3. Set up data directory at `~/.xmtp/{address}/`
+3. Resolve stable storage from the immutable agent ID: the selected IDACC
+   profile for managed workers, or the historical HOME location for standalone
+   use
 4. Load persisted allowlist from `allowlist.yaml`
 5. Load or auto-generate DB encryption key (`db.key`)
 6. Set message handler that routes inbound messages through `startQuery()` with `noAutoReply: true`
 7. Start XMTP agent and begin listening
 
+Startup and shutdown are serialized. A worker that stops while the SDK or its
+dynamic import is still starting waits for that exact attempt to settle and
+stops the resulting client, so redeploys cannot leave an unowned XMTP stream.
+At most eight inbound XMTP turns may be active or queued at once; excess
+messages are dropped before allocating another model turn. Payloads larger
+than 24 KiB of UTF-8 text are rejected before prompt construction. A
+one-minute sliding window admits at most four turns from one sender and 16
+turns globally per agent, with bounded sender-history retention; capacity
+recovers automatically as admissions leave the window. Every admitted
+external turn has a prompt-independent four-minute execution deadline, is
+cancelled without retry when that deadline expires, and releases its queue and
+XMTP admission slots through terminal cleanup.
+
 ### Data Storage
 
-XMTP data is stored at `~/.xmtp/{address}/` (outside project repos):
+Managed IDACC keeps XMTP data under the selected application profile, separated
+by immutable agent ID and signer address. Standalone Manager retains
+`~/.xmtp/{address}/`. Both locations are outside project repositories and the
+immutable application/runtime bundle:
 
 | File | Purpose |
 |------|---------|
@@ -236,7 +256,73 @@ XMTP data is stored at `~/.xmtp/{address}/` (outside project repos):
 | `db.key` | Auto-generated DB encryption key (mode 0600), persists across restarts |
 | `allowlist.yaml` | Sender allowlist with addresses and optional ENS names |
 
+Existing HOME-owned OWS state is copied through a bounded, no-follow migration
+on first managed use; the source is retained for rollback. Legacy raw-key SDK
+databases are migrated only when the exact inbox database and its encryption
+mode can be identified coherently. Ambiguous, linked, or incomplete sources
+fail closed rather than creating a new identity silently.
+
+### Runtime Session Continuity
+
+Conversation ownership is not stored in the application bundle, a source
+checkout, or the consumer's HOME. Managed workers retain a bounded
+conversation-to-runtime-session ledger at:
+
+`<profile>/manager/runtime-sessions/agents/<immutable-agent-key>/conversation-sessions.json`
+
+The optional agent-only `identityKey` is the declarative anchor used to select
+that immutable database owner during deploy and sync. Keeping the key unchanged
+allows a YAML `name` rename without replacing the row or detaching its history;
+duplicate, ambiguous, or key/name-colliding matches fail before reconciliation.
+
+The ledger is owner-only, bounded to 500 conversations, and rewritten
+atomically without following links. A restart reloads it before accepting work.
+On the first upgrade from a memory-only release, Manager seeds only completed
+session IDs from query rows belonging to the exact team and immutable agent ID;
+historical external XMTP sessions are excluded. The profile ledger then remains
+authoritative even after query retention. Unknown caller-supplied runtime IDs
+are never passed to a provider.
+
+Turns that resolve to the same conversation or provider session run serially.
+Different conversations can still use a lead's configured parallel capacity.
+`POST /clear` durably writes an empty ledger, and a content-filter failure
+durably removes only the affected conversation.
+
+### Managed Codex Storage
+
+Managed Codex workers never execute directly from the consumer's global
+`CODEX_HOME`. The global home is an authentication source only. IDACC creates
+private, dispatch-scoped configuration containing exactly the modules approved
+for that query, and retains resumable session data in stable per-agent profile
+storage. Global Codex modules, goals, memories, instructions, and unrelated
+session trees are not imported. This prevents a consumer's local configuration
+from becoming a hidden application dependency and keeps read-only control
+queries from inheriting mutating modules.
+
 ### Security Model
+
+**Managed loopback control plane:** `IDACC_ADMIN_TOKEN` enables managed mode and
+requires a distinct strong `IDACC_MANAGER_SERVICE_TOKEN`. Manager captures and
+removes both roots before any worker spawn. Anonymous callers receive only
+REST-AP discovery and minimal readiness/attestation from `/health`; the latter
+does not include teams, profiles, agents, queries, or counts.
+
+The IDACC administrator retains the existing loopback, `X-Id-Admin: 1`, and
+admin-bearer checks. Brain uses the separate service bearer with
+`X-Id-Service: brain` and can only read exact `/teams`, `/agents`, and `/events`
+routes. Every Manager-owned worker instead receives an HMAC-derived credential
+bound to its durable team ID, immutable agent ID, and current process
+generation. Manager verifies that generation from current database metadata
+before admitting a callback. Workers can discover their same-team peers,
+assert or update only their own startup metadata, publish talk/news,
+usage/activity/rate-limit callbacks, and create/claim/complete tasks. All other
+Manager routes—including profile-wide query, news, event, library, log, team,
+and administrative reads—fail closed. Path and body identities are replaced
+with or checked against the authenticated worker, and only the exact durable
+query recipient may publish its reply lifecycle.
+
+When `IDACC_ADMIN_TOKEN` is absent, the standalone HTTP contract remains
+unchanged.
 
 **Sender allowlist (3-tier):**
 - **Trusted** — on the allowlist, auto-accepted, bypasses approval callback
@@ -245,7 +331,21 @@ XMTP data is stored at `~/.xmtp/{address}/` (outside project repos):
 
 **Closed by default:** agents reject messages from unknown senders unless `openMode: true` is set in config.
 
-**Inbound message isolation:** XMTP messages are formatted with a clear boundary marker before reaching the LLM, and `noAutoReply: true` prevents reply loops.
+**Inbound message isolation:** XMTP messages are treated as untrusted by source,
+regardless of their prompt text or `openMode`. They receive no plugins, MCP
+servers, or local tools and run only through a provider path that can prove a
+text-only capability boundary. Runtimes that cannot enforce that boundary fail
+closed with a fixed safety response instead of launching. Claude Agent SDK
+turns run in a separate, empty, owner-only directory inside the selected
+profile with `settingSources: []`, `persistSession: false`, and an empty tool
+set; they cannot load the real workspace, project instructions, prior
+sessions, plugins, or MCP servers. Claude CLI variants fail closed because
+supported consumer versions do not share one capability-stable isolation
+contract. Plain-text Provider API and Ollama turns receive no working-directory
+context, enforce the same MCP removal inside each harness, and request no more
+than 1,024 completion tokens. `noAutoReply: true` prevents inter-agent reply
+loops; the XMTP handler returns only the exact terminal result registered for
+that inbound query.
 
 ### ENS Resolution
 
@@ -260,12 +360,21 @@ The manager sets these environment variables for every spawned agent:
 | Variable | Description |
 |----------|-------------|
 | `ID_AGENT_PORT` | Agent's own REST-AP port |
-| `ID_AGENT_NAME` | Agent name |
-| `ID_AGENT_ALIAS` | Agent alias (same as name) |
+| `ID_AGENT_NAME` | Full agent identity (the onchain domain after registration) |
+| `ID_AGENT_ALIAS` | Declarative local alias from the team config |
+| `ID_AGENT_ID` | Immutable database identity used to own profile state across rename, port change, and redeploy |
 | `ID_TEAM` | Team name |
+| `IDACC_DATA_DIR` | Selected writable consumer profile root for generated Manager, session, Codex, and XMTP state |
 | `MANAGER_URL` | Manager base URL |
+| `ID_AGENT_PROCESS_GENERATION` | Unique identifier for this exact Manager-owned launch |
+| `IDACC_MANAGER_AGENT_TOKEN` | Managed mode only: private team-, agent-, and generation-bound Manager callback credential |
 
-Each agent can also have its own `.env.<name>.<address>` file in the repo root containing a `PRIVATE_KEY` for onchain operations. The manager loads this file when spawning the agent and merges it into the process environment.
+Application-specific variables can be declared with the agent's top-level
+`env` map. The older `resources.env` location remains supported for compatible
+team configs. Values must be strings and keys that control the Manager,
+identity, profile, runtime, plugins, MCP, wallets, or XMTP are rejected; the
+Manager-owned launch envelope is always authoritative. Per-agent private-key
+files are not loaded by the managed consumer runtime.
 
 ## Port Map
 

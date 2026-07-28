@@ -12,7 +12,9 @@ local service address through `ID_AGENT_PORT`; never assume a fixed port.
 ## Check availability
 
 ```bash
-curl -fsS "http://127.0.0.1:$ID_AGENT_PORT/xmtp/status"
+curl -fsS "http://127.0.0.1:$ID_AGENT_PORT/xmtp/status" \
+  -H "X-Id-Team: $ID_TEAM" -H "X-Id-Agent: $ID_AGENT_ID" \
+  -H "Authorization: Bearer $IDACC_MANAGER_AGENT_TOKEN"
 ```
 
 Proceed only when the response reports that XMTP is enabled. If it is disabled,
@@ -22,6 +24,8 @@ tell the requester that the transport must be configured in IDACC.
 
 ```bash
 curl -fsS -X POST "http://127.0.0.1:$ID_AGENT_PORT/xmtp/send" \
+  -H "X-Id-Team: $ID_TEAM" -H "X-Id-Agent: $ID_AGENT_ID" \
+  -H "Authorization: Bearer $IDACC_MANAGER_AGENT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"to":"recipient.example.eth","message":"The exact message requested by the operator."}'
 ```

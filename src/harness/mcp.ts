@@ -14,26 +14,133 @@ import type { McpServerSpec } from './types.js';
 /** name → SDK/.mcp.json server config object. */
 export type McpServerRecord = Record<string, Record<string, unknown>>;
 
+const MCP_STDIO_BASE_ENV: ReadonlyArray<{
+  output: string;
+  inputs: readonly string[];
+}> = [
+  { output: 'PATH', inputs: ['PATH', 'Path'] },
+  { output: 'HOME', inputs: ['HOME'] },
+  { output: 'SHELL', inputs: ['SHELL'] },
+  { output: 'TMPDIR', inputs: ['TMPDIR'] },
+  { output: 'TMP', inputs: ['TMP'] },
+  { output: 'TEMP', inputs: ['TEMP'] },
+  { output: 'LANG', inputs: ['LANG'] },
+  // Windows process launch and npm `.cmd` resolution.
+  { output: 'APPDATA', inputs: ['APPDATA'] },
+  { output: 'LOCALAPPDATA', inputs: ['LOCALAPPDATA'] },
+  { output: 'USERPROFILE', inputs: ['USERPROFILE'] },
+  { output: 'SystemRoot', inputs: ['SystemRoot', 'SYSTEMROOT'] },
+  { output: 'WINDIR', inputs: ['WINDIR'] },
+  { output: 'ComSpec', inputs: ['ComSpec', 'COMSPEC'] },
+  { output: 'PATHEXT', inputs: ['PATHEXT'] },
+];
+
+/**
+ * Build the complete environment for a stdio MCP child. This is deliberately
+ * an allowlist rather than `{ ...process.env }`: the harness process may carry
+ * provider, database, wallet, admin, and runtime credentials that an attached
+ * MCP server has no authority to receive.
+ */
+export function mcpStdioProcessEnv(
+  explicit: Record<string, string> | undefined,
+  inherited: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const { output, inputs } of MCP_STDIO_BASE_ENV) {
+    const value = inputs
+      .map((key) => inherited[key])
+      .find((candidate): candidate is string => typeof candidate === 'string' && candidate.length > 0);
+    if (value !== undefined) out[output] = value;
+  }
+  if (explicit) {
+    for (const [key, value] of Object.entries(explicit)) {
+      out[key] = String(value);
+    }
+  }
+  return out;
+}
+
 /**
  * Normalize specs into the record keyed by server name. Only the three
  * serializable transports are emitted (stdio | http | sse); an entry missing
  * the fields its transport requires is skipped so a bad config can't crash the
  * harness rather than silently producing an invalid server.
  */
-export function toMcpServerRecord(specs: McpServerSpec[]): McpServerRecord {
+export function toMcpServerRecord(
+  specs: McpServerSpec[],
+  inherited: NodeJS.ProcessEnv = process.env,
+): McpServerRecord {
   const out: McpServerRecord = {};
   for (const s of specs) {
     if (!s || !s.name) continue;
     const transport = s.transport || 'stdio';
     if (transport === 'stdio') {
       if (!s.command) continue;
-      out[s.name] = { type: 'stdio', command: s.command, ...(s.args && { args: s.args }), ...(s.env && { env: s.env }) };
+      out[s.name] = {
+        type: 'stdio',
+        command: s.command,
+        ...(s.args && { args: s.args }),
+        // Always provide an explicit complete env so vendor SDK/CLI launchers
+        // cannot fall back to inheriting the credential-rich harness process.
+        env: mcpStdioProcessEnv(s.env, inherited),
+      };
     } else if (transport === 'http' || transport === 'sse') {
       if (!s.url) continue;
       out[s.name] = { type: transport, url: s.url, ...(s.headers && { headers: s.headers }) };
     }
   }
   return out;
+}
+
+/**
+ * Claude exposes MCP tools as `mcp__<server>__<tool>`. When an exact tool
+ * boundary is configured, attach only servers that own at least one named
+ * allowed tool. Tool-level permission enforcement remains necessary because
+ * an attached server may publish additional, unlisted tools.
+ */
+export function filterMcpServersForAllowedTools(
+  specs: McpServerSpec[] | undefined,
+  allowedTools: string[] | undefined,
+): McpServerSpec[] {
+  const servers = specs || [];
+  if (allowedTools === undefined) return [...servers];
+  return servers.filter((server) => {
+    const prefix = `mcp__${server.name}__`;
+    return allowedTools.some((tool) => (
+      typeof tool === 'string'
+      && tool.startsWith(prefix)
+      && tool.length > prefix.length
+    ));
+  });
+}
+
+export function isNamespacedMcpTool(toolName: string): boolean {
+  if (!toolName.startsWith('mcp__')) return false;
+  const separator = toolName.indexOf('__', 'mcp__'.length);
+  return separator > 'mcp__'.length && separator < toolName.length - 2;
+}
+
+const WHOLE_TOOL_NAME = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * Exact boundaries operate on whole tool identifiers only. Claude's
+ * parameterized permission syntax (for example `Bash(git:*)`) is a rule
+ * expression, not a callable tool name, and cannot be enforced consistently
+ * across SDK and CLI runtimes.
+ */
+export function exactWholeToolNames(tools: string[]): string[] {
+  return tools.map((tool) => {
+    if (
+      typeof tool !== 'string'
+      || tool !== tool.trim()
+      || !WHOLE_TOOL_NAME.test(tool)
+    ) {
+      throw new Error(
+        `Exact allowedTools entries must be whole tool names; unsupported entry: "${String(tool)}"`,
+      );
+    }
+    return tool;
+  });
 }
 
 /**

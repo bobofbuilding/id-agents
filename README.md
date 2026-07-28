@@ -22,7 +22,7 @@ Run a team of AI coding agents from a single chat. Each agent is a real process 
 - **Scheduling** - Heartbeat intervals and calendar events for automated recurring work
 - **Org chart** - Define team structure with groups and tags so agents know their peers and leads
 - **Skills & plugins** - Standard Claude Code skills and plugins, declared in config and deployed to each agent
-- **Agent wallets** - Automatic multi-chain wallets via [OWS](https://github.com/open-wallet-standard/core)
+- **Agent wallets** - Opt-in multi-chain wallets via [OWS](https://github.com/open-wallet-standard/core)
 - **Onchain identity** - ENS-based agent identity via ID Chain (e.g., `x.agent-15.xid.eth`)
 - **Remote API** - Programmatic management via `/remote` endpoint and `/tasks` REST API
 - **TUI Dashboard** - Live terminal dashboard for the running team — agents list, news feed, message detail (`npm run tui:dev`)
@@ -186,16 +186,20 @@ To update a running team later (add/remove/change agents without losing sessions
 
 ### Connecting a Manager
 
-ID Agents runs the servers and agent processes. You connect to it through a "manager" — any AI coding agent that can reach the `/remote` API. This can be Claude Code CLI, OpenAI Codex, Cursor CLI, OpenClaw, or any other agent that can make HTTP requests.
+In the unified IDACC application, use the application’s Manager controls; the
+private administrative credential is intentionally not given to agents or
+ordinary shell sessions. Standalone Manager installations can still connect a
+trusted local tool through the historical `/remote` API:
 
 ```bash
-# The manager is whatever you're chatting in — it controls the team via /remote
+# Standalone Manager only
 curl -s -X POST http://localhost:4100/remote \
   -H "Content-Type: application/json" \
   -d '{"command":"/status"}'
 ```
 
-Connect from anywhere — terminal, mobile (via Telegram), SSH, or any tool that can POST to `/remote`.
+Do not expose `/remote` over a network. Managed IDACC keeps it behind the
+loopback administrator boundary.
 
 ### TUI Dashboard
 
@@ -236,7 +240,7 @@ iTerm2 is the recommended terminal — it renders the alt-screen content flicker
 |----------|--------|---------|
 | `/agents` | GET | List all agents |
 | `/message` | POST | Fire-and-forget agent-to-agent messaging (no reply) |
-| `/remote` | POST | Execute CLI commands programmatically (no auth required) |
+| `/remote` | POST | Execute administrative commands (managed: IDACC administrator only; standalone: historical loopback contract) |
 
 ## Scheduling
 
@@ -345,9 +349,13 @@ See [Scheduling Plan](./docs/SCHEDULING_PLAN.md) for the full design.
 
 ## Remote API
 
-The Manager exposes a `/remote` endpoint (no authentication required — localhost only) that lets any external tool — including another Claude Code session — interact with your agent team programmatically. This is how you manage agents from outside the interactive CLI. Deploy and sync commands (`/deploy`, `/sync`) also work via `/remote`.
+The Manager exposes `/remote` for administrative automation. In managed IDACC,
+it requires the private loopback administrator credential and should be used
+through the application. The credential is not shipped to workers. The raw
+examples below apply only to a deliberately standalone Manager, which retains
+its historical loopback behavior.
 
-**From a terminal or script:**
+**Standalone Manager from a terminal or script:**
 
 ```bash
 curl -X POST http://localhost:4100/remote \
@@ -355,7 +363,9 @@ curl -X POST http://localhost:4100/remote \
   -d '{"command":"/agents"}'
 ```
 
-**From another Claude Code session:** If you're working in Claude Code on a different project, you can dispatch tasks to your agent team by calling the `/remote` endpoint via Bash. For example, ask your contracts agent to review code:
+**Standalone trusted local session:** A trusted local client can dispatch work
+through `/remote`. Managed IDACC users should use the application or the
+worker-scoped coordination APIs instead.
 
 ```bash
 curl -s -X POST http://localhost:4100/remote \
@@ -371,7 +381,8 @@ curl -s -X POST http://localhost:4100/remote \
   -d '{"command":"/news contracts"}'
 ```
 
-This means any Claude Code instance on the same machine can coordinate with your agent team — dispatching work, checking results, and managing the fleet without switching to the interactive CLI.
+Never give an agent the IDACC administrator bearer merely to make these
+standalone examples work.
 
 **Available Commands:**
 - `/agent <name> rebuild` - Rebuild a single agent
@@ -404,11 +415,14 @@ This means any Claude Code instance on the same machine can coordinate with your
 
 ## Task API
 
-The Manager exposes dedicated `/tasks` REST endpoints for agent task coordination. Agents should use these instead of `/remote` for task operations — it's simpler, safer, and doesn't expose arbitrary CLI access.
+The Manager exposes dedicated `/tasks` REST endpoints for agent task
+coordination. Managed workers can create, claim, and complete tasks with their
+generation-bound credential. Listing, inspecting, assigning, deleting, and
+repairing task state remains an IDACC administrator operation.
 
 | Route | Method | Description |
 |-------|--------|-------------|
-| `/tasks` | POST | Create a task (`{ title, name?, description?, team?, from? }`) |
+| `/tasks` | POST | Create a task (`{ title, name?, description?, from?, owner? }`; managed workers may name a same-team owner) |
 | `/tasks` | GET | List tasks (query params: `status`, `owner`, `team`) |
 | `/tasks/:name` | GET | Get a single task by name |
 | `/tasks/:name/claim` | POST | Claim a task (`{ agent_id }`) |
@@ -426,23 +440,29 @@ New tasks carry a durable `task-workflow.v1` contract and atomic assignment line
 **Create and claim a task:**
 
 ```bash
-# Create
-curl -s -X POST http://localhost:4100/tasks \
+# Managed worker create
+curl -s -X POST "$MANAGER_URL/tasks" \
   -H "Content-Type: application/json" \
-  -d '{"title": "Fix the overflow bug", "name": "fix-overflow"}'
+  -H "X-Id-Team: $ID_TEAM" \
+  -H "X-Id-Agent: $ID_AGENT_ID" \
+  -H "Authorization: Bearer $IDACC_MANAGER_AGENT_TOKEN" \
+  -d '{"title":"Fix the overflow bug","name":"fix-overflow","from":"my-agent","owner":"my-agent","goal_id":"goal_current_objective","expected_output":"A tested fix","acceptance_criteria":"The regression test passes","validation_path":"The assigning agent reviews the evidence","out_of_scope":"No unrelated changes","backlog_policy":"Optional refactors stay backlog","work_relevance":"medium - supports the current objective"}'
 
 # Claim
-curl -s -X POST http://localhost:4100/tasks/fix-overflow/claim \
+curl -s -X POST "$MANAGER_URL/tasks/fix-overflow/claim" \
   -H "Content-Type: application/json" \
+  -H "X-Id-Team: $ID_TEAM" \
+  -H "X-Id-Agent: $ID_AGENT_ID" \
+  -H "Authorization: Bearer $IDACC_MANAGER_AGENT_TOKEN" \
   -d '{"agent_id": "my-agent"}'
 
 # Mark done
-curl -s -X POST http://localhost:4100/tasks/fix-overflow/done \
+curl -s -X POST "$MANAGER_URL/tasks/fix-overflow/done" \
   -H "Content-Type: application/json" \
-  -d '{"agent_id": "my-agent"}'
-
-# List open tasks
-curl -s "http://localhost:4100/tasks?status=todo"
+  -H "X-Id-Team: $ID_TEAM" \
+  -H "X-Id-Agent: $ID_AGENT_ID" \
+  -H "Authorization: Bearer $IDACC_MANAGER_AGENT_TOKEN" \
+  -d '{"agent_id":"my-agent","acceptance_coverage":"Regression is fixed and the named test passes."}'
 ```
 
 Task statuses: `todo` (unclaimed), `doing` (in progress), `done` (completed). The `agent_id` field accepts agent names or aliases, resolved against the current team.
@@ -451,22 +471,35 @@ Task statuses: `todo` (unclaimed), `doing` (in progress), `done` (completed). Th
 
 A **check-in** is a supervision watch the dispatcher attaches to a delegated task. While the delegate is working, the manager fires the check-in on a configurable interval, wakes the dispatcher, and lets it observe whether the work is actually progressing. When the linked task hits a terminal status (`done`), the check-in auto-closes silently — no overhead in the happy path.
 
-The cleanest way to attach one is through the manager's `/talk-to` endpoint with a `task` field. The manager creates the task and the watching check-in atomically:
+Managed workers delegate through their own loopback `/news-to` wrapper with a
+dispatch-ready `task` object. The wrapper authenticates to Manager, binds the
+same-team owner, records the task, and delivers the assignment without exposing
+the worker credential to the peer:
 
 ```bash
-curl -s -X POST http://localhost:4100/talk-to \
+curl -s -X POST "http://127.0.0.1:$ID_AGENT_PORT/news-to" \
   -H "Content-Type: application/json" \
   -d '{
     "to": "coder",
-    "from": "me",
     "message": "Implement the X feature and reply when done.",
-    "task":  { "title": "Implement X", "name": "implement-x" },
-    "checkin": "10m",
-    "checkin_iters": 4
+    "trigger": true,
+    "task": {
+      "title":"Implement X",
+      "name":"implement-x",
+      "goal_id":"goal_current_objective",
+      "expected_output":"A tested implementation",
+      "acceptance_criteria":"The named behavior and regression tests pass",
+      "validation_path":"The assigning agent reviews the evidence",
+      "out_of_scope":"No unrelated changes",
+      "backlog_policy":"Optional improvements stay backlog",
+      "work_relevance":"medium - supports the current objective"
+    }
   }'
 ```
 
-The dispatcher (`from`) gets pinged every 10 minutes with the linked task's status, last activity, and an actions map. Defaults: 10-minute interval, `close_when: {task_status: ['done']}`. Pass `"no_checkin": true` to skip attachment.
+Standalone administrators may still use the historical Manager `/talk-to`
+auto-attach/check-in route. Managed workers cannot call that broad route.
+Create or tune explicit check-ins through IDACC.
 
 | Route | Method | Description |
 |-------|--------|-------------|
@@ -567,6 +600,8 @@ See [Skills README](./skills/README.md) for the full skill directory listing.
 | `ID_AGENT_LEAD_QUERY_CONCURRENCY` | No | Parallel query slots for lead-like agents (`default/lead`, configured team leads, `*-lead`); unset or `0` means uncapped |
 | `ID_MAX_ACTIVE_QUERIES_PER_LEAD` | No | Manager-side `/ask` admission cap for lead-like agents; unset or `0` means uncapped |
 | `ID_MAX_ACTIVE_QUERIES_PER_AGENT` | No | Worker `/ask` cap override; leave unset to keep workers at `1`. Configured leads do not inherit this worker cap. |
+| `IDACC_ADMIN_TOKEN` | Managed only | Supervisor-only Manager administration credential. Its presence enables managed mode; Manager captures and removes it before spawning workers. |
+| `IDACC_MANAGER_SERVICE_TOKEN` | Managed only | Distinct random Manager/Brain service credential (32–4096 bytes, with no whitespace). Manager captures and removes it before spawning workers. |
 
 Generic per-agent metadata caps (`maxActiveQueries`, `queryConcurrency`) apply to non-lead workers only. Use `leadMaxActiveQueries` or `leadQueryConcurrency` metadata when a lead must be intentionally throttled.
 
@@ -577,8 +612,29 @@ Generic per-agent metadata caps (`maxActiveQueries`, `queryConcurrency`) apply t
 | `ID_AGENT_PORT` | The agent's own REST-AP port (e.g., `4101`) |
 | `ID_AGENT_NAME` | Agent name |
 | `ID_AGENT_ALIAS` | Agent alias (same as name) |
+| `ID_AGENT_ID` | Immutable database identity |
 | `ID_TEAM` | Team name |
 | `MANAGER_URL` | Manager base URL (e.g., `http://localhost:4100`) |
+| `ID_AGENT_PROCESS_GENERATION` | Unique identifier for this exact Manager-owned worker launch |
+| `IDACC_MANAGER_AGENT_TOKEN` | Managed mode only: private, generation-bound Manager callback credential; never print, persist, or forward it |
+
+### Managed Desktop HTTP Privacy
+
+When `IDACC_ADMIN_TOKEN` is absent, Manager retains the historical standalone
+HTTP behavior. When it is present, `IDACC_MANAGER_SERVICE_TOKEN` is also
+required and Manager applies these loopback principals:
+
+| Principal | Credential | Manager access |
+|-----------|------------|----------------|
+| Anonymous | None | `GET`/`HEAD /.well-known/restap.json` and a minimal `GET`/`HEAD /health` readiness response only |
+| IDACC administrator | Loopback, `X-Id-Admin: 1`, and the admin bearer | Existing administrative API |
+| Brain listener | `X-Id-Service: brain` and the service bearer | `GET`/`HEAD /teams`, `/agents`, and `/events` only |
+| Managed worker | `X-Id-Team`, `X-Id-Agent`, and its derived worker bearer | Same-team agent discovery; its own startup/detail/metadata callbacks; talk/news, usage/activity/rate-limit callbacks; and task create/claim/done |
+
+Worker credentials are derived from a Manager-only root and bound to the
+durable team ID, immutable agent ID, and current process generation. Restarting
+or replacing a worker invalidates its prior credential. Base admin and Brain
+service credentials are never inherited by workers.
 
 ### YAML Configuration
 
@@ -796,7 +852,12 @@ Once registered, the `domain` and `tokenId` can be saved in the YAML config to p
 
 ## Agent Wallets (OWS)
 
-If [OWS](https://github.com/open-wallet-standard/core) (Open Wallet Standard) is installed, each agent automatically gets a multi-chain wallet at deploy time. Wallets are encrypted in the OWS vault at `~/.ows/`.
+Wallet provisioning is opt-in. Set `wallet: true` on an agent (or under
+`defaults`) to create an [OWS](https://github.com/open-wallet-standard/core)
+multi-chain wallet during deploy or sync. Omitting `wallet`, or setting it to
+`false`, does not provision a wallet. You can still provision one later with
+`/agent <name> wallet provision`. Wallets are encrypted in the OWS vault at
+`~/.ows/`.
 
 **What happens at deploy:**
 1. Manager creates an OWS wallet per agent (e.g., `idchain-contracts`)
@@ -934,13 +995,13 @@ curl -s -X POST http://localhost:$ID_AGENT_PORT/talk-to \
   -d '{"to": "agent-name", "message": "your question?", "timeout": 120000}'
 ```
 
-**`/message` (fire-and-forget):** One-way notification via the manager. No reply expected:
+**`/news-to` (fire-and-forget):** One-way notification through the agent's own
+loopback wrapper. No reply expected:
 
 ```bash
-curl -s -X POST $MANAGER_URL/message \
+curl -s -X POST "http://127.0.0.1:$ID_AGENT_PORT/news-to" \
   -H "Content-Type: application/json" \
-  -H "X-Id-Team: $ID_TEAM" \
-  -d '{"to": "agent-name", "message": "FYI: deployment is done"}'
+  -d '{"to":"agent-name","message":"FYI: deployment is done"}'
 ```
 
 ### Loop Prevention

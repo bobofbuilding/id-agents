@@ -5,9 +5,19 @@
  * Wraps the Claude Agent SDK (@anthropic-ai/claude-agent-sdk) as a harness.
  */
 
-import { query, type Options, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
+import {
+  query,
+  type CanUseTool,
+  type Options,
+  type SDKMessage,
+} from '@anthropic-ai/claude-agent-sdk';
 import { AgentHarness, HarnessOptions, HarnessMessage, HarnessType, PluginConfig } from './types.js';
-import { toMcpServerRecord } from './mcp.js';
+import {
+  exactWholeToolNames,
+  filterMcpServersForAllowedTools,
+  isNamespacedMcpTool,
+  toMcpServerRecord,
+} from './mcp.js';
 
 // Available Claude models
 export const CLAUDE_MODELS = {
@@ -17,6 +27,87 @@ export const CLAUDE_MODELS = {
   FABLE: 'claude-fable-5',
   MYTHOS: 'claude-mythos-5'
 } as const;
+
+export function claudeSdkToolPolicy(
+  options: Pick<HarnessOptions, 'allowedTools' | 'executionPolicy'>,
+): Pick<Options, 'allowedTools' | 'canUseTool' | 'permissionMode' | 'tools'> {
+  const exactAllowedTools = options.executionPolicy === 'external-text-only'
+    ? []
+    : options.allowedTools;
+  if (exactAllowedTools !== undefined) {
+    const wholeToolNames = exactWholeToolNames(exactAllowedTools);
+    const allowed = new Set(wholeToolNames);
+    const canUseTool: CanUseTool = async (toolName) => (
+      allowed.has(toolName)
+        ? { behavior: 'allow' }
+        : {
+            behavior: 'deny',
+            message: `Tool "${toolName}" is outside this agent's exact allowedTools boundary`,
+          }
+    );
+    const builtInTools = wholeToolNames.filter((tool) => !isNamespacedMcpTool(tool));
+    return {
+      tools: builtInTools,
+      allowedTools: wholeToolNames,
+      permissionMode: 'dontAsk',
+      canUseTool,
+    };
+  }
+  return {};
+}
+
+/**
+ * Build the effective SDK launch contract in one place so the external
+ * trust boundary cannot be weakened by a caller accidentally supplying
+ * resume, plugin, MCP, or persistent-setting options.
+ */
+export function buildClaudeSdkOptions(
+  options: HarnessOptions,
+  model: string,
+): Options {
+  const externalTextOnly = options.executionPolicy === 'external-text-only';
+  const configuredWorkingDirectory = options.workingDirectory?.trim();
+  if (externalTextOnly && !configuredWorkingDirectory) {
+    throw new Error('Claude Agent SDK external-text-only execution requires an isolated working directory');
+  }
+  const sdkOptions: Options = {
+    model,
+    cwd: configuredWorkingDirectory || process.cwd(),
+    persistSession: !externalTextOnly,
+    ...(externalTextOnly ? { settingSources: [] } : {}),
+    ...claudeSdkToolPolicy(options),
+  };
+
+  if (!externalTextOnly && options.resume) {
+    sdkOptions.resume = options.resume;
+  }
+  if (!externalTextOnly && options.plugins && options.plugins.length > 0) {
+    sdkOptions.plugins = options.plugins.map(
+      (plugin: PluginConfig) => ({ type: 'local' as const, path: plugin.path }),
+    );
+  }
+  if (!externalTextOnly && options.mcpServers && options.mcpServers.length > 0) {
+    const permittedMcpServers = filterMcpServersForAllowedTools(
+      options.mcpServers,
+      options.allowedTools,
+    );
+    const servers = toMcpServerRecord(permittedMcpServers);
+    if (Object.keys(servers).length > 0) {
+      sdkOptions.mcpServers = servers as Options['mcpServers'];
+    }
+  }
+
+  // Explicitly setting sdkOptions.env without extra options causes "spawn node
+  // ENOENT" in some SDK versions. When an override is necessary, retain the
+  // inherited authentication environment.
+  if (options.env && Object.keys(options.env).length > 0) {
+    sdkOptions.env = {
+      ...process.env,
+      ...options.env,
+    };
+  }
+  return sdkOptions;
+}
 
 /**
  * Map SDK message to unified HarnessMessage format
@@ -76,6 +167,7 @@ function mapSDKMessage(message: SDKMessage): HarnessMessage | null {
 
 export class ClaudeAgentSdkHarness implements AgentHarness {
   readonly type: HarnessType = 'claude-agent-sdk';
+  private abortController: AbortController | null = null;
 
   /**
    * Normalize model name - strips 'anthropic/' prefix if present for consistency
@@ -95,49 +187,10 @@ export class ClaudeAgentSdkHarness implements AgentHarness {
   async *run(prompt: string, options: HarnessOptions = {}): AsyncGenerator<HarnessMessage> {
     const rawModel = options.model || process.env.CLAUDE_MODEL || CLAUDE_MODELS.HAIKU;
     const model = this.normalizeModel(rawModel);
-    const workingDir = options.workingDirectory || process.cwd();
-
-    // Build SDK options
-    // Note: permissionMode 'bypassPermissions' and allowDangerouslySkipPermissions
-    // cause SDK crashes in newer versions, so we use default permission mode
-    const sdkOptions: Options = {
-      model,
-      cwd: workingDir,
-      persistSession: true,
-    };
-
-    // Add allowed tools if specified
-    if (options.allowedTools && options.allowedTools.length > 0) {
-      sdkOptions.allowedTools = options.allowedTools;
-    }
-
-    // Add resume/session if provided
-    if (options.resume) {
-      sdkOptions.resume = options.resume;
-    }
-
-    // Add plugins if specified
-    if (options.plugins && options.plugins.length > 0) {
-      sdkOptions.plugins = options.plugins.map((p: PluginConfig) => ({ type: 'local' as const, path: p.path }));
-    }
-
-    // Add MCP servers if specified (external tools exposed to the agent)
-    if (options.mcpServers && options.mcpServers.length > 0) {
-      const servers = toMcpServerRecord(options.mcpServers);
-      if (Object.keys(servers).length > 0) {
-        sdkOptions.mcpServers = servers as Options['mcpServers'];
-      }
-    }
-
-    // Note: Explicitly setting sdkOptions.env causes "spawn node ENOENT" errors
-    // in the SDK subprocess. Let the SDK inherit environment naturally.
-    // Only set env if additional options were provided.
-    if (options.env && Object.keys(options.env).length > 0) {
-      sdkOptions.env = {
-        ...process.env,
-        ...options.env
-      };
-    }
+    const sdkOptions = buildClaudeSdkOptions(options, model);
+    const abortController = new AbortController();
+    this.abortController = abortController;
+    sdkOptions.abortController = abortController;
 
     yield { type: 'system', subtype: 'init', content: 'Starting Claude Code harness' };
 
@@ -162,6 +215,18 @@ export class ClaudeAgentSdkHarness implements AgentHarness {
       const errorMessage = error instanceof Error ? error.message : String(error);
       yield { type: 'error', content: errorMessage };
       throw error;
+    } finally {
+      if (this.abortController === abortController) {
+        this.abortController = null;
+      }
     }
+  }
+
+  cancel(): boolean {
+    const abortController = this.abortController;
+    if (!abortController) return false;
+    this.abortController = null;
+    abortController.abort();
+    return true;
   }
 }

@@ -234,6 +234,122 @@ export async function migrateDeleteManagerShadowAgentsSqlite(adapter: SqliteAdap
   await setSqliteMigrationMarker(adapter, MANAGER_SHADOW_CLEANUP_MARKER);
 }
 
+async function migrateRuntimeLaneCooldownNamespaceSqlite(adapter: SqliteAdapter): Promise<void> {
+  const { rows: columns } = await adapter.query<{
+    name: string;
+    notnull: number;
+    pk: number;
+  }>(`SELECT name, "notnull", pk FROM pragma_table_info('runtime_lane_cooldowns')`);
+  if (columns.length === 0) return;
+
+  const primaryKey = columns
+    .filter((column) => Number(column.pk) > 0)
+    .sort((a, b) => Number(a.pk) - Number(b.pk))
+    .map((column) => column.name);
+  const teamColumn = columns.find((column) => column.name === 'team_id');
+  const runtimeNamespaceColumn = columns.find((column) => column.name === 'runtime_namespace');
+  const hasRuntimeNamespace = Boolean(runtimeNamespaceColumn);
+  const hasCanonicalSchema = (
+    hasRuntimeNamespace
+    && Number(runtimeNamespaceColumn?.notnull) === 1
+    && Number(teamColumn?.notnull) === 1
+    && primaryKey.join(',') === 'team_id,runtime_namespace,lane_id'
+  );
+  const { rows: normalizationRows } = hasCanonicalSchema
+    ? await adapter.query<{ count: number }>(`
+        SELECT COUNT(*) AS count
+        FROM runtime_lane_cooldowns
+        WHERE runtime_namespace IN ('codex-cli', 'claude-code-local')
+      `)
+    : { rows: [{ count: 1 }] };
+  if (
+    hasCanonicalSchema
+    && Number(normalizationRows[0]?.count ?? 0) === 0
+  ) {
+    return;
+  }
+
+  const runtimeNamespaceExpression = hasRuntimeNamespace
+    ? `CASE
+         WHEN COALESCE(runtime_namespace, runtime) = 'codex-cli' THEN 'codex'
+         WHEN COALESCE(runtime_namespace, runtime) = 'claude-code-local' THEN 'claude-code-cli'
+         ELSE COALESCE(runtime_namespace, runtime)
+       END`
+    : `CASE
+         WHEN runtime = 'codex-cli' THEN 'codex'
+         WHEN runtime = 'claude-code-local' THEN 'claude-code-cli'
+         ELSE runtime
+       END`;
+
+  adapter.exec(`
+    BEGIN IMMEDIATE;
+    DROP TABLE IF EXISTS runtime_lane_cooldowns_namespaced;
+    DROP INDEX IF EXISTS runtime_lane_cooldowns_until_idx;
+
+    CREATE TABLE runtime_lane_cooldowns_namespaced (
+      lane_id TEXT NOT NULL,
+      runtime TEXT NOT NULL,
+      runtime_namespace TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      cooling_until_ms INTEGER NOT NULL,
+      observed_at_ms INTEGER NOT NULL,
+      reason TEXT NOT NULL,
+      team_id TEXT NOT NULL,
+      agent_id TEXT,
+      agent_name TEXT,
+      query_id TEXT,
+      reset_text TEXT,
+      message TEXT,
+      PRIMARY KEY (team_id, runtime_namespace, lane_id)
+    );
+
+    INSERT INTO runtime_lane_cooldowns_namespaced (
+      lane_id, runtime, runtime_namespace, kind, cooling_until_ms,
+      observed_at_ms, reason, team_id, agent_id, agent_name, query_id,
+      reset_text, message
+    )
+    WITH normalized AS (
+      SELECT
+        rowid AS source_rowid,
+        lane_id,
+        runtime,
+        ${runtimeNamespaceExpression} AS normalized_runtime_namespace,
+        kind,
+        cooling_until_ms,
+        observed_at_ms,
+        reason,
+        COALESCE(team_id, '') AS normalized_team_id,
+        agent_id,
+        agent_name,
+        query_id,
+        reset_text,
+        message
+      FROM runtime_lane_cooldowns
+    ),
+    ranked AS (
+      SELECT
+        *,
+        ROW_NUMBER() OVER (
+          PARTITION BY normalized_team_id, normalized_runtime_namespace, lane_id
+          ORDER BY cooling_until_ms DESC, observed_at_ms DESC, source_rowid DESC
+        ) AS retention_rank
+      FROM normalized
+    )
+    SELECT
+      lane_id, runtime, normalized_runtime_namespace, kind, cooling_until_ms,
+      observed_at_ms, reason, normalized_team_id, agent_id, agent_name,
+      query_id, reset_text, message
+    FROM ranked
+    WHERE retention_rank = 1;
+
+    DROP TABLE runtime_lane_cooldowns;
+    ALTER TABLE runtime_lane_cooldowns_namespaced RENAME TO runtime_lane_cooldowns;
+    CREATE INDEX runtime_lane_cooldowns_until_idx
+      ON runtime_lane_cooldowns(cooling_until_ms);
+    COMMIT;
+  `);
+}
+
 export async function migrateSqlite(adapter: SqliteAdapter): Promise<void> {
   await ensureSqliteMigrationMarkers(adapter);
   adapter.exec(`
@@ -245,20 +361,21 @@ export async function migrateSqlite(adapter: SqliteAdapter): Promise<void> {
       port_end INTEGER NOT NULL DEFAULT 4125,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
-
     CREATE TABLE IF NOT EXISTS runtime_lane_cooldowns (
-      lane_id TEXT PRIMARY KEY,
+      lane_id TEXT NOT NULL,
       runtime TEXT NOT NULL,
+      runtime_namespace TEXT NOT NULL,
       kind TEXT NOT NULL,
       cooling_until_ms INTEGER NOT NULL,
       observed_at_ms INTEGER NOT NULL,
       reason TEXT NOT NULL,
-      team_id TEXT,
+      team_id TEXT NOT NULL,
       agent_id TEXT,
       agent_name TEXT,
       query_id TEXT,
       reset_text TEXT,
-      message TEXT
+      message TEXT,
+      PRIMARY KEY (team_id, runtime_namespace, lane_id)
     );
     CREATE INDEX IF NOT EXISTS runtime_lane_cooldowns_until_idx ON runtime_lane_cooldowns(cooling_until_ms);
 
@@ -511,6 +628,25 @@ export async function migrateSqlite(adapter: SqliteAdapter): Promise<void> {
       ON checkins(team_id, ttl_expires_at)
       WHERE ttl_expires_at IS NOT NULL AND status IN ('active', 'snoozed');
   `);
+
+  await migrateRuntimeLaneCooldownNamespaceSqlite(adapter);
+
+  const { rows: teamNameCollisions } = await adapter.query<{ folded_name: string; count: number }>(
+    `SELECT lower(name) AS folded_name, COUNT(*) AS count
+     FROM teams
+     GROUP BY lower(name)
+     HAVING COUNT(*) > 1
+     LIMIT 1`,
+  );
+  if (teamNameCollisions.length === 0) {
+    adapter.exec(
+      `CREATE UNIQUE INDEX IF NOT EXISTS teams_name_casefold_unique ON teams (lower(name))`,
+    );
+  } else {
+    console.error(
+      '[Manager migration] Case-only duplicate team names detected. Existing teams were preserved, but new team creation and ambiguous lookup will fail closed until an operator renames the duplicates to unique portable names.',
+    );
+  }
 
   try {
     adapter.exec(`ALTER TABLE schedule_definitions ADD COLUMN delivery_mode TEXT NOT NULL DEFAULT 'talk'`);

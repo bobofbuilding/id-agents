@@ -45,6 +45,12 @@ describe('PROTOCOL_DEFAULTS', () => {
     expect(PROTOCOL_DEFAULTS).toContain('POST $MANAGER_URL/tasks');
     expect(PROTOCOL_DEFAULTS).toContain('/tasks/<name>/claim');
     expect(PROTOCOL_DEFAULTS).toContain('/tasks/<name>/done');
+    expect(PROTOCOL_DEFAULTS).toContain('X-Id-Team: $ID_TEAM');
+    expect(PROTOCOL_DEFAULTS).toContain('X-Id-Agent: $ID_AGENT_ID');
+    expect(PROTOCOL_DEFAULTS).toContain(
+      'Authorization: Bearer $IDACC_MANAGER_AGENT_TOKEN',
+    );
+    expect(PROTOCOL_DEFAULTS).toContain('never print, persist, or forward it');
   });
 
   it('distinguishes assigned vs self-initiated work and points at the skills', () => {

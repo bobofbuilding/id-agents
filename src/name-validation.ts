@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT
 
+import { portablePathSegmentError } from './lib/portable-path-segment.js';
+
 const RESERVED_WORDS = new Set([
   'delete', 'list', 'create', 'deploy', 'sync', 'spawn', 'kill', 'stop',
   'start', 'rebuild', 'status', 'schedule', 'tasks', 'team',
@@ -39,6 +41,11 @@ export function validateName(name: string, kind: NameKind): NameValidationResult
 
   if (SHELL_META.test(name)) {
     return { valid: false, error: `${kind} name contains shell metacharacters (*, ?, [, ], {, })` };
+  }
+
+  const portableIssue = portablePathSegmentError(name);
+  if (portableIssue) {
+    return { valid: false, error: `${kind} name ${portableIssue}` };
   }
 
   if (RESERVED_WORDS.has(name.toLowerCase())) {

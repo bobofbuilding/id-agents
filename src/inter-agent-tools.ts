@@ -7,6 +7,7 @@
  */
 
 import fetch from 'node-fetch';
+import { managerWorkerRequestHeaders } from './manager-worker-auth.js';
 
 function getManagerBaseUrl(): string {
   // MANAGER_URL should be set for worker agents to communicate with the manager.
@@ -50,7 +51,9 @@ export interface BroadcastToAgentsParams {
  */
 export async function listAgents(params: ListAgentsParams): Promise<string> {
   try {
-    const response = await fetch(`${getManagerBaseUrl()}/agents`);
+    const response = await fetch(`${getManagerBaseUrl()}/agents`, {
+      headers: managerWorkerRequestHeaders(),
+    });
     
     if (!response.ok) {
       return `Error: Failed to list agents (${response.status})`;
@@ -80,7 +83,9 @@ export async function listAgents(params: ListAgentsParams): Promise<string> {
 export async function talkToAgent(params: TalkToAgentParams): Promise<string> {
   try {
     // First, find the agent
-    const listResponse = await fetch(`${getManagerBaseUrl()}/agents`);
+    const listResponse = await fetch(`${getManagerBaseUrl()}/agents`, {
+      headers: managerWorkerRequestHeaders(),
+    });
     if (!listResponse.ok) {
       return `Error: Failed to find agent (${listResponse.status})`;
     }
@@ -188,7 +193,9 @@ export async function talkToAgent(params: TalkToAgentParams): Promise<string> {
 export async function broadcastToAgents(params: BroadcastToAgentsParams): Promise<string> {
   try {
     // Get list of all agents
-    const listResponse = await fetch(`${getManagerBaseUrl()}/agents`);
+    const listResponse = await fetch(`${getManagerBaseUrl()}/agents`, {
+      headers: managerWorkerRequestHeaders(),
+    });
     if (!listResponse.ok) {
       return `Error: Failed to list agents (${listResponse.status})`;
     }

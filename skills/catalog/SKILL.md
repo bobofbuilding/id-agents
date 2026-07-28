@@ -12,13 +12,17 @@ agent's local service port through `ID_AGENT_PORT`; never assume a fixed port.
 ## Read the current catalog
 
 ```bash
-curl -fsS "http://127.0.0.1:$ID_AGENT_PORT/catalog"
+curl -fsS "http://127.0.0.1:$ID_AGENT_PORT/catalog" \
+  -H "X-Id-Team: $ID_TEAM" -H "X-Id-Agent: $ID_AGENT_ID" \
+  -H "Authorization: Bearer $IDACC_MANAGER_AGENT_TOKEN"
 ```
 
 ## Update routing metadata
 
 ```bash
 curl -fsS -X PATCH "http://127.0.0.1:$ID_AGENT_PORT/catalog" \
+  -H "X-Id-Team: $ID_TEAM" -H "X-Id-Agent: $ID_AGENT_ID" \
+  -H "Authorization: Bearer $IDACC_MANAGER_AGENT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "description":"I validate implementation evidence and focused code changes.",

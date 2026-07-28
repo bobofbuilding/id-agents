@@ -11,6 +11,18 @@ export class SqliteTeamsRepo implements TeamsRepository {
 
   async getOrCreateTeamId(teamName: string): Promise<string> {
     const name = teamName || 'default';
+    const existing = await this.db.query<{ id: string; name: string }>(
+      `SELECT id, name FROM teams WHERE lower(name) = lower(?) LIMIT 1`,
+      [name],
+    );
+    if (existing.rows[0]) {
+      if (existing.rows[0].name !== name) {
+        throw new Error(
+          `Team name case collision: "${name}" conflicts with existing "${existing.rows[0].name}"`,
+        );
+      }
+      return existing.rows[0].id;
+    }
     const id = randomUUID();
     const { rows } = await this.db.query<{ id: string }>(
       `INSERT INTO teams (id, name) VALUES (?, ?)
@@ -32,10 +44,15 @@ export class SqliteTeamsRepo implements TeamsRepository {
 
   async getTeamByName(name: string): Promise<TeamRow | null> {
     const { rows } = await this.db.query<TeamRow>(
-      `SELECT id, name, config, port_start, port_end, created_at FROM teams WHERE name = ?`,
+      `SELECT id, name, config, port_start, port_end, created_at FROM teams WHERE lower(name) = lower(?) LIMIT 1`,
       [name],
     );
     if (!rows[0]) return null;
+    if (rows[0].name !== name) {
+      throw new Error(
+        `Team name case collision: "${name}" conflicts with existing "${rows[0].name}"`,
+      );
+    }
     return { ...rows[0], config: parseJsonObject(rows[0].config) };
   }
 

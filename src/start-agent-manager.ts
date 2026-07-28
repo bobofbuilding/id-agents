@@ -16,6 +16,7 @@ import { resolveRuntime } from './runtime/registry.js';
 import { detectSessionHandoffVars } from './lib/env-hygiene.js';
 import { installFatalHandlers } from './lib/fatal-handlers.js';
 import { startParentDeathWatchdog } from './lib/parent-watchdog.js';
+import { managerWorkerRequestHeaders } from './manager-worker-auth.js';
 
 // Silent-stop incidents had the scheduler die behind a swallowed rejection —
 // the process stayed up but the tick loop was dead. Fail loud and exit so the
@@ -244,6 +245,7 @@ async function startWorkerAgent(agentId?: string) {
   const agentAlias = process.env.ID_AGENT_ALIAS || process.env.ID_AGENT_NAME || process.env.AGENT_NAME || agentId;
   const agentTokenId = process.env.ID_AGENT_TOKEN_ID || undefined;
   const managerUrl = process.env.MANAGER_URL || 'http://localhost:4100';
+  const managerAgentId = process.env.ID_AGENT_ID || process.env.ID_DB_AGENT_ID || agentId;
 
   console.log(`🤖 Starting worker agent: ${agentId} on port ${port}`);
 
@@ -254,7 +256,7 @@ async function startWorkerAgent(agentId?: string) {
   try {
     const db = await createDb();
     await migrateDb(db);
-    const dbAgentId = process.env.ID_DB_AGENT_ID || agentId;
+    const dbAgentId = process.env.ID_DB_AGENT_ID || managerAgentId;
     const dbTeamId = process.env.ID_DB_TEAM_ID || await db.teams.getOrCreateTeamId(teamName);
     dbCtx = { db, teamId: dbTeamId, agentId: dbAgentId };
   } catch (e: any) {
@@ -278,7 +280,15 @@ async function startWorkerAgent(agentId?: string) {
     if (teamName) {
       headers['X-Id-Team'] = teamName;
     }
-    const identityRes = await fetch(`${managerUrl}/agents/${agentId}`, { headers });
+    const identityHeaders = managerWorkerRequestHeaders(headers, {
+      ...process.env,
+      ID_AGENT_ID: managerAgentId,
+      ID_TEAM: teamName,
+    });
+    const identityRes = await fetch(
+      `${managerUrl}/agents/${encodeURIComponent(managerAgentId)}`,
+      { headers: identityHeaders },
+    );
     if (identityRes.ok) {
       const agentData = await identityRes.json() as any;
       // Log what manager returned for debugging

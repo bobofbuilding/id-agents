@@ -229,19 +229,19 @@ done
 
 # 3. Write configs/<team>.yaml. See "Structure: defaults + org + agents" above.
 
-# 4. Deploy.
-curl -s -X POST http://localhost:4100/remote \
-  -H "Content-Type: application/json" \
-  -d '{"executor":"operator","command":"/deploy <team>"}' | jq
+# 4. Deploy through IDACC's Teams control.
+# Select the YAML, review the diff, and confirm Deploy.
 
-# 5. Verify.
-curl -s http://localhost:4100/agents -H "X-Id-Team: <team>" | \
-  jq '.agents[] | {name, status, workingDirectory}'
+# 5. Verify in IDACC's team/agent status view.
 
 # 6. Inspect that role bodies actually got injected.
 head -40 "$PARENT/agents/lead/.claude/CLAUDE.md"
 # Should show framework boilerplate followed by your role body.
 ```
+
+Managed workers do not receive the administrator bearer and must not call raw
+`/remote` or synthesize administrator headers. The raw standalone Manager
+workflow is an operator/developer concern, not an agent capability.
 
 ## Role file template
 

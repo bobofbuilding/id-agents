@@ -29,6 +29,7 @@ import {
 } from './runtime/registry.js';
 import { isDirectEntrypoint } from './lib/direct-entrypoint.js';
 import { startParentDeathWatchdog } from './lib/parent-watchdog.js';
+import { managerWorkerRequestHeaders } from './manager-worker-auth.js';
 
 interface LocalAgentConfig {
   name: string;
@@ -39,6 +40,121 @@ interface LocalAgentConfig {
   managerUrl?: string;
   agentId?: string;  // Pre-registered agent ID from manager
   verbose?: boolean; // Enable detailed logging of agent activity
+}
+
+/**
+ * Parse the Manager-owned allowed-tools envelope. An absent value keeps the
+ * server default; malformed values fail closed to an empty tool set.
+ */
+export function parseManagedAllowedTools(value: string | undefined): string[] | undefined {
+  if (value === undefined) return undefined;
+  try {
+    const parsed = JSON.parse(value);
+    if (
+      Array.isArray(parsed)
+      && parsed.every(tool => typeof tool === 'string' && tool.trim().length > 0)
+    ) {
+      return [...new Set(parsed)];
+    }
+  } catch {
+    // Fall through to the fail-closed result.
+  }
+  return [];
+}
+
+export function parseManagedBoolean(value: string | undefined): boolean | undefined {
+  if (value === undefined) return undefined;
+  return value.trim().toLowerCase() === 'true';
+}
+
+export interface LocalAgentStopTransitionResult {
+  accepted: boolean;
+  queryIds: string[];
+}
+
+/**
+ * Persist one worker shutdown without allowing a late process to mutate its
+ * replacement's state. Managed workers first prove their exact generation is
+ * still current, then cancel only queries tagged with that generation.
+ * Standalone workers retain the historical all-query cancellation only after
+ * their PID is confirmed current.
+ */
+export async function transitionLocalAgentStopState(input: {
+  db: Db;
+  teamId: string;
+  agentId: string;
+  processPid: number;
+  processGeneration?: string;
+  restartAfterManagerStart?: boolean;
+  completedAt?: number;
+}): Promise<LocalAgentStopTransitionResult> {
+  const {
+    db,
+    teamId,
+    agentId,
+    processPid,
+    processGeneration,
+    restartAfterManagerStart = false,
+    completedAt = Date.now(),
+  } = input;
+
+  let queryIds: string[];
+  if (processGeneration) {
+    const transitioned = await db.agents.transitionOwnedProcessExit(
+      agentId,
+      processGeneration,
+      restartAfterManagerStart,
+    );
+    if (!transitioned) return { accepted: false, queryIds: [] };
+    queryIds = await db.queries.cancelForProcessGeneration(
+      agentId,
+      processGeneration,
+      completedAt,
+    );
+  } else {
+    const current = await db.agents.getById(agentId);
+    const rawCurrentPid = (
+      current?.metadata as { pid?: unknown } | null | undefined
+    )?.pid;
+    const currentPid = typeof rawCurrentPid === 'number'
+      ? rawCurrentPid
+      : Number(rawCurrentPid);
+    if (
+      Number.isSafeInteger(currentPid)
+      && currentPid > 0
+      && currentPid !== processPid
+    ) {
+      return { accepted: false, queryIds: [] };
+    }
+
+    queryIds = await db.queries.cancel(agentId, completedAt);
+    const metadata = {
+      ...((current?.metadata as Record<string, unknown> | null | undefined) ?? {}),
+    };
+    if (restartAfterManagerStart) {
+      metadata.managerRestartRequested = true;
+    }
+    delete metadata.pid;
+    delete metadata.processOwner;
+    delete metadata.processParentPid;
+    delete metadata.processInspectedAt;
+    await db.agents.updateStatus(
+      agentId,
+      restartAfterManagerStart ? 'offline' : 'stopped',
+      { metadata },
+    );
+  }
+
+  for (const queryId of queryIds) {
+    await db.news.add(teamId, agentId, {
+      timestamp: completedAt,
+      type: 'query.cancelled',
+      message: 'Query cancelled (agent stopped)',
+      data: { reason: 'agent_stopped', query_id: queryId },
+      query_id: queryId,
+    });
+  }
+  return { accepted: true, queryIds };
 }
 
 /**
@@ -89,10 +205,10 @@ async function registerWithManager(
 ): Promise<void> {
   const endpoint = `http://localhost:${port}`;
 
-  const headers: Record<string, string> = {
+  const headers = managerWorkerRequestHeaders({
     'Content-Type': 'application/json',
-    'X-Id-Team': team
-  };
+    'X-Id-Team': team,
+  });
 
   const response = await fetch(`${managerUrl}/agents/register`, {
     method: 'POST',
@@ -148,6 +264,11 @@ export async function startLocalAgent(config: LocalAgentConfig): Promise<{
   } = config;
 
   const tokenId = process.env.ID_AGENT_TOKEN_ID;
+  const processGeneration = process.env.ID_AGENT_PROCESS_GENERATION?.trim();
+  const identityName = process.env.ID_AGENT_NAME?.trim() || name;
+  const identityAlias = process.env.ID_AGENT_ALIAS?.trim() || name;
+  const managedAllowedTools = parseManagedAllowedTools(process.env.ID_AGENT_ALLOWED_TOOLS);
+  const managedOpenMode = parseManagedBoolean(process.env.XMTP_OPEN_MODE);
 
   // Use pre-registered ID or generate one
   const agentId = preRegisteredId || `local_${name.toLowerCase().replace(/[^a-z0-9_-]/g, '_')}_${Date.now()}`;
@@ -193,11 +314,7 @@ export async function startLocalAgent(config: LocalAgentConfig): Promise<{
     // Use pre-configured team ID if available
     dbTeamId = process.env.ID_DB_TEAM_ID || await db.teams.getOrCreateTeamId(team);
 
-    if (isPreRegistered) {
-      // Just update status to 'running' - agent was already registered by manager
-      await db.agents.updateStatus(agentId, 'running');
-      console.log(`📦 Updated status to running in database`);
-    } else {
+    if (!isPreRegistered) {
       // Register agent in database (standalone mode)
       await db.agents.upsert({
         team_id: dbTeamId,
@@ -231,7 +348,8 @@ export async function startLocalAgent(config: LocalAgentConfig): Promise<{
   process.env.MANAGER_URL = managerUrl;
   // Identity for best-effort token-usage attribution (read by harnesses that
   // report local-model usage to the manager's /usage/record endpoint).
-  process.env.ID_AGENT_NAME = name;
+  process.env.ID_AGENT_NAME = identityName;
+  process.env.ID_AGENT_ALIAS = identityAlias;
   process.env.ID_AGENT_TEAM = team;
   process.env.ID_AGENT_ID = agentId;
 
@@ -267,6 +385,8 @@ export async function startLocalAgent(config: LocalAgentConfig): Promise<{
   }
   const metadataSeed: Record<string, unknown> = {};
   if (catalogSeed) metadataSeed.catalog = catalogSeed;
+  metadataSeed.alias = identityAlias;
+  if (managedOpenMode !== undefined) metadataSeed.openMode = managedOpenMode;
   if (String(process.env.ID_AGENT_PRIMARY_LEAD || '').toLowerCase() === 'true') {
     metadataSeed.primaryLead = true;
   }
@@ -276,9 +396,10 @@ export async function startLocalAgent(config: LocalAgentConfig): Promise<{
     model,
     workingDirectory,
     sharedDirectory,
-    agentName: name,
+    ...(managedAllowedTools !== undefined && { allowedTools: managedAllowedTools }),
+    agentName: identityName,
     agentIdentity: {
-      name,
+      name: identityName,
       team,
       ...(tokenId && { tokenId }),
       ...(Object.keys(metadataSeed).length > 0 && { metadata: metadataSeed }),
@@ -288,6 +409,34 @@ export async function startLocalAgent(config: LocalAgentConfig): Promise<{
 
   // Start the server
   await server.start(port);
+
+  // A pre-registered managed worker may publish "running" only while the
+  // generation it was launched with is still current. Do this after the HTTP
+  // listener binds so a failed startup never leaves a durable false-positive.
+  if (isPreRegistered && db) {
+    try {
+      let activated = true;
+      if (processGeneration) {
+        activated = await db.agents.updateOwnedProcessState(
+          agentId,
+          processGeneration,
+          'running',
+        );
+      } else {
+        await db.agents.updateStatus(agentId, 'running');
+      }
+      if (!activated) {
+        throw new Error(
+          `stale managed worker generation ${processGeneration} cannot become running`,
+        );
+      }
+      console.log(`📦 Updated status to running in database`);
+    } catch (error) {
+      await server.stop().catch(() => {});
+      await db.close().catch(() => {});
+      throw error;
+    }
+  }
 
   // Register with manager (only if not pre-registered)
   if (!isPreRegistered) {
@@ -310,7 +459,10 @@ export async function startLocalAgent(config: LocalAgentConfig): Promise<{
   try {
     const metaRes = await fetch(`${managerUrl}/agents/${agentId}/metadata`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Id-Team': team },
+      headers: managerWorkerRequestHeaders({
+        'Content-Type': 'application/json',
+        'X-Id-Team': team,
+      }),
       body: JSON.stringify({ metadata: { pid: process.pid } }),
     });
     if (metaRes.ok) console.log(`📝 Published pid ${process.pid} to manager`);
@@ -322,42 +474,25 @@ export async function startLocalAgent(config: LocalAgentConfig): Promise<{
   const stop = async (opts: { restartAfterManagerStart?: boolean } = {}) => {
     console.log('\n🛑 Stopping local agent...');
 
-    // Update database status and cancel pending queries
+    // Update database status and cancel only this process's pending queries.
     if (db && dbTeamId) {
       try {
-        const ts = Date.now();
-
-        // Cancel pending queries so they don't show as orphaned
-        const queryIds = await db.queries.cancel(agentId, ts);
-
-        if (queryIds.length > 0) {
-          // Add query.cancelled news items
-          for (const queryId of queryIds) {
-            await db.news.add(dbTeamId, agentId, {
-              timestamp: ts,
-              type: 'query.cancelled',
-              message: 'Query cancelled (agent stopped)',
-              data: { reason: 'agent_stopped', query_id: queryId },
-              query_id: queryId,
-            });
-          }
-          console.log(`📋 Cancelled ${queryIds.length} pending queries`);
-        }
-
-        const current = await db.agents.getById(agentId);
-        const currentPid = (current?.metadata as { pid?: unknown } | null | undefined)?.pid;
-        if (typeof currentPid === 'number' && currentPid > 0 && currentPid !== process.pid) {
-          console.log(`📦 Skipped stopped status for stale PID ${process.pid}; current PID is ${currentPid}`);
-        } else {
-          const metadata = { ...((current?.metadata as Record<string, unknown> | null | undefined) ?? {}) };
-          if (opts.restartAfterManagerStart) {
-            metadata.managerRestartRequested = true;
-          }
-          if ('pid' in metadata) {
-            delete metadata.pid;
-            await db.agents.updateMetadata(agentId, metadata);
-          }
-          await db.agents.updateStatus(agentId, 'stopped');
+        const transition = await transitionLocalAgentStopState({
+          db,
+          teamId: dbTeamId,
+          agentId,
+          processPid: process.pid,
+          processGeneration,
+          restartAfterManagerStart: opts.restartAfterManagerStart === true,
+        });
+        if (!transition.accepted) {
+          console.log(
+            processGeneration
+              ? `📦 Skipped stale process exit for generation ${processGeneration}`
+              : `📦 Skipped stale process exit for PID ${process.pid}`,
+          );
+        } else if (transition.queryIds.length > 0) {
+          console.log(`📋 Cancelled ${transition.queryIds.length} pending queries`);
         }
       } catch {
         // Ignore errors

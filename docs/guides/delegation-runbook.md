@@ -49,11 +49,15 @@ parser-enforced — missing a label risks `task_brief_not_dispatch_ready`:
 
 ```bash
 curl -s -X POST $MANAGER_URL/tasks \
-  -H "Content-Type: application/json" -H "X-Id-Team: ops-team" \
+  -H "Content-Type: application/json" \
+  -H "X-Id-Team: $ID_TEAM" \
+  -H "X-Id-Agent: $ID_AGENT_ID" \
+  -H "Authorization: Bearer $IDACC_MANAGER_AGENT_TOKEN" \
   -d '{
     "title": "<human title>",
     "name": "<kebab-case-name>",
     "from": "ops-lead",
+    "owner": "<same-team-agent-id>",
     "description": "Goal ID: goal_plan_1fgpnd5\nExpected output: <path + contents>\nAcceptance criteria: <checkable conditions>\nValidation path: Owning lead reviews the completion; default coder and researcher validate substantial cross-team work.\nOut of scope: <exclusions>\nBacklog policy: <what becomes backlog>\nBittrees relevance: medium: <one-line reason>"
   }'
 ```
@@ -72,26 +76,28 @@ finishing or reassigning the stale task.
 
 ## 3. Dispatch independent work in parallel
 
-Per team instructions (`memory:30`, `memory:82`): fan out independent
-slices with async `/news-to ... trigger:true` **in a single batch**, not
-serially. Use `/talk-to` only for a step that must block on another's
-output first.
+Fan out independent slices with the local async `/news-to ... trigger:true`
+wrapper **in a single batch**, not serially. Use the local `/talk-to` wrapper
+only for a step that must block on another's output first.
 
 ```bash
 # fire all independent slices at once
-curl -s -X POST $MANAGER_URL/talk-to -H "Content-Type: application/json" -H "X-Id-Team: ops-team" \
-  -d '{"to":"deployer","from":"ops-lead","message":"<scope>","task":{"title":"...","name":"slice-a"}}'
-curl -s -X POST $MANAGER_URL/talk-to -H "Content-Type: application/json" -H "X-Id-Team: ops-team" \
-  -d '{"to":"content-moderator","from":"ops-lead","message":"<scope>","task":{"title":"...","name":"slice-b"}}'
+curl -s -X POST "http://127.0.0.1:$ID_AGENT_PORT/news-to" \
+  -H "Content-Type: application/json" \
+  -d '{"to":"deployer","message":"Execute existing task slice-a. Claim path: /tasks/slice-a/claim. Done path: /tasks/slice-a/done. Scope: <scope>","trigger":true}'
+curl -s -X POST "http://127.0.0.1:$ID_AGENT_PORT/news-to" \
+  -H "Content-Type: application/json" \
+  -d '{"to":"content-moderator","message":"Execute existing task slice-b. Claim path: /tasks/slice-b/claim. Done path: /tasks/slice-b/done. Scope: <scope>","trigger":true}'
 ```
 
-Include the exact `task: {title, name}` in the dispatch brief plus
-verbatim `claim URL:`/`done URL:` lines — implementers must reuse the
-assigned name so the manager's checkin doesn't fire against a phantom row.
+Because Section 2 already created these rows, include the exact returned task
+name/reference and verbatim claim/done paths in the message; do not attach a
+second `task` object. Implementers must reuse the assigned name so supervision
+does not track a phantom duplicate.
 
-`task: {...}` auto-attach only works on `$MANAGER_URL/talk-to` directly
-(not the local `localhost:<port>/talk-to` wrapper, which silently strips
-it) and it auto-creates a checkin owned by the dispatcher (default 600s).
+Managed workers must not call the Manager-wide `/talk-to` route. The task rows
+above are already bound to their same-team owners; the local wrapper performs
+peer delivery without forwarding the Manager credential.
 
 ## 4. Supervise with the checkin probe ladder — don't assume progress
 
@@ -103,11 +109,11 @@ child tasks sat "doing" for 20+ minutes with the owning agents' own
 
 When a checkin fires (or when you manually suspect stall), walk the
 ladder cheapest-first before pinging anyone:
-1. Re-`GET` the task — has `updatedAt` moved since the last check?
-2. Check the owner's `/news?since_id=0&limit=15` — any activity in the
-   claim window?
-3. Health-probe the owner's REST-AP port.
-4. Only then `/talk-to` for a one-line status check (costs the delegate a
+1. Inspect the task/check-in update delivered to your own news feed. Managed
+   workers cannot browse Manager-wide task state.
+2. Check your own news for the exact task or reply identity.
+3. Use same-team discovery, then health-probe the owner's REST-AP port.
+4. Only then use your local `/talk-to` for a one-line status check (costs the delegate a
    turn) — and expect a `429 agent_busy` if they're mid-turn on something
    else, which itself is a live/not-wedged signal.
 
@@ -157,7 +163,10 @@ objective:
 
 ```bash
 curl -s -X POST "$MANAGER_URL/tasks/%23caee67c8/done" \
-  -H "Content-Type: application/json" -H "X-Id-Team: ops-team" \
+  -H "Content-Type: application/json" \
+  -H "X-Id-Team: $ID_TEAM" \
+  -H "X-Id-Agent: $ID_AGENT_ID" \
+  -H "Authorization: Bearer $IDACC_MANAGER_AGENT_TOKEN" \
   -d '{
     "agent_id": "ops-lead",
     "delegated_task_names": ["draft-delegation-runbook-content", "screen-delegation-rules-policy-fit-d0cfd5a4"],
@@ -185,7 +194,7 @@ a false "done." Either:
 
 - [ ] Decomposed into independent slices with named owners and outputs
 - [ ] Every child task created with the full 7-field brief
-- [ ] Independent slices fired in parallel via `/talk-to` with `task:{}` auto-attach (not serialized)
+- [ ] Existing task slices fired in parallel through local `/news-to` with exact task identity and lifecycle paths
 - [ ] Progress checked via the probe ladder, not assumed
 - [ ] Stalled/wedged children nudged once, documented, not silently dropped
 - [ ] Substantial/cross-team completions relayed to `default/coder` + `default/researcher`

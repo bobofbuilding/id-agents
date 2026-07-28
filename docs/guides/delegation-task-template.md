@@ -15,11 +15,15 @@ Use the exact capitalized labels below.
 
 ```bash
 curl -s -X POST "$MANAGER_URL/tasks" \
-  -H "Content-Type: application/json" -H "X-Id-Team: <your-team>" \
+  -H "Content-Type: application/json" \
+  -H "X-Id-Team: $ID_TEAM" \
+  -H "X-Id-Agent: $ID_AGENT_ID" \
+  -H "Authorization: Bearer $IDACC_MANAGER_AGENT_TOKEN" \
   -d '{
     "title": "<human-readable title>",
     "name": "<kebab-case-unique-name>",
     "from": "<your-lead-agent-id>",
+    "owner": "<same-team-target-agent-id>",
     "description": "Goal ID: <goal_id>\nExpected output: <exact artifact path + what it must contain>\nAcceptance criteria: <checkable, falsifiable conditions — not vague adjectives>\nValidation path: Owning lead reviews the completion; default coder and researcher validate substantial cross-team work.\nOut of scope: <explicit exclusions>\nBacklog policy: <what non-required follow-ups become instead of live work>\nBittrees relevance: <rank>: <one-line reason>"
   }'
 ```
@@ -45,11 +49,15 @@ Field notes:
 
 ```bash
 curl -s -X POST "$MANAGER_URL/tasks" \
-  -H "Content-Type: application/json" -H "X-Id-Team: ops-team" \
+  -H "Content-Type: application/json" \
+  -H "X-Id-Team: $ID_TEAM" \
+  -H "X-Id-Agent: $ID_AGENT_ID" \
+  -H "Authorization: Bearer $IDACC_MANAGER_AGENT_TOKEN" \
   -d '{
     "title": "Commit delegation runbook doc to id-agents docs/guides",
     "name": "commit-delegation-runbook-doc",
     "from": "ops-lead",
+    "owner": "git-manager",
     "description": "Related to: #0acecef4\nGoal ID: goal_plan_1fgpnd5\nExpected output: docs/guides/delegation-runbook.md added and committed on origin/main.\nAcceptance criteria: New file exists in docs/guides/ on origin/main with a real commit hash; pre-existing unrelated dirty files remain untouched; no push to the upstream remote.\nValidation path: Owning lead reviews the completion; default coder and researcher validate substantial cross-team work.\nOut of scope: Editing the runbook content, touching unrelated dirty files, pushing upstream.\nBacklog policy: Non-required follow-ups become backlog candidates instead of live delegated work.\nBittrees relevance: medium: makes the delegation process durable and discoverable."
   }'
 ```
@@ -64,28 +72,33 @@ local `git log` check).
 ```bash
 # member claims (flips status todo -> doing, sets ownerName)
 curl -s -X POST "$MANAGER_URL/tasks/<name>/claim" \
-  -H "Content-Type: application/json" -H "X-Id-Team: <team>" \
+  -H "Content-Type: application/json" \
+  -H "X-Id-Team: $ID_TEAM" \
+  -H "X-Id-Agent: $ID_AGENT_ID" \
+  -H "Authorization: Bearer $IDACC_MANAGER_AGENT_TOKEN" \
   -d '{"agent_id":"<member-agent-id>"}'
 
 # member closes (flips status doing -> done)
 curl -s -X POST "$MANAGER_URL/tasks/<name>/done" \
-  -H "Content-Type: application/json" -H "X-Id-Team: <team>" \
+  -H "Content-Type: application/json" \
+  -H "X-Id-Team: $ID_TEAM" \
+  -H "X-Id-Agent: $ID_AGENT_ID" \
+  -H "Authorization: Bearer $IDACC_MANAGER_AGENT_TOKEN" \
   -d '{"agent_id":"<member-agent-id>","acceptance_coverage":"<what shipped vs. acceptance criteria>"}'
 ```
 
-Note: creating a task via `POST /tasks` as a team lead auto-assigns it to
-the lead itself by default (`default_owner_routing: configured_team_lead`)
-— it does **not** land in `todo` for a member to self-claim. To get a task
-genuinely owned by a specific member, either dispatch it via `/talk-to`
-with a `task:{title,name}` auto-attach payload (Section 3 of the runbook),
-or have the member create-and-self-claim their own task row for the scope
-you've handed them.
+In managed mode, the authenticated creator may set `owner` to one same-team
+agent. Manager resolves that identity and records the immutable owner; a worker
+cannot assign across teams. Omitting `owner` retains configured-lead routing.
 
 ## Parent close
 
 ```bash
 curl -s -X POST "$MANAGER_URL/tasks/%23<parentShortId>/done" \
-  -H "Content-Type: application/json" -H "X-Id-Team: <team>" \
+  -H "Content-Type: application/json" \
+  -H "X-Id-Team: $ID_TEAM" \
+  -H "X-Id-Agent: $ID_AGENT_ID" \
+  -H "Authorization: Bearer $IDACC_MANAGER_AGENT_TOKEN" \
   -d '{
     "agent_id": "<lead-agent-id>",
     "delegated_task_names": ["<done-member-owned-child-1>", "..."],

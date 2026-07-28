@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: MIT
 
 import { describe, expect, it } from 'vitest';
-import { computeSyncPlan, diffAgent, formatSyncSummary } from '../../src/sync.js';
+import {
+  computeSyncPlan,
+  diffAgent,
+  formatSyncSummary,
+  resolveAgentSpecIdentity,
+} from '../../src/sync.js';
 import type { AgentSpec } from '../../src/config-parser.js';
 import type { AgentRow } from '../../src/db/types.js';
 
@@ -25,6 +30,7 @@ function makeAgentRow(overrides: Partial<AgentRow> = {}): AgentRow {
       plugins: [],
       skills: [],
       allowed_tools: [],
+      yamlManaged: true,
     },
     deleted_at: null,
     runtime: 'claude-agent-sdk',
@@ -129,6 +135,58 @@ describe('diffAgent', () => {
     expect(changes).toContain('allowedTools');
   });
 
+  it('preserves the omitted versus explicit-empty allowedTools contract in both directions', () => {
+    const omittedSpec = makeAgentSpec();
+    delete omittedSpec.allowedTools;
+    const omittedRow = makeAgentRow({
+      metadata: {
+        ...makeAgentRow().metadata,
+      },
+    });
+    delete (omittedRow.metadata as Record<string, unknown>).allowed_tools;
+
+    expect(diffAgent(omittedSpec, omittedRow)).not.toContain('allowedTools');
+    expect(diffAgent(makeAgentSpec({ allowedTools: [] }), omittedRow)).toContain('allowedTools');
+    expect(diffAgent(omittedSpec, makeAgentRow())).toContain('allowedTools');
+  });
+
+  it('detects agent type changes', () => {
+    expect(diffAgent(
+      makeAgentSpec({ type: 'automator' }),
+      makeAgentRow({ type: 'claude' }),
+    )).toContain('type');
+  });
+
+  it('diffs the effective per-agent environment independent of key order', () => {
+    const row = makeAgentRow({
+      metadata: {
+        ...makeAgentRow().metadata,
+        env: {
+          APP_ENV: 'production',
+          FEATURE_FLAG: 'enabled',
+        },
+      },
+    });
+
+    expect(diffAgent(makeAgentSpec({
+      env: {
+        FEATURE_FLAG: 'enabled',
+        APP_ENV: 'production',
+      },
+    }), row)).not.toContain('env');
+
+    expect(diffAgent(makeAgentSpec({
+      resources: {
+        env: {
+          APP_ENV: 'production',
+          FEATURE_FLAG: 'disabled',
+        },
+      },
+    }), row)).toContain('env');
+
+    expect(diffAgent(makeAgentSpec(), row)).toContain('env');
+  });
+
   it('detects MCP server drift and ignores server ordering differences', () => {
     const servers = [
       { name: 'brain', transport: 'stdio' as const, command: 'node', args: ['/workspace/projects/brain/brain-mcp.mjs'] },
@@ -228,6 +286,119 @@ describe('diffAgent', () => {
 });
 
 describe('computeSyncPlan', () => {
+  it('uses identityKey before name and plans an explicit rename in place', () => {
+    const row = makeAgentRow({
+      name: 'worker',
+      metadata: {
+        ...makeAgentRow().metadata,
+        name: 'worker',
+        identityKey: 'worker-v1',
+      },
+    });
+    const spec = makeAgentSpec({
+      name: 'renamed-worker',
+      identityKey: 'worker-v1',
+    });
+
+    expect(resolveAgentSpecIdentity(spec, [row])).toEqual({ row });
+    const plan = computeSyncPlan([spec], [row]);
+
+    expect(plan.conflicts).toEqual([]);
+    expect(plan.added).toEqual([]);
+    expect(plan.removed).toEqual([]);
+    expect(plan.changed).toEqual([{
+      name: 'renamed-worker',
+      category: 'changed',
+      changes: ['name'],
+    }]);
+  });
+
+  it('adopts identityKey onto one unambiguous same-name legacy row', () => {
+    const metadata = { ...makeAgentRow().metadata, name: 'worker' };
+    delete (metadata as Record<string, unknown>).yamlManaged;
+    const row = makeAgentRow({ name: 'worker', metadata });
+    const spec = makeAgentSpec({ name: 'worker', identityKey: 'worker-v1' });
+
+    const plan = computeSyncPlan([spec], [row]);
+
+    expect(plan.conflicts).toEqual([]);
+    expect(plan.added).toEqual([]);
+    expect(plan.removed).toEqual([]);
+    expect(plan.changed).toEqual([{
+      name: 'worker',
+      category: 'changed',
+      changes: ['identityKey', 'yamlManaged'],
+    }]);
+  });
+
+  it('fails closed when an identity key and configured name resolve to different rows', () => {
+    const keyOwner = makeAgentRow({
+      id: 'agent-key-owner',
+      name: 'old-worker',
+      metadata: {
+        ...makeAgentRow().metadata,
+        name: 'old-worker',
+        identityKey: 'worker-v1',
+      },
+    });
+    const nameOwner = makeAgentRow({
+      id: 'agent-name-owner',
+      name: 'renamed-worker',
+      metadata: {
+        ...makeAgentRow().metadata,
+        name: 'renamed-worker',
+        identityKey: 'other-v1',
+      },
+    });
+
+    const resolution = resolveAgentSpecIdentity(
+      makeAgentSpec({ name: 'renamed-worker', identityKey: 'worker-v1' }),
+      [keyOwner, nameOwner],
+    );
+    expect(resolution.row).toBeNull();
+    expect(resolution.error).toContain('belongs to agent-name-owner');
+  });
+
+  it('fails closed on duplicate persisted keys and ambiguous legacy names', () => {
+    const duplicateKeyRows = [
+      makeAgentRow({
+        id: 'agent-a',
+        name: 'worker-a',
+        metadata: { ...makeAgentRow().metadata, name: 'worker-a', identityKey: 'worker-v1' },
+      }),
+      makeAgentRow({
+        id: 'agent-b',
+        name: 'worker-b',
+        metadata: { ...makeAgentRow().metadata, name: 'worker-b', identityKey: 'worker-v1' },
+      }),
+    ];
+    const duplicateKey = computeSyncPlan(
+      [makeAgentSpec({ name: 'worker-a', identityKey: 'worker-v1' })],
+      duplicateKeyRows,
+    );
+    expect(duplicateKey.conflicts).toHaveLength(1);
+    expect(duplicateKey.conflicts[0].message).toContain('already attached to multiple existing rows');
+
+    const ambiguousRows = [
+      makeAgentRow({
+        id: 'legacy-a',
+        name: 'legacy-a',
+        metadata: { ...makeAgentRow().metadata, name: 'legacy-a', alias: 'worker' },
+      }),
+      makeAgentRow({
+        id: 'legacy-b',
+        name: 'legacy-b',
+        metadata: { ...makeAgentRow().metadata, name: 'legacy-b', alias: 'worker' },
+      }),
+    ];
+    const ambiguous = computeSyncPlan(
+      [makeAgentSpec({ name: 'worker' })],
+      ambiguousRows,
+    );
+    expect(ambiguous.conflicts).toHaveLength(1);
+    expect(ambiguous.conflicts[0].message).toContain('matches multiple existing rows');
+  });
+
   it('categorizes new agents correctly', () => {
     const configAgents = [makeAgentSpec({ name: 'alice' }), makeAgentSpec({ name: 'bob' })];
     const runningAgents = [makeAgentRow({ name: 'alice' })];
@@ -328,6 +499,7 @@ describe('computeSyncPlan', () => {
         port: 4102,
         metadata: {
           ...makeAgentRow().metadata,
+          name: 'bob',
           skills: ['identity'],
         },
       }),
@@ -337,6 +509,7 @@ describe('computeSyncPlan', () => {
         port: 4103,
         metadata: {
           ...makeAgentRow().metadata,
+          name: 'charlie',
           skills: ['task-discipline'],
         },
       }),
@@ -355,7 +528,7 @@ describe('computeSyncPlan', () => {
     const runningAgents = [makeAgentRow({
       name: 'alice.xid.eth',
       domain: 'alice.xid.eth',
-      metadata: { alias: 'alice', description: 'A test agent', runtime: 'claude-agent-sdk', plugins: [], skills: [], allowed_tools: [] },
+      metadata: { alias: 'alice', description: 'A test agent', runtime: 'claude-agent-sdk', plugins: [], skills: [], allowed_tools: [], yamlManaged: true },
     })];
 
     const plan = computeSyncPlan(configAgents, runningAgents);

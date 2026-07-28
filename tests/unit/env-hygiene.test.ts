@@ -28,13 +28,15 @@ describe('SESSION_HANDOFF_VARS', () => {
 });
 
 describe('filterClaudeEnvVars', () => {
-  it('strips session-handoff vars but keeps legitimate CLAUDE_* config vars', () => {
+  it('keeps only reviewed non-secret Claude worker configuration', () => {
     const env: NodeJS.ProcessEnv = {
       CLAUDE_CODE_OAUTH_TOKEN: 'leaked-token',
       CLAUDE_CODE_ENTRYPOINT: 'cli',
       CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '1',
       CLAUDE_AGENT_SDK_VERSION: '0.42.0',
       CLAUDE_MODEL: 'claude-haiku-4-5-20251001',
+      CLAUDE_API_KEY: 'unreviewed-secret',
+      CLAUDE_CODE_USE_BEDROCK: '1',
       ANTHROPIC_API_KEY: 'sk-user-key',
       PATH: '/usr/bin',
     };
@@ -47,6 +49,8 @@ describe('filterClaudeEnvVars', () => {
     }
     // Legitimate CLAUDE_* config is preserved
     expect(filtered.CLAUDE_MODEL).toBe('claude-haiku-4-5-20251001');
+    expect(filtered).not.toHaveProperty('CLAUDE_API_KEY');
+    expect(filtered).not.toHaveProperty('CLAUDE_CODE_USE_BEDROCK');
     // Non-CLAUDE keys aren't in this filter's output
     expect(filtered).not.toHaveProperty('ANTHROPIC_API_KEY');
     expect(filtered).not.toHaveProperty('PATH');
@@ -56,9 +60,9 @@ describe('filterClaudeEnvVars', () => {
     expect(filterClaudeEnvVars({ PATH: '/usr/bin', HOME: '/root' })).toEqual({});
   });
 
-  it('coerces undefined values to empty strings', () => {
+  it('does not forward undefined reviewed values', () => {
     const env: NodeJS.ProcessEnv = { CLAUDE_MODEL: undefined as any };
-    expect(filterClaudeEnvVars(env)).toEqual({ CLAUDE_MODEL: '' });
+    expect(filterClaudeEnvVars(env)).toEqual({});
   });
 });
 

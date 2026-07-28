@@ -44,9 +44,8 @@ agents:
   - name: git-manager
     description: >-
       Owns git hygiene and push coordination for every git repository under the
-      projects root
-      (/Users/jhineline/bob/Library/Assistants/idagents/id-agents/workspace/projects),
-      which is the repo set surfaced on the control center's Projects page. For each
+      Manager-configured projects root, which is the repo set surfaced on the
+      control center's Projects page. For each
       repo: report `git status`, preserve untracked/local-only files, stage only
       intentional changes, commit meaningful changes with clear messages, keep
       branches tidy, and keep the working tree clean so the Projects page reflects

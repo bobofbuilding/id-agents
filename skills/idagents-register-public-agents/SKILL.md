@@ -5,6 +5,13 @@ description: Register a public-agent (Juno instance behind a customer domain) on
 
 # Register Public Agents (Base only)
 
+> **Managed IDACC boundary:** this is an operator reference, not an executable
+> worker workflow. A managed worker must not synthesize `X-Id-Admin`, search for
+> the administrator bearer, invoke wallet signing, or submit registration
+> transactions. Use IDACC’s Public Agents and Identity controls and wait for the
+> application’s receipt. The raw commands below are retained only for a
+> deliberately standalone, human-operated installation.
+
 This skill registers a **public-agent** (Juno) on two Base contracts so external
 callers can discover it as an ERC-8004 agent with an MCP endpoint:
 
@@ -34,12 +41,8 @@ callers can discover it as an ERC-8004 agent with an MCP endpoint:
 - Manager daemon running on `127.0.0.1:4100` (public-team endpoints live there).
 - `id-cli` installed (`which id-cli` returns a path).
 - OWS wallet configured. The manager reads `OWS_REGISTRAR_WALLET` from its `.env` to pick the signer. For direct `id-cli` commands, pass `OWS_WALLET=<wallet-name>` via env or `--wallet <wallet-name>` flag.
-- The public-agent is already registered with the manager. Verify:
-
-```bash
-curl -sS -H "X-Id-Team: public" -H "X-Id-Admin: 1" http://127.0.0.1:4100/agents \
-  | python3 -c "import sys,json;[print(a['name'],a.get('customer_domain')) for a in json.load(sys.stdin)['agents']]"
-```
+- The public-agent is already visible in IDACC's Public Agents view. Managed
+  workers cannot browse or mutate this administrative surface.
 
 ## Flow
 
@@ -57,29 +60,9 @@ curl -sSI https://$DOMAIN/mcp | head -1
 
 The manager signs with the wallet named by `OWS_REGISTRAR_WALLET`. One Base tx; assigns `<name>.agent-N.xid.eth`.
 
-Find the agent's manager id:
-
-```bash
-AGENT_NAME=docs-idagents
-AID=$(curl -sS -H "X-Id-Team: public" -H "X-Id-Admin: 1" http://127.0.0.1:4100/agents \
-  | python3 -c "
-import sys,json
-d=json.load(sys.stdin)
-for a in d['agents']:
-  if a['name']==\"$AGENT_NAME\": print(a['id']); break")
-echo "id=$AID"
-```
-
-Register:
-
-```bash
-curl -sS -X POST \
-  -H "Content-Type: application/json" \
-  -H "X-Id-Team: public" \
-  -H "X-Id-Admin: 1" \
-  "http://127.0.0.1:4100/agents/$AID/onchain/register" \
-  -d '{}' | python3 -m json.tool
-```
+Select the public agent in IDACC and choose **Register identity**. Review the
+network, wallet, expected cost, and assigned name before confirming. Wait for
+the application to show the transaction receipt.
 
 Capture `domain` (the assigned xid.eth name) and `tokenId` from the response. Example:
 
@@ -134,10 +117,7 @@ id-cli info "$ENS_NAME" --brief
 # 0. check mcp
 curl -sSI https://docs.idagents.ai/mcp | head -1
 
-# 1. ID Chain
-curl -sS -X POST -H "Content-Type: application/json" \
-  -H "X-Id-Team: public" -H "X-Id-Admin: 1" \
-  http://127.0.0.1:4100/agents/virtual_docs-idagents/onchain/register -d '{}'
+# 1. Register the public agent through IDACC's Identity control.
 # → domain: docs-idagents.agent-26.xid.eth
 
 # 2. ERC-8004

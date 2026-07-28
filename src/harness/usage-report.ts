@@ -7,6 +7,8 @@
  * was working. Wrapped so it can NEVER throw into or delay the agent's reply path —
  * on any failure it silently no-ops.
  */
+import { managerWorkerRequestHeaders } from '../manager-worker-auth.js';
+
 export function reportTurnUsage(u: {
   runtime: string;
   model: string;
@@ -34,7 +36,7 @@ export function reportTurnUsage(u: {
     };
     void fetch(`${managerUrl}/usage/record`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: managerWorkerRequestHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(3000),
     }).catch(() => { /* best-effort; ignore */ });

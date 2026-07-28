@@ -247,8 +247,8 @@ export class SchedulerService {
     console.log(`[Scheduler] Seeded schedule "${def.title}" -> [${agentIds.join(', ')}]`);
   }
 
-  async removeAgentSchedules(agentId: string): Promise<void> {
-    await this.db.schedules.deleteBySource('yaml', `heartbeat:${agentId}`);
+  async removeYamlHeartbeatSchedule(agentId: string): Promise<void> {
+    await this.db.schedules.deleteByExactSource('yaml', `heartbeat:${agentId}`);
   }
 
   /**

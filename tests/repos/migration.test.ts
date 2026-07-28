@@ -215,6 +215,48 @@ describe('SQLite migration — tasks uniqueness upgrade', () => {
   });
 });
 
+describe('SQLite migration — portable team-name uniqueness', () => {
+  it('preserves legacy case-only duplicates and skips the casefold index with an actionable warning', async () => {
+    const adapter = new SqliteAdapter(':memory:');
+    adapter.exec(`
+      CREATE TABLE teams (
+        id TEXT PRIMARY KEY,
+        name TEXT UNIQUE NOT NULL,
+        config TEXT NOT NULL DEFAULT '{}',
+        port_start INTEGER NOT NULL DEFAULT 4101,
+        port_end INTEGER NOT NULL DEFAULT 4125,
+        created_at INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT INTO teams (id, name) VALUES ('upper-team', 'Team');
+      INSERT INTO teams (id, name) VALUES ('lower-team', 'team');
+    `);
+    const originalConsoleError = console.error;
+    const warnings: string[] = [];
+    console.error = (...args: unknown[]) => {
+      warnings.push(args.map(String).join(' '));
+    };
+    try {
+      await expect(migrateSqlite(adapter)).resolves.toBeUndefined();
+    } finally {
+      console.error = originalConsoleError;
+    }
+
+    const { rows: teams } = await adapter.query<{ id: string; name: string }>(
+      `SELECT id, name FROM teams ORDER BY id`,
+    );
+    expect(teams).toEqual([
+      { id: 'lower-team', name: 'team' },
+      { id: 'upper-team', name: 'Team' },
+    ]);
+    const { rows: indexes } = await adapter.query<{ name: string }>(
+      `SELECT name FROM pragma_index_list('teams')`,
+    );
+    expect(indexes.map((index) => index.name)).not.toContain('teams_name_casefold_unique');
+    expect(warnings.join('\n')).toMatch(/case-only duplicate team names detected/i);
+    await adapter.close();
+  });
+});
+
 describe('SQLite migration — query sweep indexes', () => {
   it('indexes status/time query sweeps without requiring a team or agent prefix', async () => {
     const adapter = await freshDb();

@@ -6,6 +6,7 @@ import os from 'os';
 import path from 'path';
 
 import {
+  mergeDefaults,
   parseConfig,
   parseCatalogMarkdown,
   parseTeamConfig,
@@ -49,6 +50,57 @@ agents:
     expect(config.agents[0].agent).toBe('foundry-dev');
   });
 
+  it('resolves env placeholders without parameters or YAML retyping/injection', () => {
+    tmpDir = mkTmp();
+    const configPath = path.join(tmpDir, 'team.yaml');
+    const envName = 'ID_AGENTS_TEAM_CONFIG_OPAQUE_TEST';
+    const previous = process.env[envName];
+    const opaque = 'true # still data: "quoted"\\path\nnext: must-not-be-a-key';
+    process.env[envName] = opaque;
+    fs.writeFileSync(configPath, `version: "1"
+agents:
+  - name: worker
+    env:
+      CUSTOM_API_TOKEN: \${env:${envName}}
+`);
+    try {
+      const deploy = parseConfig(configPath);
+      const team = parseTeamConfig(configPath);
+      expect(deploy.agents[0].env?.CUSTOM_API_TOKEN).toBe(opaque);
+      expect(team.agents[0].env?.CUSTOM_API_TOKEN).toBe(opaque);
+      expect((team.agents[0].env as any).next).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env[envName];
+      else process.env[envName] = previous;
+    }
+  });
+
+  it('preserves typed exact parameters, timestamp scalars, and unrelated template literals', () => {
+    tmpDir = mkTmp();
+    const configPath = path.join(tmpDir, 'typed-team.yaml');
+    fs.writeFileSync(configPath, `version: "1"
+parameters:
+  - name: seconds
+  - name: wallet
+calendar:
+  - title: release
+    date: 2026-07-28
+    time: "10:00"
+    agents: [worker]
+agents:
+  - name: worker
+    heartbeat: \${seconds}
+    wallet: \${wallet}
+    description: 'consumer literal \${UNDECLARED_TEMPLATE}'
+`);
+
+    const config = parseConfig(configPath, ['seconds=15', 'wallet=false']);
+    expect(config.agents[0].heartbeat).toBe(15);
+    expect(config.agents[0].wallet).toBe(false);
+    expect(config.agents[0].description).toContain('${UNDECLARED_TEMPLATE}');
+    expect((config.calendar?.[0] as any).date).toBeInstanceOf(Date);
+  });
+
   it('defaults the library root to the config parent directory', () => {
     const configPath = '/Users/nxt3d/projects/id2/public-agents/configs/foundry-demo.yaml';
     expect(resolveConfigLibraryRoot(configPath)).toBe('/Users/nxt3d/projects/id2/public-agents/configs');
@@ -71,6 +123,110 @@ agents:
     expect(result.errors).toContainEqual({
       path: 'agents[0].agent',
       message: 'agent must be a string',
+    });
+  });
+
+  it('validates stable identity keys as unique, explicit agent-only values', () => {
+    const valid = validateConfig({
+      version: '1',
+      agents: [
+        { name: 'builder', identityKey: 'builder-v1' },
+        { name: 'auditor', identityKey: 'security.audit_2' },
+      ],
+    });
+    expect(valid).toEqual({ valid: true, errors: [] });
+
+    for (const identityKey of ['', ' builder', 'Builder', 'builder/key', 'builder-']) {
+      const invalid = validateConfig({
+        version: '1',
+        agents: [{ name: 'builder', identityKey }],
+      });
+      expect(invalid.valid).toBe(false);
+      expect(invalid.errors.map((error) => error.path)).toContain('agents[0].identityKey');
+    }
+
+    const duplicate = validateConfig({
+      version: '1',
+      agents: [
+        { name: 'builder', identityKey: 'worker-v1' },
+        { name: 'auditor', identityKey: 'worker-v1' },
+      ],
+    });
+    expect(duplicate.errors).toContainEqual({
+      path: 'agents[1].identityKey',
+      message: 'identityKey "worker-v1" is already used by agents[0]',
+    });
+
+    const inherited = validateConfig({
+      version: '1',
+      defaults: { identityKey: 'shared-worker' } as any,
+      agents: [{ name: 'builder' }],
+    });
+    expect(inherited.errors).toContainEqual({
+      path: 'defaults.identityKey',
+      message: 'identityKey is agent-only and cannot be inherited from defaults',
+    });
+
+    expect(mergeDefaults(
+      { name: 'renamed-builder', identityKey: 'builder-v1' },
+      { model: 'gpt-5' },
+    )).toMatchObject({
+      name: 'renamed-builder',
+      identityKey: 'builder-v1',
+      model: 'gpt-5',
+    });
+  });
+
+  it('rejects duplicate effective names and domains even with different identity keys', () => {
+    const duplicateName = validateConfig({
+      version: '1',
+      agents: [
+        { name: 'worker', identityKey: 'worker-a' },
+        { name: 'WORKER', identityKey: 'worker-b' },
+      ],
+    });
+    expect(duplicateName.errors).toContainEqual({
+      path: 'agents[1].name',
+      message: 'name "WORKER" conflicts with agents[0].name',
+    });
+
+    const duplicateDomain = validateConfig({
+      version: '1',
+      agents: [
+        { name: 'worker-a', domain: 'shared.xid.eth', identityKey: 'worker-a' },
+        { name: 'worker-b', domain: 'SHARED.XID.ETH', identityKey: 'worker-b' },
+      ],
+    });
+    expect(duplicateDomain.errors).toContainEqual({
+      path: 'agents[1].domain',
+      message: 'domain "SHARED.XID.ETH" conflicts with agents[0].domain',
+    });
+  });
+
+  it('rejects canonically equivalent ENS domains before deployment', () => {
+    const result = validateConfig({
+      version: '1',
+      agents: [
+        { name: 'composed', domain: 'é.eth' },
+        { name: 'decomposed', domain: 'e\u0301.eth' },
+      ],
+    });
+
+    expect(result.errors).toContainEqual({
+      path: 'agents[1].domain',
+      message: 'domain "é.eth" conflicts with agents[0].domain',
+    });
+  });
+
+  it('reports a non-string agent name without throwing', () => {
+    const result = validateConfig({
+      version: '1',
+      agents: [{ name: 42 as any }],
+    });
+
+    expect(result.errors).toContainEqual({
+      path: 'agents[0].name',
+      message: 'agent name must contain only alphanumeric characters, hyphens, and underscores',
     });
   });
 
@@ -244,6 +400,40 @@ agents:
     });
   });
 
+  it('rejects duplicate lane ids in one canonical runtime but permits reuse across distinct runtimes', () => {
+    const canonicalDuplicate = validateConfig({
+      version: '1',
+      runtimeCredentialPool: {
+        lanes: [
+          { id: 'shared', runtime: 'claude-code-cli', kind: 'subscription' },
+          { id: 'cli-backup', runtime: 'claude-code-cli', kind: 'subscription' },
+          { id: 'shared', runtime: 'claude-code-local', kind: 'subscription' },
+          { id: 'local-backup', runtime: 'claude-code-local', kind: 'subscription' },
+        ],
+      },
+      agents: [{ name: 'lead' }],
+    });
+    expect(canonicalDuplicate.errors).toContainEqual({
+      path: 'runtimeCredentialPool.lanes[2].id',
+      message: 'lane id "shared" duplicates runtimeCredentialPool.lanes[0].id for canonical runtime "claude-code-cli"',
+    });
+
+    const distinctRuntimeReuse = validateConfig({
+      version: '1',
+      runtimeCredentialPool: {
+        lanes: [
+          { id: 'shared', runtime: 'claude-code-cli', kind: 'subscription' },
+          { id: 'claude-backup', runtime: 'claude-code-cli', kind: 'subscription' },
+          { id: 'shared', runtime: 'codex', kind: 'subscription' },
+          { id: 'codex-backup', runtime: 'codex', kind: 'subscription' },
+        ],
+      },
+      agents: [{ name: 'lead' }],
+    });
+    expect(distinctRuntimeReuse.valid).toBe(true);
+    expect(distinctRuntimeReuse.errors).toEqual([]);
+  });
+
   it('accepts an agent entry with only peer `skills:` (no `agent:`)', () => {
     // The other zero-case: a fully inline agent that overlays skills
     // without referencing a library agent entry. Both peers are
@@ -289,6 +479,301 @@ agents:
       path: 'agents[0].name',
       message: 'Agent manager with type automator is no longer valid. The name manager is reserved for the control plane. Rename this agent to lead-automator (or any non-reserved name) and re-deploy.',
     });
+  });
+
+  it('merges preferred env and resources.env with per-agent precedence', () => {
+    const merged = mergeDefaults({
+      name: 'worker',
+      resources: {
+        env: {
+          AGENT_LEGACY: 'agent-legacy',
+          SHARED: 'agent-legacy',
+        },
+      },
+      env: {
+        AGENT_TOP: 'agent-top',
+        SHARED: 'agent-top',
+      },
+    }, {
+      resources: {
+        env: {
+          DEFAULT_LEGACY: 'default-legacy',
+          SHARED: 'default-legacy',
+        },
+      },
+      env: {
+        DEFAULT_TOP: 'default-top',
+        SHARED: 'default-top',
+      },
+    });
+
+    expect(merged.env).toEqual({
+      DEFAULT_LEGACY: 'default-legacy',
+      DEFAULT_TOP: 'default-top',
+      AGENT_LEGACY: 'agent-legacy',
+      AGENT_TOP: 'agent-top',
+      SHARED: 'agent-top',
+    });
+  });
+
+  it('validates per-agent env and rejects Manager-owned overrides', () => {
+    const valid = validateConfig({
+      version: '1',
+      defaults: { env: { APP_ENV: 'production' } },
+      agents: [{
+        name: 'worker',
+        env: { FEATURE_FLAG: 'enabled' },
+        resources: { env: { LEGACY_VALUE: 'supported' } },
+      }],
+    });
+    expect(valid.valid).toBe(true);
+    expect(valid.errors).toEqual([]);
+
+    const invalid = validateConfig({
+      version: '1',
+      defaults: { env: { PATH: '/attacker/bin' } },
+      agents: [{
+        name: 'worker',
+        env: {
+          ID_AGENT_ID: 'attacker',
+          'INVALID-KEY': 'bad',
+          NON_STRING: 42 as unknown as string,
+        },
+        resources: {
+          env: { XMTP_OPEN_MODE: 'true' },
+        },
+      }],
+    });
+
+    expect(invalid.valid).toBe(false);
+    expect(invalid.errors.map(error => error.path)).toEqual(expect.arrayContaining([
+      'defaults.env.PATH',
+      'agents[0].env.ID_AGENT_ID',
+      'agents[0].env.INVALID-KEY',
+      'agents[0].env.NON_STRING',
+      'agents[0].resources.env.XMTP_OPEN_MODE',
+    ]));
+  });
+
+  it('rejects mixed-case routing, TLS, loader, and provider overrides in every agent env layer', () => {
+    const invalid = validateConfig({
+      version: '1',
+      defaults: {
+        env: {
+          hTtP_pRoXy: 'http://attacker.test',
+          sSl_CeRt_FiLe: '/tmp/attacker.pem',
+        },
+      },
+      agents: [{
+        name: 'worker',
+        env: {
+          lD_lIbRaRy_PaTh: '/tmp/attacker',
+          oPeNaI_bAsE_uRl: 'https://attacker.test',
+          aNtHrOpIc_ApI_kEy: 'secret',
+        },
+        resources: {
+          env: {
+            nOdE_oPtIoNs: '--require=/tmp/attacker.js',
+          },
+        },
+      }],
+    });
+
+    expect(invalid.errors.map(error => error.path)).toEqual(expect.arrayContaining([
+      'defaults.env.hTtP_pRoXy',
+      'defaults.env.sSl_CeRt_FiLe',
+      'agents[0].env.lD_lIbRaRy_PaTh',
+      'agents[0].env.oPeNaI_bAsE_uRl',
+      'agents[0].env.aNtHrOpIc_ApI_kEy',
+      'agents[0].resources.env.nOdE_oPtIoNs',
+    ]));
+  });
+
+  it('allows reviewed lane credentials but rejects lane routing, trust, executable, and malformed values', () => {
+    const result = validateConfig({
+      version: '1',
+      runtimeCredentialPool: {
+        lanes: [
+          {
+            id: 'metered-a',
+            runtime: 'claude-code-cli',
+            kind: 'metered-api',
+            env: {
+              ANTHROPIC_API_KEY: 'reviewed-key',
+              aNtHrOpIc_ApI_kEy: 'mixed-case-key',
+              OPENAI_API_KEY: 'cross-provider-key',
+              OPENAI_ORGANIZATION: 'attacker-org',
+              ANTHROPIC_CUSTOM_HEADERS: 'x-attacker: true',
+              OLLAMA_HOST: 'http://attacker.test',
+              PROVIDER_API_TOKEN: 'attacker-provider-token',
+              hTtP_pRoXy: 'http://attacker.test',
+              lD_lIbRaRy_PaTh: '/tmp/attacker',
+              oPeNaI_bAsE_uRl: 'https://attacker.test',
+              'INVALID-KEY': 'bad',
+              NON_STRING: 42 as unknown as string,
+            },
+          },
+          {
+            id: 'subscription-a',
+            runtime: 'claude-code-cli',
+            kind: 'subscription',
+          },
+          {
+            id: 'subscription-b',
+            runtime: 'claude-code-cli',
+            kind: 'subscription',
+          },
+        ],
+      },
+      agents: [{ name: 'worker' }],
+    });
+
+    expect(result.errors.map(error => error.path)).toEqual(expect.arrayContaining([
+      'runtimeCredentialPool.lanes[0].env.hTtP_pRoXy',
+      'runtimeCredentialPool.lanes[0].env.lD_lIbRaRy_PaTh',
+      'runtimeCredentialPool.lanes[0].env.oPeNaI_bAsE_uRl',
+      'runtimeCredentialPool.lanes[0].env.aNtHrOpIc_ApI_kEy',
+      'runtimeCredentialPool.lanes[0].env.OPENAI_API_KEY',
+      'runtimeCredentialPool.lanes[0].env.OPENAI_ORGANIZATION',
+      'runtimeCredentialPool.lanes[0].env.ANTHROPIC_CUSTOM_HEADERS',
+      'runtimeCredentialPool.lanes[0].env.OLLAMA_HOST',
+      'runtimeCredentialPool.lanes[0].env.PROVIDER_API_TOKEN',
+      'runtimeCredentialPool.lanes[0].env.INVALID-KEY',
+      'runtimeCredentialPool.lanes[0].env.NON_STRING',
+    ]));
+    expect(result.errors.map(error => error.path)).not.toContain(
+      'runtimeCredentialPool.lanes[0].env.ANTHROPIC_API_KEY',
+    );
+  });
+
+  it('rejects malformed execution-policy fields on agents and defaults', () => {
+    const result = validateConfig({
+      version: '1',
+      defaults: {
+        openMode: 'false' as unknown as boolean,
+        dangerouslySkipPermissions: 'false' as unknown as boolean,
+        allowedTools: 'Read' as unknown as string[],
+      },
+      agents: [{
+        name: 'worker',
+        type: 'worker' as any,
+        openMode: 'false' as unknown as boolean,
+        dangerouslySkipPermissions: 'false' as unknown as boolean,
+        allowedTools: ['Read', '  '],
+      }],
+    });
+
+    expect(result.errors.map(error => error.path)).toEqual(expect.arrayContaining([
+      'defaults.openMode',
+      'defaults.dangerouslySkipPermissions',
+      'defaults.allowedTools',
+      'agents[0].type',
+      'agents[0].openMode',
+      'agents[0].dangerouslySkipPermissions',
+      'agents[0].allowedTools',
+    ]));
+  });
+
+  it('rejects explicit allowedTools on runtimes that cannot enforce an exact boundary', () => {
+    const direct = validateConfig({
+      version: '1',
+      agents: [{
+        name: 'worker',
+        runtime: 'codex',
+        allowedTools: [],
+      }],
+    });
+    expect(direct.errors).toContainEqual({
+      path: 'agents[0].allowedTools',
+      message: 'runtime "codex" cannot enforce an exact allowedTools boundary; omit allowedTools or choose a runtime that supports it',
+    });
+
+    const inherited = validateConfig({
+      version: '1',
+      defaults: {
+        runtime: 'codex',
+        allowedTools: ['Read'],
+      },
+      agents: [{ name: 'worker' }],
+    });
+    expect(inherited.errors).toContainEqual({
+      path: 'defaults.allowedTools',
+      message: 'runtime "codex" cannot enforce an exact allowedTools boundary; omit allowedTools or choose a runtime that supports it',
+    });
+  });
+
+  it('accepts only unique whole tool names and fails CLI named MCP boundaries during preflight', () => {
+    const malformed = validateConfig({
+      version: '1',
+      defaults: {
+        allowedTools: ['Read(path)', 'Read(path)'],
+      },
+      agents: [{
+        name: 'worker',
+        runtime: 'claude-agent-sdk',
+        allowedTools: ['Bash(git:*)'],
+      }],
+    });
+    expect(malformed.errors).toEqual(expect.arrayContaining([
+      {
+        path: 'defaults.allowedTools',
+        message: 'allowedTools must be an array of unique exact whole tool names',
+      },
+      {
+        path: 'agents[0].allowedTools',
+        message: 'allowedTools must be an array of unique exact whole tool names',
+      },
+    ]));
+
+    const cliMcp = validateConfig({
+      version: '1',
+      defaults: {
+        runtime: 'claude-code-cli',
+        allowedTools: ['Read', 'mcp__brain__search'],
+      },
+      agents: [{ name: 'worker' }],
+    });
+    expect(cliMcp.errors).toContainEqual({
+      path: 'defaults.allowedTools',
+      message: 'runtime "claude-code-cli" cannot enforce an exact named MCP tool boundary; use claude-agent-sdk',
+    });
+
+    const sdkMcp = validateConfig({
+      version: '1',
+      agents: [{
+        name: 'worker',
+        runtime: 'claude-agent-sdk',
+        allowedTools: ['Read', 'mcp__brain__search'],
+      }],
+    });
+    expect(sdkMcp.errors.filter((error) => error.path.endsWith('allowedTools'))).toEqual([]);
+  });
+
+  it('rejects non-portable declarative names and case-folded duplicates', () => {
+    const result = validateConfig({
+      version: '1',
+      defaults: {
+        plugins: [{ name: 'Shared', path: '/plugins/default-shared' }],
+      },
+      agents: [{
+        name: 'CON',
+        agent: 'NUL.txt',
+        plugins: [
+          { name: 'shared', path: '/plugins/agent-shared' },
+          { name: 'COM1.foo', path: '/plugins/device' },
+        ],
+        skills: ['Build', 'build', 'release.'],
+      }],
+    });
+
+    expect(result.errors.map(error => error.path)).toEqual(expect.arrayContaining([
+      'agents[0].name',
+      'agents[0].agent',
+      'agents[0].plugins[0].name',
+      'agents[0].plugins[1].name',
+      'agents[0].skills[1]',
+      'agents[0].skills[2]',
+    ]));
   });
 
   describe('catalog seed parsing', () => {

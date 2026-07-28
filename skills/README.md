@@ -72,13 +72,14 @@ Claude agents running in this environment can access skills by:
    cat ./skills/inter-agent/SKILL.md
    ```
 
-2. **Using the executable scripts:**
+2. **Using the scoped coordination endpoints documented by the skill:**
    ```bash
-   cd ./skills/idagents-admin-control
-   ./remote-command.sh "/agents"
+   cat ./skills/inter-agent/SKILL.md
    ```
 
-3. **Following the instructions** to make direct API calls
+3. **Following the instructions** without crossing the managed administration
+   boundary. Team deployment, lifecycle, identity, wallet, and Manager changes
+   go through IDACC; workers do not call `/remote` or synthesize admin headers.
 
 ### As a Developer
 

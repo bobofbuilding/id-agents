@@ -116,11 +116,25 @@ beforeAll(async () => {
         ows_wallet_seed: 'word1 word2 word3',
         my_private_key: 'another-private-key',
         api_secret: 'api-secret-value',
+        env: {
+          CUSTOM_API_TOKEN: 'arbitrary-name-secret',
+        },
+        resources: {
+          cpu: 1,
+          env: {
+            ANOTHER_OPAQUE_VALUE: 'resource-secret',
+          },
+        },
         safe_field: 'this-should-remain',
       },
     }),
   });
   expect(metaResp.status).toBe(200);
+  const seeded = await db.agents.getById(agentId);
+  await db.agents.updateMetadata(agentId, {
+    ...((seeded?.metadata as Record<string, unknown>) || {}),
+    identityKey: 'stable-sensitive-agent',
+  });
 }, 30000);
 
 afterAll(async () => {
@@ -154,6 +168,8 @@ describe('Admin principal sees unredacted record', () => {
     expect(body.metadata?.ows_wallet_seed).toBe('word1 word2 word3');
     expect(body.metadata?.my_private_key).toBe('another-private-key');
     expect(body.metadata?.api_secret).toBe('api-secret-value');
+    expect(body.metadata?.env?.CUSTOM_API_TOKEN).toBe('arbitrary-name-secret');
+    expect(body.metadata?.resources?.env?.ANOTHER_OPAQUE_VALUE).toBe('resource-secret');
   });
 
   it('GET /agents returns ssh_target for admin', async () => {
@@ -190,6 +206,8 @@ describe('Non-admin principal gets redacted record', () => {
     // regex-net catches these:
     expect(body.metadata?.my_private_key).toBeUndefined();
     expect(body.metadata?.api_secret).toBeUndefined();
+    expect(body.metadata?.env).toBeUndefined();
+    expect(body.metadata?.resources?.env).toBeUndefined();
   });
 
   it('GET /agents/:id preserves non-sensitive metadata for non-admin', async () => {
@@ -219,6 +237,47 @@ describe('Non-admin principal gets redacted record', () => {
     const agent = body.agents.find((a: any) => a.id === agentId);
     expect(agent.metadata?.auth_key_ref).toBeUndefined();
     expect(agent.metadata?.ssh_private_key).toBeUndefined();
+    expect(agent.metadata?.env).toBeUndefined();
+  });
+
+  it('metadata mutation responses do not echo persisted env to non-admin callers', async () => {
+    const resp = await fetch(`${baseUrl}/agents/${agentId}/metadata`, {
+      method: 'POST',
+      headers: anonHeaders('public'),
+      body: JSON.stringify({ metadata: { safe_field: 'still-safe' } }),
+    });
+    expect(resp.status).toBe(200);
+    const body = await resp.json() as any;
+    expect(body.metadata?.safe_field).toBe('still-safe');
+    expect(body.metadata?.env).toBeUndefined();
+    expect(body.metadata?.resources?.env).toBeUndefined();
+  });
+
+  it('generic metadata and remote meta commands cannot corrupt identityKey', async () => {
+    for (const target of [
+      `${baseUrl}/agents/${agentId}/metadata`,
+      `${baseUrl}/agents/by-name/sensitive-agent/metadata`,
+    ]) {
+      const resp = await fetch(target, {
+        method: 'POST',
+        headers: anonHeaders('public'),
+        body: JSON.stringify({ metadata: { identityKey: null } }),
+      });
+      expect(resp.status).toBe(403);
+    }
+
+    const remote = await fetch(`${baseUrl}/remote`, {
+      method: 'POST',
+      headers: anonHeaders('public'),
+      body: JSON.stringify({
+        command: '/meta set sensitive-agent identityKey corrupt-owner',
+      }),
+    });
+    expect(remote.status).toBe(200);
+    expect((await remote.json() as any).ok).toBe(false);
+
+    const row = await db.agents.getById(agentId);
+    expect((row?.metadata as any)?.identityKey).toBe('stable-sensitive-agent');
   });
 
   it('GET /agents/by-name/:name omits sensitive fields for non-admin', async () => {

@@ -9,10 +9,10 @@ export class SqliteRuntimeLaneCooldownsRepo implements RuntimeLaneCooldownsRepos
   async upsert(cooldown: RuntimeLaneCooldownRecord): Promise<void> {
     await this.db.query(
       `INSERT INTO runtime_lane_cooldowns (
-         lane_id, runtime, kind, cooling_until_ms, observed_at_ms, reason,
+         lane_id, runtime, runtime_namespace, kind, cooling_until_ms, observed_at_ms, reason,
          team_id, agent_id, agent_name, query_id, reset_text, message
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(lane_id) DO UPDATE SET
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(team_id, runtime_namespace, lane_id) DO UPDATE SET
          runtime = excluded.runtime,
          kind = excluded.kind,
          cooling_until_ms = excluded.cooling_until_ms,
@@ -27,6 +27,7 @@ export class SqliteRuntimeLaneCooldownsRepo implements RuntimeLaneCooldownsRepos
       [
         cooldown.lane_id,
         cooldown.runtime,
+        cooldown.runtime_namespace,
         cooldown.kind,
         cooldown.cooling_until_ms,
         cooldown.observed_at_ms,
@@ -43,11 +44,11 @@ export class SqliteRuntimeLaneCooldownsRepo implements RuntimeLaneCooldownsRepos
 
   async listActive(nowMs: number): Promise<RuntimeLaneCooldownRecord[]> {
     const { rows } = await this.db.query<RuntimeLaneCooldownRecord>(
-      `SELECT lane_id, runtime, kind, cooling_until_ms, observed_at_ms, reason,
+      `SELECT lane_id, runtime, runtime_namespace, kind, cooling_until_ms, observed_at_ms, reason,
               team_id, agent_id, agent_name, query_id, reset_text, message
        FROM runtime_lane_cooldowns
        WHERE cooling_until_ms > ?
-       ORDER BY lane_id`,
+       ORDER BY team_id, runtime_namespace, lane_id`,
       [nowMs],
     );
     return rows;

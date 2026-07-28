@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 import type { DbAdapter } from '../../db-adapter.js';
-import type { AgentsRepository } from '../../db-service.js';
+import type { AgentRedeployFields, AgentsRepository } from '../../db-service.js';
 import type { AgentRow } from '../../types.js';
 import { parseJsonObject, stringifyJson } from '../../db-json.js';
 import { parseAgentRef } from '../../../core/agent-identifier.js';
@@ -213,6 +213,16 @@ export class SqliteAgentsRepo implements AgentsRepository {
     return this.parseRows(rows);
   }
 
+  async listAllActive(teamId: string): Promise<AgentRow[]> {
+    const { rows } = await this.db.query(
+      `SELECT * FROM agents
+       WHERE team_id = ? AND deleted_at IS NULL
+       ORDER BY created_at DESC`,
+      [teamId],
+    );
+    return this.parseRows(rows);
+  }
+
   async nextPort(): Promise<number> {
     const { rows } = await this.db.query<{ max_port: number | null }>(
       `SELECT MAX(port) as max_port FROM agents
@@ -369,6 +379,42 @@ export class SqliteAgentsRepo implements AgentsRepository {
     );
   }
 
+  async redeploy(agentId: string, fields: AgentRedeployFields): Promise<void> {
+    const result = await this.db.query(
+      `UPDATE agents
+       SET name = ?,
+           type = ?,
+           model = ?,
+           port = ?,
+           endpoint = ?,
+           working_directory = ?,
+           status = ?,
+           metadata = ?,
+           runtime = ?,
+           token_id = ?,
+           domain = ?,
+           deleted_at = NULL
+       WHERE id = ? AND deleted_at IS NULL`,
+      [
+        fields.name,
+        fields.type,
+        fields.model,
+        fields.port,
+        fields.endpoint,
+        fields.working_directory,
+        fields.status,
+        stringifyJson(fields.metadata),
+        fields.runtime,
+        fields.token_id,
+        fields.domain,
+        agentId,
+      ],
+    );
+    if (result.rowCount !== 1) {
+      throw new Error(`Agent redeploy expected one row for ${agentId}, updated ${result.rowCount}`);
+    }
+  }
+
   async updateIdentity(
     agentId: string,
     fields: {
@@ -420,6 +466,119 @@ export class SqliteAgentsRepo implements AgentsRepository {
       `UPDATE agents SET metadata = ? WHERE id = ?`,
       [stringifyJson(metadata), agentId],
     );
+  }
+
+  async transitionOwnedProcessExit(
+    agentId: string,
+    processGeneration: string,
+    restartAfterManagerStart: boolean,
+  ): Promise<boolean> {
+    const restart = restartAfterManagerStart ? 1 : 0;
+    const withoutProcess = `
+      json_remove(
+        COALESCE(metadata, '{}'),
+        '$.pid',
+        '$.processOwner',
+        '$.processParentPid',
+        '$.processInspectedAt',
+        '$.processGeneration',
+        '$.processRuntime',
+        '$.processRuntimeLane'
+      )`;
+    const result = await this.db.query(
+      `UPDATE agents
+          SET status = CASE
+                WHEN ? = 1 OR json_extract(metadata, '$.managerRestartRequested') = 1
+                  THEN 'offline'
+                ELSE 'stopped'
+              END,
+              metadata = CASE
+                WHEN ? = 1 OR json_extract(metadata, '$.managerRestartRequested') = 1
+                  THEN json_set(
+                    ${withoutProcess},
+                    '$.managerRestartRequested',
+                    json('true')
+                  )
+                ELSE json_remove(
+                  ${withoutProcess},
+                  '$.managerRestartRequested',
+                  '$.managerOwnedLaunchIntent'
+                )
+              END
+        WHERE id = ?
+          AND json_extract(metadata, '$.processGeneration') = ?`,
+      [
+        restart,
+        restart,
+        agentId,
+        processGeneration,
+      ],
+    );
+    return result.rowCount === 1;
+  }
+
+  async updateOwnedProcessState(
+    agentId: string,
+    processGeneration: string,
+    status: string,
+    metadata?: Record<string, unknown>,
+  ): Promise<boolean> {
+    if (
+      metadata !== undefined
+      && metadata.processGeneration !== processGeneration
+    ) {
+      throw new Error('owned process metadata generation mismatch');
+    }
+    const result = metadata === undefined
+      ? await this.db.query(
+          `UPDATE agents
+              SET status = ?
+            WHERE id = ?
+              AND json_extract(metadata, '$.processGeneration') = ?`,
+          [status, agentId, processGeneration],
+        )
+      : await this.db.query(
+          `UPDATE agents
+              SET status = ?,
+                  metadata = ?
+            WHERE id = ?
+              AND json_extract(metadata, '$.processGeneration') = ?`,
+          [status, stringifyJson(metadata), agentId, processGeneration],
+        );
+    return result.rowCount === 1;
+  }
+
+  async clearOwnedProcessMetadata(
+    agentId: string,
+    expectedPid?: number,
+    expectedGeneration?: string,
+  ): Promise<boolean> {
+    const conditions = ['id = ?'];
+    const params: unknown[] = [agentId];
+    if (expectedPid !== undefined) {
+      conditions.push("CAST(json_extract(metadata, '$.pid') AS INTEGER) = ?");
+      params.push(expectedPid);
+    }
+    if (expectedGeneration !== undefined) {
+      conditions.push("json_extract(metadata, '$.processGeneration') = ?");
+      params.push(expectedGeneration);
+    }
+    const result = await this.db.query(
+      `UPDATE agents
+          SET metadata = json_remove(
+            COALESCE(metadata, '{}'),
+            '$.pid',
+            '$.processOwner',
+            '$.processParentPid',
+            '$.processInspectedAt',
+            '$.processGeneration',
+            '$.processRuntime',
+            '$.processRuntimeLane'
+          )
+        WHERE ${conditions.join(' AND ')}`,
+      params,
+    );
+    return result.rowCount === 1;
   }
 
   async moveToTeam(agentId: string, teamId: string, status?: string): Promise<void> {

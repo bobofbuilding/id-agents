@@ -29,6 +29,11 @@ import net from 'net';
 const MANAGER_URL = process.env.MANAGER_URL || 'http://127.0.0.1:4100';
 const REPLY_TIMEOUT = parseInt(process.env.ADMIN_REPLY_TIMEOUT) || 300000; // 5 min
 
+if (process.env.IDACC_MANAGER_AGENT_TOKEN || process.env.IDACC_DATA_DIR) {
+  console.error('Managed IDACC workers cannot run raw Manager administration. Use the IDACC application.');
+  process.exit(2);
+}
+
 // Find an available port dynamically
 async function findAvailablePort(startPort = 4050, endPort = 4149) {
   for (let port = startPort; port <= endPort; port++) {

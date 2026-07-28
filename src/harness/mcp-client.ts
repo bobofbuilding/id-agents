@@ -15,6 +15,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { McpServerSpec } from './types.js';
+import { exactWholeToolNames, mcpStdioProcessEnv } from './mcp.js';
 
 export interface HubTool {
   /** MCP server this tool came from. */
@@ -45,16 +46,6 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
     const t = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
     p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
   });
-}
-
-/** String-only copy of the current env merged with the spec's extra env, so a
- *  spawned stdio server inherits PATH/HOME/etc. (same trust boundary as the
- *  Claude/Codex harnesses — local, single-user). */
-function stringEnv(extra?: Record<string, string>): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(process.env)) if (typeof v === 'string') out[k] = v;
-  if (extra) for (const [k, v] of Object.entries(extra)) out[k] = String(v);
-  return out;
 }
 
 /** OpenAI/Ollama tool names must match ^[a-zA-Z0-9_-]{1,64}$. */
@@ -115,7 +106,11 @@ export class McpToolHub {
     const transport = spec.transport || (spec.url ? 'http' : 'stdio');
     if (transport === 'stdio') {
       if (!spec.command) throw new Error(`stdio server "${spec.name}" missing command`);
-      return new StdioClientTransport({ command: spec.command, args: spec.args || [], env: stringEnv(spec.env) });
+      return new StdioClientTransport({
+        command: spec.command,
+        args: spec.args || [],
+        env: mcpStdioProcessEnv(spec.env),
+      });
     }
     if (!spec.url) throw new Error(`${transport} server "${spec.name}" missing url`);
     const url = new URL(spec.url);
@@ -203,6 +198,69 @@ export function mcpToOpenAiTools(tools: HubTool[]): OpenAiTool[] {
     type: 'function',
     function: { name: t.exposed, description: t.description, parameters: sanitizeSchema(t.inputSchema) },
   }));
+}
+
+/**
+ * Apply an exact declarative tool-exposure boundary to OpenAI-compatible MCP
+ * tools. `undefined` preserves runtime defaults while an explicit empty array
+ * exposes no tools. Declarative names must identify the full owning server:
+ * either the actual `<server>__<tool>` name advertised to the model or the
+ * canonical Claude-style `mcp__<server>__<tool>` spelling. Bare final segments
+ * are intentionally rejected because two servers may publish the same name.
+ */
+export function filterOpenAiToolsForAllowlist(
+  tools: OpenAiTool[],
+  allowedTools: string[] | undefined,
+): OpenAiTool[] {
+  if (allowedTools === undefined) return tools;
+  const allowed = new Set(exactWholeToolNames(allowedTools));
+  return tools.filter((tool) => {
+    const exposedName = tool.function.name;
+    return allowed.has(exposedName) || allowed.has(`mcp__${exposedName}`);
+  });
+}
+
+/**
+ * Avoid even starting MCP servers that cannot own an explicitly allowed tool.
+ * Server startup is executable code, so schema filtering after connection is
+ * too late to represent an explicit empty or built-in-only boundary.
+ */
+export function filterOpenAiMcpServersForAllowlist(
+  servers: McpServerSpec[] | undefined,
+  allowedTools: string[] | undefined,
+): McpServerSpec[] {
+  const configured = servers || [];
+  if (allowedTools === undefined) return [...configured];
+  const allowed = exactWholeToolNames(allowedTools);
+  return configured.filter((server) => {
+    const exposedPrefix = `${server.name}__`;
+    const canonicalPrefix = `mcp__${server.name}__`;
+    return allowed.some((tool) => (
+      (tool.startsWith(exposedPrefix) && tool.length > exposedPrefix.length)
+      || (tool.startsWith(canonicalPrefix) && tool.length > canonicalPrefix.length)
+    ));
+  });
+}
+
+/** Exact set of names the model was actually shown and may therefore execute. */
+export function openAiToolExecutionSet(tools: OpenAiTool[]): ReadonlySet<string> {
+  return new Set(tools.map((tool) => tool.function.name));
+}
+
+export async function callOpenAiToolWithinBoundary(
+  hub: Pick<McpToolHub, 'callTool'>,
+  executableToolNames: ReadonlySet<string>,
+  call: OpenAiToolCall,
+  signal?: AbortSignal,
+): Promise<{ text: string; isError: boolean }> {
+  const exposed = call.function?.name || '';
+  if (!executableToolNames.has(exposed)) {
+    return {
+      text: `Tool "${exposed}" is outside the exact advertised tool boundary`,
+      isError: true,
+    };
+  }
+  return hub.callTool(exposed, parseOpenAiCallArgs(call), signal);
 }
 
 /** Parse a streamed/assembled OpenAI tool-call's `arguments` string into an object.

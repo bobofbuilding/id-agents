@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import {
   brainMcpProcessEnv,
+  mcpStdioProcessEnv,
   parseBrainMcpArgs,
   parseMcpServersEnv,
   sameMcpServerSnapshot,
@@ -14,14 +15,22 @@ describe('toMcpServerRecord — normalize McpServerSpec[] → SDK/.mcp.json reco
     const specs: McpServerSpec[] = [
       { name: 'fs', transport: 'stdio', command: 'npx', args: ['-y', 'server-filesystem', '/tmp'], env: { FOO: 'bar' } },
     ];
-    expect(toMcpServerRecord(specs)).toEqual({
-      fs: { type: 'stdio', command: 'npx', args: ['-y', 'server-filesystem', '/tmp'], env: { FOO: 'bar' } },
+    expect(toMcpServerRecord(specs, {
+      PATH: '/reviewed/bin',
+      OPENAI_API_KEY: 'must-not-cross',
+    })).toEqual({
+      fs: {
+        type: 'stdio',
+        command: 'npx',
+        args: ['-y', 'server-filesystem', '/tmp'],
+        env: { PATH: '/reviewed/bin', FOO: 'bar' },
+      },
     });
   });
 
   it('defaults missing transport to stdio', () => {
-    const out = toMcpServerRecord([{ name: 'x', command: 'run-it' }]);
-    expect(out.x).toEqual({ type: 'stdio', command: 'run-it' });
+    const out = toMcpServerRecord([{ name: 'x', command: 'run-it' }], {});
+    expect(out.x).toEqual({ type: 'stdio', command: 'run-it', env: {} });
   });
 
   it('maps http + sse servers with headers', () => {
@@ -45,6 +54,49 @@ describe('toMcpServerRecord — normalize McpServerSpec[] → SDK/.mcp.json reco
 
   it('returns an empty record for an empty list', () => {
     expect(toMcpServerRecord([])).toEqual({});
+  });
+
+  it('passes only reviewed launcher values plus the server-explicit credential', () => {
+    const inherited = {
+      PATH: '/usr/local/bin:/usr/bin',
+      HOME: '/Users/consumer',
+      SHELL: '/bin/zsh',
+      TMPDIR: '/private/tmp/consumer/',
+      LANG: 'en_US.UTF-8',
+      OPENAI_API_KEY: 'openai-secret',
+      ANTHROPIC_API_KEY: 'anthropic-secret',
+      ID_PROVIDER_API_KEY: 'provider-secret',
+      DATABASE_URL: 'postgresql://secret',
+      SKILLMESH_PRIVATE_KEY: 'wallet-secret',
+      BRAIN_TOKEN: 'ambient-brain-secret',
+    };
+    const explicit = {
+      BRAIN_MCP_BASE_URL: 'http://127.0.0.1:49123',
+      BRAIN_TOKEN: 'scoped-brain-token',
+    };
+
+    const sanitized = mcpStdioProcessEnv(explicit, inherited);
+    expect(sanitized).toEqual({
+      PATH: '/usr/local/bin:/usr/bin',
+      HOME: '/Users/consumer',
+      SHELL: '/bin/zsh',
+      TMPDIR: '/private/tmp/consumer/',
+      LANG: 'en_US.UTF-8',
+      BRAIN_MCP_BASE_URL: 'http://127.0.0.1:49123',
+      BRAIN_TOKEN: 'scoped-brain-token',
+    });
+    expect(sanitized).not.toHaveProperty('OPENAI_API_KEY');
+    expect(sanitized).not.toHaveProperty('ANTHROPIC_API_KEY');
+    expect(sanitized).not.toHaveProperty('ID_PROVIDER_API_KEY');
+    expect(sanitized).not.toHaveProperty('DATABASE_URL');
+    expect(sanitized).not.toHaveProperty('SKILLMESH_PRIVATE_KEY');
+
+    expect(toMcpServerRecord([{
+      name: 'brain',
+      command: 'node',
+      args: ['brain-mcp.mjs'],
+      env: explicit,
+    }], inherited).brain).toMatchObject({ env: sanitized });
   });
 });
 

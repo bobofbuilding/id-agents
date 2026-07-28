@@ -11,6 +11,13 @@ import {
 } from '../../src/harness/codex.js';
 
 describe('Codex harness permission policy', () => {
+  it('fails closed when a dispatch requires a zero-local-tool text-only runtime', () => {
+    expect(() => codexPermissionArgs({
+      skipPermissions: true,
+      executionPolicy: 'external-text-only',
+    })).toThrow(/cannot guarantee a zero-local-tool text-only execution policy/i);
+  });
+
   it('uses read-only sandbox config for control-plane prompts', () => {
     expect(codexPermissionArgs({
       skipPermissions: true,

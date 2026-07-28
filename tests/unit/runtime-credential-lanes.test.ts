@@ -37,6 +37,17 @@ function fakeDb(overrides: Record<string, any> = {}): any {
   };
 }
 
+function seedRuntimeLaneCooldown(
+  manager: any,
+  teamId: string,
+  cooldown: Record<string, any> & { laneId: string; runtime: string },
+): void {
+  manager.runtimeLaneCooldowns.set(
+    manager.runtimeLaneCooldownKey(teamId, cooldown.runtime, cooldown.laneId),
+    cooldown,
+  );
+}
+
 describe('runtime credential lanes', () => {
   afterEach(() => {
     delete process.env.ID_RUNTIME_CREDENTIAL_POOL;
@@ -245,7 +256,7 @@ describe('runtime credential lanes', () => {
 
   it('skips a cooling subscription runtime and selects the next active runtime', () => {
     const manager = new AgentManagerDb('/tmp/id-agents-subscription-order-test', fakeDb(), { libraryRoot: null }) as any;
-    manager.runtimeLaneCooldowns.set('codex:default', {
+    seedRuntimeLaneCooldown(manager, 'team-1', {
       laneId: 'codex:default',
       runtime: 'codex',
       kind: 'subscription',
@@ -434,10 +445,166 @@ describe('runtime credential lanes', () => {
     await manager.hydrateRuntimeStateFromTeams();
 
     expect(manager.runtimeCredentialLanes('claude-code-cli', 'team-1').map((lane: any) => lane.id)).toEqual(['sub-a', 'sub-b', 'metered']);
-    expect(manager.runtimeLaneCooldowns.has('sub-a')).toBe(true);
-    expect(manager.runtimeLaneCooldowns.get('sub-a')).toMatchObject({ queryId: 'query-original', coolingUntilMs: future });
+    const laneKey = manager.runtimeLaneCooldownKey('team-1', 'claude-code-cli', 'sub-a');
+    expect(manager.runtimeLaneCooldowns.has(laneKey)).toBe(true);
+    expect(manager.runtimeLaneCooldowns.get(laneKey)).toMatchObject({ queryId: 'query-original', coolingUntilMs: future });
     expect(db.runtimeLaneCooldowns.pruneExpired).toHaveBeenCalledWith(expect.any(Number));
     expect(db.runtimeLaneCooldowns.listActive).toHaveBeenCalledWith(expect.any(Number));
+  });
+
+  it('does not cool another team that uses the same raw lane id', async () => {
+    const db = fakeDb();
+    const manager = new AgentManagerDb('/tmp/id-agents-runtime-team-namespace-test', db, { libraryRoot: null }) as any;
+    const pool = {
+      lanes: [
+        { id: 'shared-subscription', runtime: 'claude-code-cli', kind: 'subscription' },
+        { id: 'backup-subscription', runtime: 'claude-code-cli', kind: 'subscription' },
+      ],
+    };
+    manager.runtimeCredentialPoolByTeam.set('team-a', pool);
+    manager.runtimeCredentialPoolByTeam.set('team-b', pool);
+
+    await manager.recordRuntimeRateLimit('team-a', {
+      runtime: 'claude-code-cli',
+      laneId: 'shared-subscription',
+      rateLimit: {
+        reason: 'subscription_monthly_cap',
+        retryAfterSeconds: 60,
+      },
+    });
+
+    expect(manager.chooseRuntimeCredentialLane('claude-code-cli', undefined, 'team-a').id)
+      .toBe('backup-subscription');
+    expect(manager.chooseRuntimeCredentialLane('claude-code-cli', undefined, 'team-b').id)
+      .toBe('shared-subscription');
+    expect(db.runtimeLaneCooldowns.upsert).toHaveBeenCalledWith(expect.objectContaining({
+      team_id: 'team-a',
+      runtime: 'claude-code-cli',
+      runtime_namespace: 'claude-code-cli',
+      lane_id: 'shared-subscription',
+    }));
+  });
+
+  it('does not collide when different canonical runtimes reuse the same raw lane id', async () => {
+    const manager = new AgentManagerDb('/tmp/id-agents-runtime-runtime-namespace-test', fakeDb(), { libraryRoot: null }) as any;
+    manager.runtimeCredentialPoolByTeam.set('team-1', {
+      lanes: [
+        { id: 'shared', runtime: 'codex', kind: 'subscription' },
+        { id: 'codex-backup', runtime: 'codex', kind: 'subscription' },
+        { id: 'shared', runtime: 'claude-code-cli', kind: 'subscription' },
+        { id: 'claude-backup', runtime: 'claude-code-cli', kind: 'subscription' },
+      ],
+    });
+
+    await manager.recordRuntimeRateLimit('team-1', {
+      runtime: 'codex',
+      laneId: 'shared',
+      rateLimit: {
+        reason: 'subscription_monthly_cap',
+        retryAfterSeconds: 60,
+      },
+    });
+
+    expect(manager.chooseRuntimeCredentialLane('codex', undefined, 'team-1').id)
+      .toBe('codex-backup');
+    expect(manager.chooseRuntimeCredentialLane('claude-code-cli', undefined, 'team-1').id)
+      .toBe('shared');
+  });
+
+  it('hydrates a cooldown under its persisted owner and restores another team independently', async () => {
+    const now = Date.now();
+    const pool = {
+      lanes: [
+        { id: 'shared-subscription', runtime: 'claude-code-cli', kind: 'subscription' },
+        { id: 'backup-subscription', runtime: 'claude-code-cli', kind: 'subscription' },
+      ],
+    };
+    const db = fakeDb({
+      teams: {
+        listTeamsWithConfig: vi.fn(async () => [
+          { id: 'team-a', name: 'Team A', config: { runtimeCredentialPool: pool } },
+          { id: 'team-b', name: 'Team B', config: { runtimeCredentialPool: pool } },
+        ]),
+      },
+      runtimeLaneCooldowns: {
+        listActive: vi.fn(async () => [{
+          lane_id: 'shared-subscription',
+          runtime: 'claude-code-cli',
+          runtime_namespace: 'claude-code-cli',
+          kind: 'subscription',
+          cooling_until_ms: now + 60_000,
+          observed_at_ms: now,
+          reason: 'subscription_monthly_cap',
+          team_id: 'team-a',
+          agent_id: 'agent-a',
+          agent_name: 'worker-a',
+          query_id: 'query-a',
+          reset_text: null,
+          message: null,
+        }]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-runtime-owner-hydration-test', db, { libraryRoot: null }) as any;
+    manager.rebuildLocalClaudeAgent = vi.fn(async () => ({ success: true, pid: 1234 }));
+
+    await manager.hydrateRuntimeStateFromTeams();
+
+    expect(manager.isRuntimeLaneCooling(
+      'team-a',
+      'claude-code-cli',
+      'shared-subscription',
+      now,
+    )).toBe(true);
+    expect(manager.isRuntimeLaneCooling(
+      'team-b',
+      'claude-code-cli',
+      'shared-subscription',
+      now,
+    )).toBe(false);
+
+    const restored = await manager.restoreAgentFromRateLimitFallbackIfReady(
+      'team-b',
+      'Team B',
+      {
+        team_id: 'team-b',
+        id: 'agent-b',
+        name: 'worker-b',
+        type: 'claude',
+        model: 'claude-sonnet-5',
+        port: 4312,
+        endpoint: 'http://localhost:4312',
+        working_directory: '/tmp/agent-b',
+        status: 'running',
+        created_at: 1,
+        registry: null,
+        metadata: {
+          runtimeCredentialLane: 'backup-subscription',
+          runtimeRateLimitFailover: {
+            fromLaneId: 'shared-subscription',
+            toLaneId: 'backup-subscription',
+          },
+        },
+        deleted_at: null,
+        runtime: 'claude-code-cli',
+        token_id: null,
+        domain: null,
+        api_key: null,
+        customer_domain: null,
+        public_endpoint_url: null,
+        internal_endpoint_url: null,
+        ssh_target: null,
+        last_seen: null,
+        last_probed_at: null,
+        last_error: null,
+        consecutive_failures: 0,
+      },
+      now,
+    );
+
+    expect(restored).toBe(true);
+    expect(db.agents.updateStatus).toHaveBeenCalledWith('agent-b', 'pending', expect.objectContaining({
+      metadata: expect.objectContaining({ runtimeCredentialLane: 'shared-subscription' }),
+    }));
   });
 
   it('falls back to a local model before metered overflow when every subscription lane hits a daily/weekly subscription cap', async () => {
@@ -502,7 +669,7 @@ describe('runtime credential lanes', () => {
         { id: 'metered', runtime: 'claude-code-cli', kind: 'metered-api', env: { ANTHROPIC_API_KEY: 'test-key' } },
       ],
     });
-    manager.runtimeLaneCooldowns.set('sub-b', {
+    seedRuntimeLaneCooldown(manager, 'team-1', {
       laneId: 'sub-b',
       runtime: 'claude-code-cli',
       kind: 'subscription',
@@ -773,7 +940,7 @@ describe('runtime credential lanes', () => {
         { id: 'metered', runtime: 'claude-code-cli', kind: 'metered-api', env: { ANTHROPIC_API_KEY: 'test-key' } },
       ],
     });
-    manager.runtimeLaneCooldowns.set('sub-b', {
+    seedRuntimeLaneCooldown(manager, 'team-1', {
       laneId: 'sub-b',
       runtime: 'claude-code-cli',
       kind: 'subscription',
@@ -818,6 +985,38 @@ describe('runtime credential lanes', () => {
 
     const resetAt = new Date(Date.now() + 47 * 60_000).toISOString();
     expect(manager.parseCooldownUntilMs({ reason: 'unknown_rate_limit', resetAt })).toBe(Date.parse(resetAt));
+  });
+
+  it('bounds and canonicalizes untrusted managed-worker cooldown telemetry', () => {
+    const manager = new AgentManagerDb('/tmp/id-agents-runtime-test', fakeDb(), { libraryRoot: null }) as any;
+    const before = Date.now();
+    const normalized = manager.normalizeManagedRuntimeRateLimit({
+      isRateLimit: true,
+      source: 'forged-source',
+      status: 999,
+      reason: 'forged-reason',
+      retryAfterSeconds: 999_999_999,
+      resetAt: '2999-01-01T00:00:00.000Z',
+      resetText: `reset\u0000${'x'.repeat(1_000)}`,
+      message: `message\u0000${'m'.repeat(4_000)}`,
+      secret: 'must-not-survive',
+    });
+
+    expect(normalized).toMatchObject({
+      isRateLimit: true,
+      source: 'text-fallback',
+      reason: 'unknown_rate_limit',
+      retryAfterSeconds: 8 * 24 * 60 * 60,
+    });
+    expect(normalized).not.toHaveProperty('status');
+    expect(normalized).not.toHaveProperty('resetAt');
+    expect(normalized).not.toHaveProperty('secret');
+    expect(normalized.resetText).toHaveLength(500);
+    expect(normalized.message).toHaveLength(2_000);
+    expect(manager.parseCooldownUntilMs(normalized)).toBeGreaterThan(before);
+    expect(manager.parseCooldownUntilMs(normalized)).toBeLessThanOrEqual(
+      Date.now() + 8 * 24 * 60 * 60_000,
+    );
   });
 
   it('selects local fallback models from agent responsibilities when no override is set', async () => {
@@ -1120,7 +1319,7 @@ describe('runtime credential lanes', () => {
       },
     });
     const manager = new AgentManagerDb('/tmp/id-agents-runtime-test', db, { libraryRoot: null }) as any;
-    manager.runtimeLaneCooldowns.set('claude-code-cli:default', {
+    seedRuntimeLaneCooldown(manager, 'team-1', {
       laneId: 'claude-code-cli:default',
       runtime: 'claude-code-cli',
       kind: 'subscription',
@@ -1409,7 +1608,7 @@ describe('runtime credential lanes', () => {
         { id: 'metered', runtime: 'claude-code-cli', kind: 'metered-api', env: { ANTHROPIC_API_KEY: 'test-key' } },
       ],
     });
-    manager.runtimeLaneCooldowns.set('sub-b', {
+    seedRuntimeLaneCooldown(manager, 'team-1', {
       laneId: 'sub-b',
       runtime: 'claude-code-cli',
       kind: 'subscription',

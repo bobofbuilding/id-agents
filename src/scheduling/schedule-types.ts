@@ -132,4 +132,6 @@ export interface DispatchTarget {
   talkPath: string;
   schedulePath?: string | null;
   status: string;
+  /** Manager-to-worker generation-bound headers in managed desktop mode. */
+  requestHeaders?: Record<string, string>;
 }

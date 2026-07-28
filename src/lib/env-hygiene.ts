@@ -27,20 +27,24 @@ export const SESSION_HANDOFF_VARS = [
 
 export type SessionHandoffVar = typeof SESSION_HANDOFF_VARS[number];
 
-const HANDOFF_SET: Set<string> = new Set(SESSION_HANDOFF_VARS);
+const REVIEWED_CLAUDE_CONFIG_VARS = new Set([
+  'CLAUDE_MODEL',
+]);
 
 /**
- * Return CLAUDE_* entries from `env`, minus the known session-handoff vars.
- * Legitimate config vars like CLAUDE_MODEL pass through.
+ * Return only the reviewed, non-secret Claude worker configuration. This is
+ * deliberately an allowlist: new CLAUDE_* variables may carry authentication,
+ * provider routing, or host-session state and must not cross the Manager
+ * boundary until reviewed.
  */
 export function filterClaudeEnvVars(
   env: NodeJS.ProcessEnv,
 ): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(env)) {
-    if (!k.startsWith('CLAUDE')) continue;
-    if (HANDOFF_SET.has(k)) continue;
-    out[k] = v || '';
+    if (!REVIEWED_CLAUDE_CONFIG_VARS.has(k)) continue;
+    if (typeof v !== 'string' || !v) continue;
+    out[k] = v;
   }
   return out;
 }

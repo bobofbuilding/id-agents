@@ -87,6 +87,20 @@ export interface TeamsRepository {
 // AgentsRepository
 // ---------------------------------------------------------------------------
 
+export interface AgentRedeployFields {
+  name: string;
+  type: string;
+  model: string;
+  port: number;
+  endpoint: string | null;
+  working_directory: string;
+  status: string;
+  metadata: Record<string, unknown>;
+  runtime: string;
+  token_id: string | null;
+  domain: string | null;
+}
+
 export interface AgentsRepository {
   /** Look up an agent by its primary key (id). Non-deleted only. */
   getById(agentId: string): Promise<AgentRow | null>;
@@ -126,6 +140,13 @@ export interface AgentsRepository {
    * By default hides automator agents; pass includeAutomator=true to include them.
    */
   list(teamId: string, includeAutomator?: boolean): Promise<AgentRow[]>;
+
+  /**
+   * List every non-deleted row in a team, including interactive and virtual
+   * identities. Intended for collision/security preflight, not normal UI
+   * listings.
+   */
+  listAllActive(teamId: string): Promise<AgentRow[]>;
 
   /**
    * Global sequential port allocation.
@@ -176,6 +197,13 @@ export interface AgentsRepository {
   upsert(agent: Partial<AgentRow> & { team_id: string; id: string; name: string }): Promise<void>;
 
   /**
+   * Update a same-identity YAML deployment in place. Deliberately preserves
+   * the primary key, team, created_at, registry, wallet-linked rows, messages,
+   * queries, schedules, and other foreign-key-owned history.
+   */
+  redeploy(agentId: string, fields: AgentRedeployFields): Promise<void>;
+
+  /**
    * Update identity-related columns for an agent: name, token_id, domain,
    * endpoint, and/or metadata (full replace).
    */
@@ -192,6 +220,35 @@ export interface AgentsRepository {
 
   /** Replace the full metadata JSON for an agent. */
   updateMetadata(agentId: string, metadata: Record<string, unknown>): Promise<void>;
+
+  /**
+   * Atomically accept a local worker exit only while its Manager-issued
+   * process generation is still current. Returns false for a stale worker.
+   */
+  transitionOwnedProcessExit(
+    agentId: string,
+    processGeneration: string,
+    restartAfterManagerStart: boolean,
+  ): Promise<boolean>;
+
+  /**
+   * Atomically update status and, optionally, metadata only while one exact
+   * Manager-issued process generation remains current. Returns false when a
+   * late startup/health result belongs to a stale worker.
+   */
+  updateOwnedProcessState(
+    agentId: string,
+    processGeneration: string,
+    status: string,
+    metadata?: Record<string, unknown>,
+  ): Promise<boolean>;
+
+  /** Remove only process diagnostics from the current JSON metadata value. */
+  clearOwnedProcessMetadata(
+    agentId: string,
+    expectedPid?: number,
+    expectedGeneration?: string,
+  ): Promise<boolean>;
 
   /** Move an agent row to another existing team, optionally changing status. */
   moveToTeam(agentId: string, teamId: string, status?: string): Promise<void>;
@@ -267,6 +324,17 @@ export interface QueriesRepository {
    * enforcing the team scope prevents cross-team leakage over the HTTP API).
    */
   getByQueryIdForTeam(teamId: string, queryId: string): Promise<QueryRow | null>;
+
+  /**
+   * Return a bounded newest-first list of distinct runtime session IDs that
+   * completed under this exact team/agent owner. Used once to seed the
+   * profile-owned ownership ledger during upgrades from memory-only releases.
+   */
+  listRecentCompletedSessionIds(
+    teamId: string,
+    agentId: string,
+    limit: number,
+  ): Promise<string[]>;
 
   /**
    * Mark queries older than `cutoffMs` and still in the given terminal-or-open
@@ -367,6 +435,17 @@ export interface QueriesRepository {
    * Returns the list of cancelled query_ids.
    */
   cancel(agentId: string, completed: number): Promise<string[]>;
+
+  /**
+   * Cancel only queries admitted by one exact Manager-issued worker
+   * generation. This prevents a stale worker shutdown from cancelling work
+   * already owned by its replacement.
+   */
+  cancelForProcessGeneration(
+    agentId: string,
+    processGeneration: string,
+    completed: number,
+  ): Promise<string[]>;
 }
 
 // ---------------------------------------------------------------------------
@@ -522,6 +601,9 @@ export interface SchedulesRepository {
 
   /** Delete all schedule definitions matching a source_type (and optional source_key prefix). */
   deleteBySource(sourceType: string, sourceKeyPrefix?: string): Promise<void>;
+
+  /** Delete schedule definitions matching one exact source_type/source_key pair. */
+  deleteByExactSource(sourceType: string, sourceKey: string): Promise<void>;
 
   /** Get a single schedule definition by id. */
   getDefinition(scheduleId: string): Promise<ScheduleDefinitionRow | null>;
@@ -807,11 +889,12 @@ export interface CheckinsRepository {
 export interface RuntimeLaneCooldownRecord {
   lane_id: string;
   runtime: string;
+  runtime_namespace: string;
   kind: string;
   cooling_until_ms: number;
   observed_at_ms: number;
   reason: string;
-  team_id: string | null;
+  team_id: string;
   agent_id: string | null;
   agent_name: string | null;
   query_id: string | null;

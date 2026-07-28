@@ -16,6 +16,11 @@ MESSAGE="$1"
 REPLY_ENDPOINT="${2:-http://127.0.0.1:4050/news}"
 MANAGER_URL="${MANAGER_URL:-http://127.0.0.1:4100}"
 
+if [ -n "$IDACC_MANAGER_AGENT_TOKEN" ] || [ -n "$IDACC_DATA_DIR" ]; then
+  echo "Managed IDACC workers must use their local /talk-to wrapper; raw admin helpers are disabled."
+  exit 2
+fi
+
 if [ -z "$MESSAGE" ]; then
   echo "Usage: $0 \"message\" [reply_endpoint]"
   echo ""

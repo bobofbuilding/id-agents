@@ -11,7 +11,17 @@
  */
 
 import { AgentHarness, HarnessOptions, HarnessMessage, HarnessType, McpServerSpec } from './types.js';
-import { McpToolHub, mcpToOpenAiTools, parseOpenAiCallArgs, modelSupportsTools } from './mcp-client.js';
+import {
+  callOpenAiToolWithinBoundary,
+  McpToolHub,
+  filterOpenAiMcpServersForAllowlist,
+  filterOpenAiToolsForAllowlist,
+  mcpToOpenAiTools,
+  openAiToolExecutionSet,
+  modelSupportsTools,
+} from './mcp-client.js';
+import { plainTextExecutionBoundary } from './external-text-policy.js';
+import { managerWorkerRequestHeaders } from '../manager-worker-auth.js';
 
 const DEFAULT_BASE_URL = 'http://127.0.0.1:11434/v1';
 const DEFAULT_MODEL = 'qwen3:4b';
@@ -79,7 +89,7 @@ function reportOllamaUsage(u: { model: string; input: number | null; output: num
     };
     void fetch(`${managerUrl}/usage/record`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: managerWorkerRequestHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(3000),
     }).catch(() => { /* best-effort; ignore */ });
@@ -93,6 +103,7 @@ export class OllamaHarness implements AgentHarness {
   private hub: McpToolHub | null = null; // active MCP tool hub (so cancel() can close it)
 
   async *run(prompt: string, options: HarnessOptions = {}): AsyncGenerator<HarnessMessage> {
+    const boundary = plainTextExecutionBoundary(options, MAX_TOKENS);
     const baseUrl = process.env.OLLAMA_BASE_URL || DEFAULT_BASE_URL;
     const model = options.model || process.env.OLLAMA_MODEL || DEFAULT_MODEL;
     const url = `${baseUrl}/chat/completions`;
@@ -105,8 +116,11 @@ export class OllamaHarness implements AgentHarness {
 
     // MCP tool-calling: when servers are attached AND this model supports tools,
     // run the agentic call→execute→continue loop instead of the plain-text path.
-    const servers = options.mcpServers;
-    if (servers && servers.length) {
+    const servers = filterOpenAiMcpServersForAllowlist(
+      boundary.mcpServers,
+      options.allowedTools,
+    );
+    if (servers.length) {
       let toolsOk = false;
       try { toolsOk = await modelSupportsTools(model, baseUrl); } catch { toolsOk = false; }
       if (toolsOk) { yield* this.runWithTools(prompt, options, servers, baseUrl, model); return; }
@@ -115,8 +129,8 @@ export class OllamaHarness implements AgentHarness {
 
     // Build system prompt from workingDirectory context if available
     const systemParts: string[] = [];
-    if (options.workingDirectory) {
-      systemParts.push(`Working directory: ${options.workingDirectory}`);
+    if (boundary.workingDirectory) {
+      systemParts.push(`Working directory: ${boundary.workingDirectory}`);
     }
     const systemContent = systemParts.length > 0 ? systemParts.join('\n') : undefined;
 
@@ -131,7 +145,7 @@ export class OllamaHarness implements AgentHarness {
       messages,
       stream: true,
       temperature: 0.2,
-      max_tokens: MAX_TOKENS,
+      max_tokens: boundary.maxTokens,
       // Ask the OpenAI-compatible endpoint to emit a final usage chunk
       // ({prompt_tokens, completion_tokens}) so we can report local-model
       // token throughput to the manager. Harmless on servers that ignore it.
@@ -164,7 +178,7 @@ export class OllamaHarness implements AgentHarness {
       const timeoutSignal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
       const combinedSignal = AbortSignal.any([this.abortController.signal, timeoutSignal]);
 
-      console.log(`[Ollama] Request timeout: ${REQUEST_TIMEOUT_MS}ms, max_tokens: ${MAX_TOKENS}`);
+      console.log(`[Ollama] Request timeout: ${REQUEST_TIMEOUT_MS}ms, max_tokens: ${boundary.maxTokens}`);
 
       const response = await fetch(url, {
         method: 'POST',
@@ -304,12 +318,11 @@ export class OllamaHarness implements AgentHarness {
     try {
       hub = await McpToolHub.connect(servers);
       this.hub = hub; // expose to cancel() so an abort tears down child MCP processes
-      let tools = mcpToOpenAiTools(hub.listTools());
-      if (options.allowedTools && options.allowedTools.length) {
-        const allow = new Set(options.allowedTools);
-        // Scope: allow by exposed (namespaced) name OR the underlying bare tool name.
-        tools = tools.filter((t) => allow.has(t.function.name) || allow.has(t.function.name.split('__').pop() || ''));
-      }
+      const tools = filterOpenAiToolsForAllowlist(
+        mcpToOpenAiTools(hub.listTools()),
+        options.allowedTools,
+      );
+      const executableToolNames = openAiToolExecutionSet(tools);
       console.log(`[Ollama] Attached ${servers.length} MCP server(s); ${tools.length} tool(s) exposed`);
 
       const messages: Array<Record<string, unknown>> = [
@@ -407,7 +420,12 @@ export class OllamaHarness implements AgentHarness {
           const exposed = call.function.name || '';
           yield { type: 'tool_use', tool_name: exposed, content: call.function.arguments || '' };
           console.log(`[Ollama] tool_call: ${exposed}`);
-          const out = await hub.callTool(exposed, parseOpenAiCallArgs(call), ac.signal);
+          const out = await callOpenAiToolWithinBoundary(
+            hub,
+            plainFallback ? new Set<string>() : executableToolNames,
+            call,
+            ac.signal,
+          );
           console.log(`[Ollama] tool result: ${out.text.length} chars${out.isError ? ' (error)' : ''}`);
           messages.push({ role: 'tool', tool_call_id: call.id || exposed, content: out.text });
         }

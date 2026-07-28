@@ -11,6 +11,10 @@
 version: "1"
 team: solidity-dev
 
+parameters:
+  - name: projectDir
+    description: Absolute path to the consumer's Solidity project workspace
+
 defaults:
   local: true
   runtime: claude-code-cli
@@ -22,10 +26,10 @@ defaults:
 agents:
   - name: builder
     description: "Day-to-day Foundry/Solidity developer"
-    workingDirectory: /Users/nxt3d/projects/solidity-dev-sandbox
+    workingDirectory: ${projectDir}
     agent: foundry-dev
 
   - name: auditor
     description: "Adversarial security reviewer paired with the builder"
-    workingDirectory: /Users/nxt3d/projects/solidity-dev-sandbox
+    workingDirectory: ${projectDir}
     agent: solidity-security

@@ -76,6 +76,29 @@ export class PgQueriesRepo implements QueriesRepository {
     return rows[0] ?? null;
   }
 
+  async listRecentCompletedSessionIds(
+    teamId: string,
+    agentId: string,
+    limit: number,
+  ): Promise<string[]> {
+    const boundedLimit = Math.max(1, Math.min(500, Math.floor(limit)));
+    const { rows } = await this.db.query<{ session_id: string }>(
+      `SELECT session_id
+       FROM queries
+       WHERE team_id = $1
+         AND agent_id = $2
+         AND status = 'completed'
+         AND session_id IS NOT NULL
+         AND session_id <> ''
+         AND LEFT(query_id, 5) <> 'xmtp_'
+       GROUP BY session_id
+       ORDER BY MAX(COALESCE(completed, created)) DESC
+       LIMIT $3`,
+      [teamId, agentId, boundedLimit],
+    );
+    return rows.map((row) => String(row.session_id));
+  }
+
   async expireStale(cutoffCreated: number, statuses: string[]): Promise<QueryRow[]> {
     if (statuses.length === 0) return [];
     const placeholders = statuses.map((_, i) => `$${i + 3}`).join(', ');
@@ -318,5 +341,23 @@ export class PgQueriesRepo implements QueriesRepository {
     );
 
     return queryIds;
+  }
+
+  async cancelForProcessGeneration(
+    agentId: string,
+    processGeneration: string,
+    completed: number,
+  ): Promise<string[]> {
+    const { rows } = await this.db.query<{ query_id: string }>(
+      `UPDATE queries
+          SET status = 'cancelled',
+              completed = $3
+        WHERE agent_id = $1
+          AND status IN ('pending', 'processing')
+          AND metadata->>'processGeneration' = $2
+        RETURNING query_id`,
+      [agentId, processGeneration, completed],
+    );
+    return rows.map((row) => row.query_id);
   }
 }

@@ -12,6 +12,7 @@ import { SqliteAdapter } from '../../src/db/sqlite-adapter.js';
 import { migrateSqlite } from '../../src/db/migrations/sqlite.js';
 import { SqliteTeamsRepo } from '../../src/db/repos/sqlite/teams-repo.js';
 import { SqliteAgentsRepo } from '../../src/db/repos/sqlite/agents-repo.js';
+import { PgAgentsRepo } from '../../src/db/repos/postgres/agents-repo.js';
 import { SqliteQueriesRepo } from '../../src/db/repos/sqlite/queries-repo.js';
 import { SqliteNewsRepo } from '../../src/db/repos/sqlite/news-repo.js';
 import { SqliteSchedulesRepo } from '../../src/db/repos/sqlite/schedules-repo.js';
@@ -40,6 +41,30 @@ async function makeManager() {
   const db = await createInMemoryDb();
   const manager = new AgentManagerDb(workDir, db as any);
   return { manager, db, workDir };
+}
+
+function verifiedSpawnStub(
+  db: Awaited<ReturnType<typeof createInMemoryDb>>,
+  pid: number,
+) {
+  return vi.fn(async (
+    _teamId: string,
+    _teamName: string,
+    agentData: { id: string },
+  ) => {
+    const current = await db.agents.getById(agentData.id);
+    if (!current) return { success: false, error: 'agent row missing' };
+    const metadata = {
+      ...((current.metadata as Record<string, unknown> | null | undefined) ?? {}),
+      pid,
+      processOwner: 'manager-child',
+      processGeneration: `test-generation-${pid}`,
+      managerOwnedLaunchIntent: true,
+    };
+    delete metadata.managerRestartRequested;
+    await db.agents.updateStatus(agentData.id, 'running', { metadata });
+    return { success: true, pid };
+  });
 }
 
 async function startTalkServer(response: Record<string, unknown>) {
@@ -106,11 +131,12 @@ async function startCancelServer(response: Record<string, unknown> = { cancelled
 }
 
 async function startHealthServer(status = 200, payload: Record<string, unknown> = {}) {
+  let responseStatus = status;
   const server = http.createServer((req, res) => {
     if (req.method === 'GET' && req.url === '/health') {
-      res.writeHead(status, { 'content-type': 'application/json' });
+      res.writeHead(responseStatus, { 'content-type': 'application/json' });
       res.end(JSON.stringify({
-        status: status >= 200 && status < 300 ? 'ok' : 'error',
+        status: responseStatus >= 200 && responseStatus < 300 ? 'ok' : 'error',
         ...payload,
       }));
       return;
@@ -123,6 +149,9 @@ async function startHealthServer(status = 200, payload: Record<string, unknown> 
   if (!address || typeof address === 'string') throw new Error('health server failed to bind a loopback port');
   return {
     port: address.port,
+    setStatus(nextStatus: number) {
+      responseStatus = nextStatus;
+    },
     close: () => new Promise<void>((resolve, reject) => {
       server.close((err) => (err ? reject(err) : resolve()));
     }),
@@ -219,6 +248,9 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     delete process.env.IDACC_AGENT_LOG_DIR;
     delete process.env.ELECTRON_RUN_AS_NODE;
     delete process.env.IDACC_ADMIN_TOKEN;
+    delete process.env.IDACC_MANAGER_SERVICE_TOKEN;
+    delete process.env.IDACC_MANAGED_SERVICE;
+    delete process.env.IDACC_MANAGER_RESTART_MARKER_GRACE_MS;
     delete process.env.BRAIN_TOKEN;
     while (dbs.length > 0) {
       await dbs.pop()!.close();
@@ -625,6 +657,72 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     }
   });
 
+  it('retains a live managed generation across one failed health probe and recovers it', async () => {
+    process.env.IDACC_ADMIN_TOKEN = 'managed-health-recovery-admin-token';
+    process.env.IDACC_MANAGER_SERVICE_TOKEN = 'managed-health-recovery-service-token-000000000000';
+    const healthServer = await startHealthServer(503);
+    try {
+      const { manager, db, workDir } = await makeManager();
+      dbs.push(db);
+      workDirs.push(workDir);
+      const teamId = await db.teams.getOrCreateTeamId('default');
+      const agentId = 'agent-health-recovery';
+      const generation = 'health-recovery-generation';
+      const pid = 54320;
+      await db.agents.create(agentRow({
+        team_id: teamId,
+        id: agentId,
+        name: 'health-recovery',
+        port: healthServer.port,
+        status: 'running',
+        runtime: 'codex',
+        metadata: {
+          runtime: 'codex',
+          pid,
+          processOwner: 'manager-child',
+          processParentPid: process.pid,
+          managerOwnedLaunchIntent: true,
+          processGeneration: generation,
+          processRuntime: 'codex',
+          processRuntimeLane: 'codex:default',
+        },
+      }));
+      const proc = Object.assign(new EventEmitter(), {
+        pid,
+        exitCode: null,
+        signalCode: null,
+      });
+      (manager as any).ownedAgentProcesses.set(pid, {
+        proc,
+        agentId,
+        agentName: 'health-recovery',
+        port: healthServer.port,
+        processGeneration: generation,
+      });
+
+      await (manager as any).runHealthChecks();
+      let row = await db.agents.getById(agentId);
+      expect(row?.status).toBe('offline');
+      expect(row?.metadata).toMatchObject({
+        processGeneration: generation,
+        processRuntime: 'codex',
+        processRuntimeLane: 'codex:default',
+      });
+
+      healthServer.setStatus(200);
+      await (manager as any).runHealthChecks();
+      row = await db.agents.getById(agentId);
+      expect(row?.status).toBe('running');
+      expect(row?.metadata?.processGeneration).toBe(generation);
+      expect(await (manager as any).hasCurrentManagedWorkerAssignment(
+        row,
+        generation,
+      )).toBe(true);
+    } finally {
+      await healthServer.close();
+    }
+  });
+
   it('spawns with the bundled executable and writes only profile-private logs', async () => {
     const { manager, db, workDir } = await makeManager();
     dbs.push(db);
@@ -680,6 +778,65 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     expect(options.detached).toBe(true);
     expect(options.windowsHide).toBe(true);
     expect(proc.unref).toHaveBeenCalledOnce();
+  });
+
+  it('durably binds a managed worker generation to the exact runtime lane issued at spawn', async () => {
+    process.env.IDACC_ADMIN_TOKEN = 'managed-issued-lane-admin-token';
+    process.env.IDACC_MANAGER_SERVICE_TOKEN = 'managed-issued-lane-service-token-000000000000';
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    await db.agents.create(agentRow({
+      team_id: teamId,
+      id: 'agent-issued-lane',
+      name: 'issued-lane',
+      port: 4110,
+      status: 'pending',
+      runtime: 'codex',
+      metadata: {
+        runtime: 'codex',
+        runtimeCredentialLane: 'codex-subscription-b',
+      },
+    }));
+    (manager as any).runtimeCredentialPoolByTeam.set(teamId, {
+      lanes: [
+        { id: 'codex-subscription-a', runtime: 'codex', kind: 'subscription' },
+        { id: 'codex-subscription-b', runtime: 'codex', kind: 'subscription' },
+      ],
+    });
+    (manager as any).killAgentProcess = vi.fn(async () => ({ killed: false, pids: [] }));
+    (manager as any).clearAgentPid = vi.fn(async () => {});
+    (manager as any).waitForAgentPortToBind = vi.fn(async () => ({ ok: true }));
+    const proc = Object.assign(new EventEmitter(), {
+      pid: 54322,
+      unref: vi.fn(),
+    });
+    const spawnSpy = vi.fn(() => proc);
+    (manager as any).spawnLocalAgentChild = spawnSpy;
+
+    const result = await (manager as any).spawnLocalAgentProcessUnlocked(
+      teamId,
+      'default',
+      {
+        id: 'agent-issued-lane',
+        name: 'issued-lane',
+        port: 4110,
+      },
+    );
+
+    expect(result.success).toBe(true);
+    const options = spawnSpy.mock.calls[0][2];
+    expect(options.env.ID_HARNESS).toBe('codex');
+    expect(options.env.ID_RUNTIME_LANE_ID).toBe('codex-subscription-b');
+    expect(options.env.IDACC_MANAGER_AGENT_TOKEN).toEqual(expect.any(String));
+    const persisted = await db.agents.getById('agent-issued-lane');
+    expect(persisted?.metadata).toMatchObject({
+      processGeneration: expect.any(String),
+      processRuntime: 'codex',
+      processRuntimeLane: 'codex-subscription-b',
+      pid: 54322,
+    });
   });
 
   it('bounds profile-owned agent logs while retaining their newest tail', async () => {
@@ -835,7 +992,17 @@ describe('AgentManagerDb killAgentProcess guards', () => {
       ...agentRow({
         team_id: teamId,
         id: 'agent-process-meta',
-        metadata: { pid: 43210, processOwner: 'manager-child', processParentPid: process.pid, processInspectedAt: 2000 },
+        metadata: {
+          pid: 43210,
+          processOwner: 'manager-child',
+          processParentPid: process.pid,
+          processInspectedAt: 2000,
+          processGeneration: 'process-meta-generation',
+          processRuntime: 'codex',
+          processRuntimeLane: 'codex:default',
+          allowed_tools: ['Read'],
+          mcpServers: [{ name: 'brain', transport: 'stdio' }],
+        },
       }),
     });
 
@@ -846,6 +1013,11 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     expect(row?.metadata).not.toHaveProperty('processOwner');
     expect(row?.metadata).not.toHaveProperty('processParentPid');
     expect(row?.metadata).not.toHaveProperty('processInspectedAt');
+    expect(row?.metadata).not.toHaveProperty('processGeneration');
+    expect(row?.metadata).not.toHaveProperty('processRuntime');
+    expect(row?.metadata).not.toHaveProperty('processRuntimeLane');
+    expect(row?.metadata?.allowed_tools).toEqual(['Read']);
+    expect(row?.metadata?.mcpServers).toEqual([{ name: 'brain', transport: 'stdio' }]);
   });
 
   it('marks owned running agents for restoration and stops them during Manager shutdown', async () => {
@@ -900,8 +1072,8 @@ describe('AgentManagerDb killAgentProcess guards', () => {
       status: 'stopped',
       metadata: { runtime: 'codex' },
     }));
-    const spawn = vi.fn(async () => ({ success: true, pid: 76543 }));
-    (manager as any).spawnLocalAgentProcess = spawn;
+    const spawn = verifiedSpawnStub(db, 76543);
+    (manager as any).spawnLocalAgentProcessUnlocked = spawn;
 
     await (manager as any).restoreManagerOwnedAgentsAfterRestart();
 
@@ -916,6 +1088,501 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     expect(restored?.metadata).not.toHaveProperty('managerRestartRequested');
     const parked = await db.agents.getById('agent-stay-stopped');
     expect(parked?.status).toBe('stopped');
+  });
+
+  it('restores a non-provider worker whose parent-watchdog marker lands after the first managed startup scan', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+    process.env.IDACC_MANAGED_SERVICE = '1';
+    process.env.IDACC_MANAGER_RESTART_MARKER_GRACE_MS = '40';
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    await db.agents.create(agentRow({
+      team_id: teamId,
+      id: 'agent-late-parent-watchdog',
+      name: 'late-parent-watchdog',
+      port: 4117,
+      status: 'stopped',
+      runtime: 'codex',
+      metadata: { runtime: 'codex' },
+    }));
+    const verifiedSpawn = verifiedSpawnStub(db, 76545);
+    (manager as any).spawnLocalAgentProcessUnlocked = verifiedSpawn;
+
+    const lateMarker = new Promise<void>((resolve, reject) => {
+      setTimeout(() => {
+        void (async () => {
+          const current = await db.agents.getById('agent-late-parent-watchdog');
+          await db.agents.updateMetadata('agent-late-parent-watchdog', {
+            ...((current?.metadata as Record<string, unknown>) || {}),
+            managerRestartRequested: true,
+          });
+        })().then(resolve, reject);
+      }, 10);
+    });
+    await Promise.all([
+      (manager as any).restoreManagerOwnedAgentsAtStartup(),
+      lateMarker,
+    ]);
+
+    expect(verifiedSpawn).toHaveBeenCalledOnce();
+    const restored = await db.agents.getById('agent-late-parent-watchdog');
+    expect(restored?.status).toBe('running');
+    expect(restored?.metadata).not.toHaveProperty('managerRestartRequested');
+  });
+
+  it('migrates a dead legacy Manager child to durable launch intent before stale metadata is cleared', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    await db.agents.create(agentRow({
+      team_id: teamId,
+      id: 'agent-windows-job-loss',
+      name: 'windows-job-loss',
+      port: 4118,
+      status: 'running',
+      runtime: 'codex',
+      metadata: {
+        runtime: 'codex',
+        pid: 87654,
+        processOwner: 'manager-child',
+        processParentPid: 76543,
+      },
+    }));
+    (manager as any).inspectProcess = vi.fn(() => null);
+    (manager as any).processIsAlive = vi.fn(() => false);
+
+    await (manager as any).reconcileLocalAgentProcessMetadata();
+
+    const awaiting = await db.agents.getById('agent-windows-job-loss');
+    expect(awaiting?.status).toBe('offline');
+    expect(awaiting?.metadata).toMatchObject({
+      managerOwnedLaunchIntent: true,
+      managerRestartRequested: true,
+    });
+    expect(awaiting?.metadata).not.toHaveProperty('pid');
+
+    const verifiedSpawn = verifiedSpawnStub(db, 87655);
+    (manager as any).spawnLocalAgentProcessUnlocked = verifiedSpawn;
+    await (manager as any).restoreManagerOwnedAgentsAfterRestart();
+
+    const restored = await db.agents.getById('agent-windows-job-loss');
+    expect(verifiedSpawn).toHaveBeenCalledOnce();
+    expect(restored?.status).toBe('running');
+    expect(restored?.metadata?.managerOwnedLaunchIntent).toBe(true);
+    expect(restored?.metadata).not.toHaveProperty('managerRestartRequested');
+  });
+
+  it('does not adopt a running port without exact PID attestation during restore', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    await db.agents.create(agentRow({
+      team_id: teamId,
+      id: 'agent-restore-pid-mismatch',
+      name: 'restore-pid-mismatch',
+      port: 4120,
+      status: 'running',
+      runtime: 'codex',
+      metadata: {
+        runtime: 'codex',
+        pid: 91001,
+        managerOwnedLaunchIntent: true,
+        managerRestartRequested: true,
+      },
+    }));
+    const probe = vi.spyOn(manager as any, 'probeLocalAgentIdentity')
+      .mockResolvedValue({ ok: true, attested: false });
+    const spawn = verifiedSpawnStub(db, 91002);
+    (manager as any).spawnLocalAgentProcessUnlocked = spawn;
+
+    await (manager as any).restoreManagerOwnedAgentsAfterRestart();
+
+    expect(probe).toHaveBeenCalledWith(
+      4120,
+      { id: 'agent-restore-pid-mismatch', name: 'restore-pid-mismatch', pid: 91001 },
+      { requireAttestation: true },
+    );
+    expect(spawn).toHaveBeenCalledOnce();
+    const row = await db.agents.getById('agent-restore-pid-mismatch');
+    expect(row?.status).toBe('running');
+    expect(row?.metadata?.managerOwnedLaunchIntent).toBe(true);
+    expect(row?.metadata).not.toHaveProperty('managerRestartRequested');
+  });
+
+  it('uses process-generation CAS so a stale worker cannot stop its replacement', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    await db.agents.create(agentRow({
+      team_id: teamId,
+      id: 'agent-generation-cas',
+      name: 'generation-cas',
+      status: 'running',
+      metadata: {
+        runtime: 'codex',
+        pid: 90002,
+        processGeneration: 'replacement-generation',
+        processOwner: 'manager-child',
+        managerOwnedLaunchIntent: true,
+      },
+    }));
+
+    expect(await db.agents.transitionOwnedProcessExit(
+      'agent-generation-cas',
+      'stale-generation',
+      false,
+    )).toBe(false);
+    let row = await db.agents.getById('agent-generation-cas');
+    expect(row?.status).toBe('running');
+    expect(row?.metadata?.pid).toBe(90002);
+    expect(row?.metadata?.processGeneration).toBe('replacement-generation');
+
+    const originalQuery = db.adapter.query.bind(db.adapter);
+    let releaseExit!: () => void;
+    let signalExitStatement!: () => void;
+    const exitStatement = new Promise<void>((resolve) => { signalExitStatement = resolve; });
+    const exitGate = new Promise<void>((resolve) => { releaseExit = resolve; });
+    (db.adapter as any).query = async (sql: string, params: unknown[] = []) => {
+      if (
+        sql.includes("json_extract(metadata, '$.processGeneration')")
+        && params.at(-1) === 'replacement-generation'
+      ) {
+        signalExitStatement();
+        await exitGate;
+      }
+      return originalQuery(sql, params);
+    };
+    const validExit = db.agents.transitionOwnedProcessExit(
+      'agent-generation-cas',
+      'replacement-generation',
+      false,
+    );
+    await exitStatement;
+    const beforeExit = await db.agents.getById('agent-generation-cas');
+    await db.agents.updateMetadata('agent-generation-cas', {
+      ...((beforeExit?.metadata as Record<string, unknown>) || {}),
+      allowed_tools: ['Read'],
+      mcpServers: [{ name: 'brain', transport: 'stdio' }],
+    });
+    releaseExit();
+    expect(await validExit).toBe(true);
+    (db.adapter as any).query = originalQuery;
+    row = await db.agents.getById('agent-generation-cas');
+    expect(row?.status).toBe('stopped');
+    expect(row?.metadata).not.toHaveProperty('pid');
+    expect(row?.metadata).not.toHaveProperty('processGeneration');
+    expect(row?.metadata).not.toHaveProperty('managerOwnedLaunchIntent');
+    expect(row?.metadata?.allowed_tools).toEqual(['Read']);
+    expect(row?.metadata?.mcpServers).toEqual([{ name: 'brain', transport: 'stdio' }]);
+  });
+
+  it('uses one PostgreSQL JSONB update so generation exit preserves same-generation metadata', async () => {
+    const calls: Array<{ sql: string; params?: unknown[] }> = [];
+    const adapter = {
+      dialect: 'postgres' as const,
+      query: vi.fn(async (sql: string, params?: unknown[]) => {
+        calls.push({ sql, params });
+        return { rows: [], rowCount: 1 };
+      }),
+      close: vi.fn(async () => {}),
+    };
+    const repo = new PgAgentsRepo(adapter);
+
+    expect(await repo.transitionOwnedProcessExit(
+      'agent-postgres-generation',
+      'current-generation',
+      true,
+    )).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].sql).toContain("COALESCE(metadata, '{}'::jsonb)");
+    expect(calls[0].sql).toContain("- 'processGeneration'");
+    expect(calls[0].sql).toContain("|| '{\"managerRestartRequested\":true}'::jsonb");
+    expect(calls[0].sql).not.toMatch(/SET\s+metadata\s*=\s*\$\d/i);
+    expect(calls[0].params).toEqual([
+      'agent-postgres-generation',
+      'current-generation',
+      true,
+    ]);
+  });
+
+  it('does not resurrect a worker that exits between readiness and startup commit', async () => {
+    process.env.IDACC_ADMIN_TOKEN = 'startup-commit-admin-token';
+    process.env.IDACC_MANAGER_SERVICE_TOKEN = 'startup-commit-service-token-000000000000';
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    const agentId = 'agent-startup-commit-race';
+    await db.agents.create(agentRow({
+      team_id: teamId,
+      id: agentId,
+      name: 'startup-commit-race',
+      port: 4123,
+      status: 'offline',
+      runtime: 'codex',
+      metadata: {
+        runtime: 'codex',
+        runtimeCredentialLane: 'codex:default',
+        managerOwnedLaunchIntent: true,
+        managerRestartRequested: true,
+      },
+    }));
+
+    const proc = Object.assign(new EventEmitter(), {
+      pid: 99123,
+      exitCode: null,
+      signalCode: null,
+      unref: vi.fn(),
+    });
+    vi.spyOn(manager as any, 'spawnLocalAgentChild').mockReturnValue(proc);
+    vi.spyOn(manager as any, 'killAgentProcess')
+      .mockResolvedValue({ killed: false, pids: [] });
+    vi.spyOn(manager as any, 'waitForAgentPortToBind')
+      .mockResolvedValue({ ok: true });
+
+    const realCommit = db.agents.updateOwnedProcessState.bind(db.agents);
+    vi.spyOn(db.agents, 'updateOwnedProcessState').mockImplementation(
+      async (id, generation, status, metadata) => {
+        expect(status).toBe('running');
+        expect(await db.agents.transitionOwnedProcessExit(
+          id,
+          generation,
+          true,
+        )).toBe(true);
+        return realCommit(id, generation, status, metadata);
+      },
+    );
+
+    const result = await (manager as any).spawnLocalAgentProcessUnlocked(
+      teamId,
+      'default',
+      {
+        id: agentId,
+        name: 'startup-commit-race',
+        port: 4123,
+      },
+    );
+    expect(result).toMatchObject({
+      success: false,
+      error: 'verified worker startup could not be committed durably',
+    });
+    const row = await db.agents.getById(agentId);
+    expect(row?.status).toBe('offline');
+    expect(row?.metadata).not.toHaveProperty('pid');
+    expect(row?.metadata).not.toHaveProperty('processGeneration');
+    expect(row?.metadata?.managerRestartRequested).toBe(true);
+  });
+
+  it('drains an in-flight lifecycle gate and rechecks shutdown before creating a child', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    await db.agents.create(agentRow({
+      team_id: teamId,
+      id: 'agent-shutdown-spawn-barrier',
+      name: 'shutdown-spawn-barrier',
+      port: 4119,
+      status: 'offline',
+      runtime: 'codex',
+      metadata: {
+        runtime: 'codex',
+        managerOwnedLaunchIntent: true,
+        managerRestartRequested: true,
+      },
+    }));
+    let releaseKill!: () => void;
+    let signalKillStarted!: () => void;
+    const killStarted = new Promise<void>((resolve) => { signalKillStarted = resolve; });
+    const killGate = new Promise<void>((resolve) => { releaseKill = resolve; });
+    (manager as any).killAgentProcess = vi.fn(async () => {
+      signalKillStarted();
+      await killGate;
+      return { killed: false, pids: [] };
+    });
+    const spawnChild = vi.fn();
+    (manager as any).spawnLocalAgentChild = spawnChild;
+
+    const spawn = (manager as any).spawnLocalAgentProcess(teamId, 'default', {
+      name: 'shutdown-spawn-barrier',
+      id: 'agent-shutdown-spawn-barrier',
+      port: 4119,
+    });
+    await killStarted;
+    const shutdown = manager.shutdown();
+    releaseKill();
+    const [spawnResult] = await Promise.all([spawn, shutdown]);
+
+    expect(spawnResult).toMatchObject({
+      success: false,
+      error: expect.stringMatching(/shutting down/i),
+    });
+    expect(spawnChild).not.toHaveBeenCalled();
+    const row = await db.agents.getById('agent-shutdown-spawn-barrier');
+    expect(row?.metadata).toMatchObject({
+      managerOwnedLaunchIntent: true,
+      managerRestartRequested: true,
+    });
+  });
+
+  it('keeps provider agents paused until the new Manager process receives an authenticated binding', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    await db.agents.create(agentRow({
+      team_id: teamId,
+      id: 'agent-provider-paused',
+      name: 'provider-paused',
+      port: 4114,
+      status: 'offline',
+      runtime: 'provider-api',
+      metadata: {
+        runtime: 'provider:openrouter',
+        providerRuntime: {
+          lane: 'provider:openrouter',
+          name: 'openrouter',
+          kind: 'openai-compatible',
+          baseUrl: 'https://openrouter.ai/api/v1',
+        },
+        managerRestartRequested: true,
+      },
+    }));
+    const spawnChild = vi.fn();
+    (manager as any).spawnLocalAgentChild = spawnChild;
+
+    const directStart = await (manager as any).spawnLocalAgentProcess(teamId, 'default', {
+      name: 'provider-paused',
+      id: 'agent-provider-paused',
+      port: 4114,
+    });
+    expect(directStart).toEqual({
+      success: false,
+      error: expect.stringMatching(/authenticated IDACC control plane rebinds/i),
+    });
+    expect(spawnChild).not.toHaveBeenCalled();
+
+    // If the desktop rebind arrives while the startup scan is still walking
+    // the fleet, the scan must still leave provider resume to the authenticated
+    // route so both paths cannot race into duplicate worker spawns.
+    (manager as any).providerRuntimeAssignments.set('agent-provider-paused', {
+      lane: 'provider:openrouter',
+      name: 'openrouter',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey: 'process-local-race-binding',
+    });
+    const statusWrites = vi.spyOn(db.agents, 'updateStatus');
+    await (manager as any).restoreManagerOwnedAgentsAfterRestart();
+    expect(spawnChild).not.toHaveBeenCalled();
+    expect(statusWrites).not.toHaveBeenCalledWith('agent-provider-paused', 'offline');
+    const paused = await db.agents.getById('agent-provider-paused');
+    expect(paused?.status).toBe('offline');
+    expect(paused?.metadata?.managerRestartRequested).toBe(true);
+  });
+
+  it('clears a provider restart marker only after a rebound worker passes verified spawn', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    const apiKey = 'provider-secret-must-stay-process-local';
+    await db.agents.create(agentRow({
+      team_id: teamId,
+      id: 'agent-provider-resume',
+      name: 'provider-resume',
+      port: 4115,
+      status: 'offline',
+      runtime: 'provider-api',
+      metadata: {
+        runtime: 'provider:openrouter',
+        providerRuntime: {
+          lane: 'provider:openrouter',
+          name: 'openrouter',
+          kind: 'openai-compatible',
+          baseUrl: 'https://openrouter.ai/api/v1',
+        },
+        managerRestartRequested: true,
+      },
+    }));
+    (manager as any).providerRuntimeAssignments.set('agent-provider-resume', {
+      lane: 'provider:openrouter',
+      name: 'openrouter',
+      kind: 'openai-compatible',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey,
+    });
+    const verifiedSpawn = verifiedSpawnStub(db, 76544);
+    (manager as any).spawnLocalAgentProcessUnlocked = verifiedSpawn;
+
+    const result = await (manager as any).resumeProviderAgentAfterManagerRestart(
+      teamId,
+      'default',
+      'agent-provider-resume',
+    );
+
+    expect(result).toEqual({ success: true });
+    expect(JSON.stringify(result)).not.toContain(apiKey);
+    expect(verifiedSpawn).toHaveBeenCalledOnce();
+    const resumed = await db.agents.getById('agent-provider-resume');
+    expect(resumed?.status).toBe('running');
+    expect(resumed?.metadata).not.toHaveProperty('managerRestartRequested');
+    expect(JSON.stringify(resumed?.metadata)).not.toContain(apiKey);
+  });
+
+  it('keeps failed provider resume attempts offline and marked for a later secure retry', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    await db.agents.create(agentRow({
+      team_id: teamId,
+      id: 'agent-provider-resume-failed',
+      name: 'provider-resume-failed',
+      port: 4116,
+      status: 'offline',
+      runtime: 'provider-api',
+      metadata: {
+        runtime: 'provider:openrouter',
+        providerRuntime: {
+          lane: 'provider:openrouter',
+          name: 'openrouter',
+          kind: 'openai-compatible',
+          baseUrl: 'https://openrouter.ai/api/v1',
+        },
+        managerRestartRequested: true,
+      },
+    }));
+    (manager as any).providerRuntimeAssignments.set('agent-provider-resume-failed', {
+      lane: 'provider:openrouter',
+      name: 'openrouter',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey: 'failed-provider-secret',
+    });
+    (manager as any).spawnLocalAgentProcessUnlocked = vi.fn(async () => ({
+      success: false,
+      error: 'verified spawn failed',
+    }));
+
+    const result = await (manager as any).resumeProviderAgentAfterManagerRestart(
+      teamId,
+      'default',
+      'agent-provider-resume-failed',
+    );
+
+    expect(result).toEqual({
+      success: false,
+      status: 503,
+      error: expect.stringMatching(/verified worker startup failed/i),
+    });
+    const paused = await db.agents.getById('agent-provider-resume-failed');
+    expect(paused?.status).toBe('offline');
+    expect(paused?.metadata?.managerRestartRequested).toBe(true);
+    expect(JSON.stringify(result)).not.toContain('failed-provider-secret');
+    expect(JSON.stringify(paused?.metadata)).not.toContain('failed-provider-secret');
   });
 
   it('reconciles running local process ownership on startup audit', async () => {
@@ -2006,7 +2673,7 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     }
   });
 
-  it('refreshes framework instructions during agent rebuild without duplicating stale org sidecar text', async () => {
+  it('refreshes framework instructions during agent rebuild and unwraps a legacy org sidecar fence', async () => {
     const { manager, db, workDir } = await makeManager();
     dbs.push(db);
     workDirs.push(workDir);
@@ -2027,10 +2694,6 @@ Load relevant memories at the start of any non-trivial task. Verify file paths a
 
 ## Team coordination
 keep this role-specific coordination text
-
-<!-- BEGIN id-agents org -->
-old org text that should be replaced
-<!-- END id-agents org -->
 <!-- END id-agents framework -->
 
 ## user tail
@@ -2045,7 +2708,9 @@ new org text from sidecar
 `,
     );
 
-    (manager as any).refreshPersonalityFileForRebuild(agentRow({
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    await (manager as any).refreshManagedOverlayForRebuild(teamId, 'default', agentRow({
+      team_id: teamId,
       id: 'agent-refresh',
       name: 'refresh-agent',
       runtime: 'codex',
@@ -2058,8 +2723,20 @@ new org text from sidecar
     expect(out).toContain('keep this role-specific coordination text');
     expect(out).toContain('new org text from sidecar');
     expect(out).not.toContain('old protocol body');
-    expect(out).not.toContain('old org text that should be replaced');
+    expect(out).not.toContain('<!-- BEGIN id-agents org -->');
+    expect(out).not.toContain('<!-- END id-agents org -->');
     expect(out).toContain('## user tail');
+
+    await (manager as any).refreshManagedOverlayForRebuild(teamId, 'default', agentRow({
+      team_id: teamId,
+      id: 'agent-refresh',
+      name: 'refresh-agent',
+      runtime: 'codex',
+      working_directory: agentDir,
+    }));
+    const secondPass = fs.readFileSync(path.join(agentDir, 'AGENTS.md'), 'utf-8');
+    expect(secondPass).toBe(out);
+    expect(secondPass.match(/new org text from sidecar/g)).toHaveLength(1);
   });
 
   it('rejects /ask before dispatch when the target agent queue is saturated', async () => {

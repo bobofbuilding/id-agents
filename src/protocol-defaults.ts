@@ -72,6 +72,11 @@ section contains the full guidance.
    Status flips to \`doing\`.
 3. **Work**: Do the work. Write artifacts to \`./output/\`.
 4. **Done**: \`POST $MANAGER_URL/tasks/<name>/done\` with \`{ agent_id: "<your-name>" }\`
+
+Every Manager request from a worker must include \`X-Id-Team: $ID_TEAM\`,
+\`X-Id-Agent: $ID_AGENT_ID\`, and
+\`Authorization: Bearer $IDACC_MANAGER_AGENT_TOKEN\`. The token is private to
+this exact worker process; never print, persist, or forward it.
    Status flips to \`done\`.
    If the claim response included \`brain_context\`, include \`used_source_ids\` with any
    Brain source IDs you relied on.

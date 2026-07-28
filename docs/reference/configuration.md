@@ -151,8 +151,10 @@ All configs should include `skills: [identity, inter-agent, catalog]` at minimum
 | `skills` | Array | Skills deployed to each agent (minimum: `[identity, inter-agent, catalog]`) |
 | `plugins` | Array | Optional plugins for agent runtimes that support them |
 | `allowedTools` | Array | Default tool restrictions for all agents |
+| `env` | Object | Default application-specific environment variables for all agents |
 | `heartbeat` | Number or Object | Default heartbeat interval in seconds (or legacy `{interval, message}` object) |
 | `register` | Boolean | Default onchain registration setting (overrides `onchain.register` per agent) |
+| `wallet` | Boolean | Default wallet opt-in. Only explicit `true` provisions an OWS wallet |
 
 ### calendar
 
@@ -213,6 +215,7 @@ Each agent can have the following fields:
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `name` | Yes | - | Agent name (must be unique within team) |
+| `identityKey` | No | - | Stable declarative identity used to preserve the same agent across a rename. Agent-only; 1–128 lowercase characters from `[a-z0-9._-]`, beginning and ending with an alphanumeric character |
 | `description` | No | - | Human-readable description of the agent |
 | `model` | No | From defaults | LLM model to use |
 | `runtime` | No | From defaults | Agent runtime/harness |
@@ -222,10 +225,15 @@ Each agent can have the following fields:
 | `allowedTools` | No | From defaults | Restrict agent to specific tools |
 | `env` | No | `{}` | Environment variables for the agent process |
 | `register` | No | From onchain | Whether to register onchain |
+| `wallet` | No | `false` | Provision an OWS wallet during deploy/sync only when explicitly `true` |
 | `workingDirectory` | No | - | Working directory for the agent process |
 | `agent` | No | - | Library agent entry name. Resolves to `configs/agents/<name>/` (Claude-native) or the `configs/agents/<name>.md` + `configs/agents/<name>/` sibling pair (AGENTS.md-native), and deploys to the runtime-aware overlay target before `skills` are applied |
 | `heartbeat` | No | - | Heartbeat interval in seconds, or legacy `{interval, message}` object |
 | `openMode` | No | `false` | Accept XMTP messages from any sender (not recommended for production) |
+
+Set `identityKey` once and keep it unchanged when renaming an agent. It is not
+inherited from `defaults`; duplicate keys and identity collisions fail closed
+instead of guessing which stored agent to update.
 
 ### Agent Example
 
@@ -363,7 +371,12 @@ Skills from defaults and per-agent lists are merged (deduped).
 
 The `xmtp` skill enables agents to send encrypted messages via the XMTP protocol. When included, agents can use `curl` to call `/xmtp/send` and `/xmtp/status` on their own port.
 
-XMTP requires an OWS wallet (set via `OWS_WALLET` env var, auto-assigned at deploy). Data is stored at `~/.xmtp/{address}/` outside the project repo.
+XMTP requires an OWS wallet. Set `wallet: true` to opt into provisioning; after
+the wallet exists, the Manager injects its name through `OWS_WALLET`. In managed
+IDACC, the wallet database, key, and allowlist live under the selected
+application profile and are keyed by the agent's immutable ID.
+Standalone Manager keeps the historical `~/.xmtp/{address}/` location. Neither
+mode stores XMTP state in the application bundle or a project repository.
 
 ```yaml
 defaults:
@@ -399,17 +412,33 @@ Plugins are copied to the agent's working directory at spawn time. Each agent ow
 
 ## Process Configuration
 
-Settings for agent processes.
+Application-specific settings for agent processes. Declare `env` on an agent,
+or under `defaults` when every agent should receive the same value. The former
+`resources.env` location remains supported for compatibility, but top-level
+`env` is preferred.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `env` | Object | `{}` | Environment variables for the agent process |
 
 ```yaml
-env:
-  MY_VAR: "value"
-  DEBUG: "true"
+defaults:
+  env:
+    APP_ENV: "production"
+
+agents:
+  - name: worker
+    env:
+      MY_VAR: "value"
+      DEBUG: "true"
 ```
+
+Environment keys must use shell-variable syntax (`[A-Za-z_][A-Za-z0-9_]*`) and
+all values must be strings. Keys owned by the Manager—including profile,
+identity, runtime/provider, plugin, MCP, wallet, and XMTP variables—are rejected
+and cannot override the managed launch envelope. Environment declarations are
+stored with the agent's Manager profile; use `${env:VAR_NAME}` substitution to
+avoid writing a secret directly into the YAML file.
 
 ---
 
@@ -574,16 +603,60 @@ Configuration can also be provided via environment variables:
 | `DATABASE_URL` | PostgreSQL connection string |
 | `ORCHESTRATOR_TYPE` | Agent runtime type |
 | `PUBLIC_BASE_URL` | Public URL base for agents (e.g., `https://idbot.live`) |
+| `IDACC_ADMIN_TOKEN` | Managed IDACC only: supervisor administration credential whose presence enables managed mode; captured and removed before worker spawn |
+| `IDACC_MANAGER_SERVICE_TOKEN` | Managed IDACC only: distinct random Manager/Brain credential, 32–4096 bytes without whitespace; captured and removed before worker spawn |
+
+Managed mode gives anonymous callers only REST-AP discovery and minimal
+readiness. Administrative routes retain loopback plus `X-Id-Admin: 1` and the
+admin bearer. Brain can use the service bearer only with
+`X-Id-Service: brain` for `GET`/`HEAD /teams`, `/agents`, and `/events`.
+Manager-owned workers receive neither base credential; each gets a derived
+credential bound to its team, immutable ID, and current process generation.
+Without `IDACC_ADMIN_TOKEN`, standalone HTTP behavior remains unchanged.
 
 **XMTP messaging:**
 
 | Variable | Description |
 |----------|-------------|
-| `OWS_WALLET` | OWS wallet name for XMTP signing (per-agent, set automatically at deploy) |
+| `OWS_WALLET` | OWS wallet name for XMTP signing (injected after explicit provisioning with `wallet: true` or the wallet-provision command) |
 | `XMTP_ENV` | XMTP network: `local`, `dev`, or `production` (default: `production`) |
 | `WEB3_BIO_API_KEY` | API key for web3.bio ENS resolution (optional, used as fallback) |
 
-XMTP starts automatically on agents that have an `OWS_WALLET` set. The DB encryption key is auto-generated per agent at `~/.xmtp/{address}/db.key`.
+XMTP starts automatically on agents that have an `OWS_WALLET` set. Managed
+workers receive only a validated `local`, `dev`, or `production` `XMTP_ENV`;
+ambient raw-wallet or database-key variables are not copied to every agent.
+Each managed agent's DB encryption key is generated and retained inside the
+selected IDACC profile. Standalone use retains the historical
+`~/.xmtp/{address}/db.key` behavior.
+
+Inbound XMTP payloads are capped at 24 KiB of UTF-8 text, and work is capped at
+eight active or queued turns per agent. A one-minute sliding window permits at
+most four accepted turns per sender and 16 globally, then recovers
+automatically. Retained sender histories are bounded. Each admitted turn has a
+fixed four-minute deadline and is cancelled without automatic retry so a hung
+provider cannot retain a worker or XMTP slot. XMTP turns never receive local
+tools, plugins, MCP servers, resume state, or the real agent workspace.
+The Claude Agent SDK uses an empty owner-only profile directory with settings
+sources and persistence disabled; Provider API and Ollama enforce MCP removal,
+omit local working-directory context, and cap requested completions at 1,024
+tokens. Claude CLI and other runtimes without a provable text-only mode return
+a fixed safety response instead of launching. This source-based boundary also
+applies when `openMode: true`.
+
+**Managed Codex state:** IDACC uses `CODEX_HOME` only to locate the consumer's
+canonical Codex login. It does not import global Codex modules, goals,
+memories, instructions, or unrelated session history. Generated module
+configuration is private and dispatch-scoped, while each agent's own resumable
+session state remains in that agent's selected IDACC profile.
+
+**Managed conversation continuity:** Manager stores at most 500
+conversation-to-runtime-session ownership entries per immutable agent under
+`<IDACC_DATA_DIR>/manager/runtime-sessions/agents/`. Entries are loaded before
+work begins and updated atomically. Same-conversation turns are serialized;
+different lead conversations retain parallel execution. `/clear` and automatic
+content-filter recovery update the durable ledger, not only process memory.
+Caller-supplied runtime session IDs resume only after this exact agent has
+durably established ownership.
 
 Environment variables take precedence over config file values for most settings.
 
@@ -594,8 +667,12 @@ Environment variables take precedence over config file values for most settings.
 | `ID_AGENT_PORT` | Agent's own REST-AP port (e.g., `4101`) |
 | `ID_AGENT_NAME` | Agent name |
 | `ID_AGENT_ALIAS` | Agent alias (same as name) |
+| `ID_AGENT_ID` | Immutable agent identity used for profile-owned runtime state |
 | `ID_TEAM` | Team name |
+| `IDACC_DATA_DIR` | Selected writable IDACC profile root (set automatically by the desktop app) |
 | `MANAGER_URL` | Manager base URL (e.g., `http://localhost:4100`) |
+| `ID_AGENT_PROCESS_GENERATION` | Unique identifier for the exact Manager-owned worker launch |
+| `IDACC_MANAGER_AGENT_TOKEN` | Managed mode only: private, generation-bound Manager callback credential; never print, persist, or forward it |
 
 ---
 

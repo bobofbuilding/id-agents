@@ -34,7 +34,9 @@ contains `task: <name>` plus explicit claim/done URLs (see the
 
 Use the brief's URLs verbatim:
 
-1. `POST <claim URL>` with `{"agent_id": "<your-name>"}` — flips to `doing`.
+1. `POST <claim URL>` with `{"agent_id": "<your-name>"}` — flips a queued
+   task to `doing`; an already preassigned `doing` task returns idempotent
+   success for its exact owner.
 2. Do the work.
 3. `POST <done URL>` with `{"agent_id": "<your-name>"}` — flips to `done`.
 4. Reply citing the assigned task name.
@@ -56,6 +58,11 @@ lifecycle below: create → claim → do → done.
 2. Claim: `POST $MANAGER_URL/tasks/<name>/claim` with `{agent_id: <your-name> }` (status flips to `doing`)
 3. Do the work. Write artifacts to `./output/` in your working directory.
 4. Complete: `POST $MANAGER_URL/tasks/<name>/done` with `{agent_id: <your-name> }` (status flips to `done`)
+
+Include `X-Id-Team: $ID_TEAM`, `X-Id-Agent: $ID_AGENT_ID`, and
+`Authorization: Bearer $IDACC_MANAGER_AGENT_TOKEN` on every Manager request.
+The credential is private to this exact worker generation; never print,
+persist, or forward it.
 5. Reply to the requester or team lead with a completion packet:
    - `Task:` the assigned task name, verbatim
    - `Summary:` what changed or what you learned

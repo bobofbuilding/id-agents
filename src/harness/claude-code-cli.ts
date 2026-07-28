@@ -18,7 +18,11 @@
 import { ChildProcess } from 'child_process';
 import { AgentHarness, HarnessOptions, HarnessMessage, HarnessType } from './types.js';
 import { resolveModelAlias } from '../core/model-aliases.js';
-import { toMcpServerRecord } from './mcp.js';
+import {
+  exactWholeToolNames,
+  isNamespacedMcpTool,
+  toMcpServerRecord,
+} from './mcp.js';
 import { reportTurnUsage } from './usage-report.js';
 import { detectClaudeCliRateLimit } from './rate-limit.js';
 import { resolveExecutable } from '../lib/executable-resolution.js';
@@ -30,6 +34,7 @@ import {
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { managerWorkerRequestHeaders } from '../manager-worker-auth.js';
 
 /**
  * Fire-and-forget report of one activity step (a tool call / file edit) to the
@@ -55,7 +60,7 @@ function reportActivity(kind: string, tool: string | undefined, summary: string,
     };
     void fetch(`${managerUrl}/activity/record`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: managerWorkerRequestHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(2000),
     }).catch(() => { /* best-effort; ignore */ });
@@ -83,18 +88,60 @@ function summarizeTool(name: string, input: any): { kind: string; summary: strin
 }
 
 export function claudeCliToolArgs(options: Pick<HarnessOptions, 'allowedTools' | 'executionPolicy'>): string[] {
-  const tools = (options.allowedTools || [])
-    .map((tool) => String(tool || '').trim())
-    .filter(Boolean);
-  if (tools.length === 0) return [];
-
-  const toolList = tools.join(',');
-  if (options.executionPolicy === 'control-plane-readonly') {
-    // Claude CLI's --allowedTools means "auto-approve", not "only expose".
-    // Use --tools for control-plane prompts so Bash/Edit/Write are unavailable.
-    return ['--tools', toolList, '--allowedTools', toolList];
+  if (options.executionPolicy === 'external-text-only') {
+    // Tool removal alone is insufficient: older consumer CLI releases may
+    // still ingest CLAUDE.md, settings, hooks, or resumable state and do not
+    // expose a capability-stable safe-mode contract. The dispatch layer uses
+    // the fixed text-only fallback instead of invoking this harness.
+    throw new Error(
+      'Claude Code CLI cannot guarantee external-text-only execution on every supported consumer version',
+    );
   }
-  return ['--allowedTools', toolList];
+  if (options.allowedTools === undefined) return [];
+  const tools = exactWholeToolNames(options.allowedTools);
+  const namedMcpTool = tools.find(isNamespacedMcpTool);
+  if (namedMcpTool) {
+    throw new Error(
+      `Claude Code CLI cannot enforce an exact named MCP tool boundary for "${namedMcpTool}"; use the Claude Agent SDK runtime`,
+    );
+  }
+  const builtInToolList = tools
+    .join(',');
+  const exactToolList = tools.join(',');
+  // --tools is the actual built-in exposure boundary; --allowedTools only
+  // controls permission. Explicitly discard user/project/local settings so
+  // ambient allow rules and hooks cannot broaden the declarative boundary.
+  // Named MCP tools fail closed above because the CLI cannot hide sibling
+  // tools published by an attached server.
+  return [
+    '--setting-sources',
+    '',
+    '--permission-mode',
+    'dontAsk',
+    '--tools',
+    builtInToolList,
+    ...(tools.length > 0 ? ['--allowedTools', exactToolList] : []),
+  ];
+}
+
+export function claudeCliMcpPolicy(
+  options: Pick<HarnessOptions, 'allowedTools' | 'mcpServers'>,
+): { servers: HarnessOptions['mcpServers']; strict: boolean } {
+  if (options.allowedTools !== undefined) {
+    const wholeToolNames = exactWholeToolNames(options.allowedTools);
+    const namedMcpTool = wholeToolNames.find(isNamespacedMcpTool);
+    if (namedMcpTool) {
+      throw new Error(
+        `Claude Code CLI cannot enforce an exact named MCP tool boundary for "${namedMcpTool}"; use the Claude Agent SDK runtime`,
+      );
+    }
+    return { servers: [], strict: true };
+  }
+  const servers = [...(options.mcpServers || [])];
+  return {
+    servers,
+    strict: servers.length > 0,
+  };
 }
 
 export interface ClaudeCliStdinInvocation {
@@ -164,7 +211,9 @@ export class ClaudeCodeCliHarness implements AgentHarness {
     // no interactive shell to approve prompts. The agent's
     // `dangerouslySkipPermissions: false` config can opt out; the spawn site
     // sets ID_AGENT_SKIP_PERMISSIONS=false in that case.
-    const skipPermissions = process.env.ID_AGENT_SKIP_PERMISSIONS !== 'false';
+    const exactToolBoundary = options.allowedTools !== undefined;
+    const skipPermissions = !exactToolBoundary
+      && process.env.ID_AGENT_SKIP_PERMISSIONS !== 'false';
     const args: string[] = [
       '-p', prompt,
       ...(process.env.ID_AGENT_CLAUDE_BARE === '1' ? ['--bare'] : []),
@@ -221,9 +270,10 @@ export class ClaudeCodeCliHarness implements AgentHarness {
     // ONLY this file (ignoring any project/user .mcp.json). Written to a temp
     // file and removed in the finally below.
     let mcpConfigFile: string | undefined;
-    if (options.mcpServers && options.mcpServers.length > 0) {
-      const mcpServers = toMcpServerRecord(options.mcpServers);
-      if (Object.keys(mcpServers).length > 0) {
+    const mcpPolicy = claudeCliMcpPolicy(options);
+    if (mcpPolicy.strict) {
+      const mcpServers = toMcpServerRecord(mcpPolicy.servers || []);
+      if (options.allowedTools !== undefined || Object.keys(mcpServers).length > 0) {
         mcpConfigFile = path.join(os.tmpdir(), `claude-mcp-${process.pid}-${Date.now()}.json`);
         // MCP env/headers can carry tokens; write owner-only and fail closed on
         // a pre-existing name ('wx') to avoid clobber/symlink races in shared /tmp.
@@ -234,7 +284,7 @@ export class ClaudeCodeCliHarness implements AgentHarness {
           fs.closeSync(fd);
         }
         args.push('--mcp-config', mcpConfigFile, '--strict-mcp-config');
-        console.log(`[Claude CLI] MCP: ${Object.keys(mcpServers).join(', ')} via ${mcpConfigFile}`);
+        console.log(`[Claude CLI] MCP: ${Object.keys(mcpServers).join(', ') || '(none)'} via ${mcpConfigFile}`);
       }
     }
 

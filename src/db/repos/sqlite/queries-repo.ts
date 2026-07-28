@@ -109,6 +109,29 @@ export class SqliteQueriesRepo implements QueriesRepository {
     return r.rows[0] ? this.parseQueryRow(r.rows[0]) : null;
   }
 
+  async listRecentCompletedSessionIds(
+    teamId: string,
+    agentId: string,
+    limit: number,
+  ): Promise<string[]> {
+    const boundedLimit = Math.max(1, Math.min(500, Math.floor(limit)));
+    const r = await this.db.query<{ session_id: string }>(
+      `SELECT session_id
+       FROM queries
+       WHERE team_id = ?
+         AND agent_id = ?
+         AND status = 'completed'
+         AND session_id IS NOT NULL
+         AND session_id <> ''
+         AND substr(query_id, 1, 5) <> 'xmtp_'
+       GROUP BY session_id
+       ORDER BY MAX(COALESCE(completed, created)) DESC
+       LIMIT ?`,
+      [teamId, agentId, boundedLimit],
+    );
+    return r.rows.map((row) => String(row.session_id));
+  }
+
   async expireStale(cutoffCreated: number, statuses: string[]): Promise<QueryRow[]> {
     if (statuses.length === 0) return [];
     const placeholders = statuses.map(() => '?').join(', ');
@@ -359,5 +382,23 @@ export class SqliteQueriesRepo implements QueriesRepository {
     }
 
     return queryIds;
+  }
+
+  async cancelForProcessGeneration(
+    agentId: string,
+    processGeneration: string,
+    completed: number,
+  ): Promise<string[]> {
+    const r = await this.db.query<{ query_id: string }>(
+      `UPDATE queries
+          SET status = 'cancelled',
+              completed = ?
+        WHERE agent_id = ?
+          AND status IN ('pending', 'processing')
+          AND json_extract(metadata, '$.processGeneration') = ?
+        RETURNING query_id`,
+      [completed, agentId, processGeneration],
+    );
+    return r.rows.map((row) => row.query_id);
   }
 }

@@ -150,6 +150,30 @@ export class PgSchedulesRepo implements SchedulesRepository {
     }
   }
 
+  async deleteByExactSource(sourceType: string, sourceKey: string): Promise<void> {
+    const result = await this.db.query<{ id: string }>(
+      `SELECT id FROM schedule_definitions
+       WHERE source_type = $1 AND source_key = $2`,
+      [sourceType, sourceKey],
+    );
+    const ids = result.rows.map((row) => row.id);
+    if (ids.length === 0) return;
+
+    const placeholders = ids.map((_, index) => `$${index + 1}`).join(', ');
+    await this.db.query(
+      `DELETE FROM schedule_runs WHERE schedule_id IN (${placeholders})`,
+      ids,
+    );
+    await this.db.query(
+      `DELETE FROM schedule_targets WHERE schedule_id IN (${placeholders})`,
+      ids,
+    );
+    await this.db.query(
+      `DELETE FROM schedule_definitions WHERE id IN (${placeholders})`,
+      ids,
+    );
+  }
+
   // ---------------------------------------------------------------------------
   // Targets
   // ---------------------------------------------------------------------------

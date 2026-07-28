@@ -1,6 +1,9 @@
-# Admin Control Guide
+# Standalone Admin Control Reference
 
-The `idagents-admin-control` skill lets any **Claude Code** session programmatically manage an ID Agents team (the same `/remote` flows work from **OpenAI Codex** or **Cursor CLI** if you adapt skill paths to `.agents/skills/` or `.cursor/skills/`). It provides scripts for sending CLI commands via HTTP, chatting with the manager, and polling for multi-agent replies — all without opening the interactive CLI.
+This guide documents the historical standalone Manager scripts. In unified
+IDACC, use the application’s Manager and Settings controls. Managed workers do
+not receive the administrator bearer, and these scripts intentionally must not
+be used to discover or bypass it.
 
 ## When to Use
 
@@ -14,7 +17,9 @@ The manager daemon (`npm run id-agents` or `node dist/start-agent-manager.js`) m
 
 ## The `/remote` Endpoint
 
-The manager exposes `POST /remote` on the manager daemon (port 4100 by default). No authentication required — it binds to localhost only.
+Standalone Manager exposes the historical loopback `/remote` contract. Managed
+IDACC requires loopback, `X-Id-Admin: 1`, and its private administrator bearer;
+the application owns that credential and does not export it to agents.
 
 Send any CLI command as an HTTP request:
 

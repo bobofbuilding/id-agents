@@ -9,8 +9,16 @@
  */
 
 import { AgentHarness, HarnessOptions, HarnessMessage, HarnessType, McpServerSpec } from './types.js';
-import { McpToolHub, mcpToOpenAiTools, parseOpenAiCallArgs } from './mcp-client.js';
+import {
+  callOpenAiToolWithinBoundary,
+  McpToolHub,
+  filterOpenAiMcpServersForAllowlist,
+  filterOpenAiToolsForAllowlist,
+  mcpToOpenAiTools,
+  openAiToolExecutionSet,
+} from './mcp-client.js';
 import { reportTurnUsage } from './usage-report.js';
+import { plainTextExecutionBoundary } from './external-text-policy.js';
 
 const DEFAULT_MODEL = 'default';
 const REQUEST_TIMEOUT_MS = Number(process.env.PROVIDER_API_REQUEST_TIMEOUT_MS ?? 600000);
@@ -62,6 +70,7 @@ export class ProviderApiHarness implements AgentHarness {
   private hub: McpToolHub | null = null;
 
   async *run(prompt: string, options: HarnessOptions = {}): AsyncGenerator<HarnessMessage> {
+    const boundary = plainTextExecutionBoundary(options, MAX_TOKENS);
     const provider = process.env.ID_PROVIDER_NAME || 'api-provider';
     const baseUrl = process.env.ID_PROVIDER_BASE_URL || process.env.OPENAI_BASE_URL || '';
     const apiKey = process.env.ID_PROVIDER_API_KEY || process.env.OPENAI_API_KEY || '';
@@ -85,8 +94,12 @@ export class ProviderApiHarness implements AgentHarness {
 
     this.abortController = new AbortController();
 
-    if (options.mcpServers && options.mcpServers.length) {
-      yield* this.runWithTools(prompt, options, options.mcpServers, provider, url, apiKey, model);
+    const permittedMcpServers = filterOpenAiMcpServersForAllowlist(
+      boundary.mcpServers,
+      options.allowedTools,
+    );
+    if (permittedMcpServers.length) {
+      yield* this.runWithTools(prompt, options, permittedMcpServers, provider, url, apiKey, model);
       return;
     }
 
@@ -95,8 +108,8 @@ export class ProviderApiHarness implements AgentHarness {
     let usage: { prompt_tokens?: number; completion_tokens?: number } | null = null;
 
     const messages: Array<{ role: string; content: string }> = [];
-    if (options.workingDirectory) {
-      messages.push({ role: 'system', content: `Working directory: ${options.workingDirectory}` });
+    if (boundary.workingDirectory) {
+      messages.push({ role: 'system', content: `Working directory: ${boundary.workingDirectory}` });
     }
     messages.push({ role: 'user', content: prompt });
 
@@ -111,7 +124,7 @@ export class ProviderApiHarness implements AgentHarness {
           messages,
           stream: true,
           temperature: 0.2,
-          ...(MAX_TOKENS >= 0 ? { max_tokens: MAX_TOKENS } : {}),
+          ...(boundary.maxTokens >= 0 ? { max_tokens: boundary.maxTokens } : {}),
           stream_options: { include_usage: true },
         }),
         signal,
@@ -198,11 +211,11 @@ export class ProviderApiHarness implements AgentHarness {
     try {
       hub = await McpToolHub.connect(servers);
       this.hub = hub;
-      let tools = mcpToOpenAiTools(hub.listTools());
-      if (options.allowedTools && options.allowedTools.length) {
-        const allow = new Set(options.allowedTools);
-        tools = tools.filter((tool) => allow.has(tool.function.name) || allow.has(tool.function.name.split('__').pop() || ''));
-      }
+      const tools = filterOpenAiToolsForAllowlist(
+        mcpToOpenAiTools(hub.listTools()),
+        options.allowedTools,
+      );
+      const executableToolNames = openAiToolExecutionSet(tools);
 
       if (!tools.length) {
         console.log(`[ProviderAPI] ${servers.length} MCP server(s) attached, but no tools were available — plain-text path`);
@@ -324,7 +337,12 @@ export class ProviderApiHarness implements AgentHarness {
           const exposed = call.function.name || '';
           yield { type: 'tool_use', tool_name: exposed, content: call.function.arguments || '' };
           console.log(`[ProviderAPI] tool_call: ${exposed}`);
-          const out = await hub.callTool(exposed, parseOpenAiCallArgs(call), ac.signal);
+          const out = await callOpenAiToolWithinBoundary(
+            hub,
+            plainFallback ? new Set<string>() : executableToolNames,
+            call,
+            ac.signal,
+          );
           console.log(`[ProviderAPI] tool result: ${out.text.length} chars${out.isError ? ' (error)' : ''}`);
           messages.push({ role: 'tool', tool_call_id: call.id || exposed, content: out.text });
         }

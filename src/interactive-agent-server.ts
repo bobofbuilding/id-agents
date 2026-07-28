@@ -4,6 +4,11 @@ import express from 'express';
 import { EventEmitter } from 'events';
 import { NewsItem } from './agent-rest-server.js';
 import type { Db } from './db/db-service.js';
+import {
+  MANAGER_AGENT_TOKEN_ENV,
+  MANAGER_TASK_RECEIPT_SERVICE,
+  managerWorkerBearerMatches,
+} from './manager-worker-auth.js';
 
 export interface IncomingReply {
   type: string;
@@ -38,6 +43,7 @@ export class InteractiveAgentServer extends EventEmitter {
   constructor(private name: string, private port: number = 4000) {
     super();
     this.app = express();
+    this.installManagedHttpBoundary();
     // Configure JSON parser with error handling
     this.app.use(express.json({ 
       strict: true,
@@ -65,6 +71,67 @@ export class InteractiveAgentServer extends EventEmitter {
         this.newsItems = this.newsItems.slice(0, this.maxNewsItems);
       }
     }, 5 * 60 * 1000);
+  }
+
+  private installManagedHttpBoundary(): void {
+    if (!process.env[MANAGER_AGENT_TOKEN_ENV]?.trim()) return;
+    this.app.use((req, res, next) => {
+      res.setHeader('Cache-Control', 'no-store');
+      if (typeof req.headers.origin === 'string' && req.headers.origin.trim()) {
+        return res.status(403).json({ error: 'browser_origin_forbidden' });
+      }
+      const rawHost = String(req.headers.host || '').trim().toLowerCase();
+      const hostName = rawHost.startsWith('[')
+        ? rawHost.slice(1, rawHost.indexOf(']'))
+        : rawHost.split(':', 1)[0];
+      if (
+        hostName !== '127.0.0.1'
+        && hostName !== 'localhost'
+        && hostName !== '::1'
+        && hostName !== '::ffff:127.0.0.1'
+      ) {
+        return res.status(403).json({ error: 'loopback_host_required' });
+      }
+      if (
+        (req.method === 'GET' || req.method === 'HEAD')
+        && req.path === '/.well-known/restap.json'
+        && !req.headers.authorization
+        && !req.headers['x-id-service']
+        && !req.headers['x-id-agent']
+        && !req.headers['x-id-team']
+      ) {
+        res.locals.idaccManagedAnonymous = true;
+        return next();
+      }
+      if (!managerWorkerBearerMatches(req.headers.authorization)) {
+        return res.status(401).json({ error: 'managed_worker_auth_required' });
+      }
+      const expectedAgentId = String(
+        process.env.ID_AGENT_ID || process.env.ID_DB_AGENT_ID || '',
+      ).trim();
+      const expectedTeam = String(
+        process.env.ID_AGENT_TEAM || process.env.ID_TEAM || process.env.ID_PROJECT || '',
+      ).trim();
+      if (
+        !expectedAgentId
+        || !expectedTeam
+        || req.headers['x-id-agent'] !== expectedAgentId
+        || req.headers['x-id-team'] !== expectedTeam
+      ) {
+        return res.status(403).json({ error: 'managed_worker_principal_mismatch' });
+      }
+      if (req.headers['x-id-service'] === MANAGER_TASK_RECEIPT_SERVICE) {
+        return next();
+      }
+      if (
+        req.headers['x-id-service'] === undefined
+        && (req.method === 'GET' || req.method === 'HEAD')
+        && req.path === '/news'
+      ) {
+        return next();
+      }
+      return res.status(403).json({ error: 'managed_worker_route_forbidden' });
+    });
   }
 
   setDbConfig(cfg: { db: Db; teamId: string; agentId: string }) {
@@ -111,6 +178,12 @@ export class InteractiveAgentServer extends EventEmitter {
   private setupRoutes() {
     // REST-AP discovery
     this.app.get('/.well-known/restap.json', (req, res) => {
+      if (res.locals.idaccManagedAnonymous === true) {
+        return res.json({
+          restap_version: '1.0',
+          status: 'available',
+        });
+      }
       res.json({
         restap_version: '1.0',
         agent: {

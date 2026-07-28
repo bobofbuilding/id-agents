@@ -51,8 +51,14 @@ export interface HarnessOptions {
    * is for manager/status/review prompts that should not edit files or run
    * unrestricted shell commands.
    */
-  executionPolicy?: 'default' | 'control-plane-readonly';
+  executionPolicy?: 'default' | 'control-plane-readonly' | 'external-text-only';
   resume?: string;
+  /**
+   * Trust assertion from the profile-owned dispatch layer. Provider/global
+   * session migration must remain disabled unless the runtime id was resolved
+   * from this exact agent's durable ownership records.
+   */
+  resumeAuthorization?: 'agent-owned';
   env?: Record<string, string | undefined>;
   /** The originating dispatch's query id, threaded through so live activity
    *  steps can be attributed to the exact query (per-dispatch trace). */

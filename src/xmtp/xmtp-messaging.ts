@@ -12,12 +12,42 @@
  * - Outbound messages can optionally go through an approval callback before being sent
  */
 
-import { Agent, createNameResolver, type MessageContext } from '@xmtp/agent-sdk';
+import {
+  Agent,
+  createBackend,
+  createNameResolver,
+  createSigner,
+  createUser,
+  generateInboxId,
+  getInboxIdForIdentifier,
+  type MessageContext,
+} from '@xmtp/agent-sdk';
 import { EventEmitter } from 'events';
 import { execFileSync } from 'child_process';
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
-import path from 'path';
+import { existsSync } from 'fs';
 import yaml from 'js-yaml';
+import {
+  ensureXmtpStoragePrivacy,
+  hardenPrivateXmtpFile,
+  migrateLegacyRawXmtpStorage,
+  migrateLegacyXmtpStorage,
+  readPrivateXmtpFile,
+  resolveXmtpStoragePaths,
+  writePrivateXmtpFile,
+  type XmtpStoragePaths,
+} from './storage-paths.js';
+
+export {
+  resolveXmtpStoragePaths,
+  type XmtpStorageContext,
+  type XmtpStoragePaths,
+  ensureXmtpStoragePrivacy,
+  hardenPrivateXmtpFile,
+  migrateLegacyRawXmtpStorage,
+  migrateLegacyXmtpStorage,
+  readPrivateXmtpFile,
+  writePrivateXmtpFile,
+} from './storage-paths.js';
 
 // ---------- Types ----------
 
@@ -34,6 +64,12 @@ export interface XmtpConfig {
   dbPath?: string;
   /** Working directory for persisting .xmtp/ data (allowlist, DB). */
   workingDirectory?: string;
+  /** Exact agent workspace used by pre-profile OWS Manager releases. */
+  legacyWorkingDirectory?: string;
+  /** Actual old child-process cwd used by raw Agent.createFromEnv. */
+  legacyProcessWorkingDirectory?: string;
+  /** Port used by the pre-profile OWS database filename. */
+  legacyPort?: number;
   /**
    * If true, accept messages from any sender (even if allowlist is empty).
    * Must be explicitly set — defaults to false (closed mode).
@@ -86,6 +122,8 @@ export class XmtpMessaging extends EventEmitter {
   private messageHandler: MessageHandler | null = null;
   private resolveAddress: ((name: string) => Promise<string | null>) | null = null;
   private started = false;
+  private startPromise: Promise<void> | null = null;
+  private lifecycleEpoch = 0;
 
   /**
    * Allowlist of trusted sender addresses (lowercase).
@@ -162,21 +200,45 @@ export class XmtpMessaging extends EventEmitter {
     return this.allowedSenders.has(address.toLowerCase());
   }
 
-  /** Per-agent data directory: ~/.xmtp/{address}/ */
-  private dataDir: string | null = null;
+  /** All profile-owned paths for the resolved signer. */
+  private storagePaths: XmtpStoragePaths | null = null;
 
-  /** Get the per-agent data directory. Available after signer is resolved. */
-  private getDataDir(address: string): string {
-    const home = process.env.HOME || '/tmp';
-    const dir = path.join(home, '.xmtp', address.toLowerCase());
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    return dir;
+  /** Resolve and create the per-agent storage paths after signer resolution. */
+  private prepareStorage(
+    address: string,
+    network: 'local' | 'dev' | 'production',
+    includeAddressDatabase = true,
+  ): XmtpStoragePaths {
+    const storage = resolveXmtpStoragePaths(this.config, address, network);
+    ensureXmtpStoragePrivacy(storage);
+    migrateLegacyXmtpStorage(storage, address, network, {
+      legacyWorkingDirectory: this.config.legacyWorkingDirectory,
+      legacyPort: this.config.legacyPort,
+      includeAddressDatabase,
+    });
+    this.storagePaths = storage;
+    return storage;
+  }
+
+  /** Resolve the same inbox id the SDK will pass to its dbPath callback. */
+  private async resolveInboxId(
+    signer: ReturnType<typeof createSigner>,
+    network: 'local' | 'dev' | 'production',
+  ): Promise<string> {
+    const identifier = await signer.getIdentifier();
+    const backend = await createBackend({
+      env: network,
+      ...(process.env.XMTP_GATEWAY_HOST
+        ? { gatewayHost: process.env.XMTP_GATEWAY_HOST }
+        : {}),
+    });
+    return (await getInboxIdForIdentifier(backend, identifier))
+      || generateInboxId(identifier);
   }
 
   /** Get the path to allowlist.yaml */
   private getAllowlistPath(): string | null {
-    if (!this.dataDir) return null;
-    return path.join(this.dataDir, 'allowlist.yaml');
+    return this.storagePaths?.allowlistPath ?? null;
   }
 
   /** Load allowlist from .xmtp/allowlist.yaml */
@@ -185,7 +247,7 @@ export class XmtpMessaging extends EventEmitter {
     if (!filePath || !existsSync(filePath)) return;
     try {
       // Parse YAML entries (list of {address, name} objects or plain strings)
-      const data = yaml.load(readFileSync(filePath, 'utf8'));
+      const data = yaml.load(readPrivateXmtpFile(this.storagePaths!, filePath).toString('utf8'));
       if (!Array.isArray(data)) return;
       for (const entry of data) {
         if (typeof entry === 'string') {
@@ -208,13 +270,15 @@ export class XmtpMessaging extends EventEmitter {
     const filePath = this.getAllowlistPath();
     if (!filePath) return;
     try {
-      const dir = path.dirname(filePath);
-      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
       const entries = [...this.allowedSenders].map(addr => {
         const name = this.allowedSenderNames.get(addr);
         return name ? { address: addr, name } : { address: addr };
       });
-      writeFileSync(filePath, '# XMTP allowed senders\n' + yaml.dump(entries));
+      writePrivateXmtpFile(
+        this.storagePaths!,
+        filePath,
+        '# XMTP allowed senders\n' + yaml.dump(entries),
+      );
     } catch (err: any) {
       console.warn(`[XMTP] Failed to save allowlist: ${err.message}`);
     }
@@ -230,23 +294,28 @@ export class XmtpMessaging extends EventEmitter {
    * Persisted at .xmtp/db.key so it survives restarts.
    */
   private async getDbEncryptionKey(): Promise<`0x${string}`> {
-    // Explicit env var takes priority
-    if (process.env.XMTP_DB_ENCRYPTION_KEY) {
-      const key = process.env.XMTP_DB_ENCRYPTION_KEY.replace(/^0x/, '');
+    // Explicit config takes priority; the environment remains a standalone
+    // compatibility fallback.
+    const configuredKey = this.config.dbEncryptionKey || process.env.XMTP_DB_ENCRYPTION_KEY;
+    if (configuredKey) {
+      const key = configuredKey.replace(/^0x/, '');
       return `0x${key}` as `0x${string}`;
     }
 
-    // Load or generate from ~/.xmtp/{address}/db.key
-    if (this.dataDir) {
-      const keyPath = path.join(this.dataDir, 'db.key');
+    // Load or generate from the resolved profile-owned data directory.
+    if (this.storagePaths) {
+      const keyPath = this.storagePaths.dbEncryptionKeyPath;
       if (existsSync(keyPath)) {
-        const key = readFileSync(keyPath, 'utf8').trim().replace(/^0x/, '');
+        const key = readPrivateXmtpFile(this.storagePaths, keyPath)
+          .toString('utf8')
+          .trim()
+          .replace(/^0x/, '');
         return `0x${key}` as `0x${string}`;
       }
       // Generate new key
       const { randomBytes } = await import('crypto');
       const key = randomBytes(32).toString('hex');
-      writeFileSync(keyPath, key, { mode: 0o600 });
+      writePrivateXmtpFile(this.storagePaths, keyPath, key);
       console.log(`[XMTP] Generated DB encryption key at ${keyPath}`);
       return `0x${key}` as `0x${string}`;
     }
@@ -259,7 +328,18 @@ export class XmtpMessaging extends EventEmitter {
   /** Start the XMTP agent and begin listening for messages. */
   async start(): Promise<void> {
     if (this.started) return;
+    if (this.startPromise) return this.startPromise;
+    const epoch = this.lifecycleEpoch;
+    const attempt = this.startOnce(epoch);
+    this.startPromise = attempt;
+    try {
+      await attempt;
+    } finally {
+      if (this.startPromise === attempt) this.startPromise = null;
+    }
+  }
 
+  private async startOnce(epoch: number): Promise<void> {
     // Set up name resolver for ENS lookups
     this.resolveAddress = createNameResolver(process.env.WEB3_BIO_API_KEY || '');
 
@@ -267,56 +347,136 @@ export class XmtpMessaging extends EventEmitter {
 
     // Determine signer and resolve address to set up data directory
     const owsWallet = this.config.owsWallet || process.env.OWS_WALLET;
-    let signerAddress: string;
+    let createdAgent: Agent;
 
     if (owsWallet) {
       const { createOwsSigner } = await import('./ows-signer.js');
       const { signer, address } = createOwsSigner(owsWallet);
-      signerAddress = address;
       console.log(`[XMTP] Using OWS wallet "${owsWallet}" (${address})`);
 
-      // Set up data dir at ~/.xmtp/{address}/
-      this.dataDir = this.getDataDir(address);
+      const storage = this.prepareStorage(address, env);
       this.loadAllowlist();
 
       const dbEncryptionKey = await this.getDbEncryptionKey();
-      const dbPath = path.join(this.dataDir, `${env}.db3`);
 
-      this.agent = await Agent.create(signer, {
+      createdAgent = await Agent.create(signer, {
         env,
-        dbPath: () => dbPath,
+        dbPath: () => storage.dbPath,
         dbEncryptionKey,
       });
     } else {
-      // Fallback: raw key from env — address resolved after agent creation
-      this.agent = await Agent.createFromEnv({
-        ...(this.config.env && { env: this.config.env }),
-      });
-      signerAddress = this.agent.address || '';
-      if (signerAddress) {
-        this.dataDir = this.getDataDir(signerAddress);
+      const preserveStandaloneCreateFromEnv = (
+        process.env.IDACC_MANAGED_SERVICE !== '1'
+        && !process.env.IDACC_DATA_DIR?.trim()
+        && !this.config.walletKey
+        && !this.config.dbPath
+        && !this.config.workingDirectory
+        && !this.config.dbEncryptionKey
+      );
+      if (preserveStandaloneCreateFromEnv) {
+        // Preserve the existing public standalone contract exactly: the SDK
+        // owns cwd/XMTP_DB_DIRECTORY and optional undefined encryption.
+        createdAgent = await Agent.createFromEnv({
+          ...(this.config.env && { env: this.config.env }),
+        });
+        const address = createdAgent.address || '';
+        if (address) {
+          this.prepareStorage(address, env, false);
+          this.loadAllowlist();
+        }
+      } else {
+        // Managed/explicit raw-key mode uses stable profile storage and resolves
+        // the SDK inbox id before importing its exact old DB filename.
+        const walletKey = this.config.walletKey || process.env.XMTP_WALLET_KEY;
+        if (!walletKey) {
+          throw new Error('XMTP wallet key is not configured');
+        }
+        const user = createUser(walletKey as `0x${string}`);
+        const signer = createSigner(user);
+        const inboxId = await this.resolveInboxId(signer, env);
+        const storage = this.prepareStorage(user.account.address, env, false);
+        const rawMigration = migrateLegacyRawXmtpStorage(
+          storage,
+          inboxId,
+          env,
+          {
+            legacyWorkingDirectory: this.config.legacyProcessWorkingDirectory,
+            dbEncryptionKey: this.config.dbEncryptionKey
+              || process.env.XMTP_DB_ENCRYPTION_KEY,
+          },
+        );
         this.loadAllowlist();
+        const dbEncryptionKey = rawMigration.encryptionMode === 'unencrypted'
+          ? undefined
+          : await this.getDbEncryptionKey();
+        createdAgent = await Agent.create(signer, {
+          env,
+          dbPath: (resolvedInboxId) => {
+            if (resolvedInboxId !== inboxId) {
+              throw new Error('XMTP inbox id changed during legacy migration');
+            }
+            return storage.dbPath;
+          },
+          ...(dbEncryptionKey && { dbEncryptionKey }),
+          ...(process.env.XMTP_GATEWAY_HOST
+            ? { gatewayHost: process.env.XMTP_GATEWAY_HOST }
+            : {}),
+        });
       }
     }
 
+    // Publish only the exact client created by this lifecycle attempt. Keeping
+    // the local reference avoids rereading mutable state after an overlapping
+    // stop and lets stale attempts clean up their own client deterministically.
+    const startedAgent = createdAgent;
+    this.agent = startedAgent;
+
     // Handle incoming text messages
-    this.agent.on('text', async (ctx: MessageContext) => {
+    startedAgent.on('text', async (ctx: MessageContext) => {
+      if (epoch !== this.lifecycleEpoch || this.agent !== startedAgent) return;
       await this.handleInbound(ctx);
     });
 
-    this.agent.on('start', () => {
+    startedAgent.on('start', () => {
+      if (epoch !== this.lifecycleEpoch || this.agent !== startedAgent) return;
       console.log(`[XMTP] Agent started`);
-      console.log(`[XMTP] Address: ${this.agent!.address}`);
-      this.emit('ready', this.agent!.address);
+      console.log(`[XMTP] Address: ${startedAgent.address}`);
+      this.emit('ready', startedAgent.address);
     });
 
-    this.agent.on('unhandledError', (error: Error) => {
+    startedAgent.on('unhandledError', (error: Error) => {
+      if (epoch !== this.lifecycleEpoch || this.agent !== startedAgent) return;
       console.error(`[XMTP] Error:`, error);
-      this.emit('error', error);
+      // EventEmitter treats an unhandled "error" event as a process-level
+      // exception. Standalone consumers are not required to register one, so
+      // log safely unless a listener explicitly opted into the event.
+      if (this.listenerCount('error') > 0) this.emit('error', error);
     });
 
-    this.started = true;
-    await this.agent.start();
+    try {
+      if (epoch !== this.lifecycleEpoch) {
+        if (this.agent === startedAgent) this.agent = null;
+        await startedAgent.stop();
+        return;
+      }
+      await startedAgent.start();
+      if (epoch !== this.lifecycleEpoch || this.agent !== startedAgent) {
+        if (this.agent === startedAgent) this.agent = null;
+        // stop() may have run before the pending SDK start settled. Stop again
+        // after settlement so a late-created stream cannot survive unowned.
+        await startedAgent.stop();
+        return;
+      }
+      this.started = true;
+    } catch (error) {
+      const ownsAgent = this.agent === startedAgent;
+      if (ownsAgent) this.agent = null;
+      this.started = false;
+      if (ownsAgent) {
+        try { await startedAgent.stop(); } catch { /* preserve the start error */ }
+      }
+      throw error;
+    }
   }
 
   /** Resolve xid.eth names via id-cli (CCIP-Read gateway workaround). */
@@ -340,9 +500,14 @@ export class XmtpMessaging extends EventEmitter {
 
   /** Stop the XMTP agent. */
   async stop(): Promise<void> {
-    // Agent SDK doesn't expose a stop method in the current API
-    this.started = false;
+    this.lifecycleEpoch += 1;
+    const agent = this.agent;
     this.agent = null;
+    this.started = false;
+    if (agent) await agent.stop();
+    if (this.startPromise) {
+      try { await this.startPromise; } catch { /* failed start is already cleaned */ }
+    }
   }
 
   /**

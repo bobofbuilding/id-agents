@@ -121,7 +121,7 @@ const PROFILES: Record<RuntimeId, RuntimeProfile> = {
     capabilities: {
       supportsResume: true,
       supportsPlugins: true,
-      supportsAllowedTools: true,
+      supportsAllowedTools: false,
       supportsMcp: true,
       supportsSkillFiles: true,
       supportsPluginSkillFallback: true,
@@ -269,7 +269,7 @@ const PROFILES: Record<RuntimeId, RuntimeProfile> = {
     capabilities: {
       supportsResume: false,
       supportsPlugins: false,
-      supportsAllowedTools: false,
+      supportsAllowedTools: true,
       supportsMcp: true,
       supportsSkillFiles: true,
       supportsPluginSkillFallback: true,
@@ -291,7 +291,7 @@ const PROFILES: Record<RuntimeId, RuntimeProfile> = {
     capabilities: {
       supportsResume: false,
       supportsPlugins: false,
-      supportsAllowedTools: false,
+      supportsAllowedTools: true,
       supportsMcp: true,
       supportsSkillFiles: true,
       supportsPluginSkillFallback: true,
