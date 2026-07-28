@@ -15,10 +15,17 @@ import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
+import { pathToFileURL } from 'node:url';
 
 const repo = resolve(import.meta.dirname, '..');
 const entry = join(repo, 'dist', 'start-agent-manager.js');
+const workerAuthEntry = join(repo, 'dist', 'manager-worker-auth.js');
 assert.equal(existsSync(entry), true, 'build the Manager before running the lifecycle smoke');
+assert.equal(existsSync(workerAuthEntry), true, 'build the Manager before running the lifecycle smoke');
+const {
+  deriveManagerAgentToken,
+  MANAGER_TASK_RECEIPT_SERVICE,
+} = await import(pathToFileURL(workerAuthEntry).href);
 
 function reservePort() {
   return new Promise((resolvePort, reject) => {
@@ -78,6 +85,21 @@ async function jsonRequest(baseUrl, token, path, options = {}) {
       authorization: `Bearer ${token}`,
     },
     ...(options.body ? { body: JSON.stringify(options.body) } : {}),
+  });
+  const text = await response.text();
+  const body = text ? JSON.parse(text) : {};
+  return { status: response.status, body };
+}
+
+async function workerHealthRequest(baseUrl, headers = {}) {
+  const response = await fetch(new URL('/health', baseUrl), {
+    method: 'GET',
+    redirect: 'error',
+    signal: AbortSignal.timeout(5_000),
+    headers: {
+      accept: 'application/json',
+      ...headers,
+    },
   });
   const text = await response.text();
   const body = text ? JSON.parse(text) : {};
@@ -148,7 +170,38 @@ try {
   assert.equal(first.body.status, 'running');
   stoppedPid = Number(first.body.pid);
   assert.equal(Number.isInteger(stoppedPid) && stoppedPid > 0, true);
-  const firstHealth = await jsonRequest(`http://127.0.0.1:${first.body.port}`, token, '/health');
+  const firstWorkerUrl = `http://127.0.0.1:${first.body.port}`;
+  const anonymousHealth = await workerHealthRequest(firstWorkerUrl);
+  assert.equal(anonymousHealth.status, 200);
+  assert.deepEqual(anonymousHealth.body, { status: 'ok' });
+
+  const rejectedAdminHealth = await jsonRequest(firstWorkerUrl, token, '/health');
+  assert.equal(rejectedAdminHealth.status, 401);
+  assert.deepEqual(rejectedAdminHealth.body, { error: 'managed_worker_auth_required' });
+
+  const firstAssignment = await jsonRequest(
+    managerUrl,
+    token,
+    `/agents/${encodeURIComponent(first.body.id)}`,
+  );
+  assert.equal(firstAssignment.status, 200, JSON.stringify(firstAssignment.body));
+  const firstGeneration = firstAssignment.body.metadata?.processGeneration;
+  assert.equal(typeof first.body.teamId, 'string');
+  assert.equal(typeof first.body.teamName, 'string');
+  assert.equal(typeof firstGeneration, 'string');
+  assert.equal(firstGeneration.length > 0, true);
+  const firstHealth = await workerHealthRequest(firstWorkerUrl, {
+    authorization: `Bearer ${deriveManagerAgentToken(
+      token,
+      first.body.teamId,
+      first.body.id,
+      firstGeneration,
+    )}`,
+    'x-id-service': MANAGER_TASK_RECEIPT_SERVICE,
+    'x-id-agent': first.body.id,
+    'x-id-team': first.body.teamName,
+  });
+  assert.equal(firstHealth.status, 200, JSON.stringify(firstHealth.body));
   assert.equal(firstHealth.body.agent, firstName);
   assert.equal(firstHealth.body.agentId, first.body.id);
   assert.equal(Number(firstHealth.body.pid), stoppedPid);

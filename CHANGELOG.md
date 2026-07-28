@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.154]
+
+- Align the packaged local-agent lifecycle smoke with the managed worker privacy
+  boundary: anonymous health proves liveness only, the desktop admin bearer is
+  rejected at the worker boundary, and identity/PID attestation requires the
+  exact team-, agent-, and process-generation-bound Manager credential.
+
 ## [0.1.153]
 
 - Align the full Manager regression suite with verified child registration,
