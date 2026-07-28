@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.153]
+
+- Align the full Manager regression suite with verified child registration,
+  generation-bound worker credentials, and the fail-closed pending lifecycle;
+  tests no longer promote a worker to running before health attestation.
+- Exercise Manager-reminted target credentials and task receipts without
+  weakening wrapper authentication, and distinguish public transaction hashes
+  from actual private-key leakage.
+- Make cross-platform worker-environment fixtures portable and eliminate stale
+  child-exit mocks that caused long test timeouts and unhandled errors.
+
 ## [0.1.152]
 
 - Add a managed-desktop HTTP privacy boundary while preserving the standalone

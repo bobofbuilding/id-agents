@@ -175,7 +175,9 @@ describe('agent-manager-db spawn-flow wiring guard', () => {
   it('spawn-flow paths use the unified overlay reconciler and rebuild refreshes the whole overlay', () => {
     const reconcileCalls = source.match(/this\.reconcileAgentManagedOverlay\(\{/g) ?? [];
     expect(reconcileCalls.length).toBeGreaterThanOrEqual(8);
-    expect(source).toContain('await this.refreshManagedOverlayForRebuild(teamId, teamName, agent)');
+    // Rebuild must reconcile from the row reloaded under the lifecycle lock,
+    // not from the potentially stale caller snapshot.
+    expect(source).toContain('await this.refreshManagedOverlayForRebuild(teamId, teamName, current)');
   });
 
   it('the transactional managed overlay reconciler is imported', () => {

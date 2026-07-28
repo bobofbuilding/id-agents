@@ -514,6 +514,17 @@ describe('direct deploy/sync persistence wiring (no listener)', () => {
       agentData: Record<string, any>,
     ) => {
       spawnCalls.push({ ...agentData });
+      const current = await db.agents.getById(agentData.id);
+      if (!current) return { success: false, error: 'agent row missing' };
+      await db.agents.updateStatus(agentData.id, 'running', {
+        metadata: {
+          ...((current.metadata as Record<string, unknown> | null | undefined) ?? {}),
+          pid: 45678,
+          processOwner: 'manager-child',
+          processGeneration: 'test-generation-45678',
+          managerOwnedLaunchIntent: true,
+        },
+      });
       return { success: true, pid: 45678, logFile: '/tmp/deploy-sync-direct.log' };
     };
     (manager as any).killAgentProcess = async (port: number, id?: string) => {

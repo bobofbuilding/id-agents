@@ -103,7 +103,9 @@ function fakeDb(overrides: Record<string, any> = {}): any {
       getByName: vi.fn(async () => null),
       resolve: vi.fn(async () => [agent()]),
       list: vi.fn(async () => [agent()]),
+      updateMetadata: vi.fn(async () => {}),
       updateStatus: vi.fn(async () => {}),
+      transitionOwnedProcessExit: vi.fn(async () => true),
       ...overrides.agents,
     },
     tasks: {
@@ -4323,7 +4325,7 @@ describe('stalled task sweeper', () => {
     });
     const manager = new AgentManagerDb('/tmp/id-agents-rebuild-cancel-test', db, { libraryRoot: null }) as any;
     manager.killAgentProcess = vi.fn(async () => ({ killed: true }));
-    manager.spawnLocalAgentProcess = vi.fn(async () => ({ success: true, pid: 123, logFile: '/tmp/agent.log' }));
+    manager.spawnLocalAgentProcessUnlocked = vi.fn(async () => ({ success: true, pid: 123, logFile: '/tmp/agent.log' }));
 
     const result = await manager.rebuildLocalClaudeAgent(TEAM_ID, 'default', agent());
 
@@ -4772,7 +4774,7 @@ describe('stalled task sweeper', () => {
         port: 4217,
       }),
     );
-    expect(db.agents.updateStatus).toHaveBeenCalledWith(stoppedWorker.id, 'running');
+    expect(db.agents.updateStatus).not.toHaveBeenCalledWith(stoppedWorker.id, 'running');
     expect(db.tasks.claim).toHaveBeenCalledWith('queued-task', stoppedWorker.id, nowSec, expect.objectContaining({
       maxDoingForTeam: expect.any(Number),
       workflow: expect.objectContaining({ assignmentId: expect.any(String) }),
@@ -5656,7 +5658,7 @@ describe('stalled task sweeper', () => {
       name: stoppedWorker.name,
       port: stoppedWorker.port,
     }));
-    expect(db.agents.updateStatus).toHaveBeenCalledWith(stoppedWorker.id, 'running');
+    expect(db.agents.updateStatus).not.toHaveBeenCalledWith(stoppedWorker.id, 'running');
     expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
       'research',
       'research-lead',
@@ -5688,7 +5690,7 @@ describe('stalled task sweeper', () => {
   });
 
   it('triages a stalled task to the lead when the owner is unavailable', async () => {
-    const unavailableOwner = agent({ status: 'stopped' });
+    const unavailableOwner = agent({ status: 'stopped', runtime: 'public-agent-remote' });
     const lead = agent({ id: 'lead-1', name: 'lead', metadata: { primaryLead: true } });
     const db = fakeDb({
       agents: {
@@ -5723,7 +5725,7 @@ describe('stalled task sweeper', () => {
   });
 
   it('routes stalled-owner triage to task-master when the team lead is offline', async () => {
-    const unavailableOwner = agent({ status: 'stopped' });
+    const unavailableOwner = agent({ status: 'stopped', runtime: 'public-agent-remote' });
     const liveNonLead = agent({ id: 'risk-id', name: 'risk-analyst', port: 4211, status: 'running' });
     const opsTeam = team({ id: 'ops-team-id', name: 'ops-team' });
     const taskMaster = agent({
@@ -5776,7 +5778,7 @@ describe('stalled task sweeper', () => {
   });
 
   it('does not fan out task-manager fallback prompts while the task-manager lane is cooling down', async () => {
-    const unavailableOwner = agent({ status: 'stopped' });
+    const unavailableOwner = agent({ status: 'stopped', runtime: 'public-agent-remote' });
     const opsTeam = team({ id: 'ops-team-id', name: 'ops-team' });
     const taskMaster = agent({
       id: 'task-master-id',
@@ -5834,7 +5836,7 @@ describe('stalled task sweeper', () => {
   });
 
   it('does not fan out task-manager triage delegations after a restart', async () => {
-    const unavailableOwner = agent({ status: 'stopped' });
+    const unavailableOwner = agent({ status: 'stopped', runtime: 'public-agent-remote' });
     const opsTeam = team({ id: 'ops-team-id', name: 'ops-team' });
     const taskMaster = agent({
       id: 'task-master-id',
@@ -5892,7 +5894,7 @@ describe('stalled task sweeper', () => {
   });
 
   it('uses recently completed task-manager triage as restart-persistent lane cooldown', async () => {
-    const unavailableOwner = agent({ status: 'stopped' });
+    const unavailableOwner = agent({ status: 'stopped', runtime: 'public-agent-remote' });
     const opsTeam = team({ id: 'ops-team-id', name: 'ops-team' });
     const taskMaster = agent({
       id: 'task-master-id',
@@ -6314,7 +6316,7 @@ describe('stalled task sweeper', () => {
       name: stoppedOwner.name,
       port: stoppedOwner.port,
     }));
-    expect(db.agents.updateStatus).toHaveBeenCalledWith(stoppedOwner.id, 'running');
+    expect(db.agents.updateStatus).not.toHaveBeenCalledWith(stoppedOwner.id, 'running');
     expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
       'default',
       'worker',
@@ -6649,7 +6651,7 @@ describe('stalled task sweeper', () => {
   });
 
   it('falls through to ops-lead when task-master is busy', async () => {
-    const unavailableOwner = agent({ status: 'stopped' });
+    const unavailableOwner = agent({ status: 'stopped', runtime: 'public-agent-remote' });
     const opsTeam = team({ id: 'ops-team-id', name: 'ops-team' });
     const taskMaster = agent({
       id: 'task-master-id',
@@ -7951,7 +7953,7 @@ describe('stalled task sweeper', () => {
       name: 'worker',
       port: 4210,
     }));
-    expect(db.agents.updateStatus).toHaveBeenCalledWith('worker-1', 'running');
+    expect(db.agents.updateStatus).not.toHaveBeenCalledWith('worker-1', 'running');
     expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
       'default',
       'worker',

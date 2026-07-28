@@ -27,6 +27,7 @@ import { SqliteQueriesRepo } from '../../src/db/repos/sqlite/queries-repo.js';
 import { SqliteNewsRepo } from '../../src/db/repos/sqlite/news-repo.js';
 import { SqliteSchedulesRepo } from '../../src/db/repos/sqlite/schedules-repo.js';
 import { SqliteTasksRepo } from '../../src/db/repos/sqlite/tasks-repo.js';
+import { SqliteEventsRepo } from '../../src/db/repos/sqlite/events-repo.js';
 import type { DeliverFn, DeliverResult } from '../../src/lib/ssh-deliver.js';
 import type { IdChainRegisterResult } from '../../src/onchain/idchain-register.js';
 import {
@@ -48,6 +49,7 @@ async function createInMemoryDb() {
     news: new SqliteNewsRepo(adapter),
     schedules: new SqliteSchedulesRepo(adapter),
     tasks: new SqliteTasksRepo(adapter),
+    events: new SqliteEventsRepo(adapter),
     async close() { await adapter.close(); },
   };
 }
@@ -592,16 +594,40 @@ describe('7. Response shape — no secrets in GET /agents', () => {
     expect(bodyText).not.toContain('PRIVATE_KEY');
   });
 
-  it('response does NOT contain private key hex strings (> 40 chars)', async () => {
+  it('response does NOT contain private key material', async () => {
     const resp = await customFetch(`${managerBaseUrl}/agents`, {
       headers: adminHeaders('public'),
     }) as any;
     const bodyText = await resp.text();
-    // Private keys are 64-char hex (66 with 0x prefix).
-    // Ethereum addresses are 40 hex chars (42 with 0x). Skip those.
-    const longHexPattern = /0x[0-9a-f]{43,}/gi;
-    const matches = bodyText.match(longHexPattern) ?? [];
-    expect(matches).toHaveLength(0);
+    const configuredPrivateKey = process.env.PRIVATE_KEY;
+    expect(configuredPrivateKey).toBeTruthy();
+    expect(bodyText).not.toContain(configuredPrivateKey);
+
+    // Public transaction hashes are also 32-byte hex values, so length alone
+    // cannot distinguish them from a private key. Reject secret-bearing fields
+    // while allowing public txHash values in the response.
+    const secretFields: string[] = [];
+    const visit = (value: unknown, at = 'response'): void => {
+      if (Array.isArray(value)) {
+        value.forEach((entry, index) => visit(entry, `${at}[${index}]`));
+        return;
+      }
+      if (!value || typeof value !== 'object') return;
+      for (const [key, entry] of Object.entries(value)) {
+        const normalizedKey = key
+          .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+          .replace(/-/g, '_')
+          .toLowerCase();
+        if (
+          /(?:^|_)(?:private_key|mnemonic|seed_phrase)(?:$|_)/.test(normalizedKey)
+        ) {
+          secretFields.push(`${at}.${key}`);
+        }
+        visit(entry, `${at}.${key}`);
+      }
+    };
+    visit(JSON.parse(bodyText));
+    expect(secretFields).toEqual([]);
   });
 });
 

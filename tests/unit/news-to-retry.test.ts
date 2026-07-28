@@ -6,6 +6,7 @@ import type { AddressInfo } from 'node:net';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AgentRestServer } from '../../src/claude-agent-server.js';
+import { MANAGER_TASK_RECEIPT_HEADER } from '../../src/manager-worker-auth.js';
 
 async function startHttpServer(
   handler: http.RequestListener,
@@ -204,6 +205,8 @@ describe('AgentRestServer /news-to retry', () => {
     const targetAuth: Array<string | undefined> = [];
     const targetServices: Array<string | undefined> = [];
     const targetReceipts: Array<string | undefined> = [];
+    const targetAgents: Array<string | undefined> = [];
+    const targetTeams: Array<string | undefined> = [];
     const target = await startHttpServer((req, res) => {
       if (req.url !== '/news' || req.method !== 'POST') {
         res.statusCode = 404;
@@ -217,6 +220,8 @@ describe('AgentRestServer /news-to retry', () => {
         targetAuth.push(req.headers.authorization);
         targetServices.push(req.headers['x-id-service'] as string | undefined);
         targetReceipts.push(req.headers['x-id-task-receipt'] as string | undefined);
+        targetAgents.push(req.headers['x-id-agent'] as string | undefined);
+        targetTeams.push(req.headers['x-id-team'] as string | undefined);
         res.statusCode = 202;
         res.setHeader('Content-Type', 'application/json');
         res.end(JSON.stringify({ ok: true }));
@@ -230,6 +235,7 @@ describe('AgentRestServer /news-to retry', () => {
       authorization?: string;
       agent?: string;
       team?: string;
+      receipt?: string;
       body?: any;
     }> = [];
     const manager = await startHttpServer((req, res) => {
@@ -239,6 +245,9 @@ describe('AgentRestServer /news-to retry', () => {
         authorization: req.headers.authorization,
         agent: req.headers['x-id-agent'] as string | undefined,
         team: req.headers['x-id-team'] as string | undefined,
+        receipt: req.headers[
+          MANAGER_TASK_RECEIPT_HEADER.toLowerCase()
+        ] as string | undefined,
         body: undefined as any,
       };
       if (req.url === '/agents' && req.method === 'GET') {
@@ -263,7 +272,7 @@ describe('AgentRestServer /news-to retry', () => {
           res.statusCode = 201;
           res.setHeader('Content-Type', 'application/json');
           res.end(JSON.stringify({
-            task_receipt: 'opaque-target-bound-task-receipt',
+            task_receipt: 'sender-to-manager-task-receipt',
             task: {
               id: 'task-1',
               name: 'validate-assignment',
@@ -271,6 +280,60 @@ describe('AgentRestServer /news-to retry', () => {
               owner: 'worker-1',
             },
           }));
+        });
+        return;
+      }
+      if (req.url === '/news-to' && req.method === 'POST') {
+        let raw = '';
+        req.on('data', chunk => { raw += chunk; });
+        req.on('end', async () => {
+          try {
+            hit.body = raw ? JSON.parse(raw) : null;
+            managerHits.push(hit);
+            const task = hit.body?.task;
+            const data = hit.body?.data;
+            const targetRes = await fetch(`${target.baseUrl}/news`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': 'Bearer target-generation-token',
+                'X-Id-Service': 'manager',
+                'X-Id-Agent': 'worker-1',
+                'X-Id-Team': 'engineering-team',
+                [MANAGER_TASK_RECEIPT_HEADER]: 'manager-to-target-task-receipt',
+              },
+              body: JSON.stringify({
+                type: 'notify',
+                from: hit.body?.from,
+                message: hit.body?.message,
+                data: task
+                  ? {
+                      ...(data && typeof data === 'object' && !Array.isArray(data)
+                        ? data
+                        : {}),
+                      task,
+                    }
+                  : data,
+                ...(task ? { task } : {}),
+                reply_expected: false,
+                ...(hit.body?.trigger === true ? { trigger: true } : {}),
+              }),
+            });
+            await targetRes.text();
+            res.statusCode = targetRes.status;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({
+              success: true,
+              task,
+            }));
+          } catch (error) {
+            res.statusCode = 502;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({
+              error: 'news_delivery_failed',
+              message: error instanceof Error ? error.message : String(error),
+            }));
+          }
         });
         return;
       }
@@ -292,7 +355,12 @@ describe('AgentRestServer /news-to retry', () => {
 
     const res = await fetch(`${agentBaseUrl}/news-to`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer derived-worker-token',
+        'X-Id-Agent': 'sender-id',
+        'X-Id-Team': 'engineering-team',
+      },
       body: JSON.stringify({
         to: 'worker',
         message: 'validate this',
@@ -319,7 +387,7 @@ describe('AgentRestServer /news-to retry', () => {
         name: 'validate-assignment',
       },
     });
-    expect(managerHits).toHaveLength(2);
+    expect(managerHits).toHaveLength(3);
     for (const hit of managerHits) {
       expect(hit).toMatchObject({
         authorization: 'Bearer derived-worker-token',
@@ -331,6 +399,19 @@ describe('AgentRestServer /news-to retry', () => {
       from: 'sender',
       owner: 'worker-1',
       name: 'validate-assignment',
+    });
+    expect(managerHits[2]).toMatchObject({
+      method: 'POST',
+      url: '/news-to',
+      receipt: 'sender-to-manager-task-receipt',
+      body: {
+        to: 'worker',
+        from: 'sender',
+        task: {
+          id: 'task-1',
+          name: 'validate-assignment',
+        },
+      },
     });
     await vi.waitFor(() => expect(targetBodies).toHaveLength(1));
     expect(targetBodies[0]).toMatchObject({
@@ -346,10 +427,14 @@ describe('AgentRestServer /news-to retry', () => {
         },
       },
     });
-    expect(targetAuth).toEqual([undefined]);
+    expect(targetAuth).toEqual(['Bearer target-generation-token']);
+    expect(targetAuth).not.toContain('Bearer derived-worker-token');
     expect(targetServices).toEqual(['manager']);
-    expect(targetReceipts).toEqual(['opaque-target-bound-task-receipt']);
-    expect(JSON.stringify(targetBodies[0])).not.toContain('opaque-target-bound-task-receipt');
+    expect(targetReceipts).toEqual(['manager-to-target-task-receipt']);
+    expect(targetAgents).toEqual(['worker-1']);
+    expect(targetTeams).toEqual(['engineering-team']);
+    expect(JSON.stringify(targetBodies[0])).not.toContain('sender-to-manager-task-receipt');
+    expect(JSON.stringify(targetBodies[0])).not.toContain('manager-to-target-task-receipt');
   });
 
   it('records a failed outbound notify when both delivery attempts fail', async () => {

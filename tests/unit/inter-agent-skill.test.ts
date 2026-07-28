@@ -106,7 +106,9 @@ describe('INTER_AGENT_SKILL — consumer-safe delegation flow', () => {
     expect(INTER_AGENT_SKILL).toContain('acceptance evidence');
     expect(INTER_AGENT_SKILL).toContain('authority limits');
     expect(INTER_AGENT_SKILL).toContain('Do not include credentials, unrelated profile data');
-    expect(INTER_AGENT_SKILL).toContain('Never print, persist, forward, or send it to another agent');
+    expect(INTER_AGENT_SKILL).toMatch(
+      /Never print, persist,\s+forward, or send it to another agent/i,
+    );
     expect(INTER_AGENT_SKILL).toMatch(/evidence to review, not as\s+automatic authorization/i);
   });
 

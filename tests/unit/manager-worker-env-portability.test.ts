@@ -222,38 +222,50 @@ describe('Manager worker environment portability', () => {
   });
 
   it('preserves Windows runtime variables and desktop-resolved CLI paths', () => {
+    // Create the fixture before overriding TEMP/TMP. On Windows os.tmpdir()
+    // reads those variables, and the synthetic C:\ paths do not exist on CI.
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'manager-worker-env-'));
+    workDirs.push(workDir);
+    const windows = path.win32;
+    const consumerHome = windows.join('C:\\', 'Users', 'consumer');
+    const consumerLocalAppData = windows.join(consumerHome, 'AppData', 'Local');
+    const consumerRoamingAppData = windows.join(consumerHome, 'AppData', 'Roaming');
+    const profileDataDir = windows.join(
+      consumerRoamingAppData,
+      'IDACC',
+      'profiles',
+      'default',
+    );
     const values: Record<(typeof ENV_KEYS)[number], string> = {
-      APPDATA: 'C:\\Users\\consumer\\AppData\\Roaming',
-      LOCALAPPDATA: 'C:\\Users\\consumer\\AppData\\Local',
-      USERPROFILE: 'C:\\Users\\consumer',
-      TEMP: 'C:\\Users\\consumer\\AppData\\Local\\Temp',
-      TMP: 'C:\\Users\\consumer\\AppData\\Local\\Temp',
-      SystemRoot: 'C:\\Windows',
-      ComSpec: 'C:\\Windows\\System32\\cmd.exe',
+      APPDATA: consumerRoamingAppData,
+      LOCALAPPDATA: consumerLocalAppData,
+      USERPROFILE: consumerHome,
+      TEMP: windows.join(consumerLocalAppData, 'Temp'),
+      TMP: windows.join(consumerLocalAppData, 'Temp'),
+      SystemRoot: windows.join('C:\\', 'Windows'),
+      ComSpec: windows.join('C:\\', 'Windows', 'System32', 'cmd.exe'),
       PATHEXT: '.COM;.EXE;.BAT;.CMD',
-      CLAUDE_PATH: 'C:\\Users\\consumer\\AppData\\Roaming\\npm\\claude.cmd',
-      ID_AGENT_CODEX_BIN: 'C:\\Users\\consumer\\AppData\\Roaming\\npm\\codex.cmd',
-      CODEX_BIN: 'C:\\standalone\\codex-bin.cmd',
-      CODEX_EXECUTABLE: 'C:\\standalone\\codex-executable.cmd',
-      SQLITE_PATH: 'C:\\Users\\consumer\\AppData\\Roaming\\IDACC\\profiles\\default\\manager.sqlite',
+      CLAUDE_PATH: windows.join(consumerRoamingAppData, 'npm', 'claude.cmd'),
+      ID_AGENT_CODEX_BIN: windows.join(consumerRoamingAppData, 'npm', 'codex.cmd'),
+      CODEX_BIN: windows.join('C:\\', 'standalone', 'codex-bin.cmd'),
+      CODEX_EXECUTABLE: windows.join('C:\\', 'standalone', 'codex-executable.cmd'),
+      SQLITE_PATH: windows.join(profileDataDir, 'manager.sqlite'),
       DATABASE_URL: 'postgresql://manager.example/idagents',
-      ID_WORKSPACE_DIR: 'C:\\Users\\consumer\\AppData\\Roaming\\IDACC\\profiles\\default\\workspace',
-      WORKSPACE_DIR: 'C:\\legacy-workspace-that-must-not-win',
+      ID_WORKSPACE_DIR: windows.join(profileDataDir, 'workspace'),
+      WORKSPACE_DIR: windows.join('C:\\', 'legacy-workspace-that-must-not-win'),
       IDACC_MANAGED_SERVICE: '1',
-      IDACC_DATA_DIR: 'C:\\Users\\consumer\\AppData\\Roaming\\IDACC\\profiles\\default',
-      CODEX_HOME: 'C:\\Users\\consumer\\.custom-codex',
+      IDACC_DATA_DIR: profileDataDir,
+      CODEX_HOME: windows.join(consumerHome, '.custom-codex'),
       XMTP_ENV: 'dev',
       XMTP_WALLET_KEY: 'must-not-cross-worker-boundary',
       XMTP_DB_ENCRYPTION_KEY: 'must-not-cross-worker-boundary',
-      XMTP_DB_DIRECTORY: 'C:\\legacy-xmtp-state',
+      XMTP_DB_DIRECTORY: windows.join('C:\\', 'legacy-xmtp-state'),
     };
     for (const key of ENV_KEYS) {
       originals.set(key, process.env[key]);
       process.env[key] = values[key];
     }
 
-    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'manager-worker-env-'));
-    workDirs.push(workDir);
     const manager = new AgentManagerDb(workDir, {} as any, { libraryRoot: null }) as any;
     const env = manager.buildLocalAgentEnv(
       'team-id',
@@ -280,6 +292,12 @@ describe('Manager worker environment portability', () => {
   });
 
   it('prevents hostile credential-lane env from overriding the managed worker envelope', () => {
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'manager-worker-lane-env-'));
+    workDirs.push(workDir);
+    const profileDataDir = path.join(workDir, 'profiles', 'default');
+    const profileWorkspace = path.join(profileDataDir, 'workspace');
+    const profileSqlite = path.join(profileDataDir, 'manager.sqlite');
+    const providerHome = path.join(workDir, 'operator', 'codex-provider');
     for (const key of ENV_KEYS) originals.set(key, process.env[key]);
     for (const key of ['CLAUDE_CODE_OAUTH_TOKEN', 'NODE_OPTIONS', 'DYLD_INSERT_LIBRARIES']) {
       originals.set(key, process.env[key]);
@@ -287,14 +305,12 @@ describe('Manager worker environment portability', () => {
     }
     delete process.env.CODEX_BIN;
     process.env.IDACC_MANAGED_SERVICE = '1';
-    process.env.IDACC_DATA_DIR = '/profiles/default';
-    process.env.ID_WORKSPACE_DIR = '/profiles/default/workspace';
-    process.env.SQLITE_PATH = '/profiles/default/manager.sqlite';
-    process.env.CODEX_HOME = '/operator/codex-provider';
+    process.env.IDACC_DATA_DIR = profileDataDir;
+    process.env.ID_WORKSPACE_DIR = profileWorkspace;
+    process.env.SQLITE_PATH = profileSqlite;
+    process.env.CODEX_HOME = providerHome;
     process.env.XMTP_ENV = 'dev';
 
-    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'manager-worker-lane-env-'));
-    workDirs.push(workDir);
     const manager = new AgentManagerDb(workDir, {} as any, { libraryRoot: null }) as any;
     manager.runtimeCredentialPoolByTeam.set('team-id', {
       lanes: [{
@@ -369,16 +385,16 @@ describe('Manager worker environment portability', () => {
     expect(env.PROVIDER_API_TOKEN).toBeUndefined();
     expect(env.oPeNaI_aPi_kEy).toBeUndefined();
     expect(env.CUSTOM_OBJECT).toBeUndefined();
-    expect(env.IDACC_DATA_DIR).toBe('/profiles/default');
+    expect(env.IDACC_DATA_DIR).toBe(profileDataDir);
     expect(env.ID_AGENT_ID).toBe('stable-agent-id');
     expect(env.ID_MCP_SERVERS).toBeUndefined();
     expect(env.ID_PLUGINS).toBeUndefined();
     expect(env.ID_RUNTIME_LANE_ID).toBe('hostile-lane');
-    expect(env.ID_WORKSPACE_DIR).toBe('/profiles/default/workspace');
+    expect(env.ID_WORKSPACE_DIR).toBe(profileWorkspace);
     expect(env.idAcc_instance_nonce).toBeUndefined();
-    expect(env.SQLITE_PATH).toBe('/profiles/default/manager.sqlite');
+    expect(env.SQLITE_PATH).toBe(profileSqlite);
     expect(env.DATABASE_URL).toBeUndefined();
-    expect(env.CODEX_HOME).toBe('/operator/codex-provider');
+    expect(env.CODEX_HOME).toBe(providerHome);
     expect(env.MANAGER_URL).toMatch(/^http:\/\/127\.0\.0\.1:/);
     expect(env.OWS_WALLET).toBeUndefined();
     expect(env.oWs_Private_Key).toBeUndefined();
@@ -602,12 +618,13 @@ describe('Manager worker environment portability', () => {
   });
 
   it('forwards a trimmed custom Codex provider home and only a validated XMTP network', () => {
-    for (const key of ENV_KEYS) originals.set(key, process.env[key]);
-    process.env.CODEX_HOME = '  /profiles/default/provider-codex  ';
-    process.env.XMTP_ENV = 'production';
-
     const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'manager-worker-provider-env-'));
     workDirs.push(workDir);
+    const providerHome = path.join(workDir, 'profiles', 'default', 'provider-codex');
+    for (const key of ENV_KEYS) originals.set(key, process.env[key]);
+    process.env.CODEX_HOME = `  ${providerHome}  `;
+    process.env.XMTP_ENV = 'production';
+
     const manager = new AgentManagerDb(workDir, {} as any, { libraryRoot: null }) as any;
     const codex = manager.buildLocalAgentEnv(
       'team-id',
@@ -615,7 +632,7 @@ describe('Manager worker environment portability', () => {
       43129,
       { id: 'codex-id', runtime: 'codex', metadata: {} },
     );
-    expect(codex.CODEX_HOME).toBe('/profiles/default/provider-codex');
+    expect(codex.CODEX_HOME).toBe(providerHome);
     expect(codex.XMTP_ENV).toBe('production');
     expect(codex.XMTP_DB_PATH).toBeUndefined();
     expect(codex.XMTP_WALLET_KEY).toBeUndefined();
@@ -639,16 +656,19 @@ describe('Manager worker environment portability', () => {
   });
 
   it('hands profile workers SQLite and the fallback workspace only without higher-precedence settings', () => {
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'manager-worker-db-env-'));
+    workDirs.push(workDir);
+    const profileDataDir = path.join(workDir, 'profiles', 'default');
+    const sqlitePath = path.join(profileDataDir, 'manager', 'id-agents.db');
+    const fallbackWorkspace = path.join(profileDataDir, 'workspace');
     for (const key of ENV_KEYS) {
       originals.set(key, process.env[key]);
     }
-    process.env.SQLITE_PATH = '/profiles/default/manager/id-agents.db';
+    process.env.SQLITE_PATH = sqlitePath;
     delete process.env.DATABASE_URL;
     delete process.env.ID_WORKSPACE_DIR;
-    process.env.WORKSPACE_DIR = '/profiles/default/workspace';
+    process.env.WORKSPACE_DIR = fallbackWorkspace;
 
-    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'manager-worker-db-env-'));
-    workDirs.push(workDir);
     const manager = new AgentManagerDb(workDir, {} as any, { libraryRoot: null }) as any;
     const env = manager.buildLocalAgentEnv(
       'team-id',
@@ -657,9 +677,9 @@ describe('Manager worker environment portability', () => {
       { runtime: 'codex', metadata: {} },
     );
 
-    expect(env.SQLITE_PATH).toBe('/profiles/default/manager/id-agents.db');
+    expect(env.SQLITE_PATH).toBe(sqlitePath);
     expect(env.DATABASE_URL).toBeUndefined();
-    expect(env.ID_WORKSPACE_DIR).toBe('/profiles/default/workspace');
+    expect(env.ID_WORKSPACE_DIR).toBe(fallbackWorkspace);
     expect(env.WORKSPACE_DIR).toBeUndefined();
   });
 

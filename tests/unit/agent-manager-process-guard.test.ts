@@ -1964,11 +1964,7 @@ describe('AgentManagerDb killAgentProcess guards', () => {
       source_key: 'heartbeat:agent-stopped-scheduled-worker',
     });
 
-    (manager as any).spawnLocalAgentProcess = vi.fn(async () => ({
-      success: true,
-      pid: 55572,
-      logFile: '/tmp/skill-discoverer.log',
-    }));
+    (manager as any).spawnLocalAgentProcess = verifiedSpawnStub(db, 55572);
 
     const target = await (manager as any).prepareScheduledDispatchTarget(
       {

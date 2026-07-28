@@ -45,6 +45,24 @@ async function createInMemoryDb() {
   };
 }
 
+async function commitVerifiedSpawn(
+  db: Awaited<ReturnType<typeof createInMemoryDb>>,
+  agentId: string,
+  pid: number,
+): Promise<void> {
+  const current = await db.agents.getById(agentId);
+  if (!current) throw new Error(`verified spawn target ${agentId} is missing`);
+  const metadata = {
+    ...((current.metadata as Record<string, unknown> | null | undefined) ?? {}),
+    pid,
+    processOwner: 'manager-child',
+    processGeneration: `test-generation-${pid}`,
+    managerOwnedLaunchIntent: true,
+  };
+  delete metadata.managerRestartRequested;
+  await db.agents.updateStatus(agentId, 'running', { metadata });
+}
+
 async function findFreePort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const server = net.createServer();
@@ -975,7 +993,7 @@ describe('IDACC Manager admin bearer', () => {
       await vi.waitFor(async () => {
         const current = await db.agents.getById(agentId);
         expect(current?.metadata?.processGeneration).toBe(replacementGeneration);
-        expect(current?.status).toBe('starting');
+        expect(current?.status).toBe('running');
       });
       expect((await fetch(`${managerUrl}/agents`, {
         headers: headersFor(oldToken),
@@ -1442,7 +1460,10 @@ describe('IDACC Manager admin bearer', () => {
     expect(JSON.stringify(await anonymous.json())).not.toContain(apiKey);
 
     const verifiedSpawn = vi.spyOn(manager as any, 'spawnLocalAgentProcessUnlocked')
-      .mockResolvedValue({ success: true, pid: 45210 });
+      .mockImplementation(async (_teamId: string, _teamName: string, agentData: { id: string }) => {
+        await commitVerifiedSpawn(db, agentData.id, 45210);
+        return { success: true, pid: 45210 };
+      });
     try {
       const rebound = await fetch(url, {
         method: 'POST',
@@ -1503,9 +1524,10 @@ describe('IDACC Manager admin bearer', () => {
     const spawnStarted = new Promise<void>((resolve) => { signalSpawnStarted = resolve; });
     const spawnGate = new Promise<void>((resolve) => { releaseSpawn = resolve; });
     const spawn = vi.spyOn(manager as any, 'spawnLocalAgentProcessUnlocked')
-      .mockImplementation(async () => {
+      .mockImplementation(async (_teamId: string, _teamName: string, agentData: { id: string }) => {
         signalSpawnStarted();
         await spawnGate;
+        await commitVerifiedSpawn(db, agentData.id, 45220);
         return { success: true, pid: 45220 };
       });
     const url = `${managerUrl}/agents/${encodeURIComponent(agentId)}/runtime`;
@@ -1793,16 +1815,18 @@ describe('IDACC Manager admin bearer', () => {
     const order: string[] = [];
     let spawnCount = 0;
     const spawn = vi.spyOn(manager as any, 'spawnLocalAgentProcessUnlocked')
-      .mockImplementation(async (_teamId: string) => {
+      .mockImplementation(async (_teamId: string, _teamName: string, agentData: { id: string }) => {
         spawnCount += 1;
         if (spawnCount === 1) {
           order.push('rebind-spawn-start');
           signalFirstSpawn();
           await firstSpawnGate;
           order.push('rebind-spawn-end');
+          await commitVerifiedSpawn(db, agentData.id, 45250);
           return { success: true, pid: 45250 };
         }
         order.push('move-rebuild-spawn');
+        await commitVerifiedSpawn(db, agentData.id, 45251);
         return { success: true, pid: 45251 };
       });
     const refresh = vi.spyOn(manager as any, 'refreshManagedOverlayForRebuild')

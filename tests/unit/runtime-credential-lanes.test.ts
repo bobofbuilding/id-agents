@@ -137,7 +137,19 @@ describe('runtime credential lanes', () => {
     expect(db.agents.updateMetadata).toHaveBeenCalledWith('agent-1', expect.objectContaining({
       runtimeCredentialLane: 'sub-b',
     }));
-    expect(manager.forwardToAgent).toHaveBeenCalledWith('http://localhost:4311', 'do the work', 'manager', 'session-1');
+    expect(manager.forwardToAgent).toHaveBeenCalledWith(
+      'http://localhost:4311',
+      'do the work',
+      'manager',
+      'session-1',
+      undefined,
+      expect.objectContaining({
+        id: 'agent-1',
+        team_id: 'team-1',
+        runtime: 'claude-code-cli',
+      }),
+      'default',
+    );
     expect(db.queries.create).toHaveBeenCalledWith(
       'team-1',
       'query-retry',
@@ -237,6 +249,9 @@ describe('runtime credential lanes', () => {
       'triage the staffing plan',
       'manager',
       'session-1',
+      undefined,
+      agent,
+      'legal',
     );
     expect(db.queries.create).toHaveBeenCalledWith(
       'team-1',
@@ -354,7 +369,15 @@ describe('runtime credential lanes', () => {
         runtimeRateLimitFailover: expect.objectContaining({ reason: 'model_capacity', fromModel: 'gpt-5.6-luna', toModel: 'gpt-5.5' }),
       }),
     }));
-    expect(manager.forwardToAgent).toHaveBeenCalledWith('http://localhost:4311', 'validate the build', 'manager', 'session-1');
+    expect(manager.forwardToAgent).toHaveBeenCalledWith(
+      'http://localhost:4311',
+      'validate the build',
+      'manager',
+      'session-1',
+      undefined,
+      agent,
+      'default',
+    );
     expect(db.queries.create).toHaveBeenCalledWith(
       'team-1',
       'query-retry',
