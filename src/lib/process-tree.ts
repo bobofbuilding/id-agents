@@ -146,6 +146,7 @@ export async function terminateOwnedProcessTree(
   pid: number,
   options: TerminateOwnedProcessTreeOptions,
 ): Promise<TerminateOwnedProcessTreeResult> {
+  const platform = options.platform ?? process.platform;
   const currentPid = options.currentPid ?? process.pid;
   const ownershipVerified = await Promise.resolve()
     .then(() => options.verifyOwnership(pid))
@@ -162,7 +163,7 @@ export async function terminateOwnedProcessTree(
   }
 
   const signalOptions: SignalOwnedProcessTreeOptions = {
-    platform: options.platform,
+    platform,
     env: options.env,
     execFileSync: options.execFileSync,
     kill: options.kill,
@@ -171,21 +172,29 @@ export async function terminateOwnedProcessTree(
   };
   const gracefulSignalled = signalOwnedProcessTree(target, 'SIGTERM', signalOptions);
   const isAlive = options.isAlive ?? defaultIsAlive;
-  if (!gracefulSignalled) {
+  const aliveAfterGracefulAttempt = isAlive(pid);
+  if (
+    !gracefulSignalled
+    && (
+      !aliveAfterGracefulAttempt
+      || platform !== 'win32'
+      || options.forceAfterGrace === false
+    )
+  ) {
     return {
       accepted: true,
       gracefulSignalled: false,
       forcedSignalled: false,
-      exited: !isAlive(pid),
+      exited: !aliveAfterGracefulAttempt,
       ownershipLost: false,
     };
   }
   if (options.forceAfterGrace === false) {
     return {
       accepted: true,
-      gracefulSignalled: true,
+      gracefulSignalled,
       forcedSignalled: false,
-      exited: !isAlive(pid),
+      exited: !aliveAfterGracefulAttempt,
       ownershipLost: false,
     };
   }
@@ -211,7 +220,7 @@ export async function terminateOwnedProcessTree(
   if (!isAlive(pid)) {
     return {
       accepted: true,
-      gracefulSignalled: true,
+      gracefulSignalled,
       forcedSignalled: false,
       exited: true,
       ownershipLost: false,
@@ -225,7 +234,7 @@ export async function terminateOwnedProcessTree(
   if (!forceTarget) {
     return {
       accepted: true,
-      gracefulSignalled: true,
+      gracefulSignalled,
       forcedSignalled: false,
       exited: false,
       ownershipLost: true,
@@ -235,7 +244,7 @@ export async function terminateOwnedProcessTree(
   const forcedSignalled = signalOwnedProcessTree(forceTarget, 'SIGKILL', signalOptions);
   return {
     accepted: true,
-    gracefulSignalled: true,
+    gracefulSignalled,
     forcedSignalled,
     exited: !isAlive(pid),
     ownershipLost: false,

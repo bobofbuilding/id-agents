@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.155]
+
+- On Windows, continue from a rejected graceful `taskkill /T` attempt to the
+  bounded grace period, exact ownership recheck, and existing `/T /F` fallback
+  instead of leaving a verified managed worker running after an explicit stop.
+- Preserve fail-closed ownership loss and graceful-only shutdown behavior, with
+  regression coverage for every initial `taskkill` failure branch.
+
 ## [0.1.154]
 
 - Align the packaged local-agent lifecycle smoke with the managed worker privacy

@@ -80,6 +80,103 @@ describe('owned process-tree termination', () => {
     });
   });
 
+  it('rechecks ownership and uses /F when Windows rejects graceful tree termination', async () => {
+    const invocations: string[][] = [];
+    const waits: number[] = [];
+    const verifyOwnership = vi.fn(() => true);
+    let alive = true;
+
+    const result = await terminateOwnedProcessTree(5858, {
+      platform: 'win32',
+      currentPid: 100,
+      execFileSync: (_command, args) => {
+        invocations.push([...args]);
+        if (!args.includes('/F')) throw new Error('graceful taskkill rejected');
+        alive = false;
+      },
+      verifyOwnership,
+      isAlive: () => alive,
+      graceMs: 20,
+      pollIntervalMs: 10,
+      wait: async (ms) => { waits.push(ms); },
+    });
+
+    expect(waits).toEqual([10, 10]);
+    expect(verifyOwnership).toHaveBeenCalledTimes(2);
+    expect(invocations).toEqual([
+      ['/PID', '5858', '/T'],
+      ['/PID', '5858', '/T', '/F'],
+    ]);
+    expect(result).toEqual({
+      accepted: true,
+      gracefulSignalled: false,
+      forcedSignalled: true,
+      exited: true,
+      ownershipLost: false,
+    });
+  });
+
+  it('never uses /F after a rejected graceful call when exact ownership is lost', async () => {
+    const invocations: string[][] = [];
+    let verification = 0;
+
+    const result = await terminateOwnedProcessTree(5959, {
+      platform: 'win32',
+      currentPid: 100,
+      execFileSync: (_command, args) => {
+        invocations.push([...args]);
+        throw new Error('taskkill rejected');
+      },
+      verifyOwnership: () => {
+        verification += 1;
+        return verification === 1;
+      },
+      isAlive: () => true,
+      graceMs: 10,
+      pollIntervalMs: 10,
+      wait: async () => {},
+    });
+
+    expect(invocations).toEqual([['/PID', '5959', '/T']]);
+    expect(result).toEqual({
+      accepted: true,
+      gracefulSignalled: false,
+      forcedSignalled: false,
+      exited: false,
+      ownershipLost: true,
+    });
+  });
+
+  it('does not wait or use /F after a rejected graceful-only shutdown call', async () => {
+    const invocations: string[][] = [];
+    const wait = vi.fn(async () => {});
+    const verifyOwnership = vi.fn(() => true);
+
+    const result = await terminateOwnedProcessTree(6060, {
+      platform: 'win32',
+      currentPid: 100,
+      execFileSync: (_command, args) => {
+        invocations.push([...args]);
+        throw new Error('taskkill rejected');
+      },
+      verifyOwnership,
+      isAlive: () => true,
+      forceAfterGrace: false,
+      wait,
+    });
+
+    expect(invocations).toEqual([['/PID', '6060', '/T']]);
+    expect(verifyOwnership).toHaveBeenCalledTimes(1);
+    expect(wait).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      accepted: true,
+      gracefulSignalled: false,
+      forcedSignalled: false,
+      exited: false,
+      ownershipLost: false,
+    });
+  });
+
   it('never force-kills when exact ownership is lost during the grace period', async () => {
     const invocations: string[][] = [];
     let verification = 0;
