@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.157]
+
+- Update the MCP SDK and its Node adapter override to patched releases so the
+  bundled production tree no longer includes the Windows encoded-backslash
+  static-file path traversal advisory.
+
 ## [0.1.156]
 
 - Recover pre-receipt consumer workspaces by archiving conflicting historical
