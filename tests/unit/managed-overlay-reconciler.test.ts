@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 import {
+  existsSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -88,6 +89,67 @@ describe('managed overlay reconciler', () => {
     expect(cleanup.preserved).toContain('.claude/rules/agent.md');
     expect(readFileSync(join(workspace, '.claude/rules/agent.md'), 'utf8'))
       .toBe('user-edited\n');
+  });
+
+  it('archives and migrates pre-receipt overlays once, then restores strict drift protection', () => {
+    const workspace = temporaryRoot('managed-overlay-pre-receipt-');
+    const exactPath = join(workspace, '.agents/skills/brain/SKILL.md');
+    const agentsPath = join(workspace, 'AGENTS.md');
+    const legacyExact = 'legacy managed brain\n';
+    const legacyAgents = [
+      'user prefix',
+      '<!-- BEGIN id-agents framework -->',
+      'legacy framework',
+      '<!-- BEGIN id-agents org -->',
+      'legacy organization',
+      '<!-- END id-agents org -->',
+      '<!-- END id-agents framework -->',
+      'user suffix',
+      '',
+    ].join('\n');
+    write(exactPath, legacyExact);
+    write(agentsPath, legacyAgents);
+
+    const options = {
+      workspaceRoot: workspace,
+      files: [{ destination: '.agents/skills/brain/SKILL.md', content: 'current brain\n' }],
+      markerFiles: [{
+        destination: 'AGENTS.md',
+        blocks: [{ id: 'framework', content: 'current framework' }],
+      }],
+      recoverPreReceiptWorkspace: true,
+    };
+
+    const preflight = reconcileManagedOverlay({ ...options, preflightOnly: true });
+    expect(preflight.archived).toEqual([]);
+    expect(readFileSync(exactPath, 'utf8')).toBe(legacyExact);
+    expect(readFileSync(agentsPath, 'utf8')).toBe(legacyAgents);
+    expect(existsSync(join(workspace, '.id-agents'))).toBe(false);
+
+    const migrated = reconcileManagedOverlay(options);
+    expect(migrated.archived.map((entry) => entry.path).sort()).toEqual([
+      '.agents/skills/brain/SKILL.md',
+      'AGENTS.md',
+    ]);
+    expect(readFileSync(exactPath, 'utf8')).toBe('current brain\n');
+    const currentAgents = readFileSync(agentsPath, 'utf8');
+    expect(currentAgents).toContain('user prefix\nuser suffix\n');
+    expect(currentAgents).toContain('<!-- BEGIN id-agents framework -->\ncurrent framework');
+    expect(currentAgents).not.toContain('legacy organization');
+    expect(currentAgents).not.toContain('id-agents org');
+
+    const exactRecovery = migrated.archived.find(
+      (entry) => entry.path === '.agents/skills/brain/SKILL.md',
+    );
+    const markerRecovery = migrated.archived.find((entry) => entry.path === 'AGENTS.md');
+    expect(readFileSync(join(workspace, exactRecovery!.recoveryPath), 'utf8'))
+      .toBe(legacyExact);
+    expect(readFileSync(join(workspace, markerRecovery!.recoveryPath), 'utf8'))
+      .toBe(legacyAgents);
+
+    writeFileSync(exactPath, 'user edit after receipt\n');
+    expect(() => reconcileManagedOverlay(options)).toThrow(/user-modified managed file/i);
+    expect(readFileSync(exactPath, 'utf8')).toBe('user edit after receipt\n');
   });
 
   it('never reclaims retained self-source drift while keeping unchanged files cleanable', () => {

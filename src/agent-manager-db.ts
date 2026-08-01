@@ -5072,6 +5072,7 @@ Return this JSON shape:
         blocks: markerBlocks,
       }],
       preflightOnly: input.preflightOnly,
+      recoverPreReceiptWorkspace: true,
     });
 
     if (input.preflightOnly) return { localPlugins, result };
@@ -5091,6 +5092,11 @@ Return this JSON shape:
     if (result.preserved.length > 0) {
       console.warn(
         `[AgentManager] Preserved user-modified managed overlay paths: ${result.preserved.join(', ')}`,
+      );
+    }
+    if (result.archived.length > 0) {
+      console.warn(
+        `[AgentManager] Archived pre-receipt managed overlay paths: ${result.archived.map((entry) => `${entry.path} -> ${entry.recoveryPath}`).join(', ')}`,
       );
     }
     return { localPlugins, result };

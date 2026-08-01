@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.156]
+
+- Recover pre-receipt consumer workspaces by archiving conflicting historical
+  managed files byte-for-byte before publishing the current runtime overlay.
+- Migrate the legacy nested framework/organization marker form while retaining
+  every byte of surrounding user-authored instructions.
+- Keep the migration one-time and restore strict receipt-backed drift protection
+  immediately afterward, with non-mutating preflight and regression coverage.
+
 ## [0.1.155]
 
 - On Windows, continue from a rejected graceful `taskkill /T` attempt to the

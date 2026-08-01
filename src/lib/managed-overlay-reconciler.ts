@@ -36,6 +36,7 @@ const DEFAULT_RECEIPT = '.id-agents/managed-overlay-receipt.json';
 const DEFAULT_MAX_FILES = 10_000;
 const DEFAULT_MAX_FILE_BYTES = 64 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES = 512 * 1024 * 1024;
+const LEGACY_RECOVERY_ROOT = '.id-agents/managed-overlay-recovery';
 const SHA256 = /^[0-9a-f]{64}$/;
 
 export interface ManagedOverlayTree {
@@ -89,9 +90,17 @@ export interface ManagedOverlayReconcileOptions {
   maxFiles?: number;
   maxFileBytes?: number;
   maxTotalBytes?: number;
+  /**
+   * One-time migration for workspaces created before aggregate receipts.
+   * Conflicting exact files are archived byte-for-byte before replacement and
+   * the historical nested framework marker is retired while outside text is
+   * preserved. This is ignored once a receipt exists.
+   */
+  recoverPreReceiptWorkspace?: boolean;
 }
 
 export interface ManagedOverlayReconcileResult {
+  archived: Array<{ path: string; recoveryPath: string }>;
   written: string[];
   removed: string[];
   unchanged: string[];
@@ -649,6 +658,90 @@ function currentDigest(root: string, path: string): string | null {
   return sha256(readPrivateFileNoFollow(root, path));
 }
 
+function legacyRecoveryPath(path: string, digest: string): string {
+  return `${LEGACY_RECOVERY_ROOT}/${digest}/${path}`;
+}
+
+function preflightLegacyArchive(
+  root: string,
+  target: string,
+  path: string,
+  digest: string,
+  maxBytes: number,
+): string {
+  const contents = readPrivateFileNoFollow(root, target, { maxBytes });
+  if (sha256(contents) !== digest) fail(`legacy recovery source changed while planning: ${path}`);
+  const recoveryPath = legacyRecoveryPath(path, digest);
+  const recoveryTarget = assertCaseAndLinkSafePath(root, recoveryPath, 'file');
+  const recoveryDigest = currentDigest(root, recoveryTarget);
+  if (recoveryDigest !== null && recoveryDigest !== digest) {
+    fail(`legacy recovery destination is occupied by different content: ${recoveryPath}`);
+  }
+  return recoveryPath;
+}
+
+function archiveLegacyFile(
+  root: string,
+  target: string,
+  path: string,
+  digest: string,
+  recoveryPath: string,
+  maxBytes: number,
+): void {
+  const contents = readPrivateFileNoFollow(root, target, { maxBytes });
+  if (sha256(contents) !== digest) fail(`legacy recovery source changed after preflight: ${path}`);
+  const recoveryTarget = absoluteTarget(root, recoveryPath);
+  if (!existsSync(recoveryTarget)) {
+    atomicWritePrivateFile(root, recoveryTarget, contents, { noOverwrite: true });
+  }
+  if (currentDigest(root, recoveryTarget) !== digest) {
+    fail(`legacy recovery archive failed its digest check: ${recoveryPath}`);
+  }
+}
+
+/**
+ * Older IDACC builds nested an `org` block inside the app-owned `framework`
+ * block. Current marker files deliberately reject nesting. At the explicit
+ * pre-receipt migration boundary, retire that one historical outer block and
+ * leave every byte before and after it untouched.
+ */
+function removeLegacyNestedFramework(contents: string, pathLabel: string): string | null {
+  const pattern = /<!-- (BEGIN|END) id-agents ([^>\r\n]+) -->/g;
+  const stack: Array<{ id: string; start: number }> = [];
+  let migrated: { start: number; end: number } | null = null;
+  let frameworkNested = false;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(contents)) !== null) {
+    const kind = match[1];
+    const id = match[2].trim();
+    validateMarkerId(id);
+    if (kind === 'BEGIN') {
+      if (stack.length > 0) {
+        if (stack[0].id !== 'framework') {
+          fail(`nested managed markers in ${pathLabel}: ${stack[0].id}, ${id}`);
+        }
+        frameworkNested = true;
+      }
+      stack.push({ id, start: match.index });
+      continue;
+    }
+    const open = stack.at(-1);
+    if (!open || open.id !== id) fail(`mismatched managed marker "${id}" in ${pathLabel}`);
+    stack.pop();
+    if (stack.length === 0 && id === 'framework' && frameworkNested) {
+      if (migrated) fail(`duplicate managed marker "framework" in ${pathLabel}`);
+      let end = match.index + match[0].length;
+      if (contents.startsWith('\r\n', end)) end += 2;
+      else if (contents.startsWith('\n', end)) end += 1;
+      migrated = { start: open.start, end };
+      frameworkNested = false;
+    }
+  }
+  if (stack.length > 0) fail(`unterminated managed marker "${stack.at(-1)?.id}" in ${pathLabel}`);
+  if (!migrated) return null;
+  return `${contents.slice(0, migrated.start)}${contents.slice(migrated.end)}`;
+}
+
 /**
  * Reconcile one aggregate desired runtime overlay. Callers must resolve source
  * precedence before invoking this function. A single receipt lets plugin,
@@ -698,6 +791,7 @@ export function reconcileManagedOverlay(
       fail(`workspace root does not exist: ${configuredRoot}`);
     }
     return {
+      archived: [],
       written: [],
       removed: [],
       unchanged: [],
@@ -710,8 +804,12 @@ export function reconcileManagedOverlay(
     fail(`workspace root must be a real directory: ${configuredRoot}`);
   }
   const root = realpathSync(configuredRoot);
+  const receiptTarget = assertCaseAndLinkSafePath(root, receiptPath, 'file');
+  const recoverPreReceiptWorkspace = options.recoverPreReceiptWorkspace === true
+    && !existsSync(receiptTarget);
   const receipt = readReceipt(root, receiptPath);
   const result: ManagedOverlayReconcileResult = {
+    archived: [],
     written: [],
     removed: [],
     unchanged: [],
@@ -720,6 +818,16 @@ export function reconcileManagedOverlay(
   };
   const existingDirectories = new Set<string>();
   const missingDirectories = new Set<string>();
+  const maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
+  const legacyFileRecoveries = new Map<string, {
+    digest: string;
+    recoveryPath: string;
+  }>();
+  const legacyMarkerMigrations = new Map<string, {
+    digest: string;
+    migrated: string;
+    recoveryPath: string;
+  }>();
 
   // Complete every path, collision, link, ownership, and drift preflight before
   // the first overlay file is mutated.
@@ -748,7 +856,19 @@ export function reconcileManagedOverlay(
       && digest !== null
       && digest !== wanted.sha256
     ) {
-      fail(`refusing to overwrite an unowned file: ${path}`);
+      if (!recoverPreReceiptWorkspace) {
+        fail(`refusing to overwrite an unowned file: ${path}`);
+      }
+      legacyFileRecoveries.set(path, {
+        digest,
+        recoveryPath: preflightLegacyArchive(
+          root,
+          target,
+          path,
+          digest,
+          maxFileBytes,
+        ),
+      });
     }
     if (owned && digest !== null) {
       const permitted = new Set([
@@ -775,9 +895,28 @@ export function reconcileManagedOverlay(
       if (existsSync(absolute)) existingDirectories.add(directory);
       else missingDirectories.add(directory);
     }
-    const contents = existsSync(target)
+    const originalContents = existsSync(target)
       ? readPrivateFileNoFollow(root, target).toString('utf8')
       : '';
+    let contents = originalContents;
+    if (recoverPreReceiptWorkspace && existsSync(target)) {
+      const migrated = removeLegacyNestedFramework(originalContents, path);
+      if (migrated !== null) {
+        const digest = sha256(Buffer.from(originalContents, 'utf8'));
+        legacyMarkerMigrations.set(path, {
+          digest,
+          migrated,
+          recoveryPath: preflightLegacyArchive(
+            root,
+            target,
+            path,
+            digest,
+            maxFileBytes,
+          ),
+        });
+        contents = migrated;
+      }
+    }
     const parsed = parseManagedMarkerBlocks(contents, path);
     const owned = receipt.markers[path] || {};
 
@@ -815,6 +954,23 @@ export function reconcileManagedOverlay(
   }
 
   if (options.preflightOnly) return result;
+
+  // Retire the historical nested marker form before normal strict marker
+  // reconciliation. The complete original host file remains recoverable and
+  // bytes outside the old outer framework block are retained exactly.
+  for (const [path, migration] of legacyMarkerMigrations) {
+    const target = absoluteTarget(root, path);
+    archiveLegacyFile(
+      root,
+      target,
+      path,
+      migration.digest,
+      migration.recoveryPath,
+      maxFileBytes,
+    );
+    atomicWritePrivateFile(root, target, migration.migrated);
+    result.archived.push({ path, recoveryPath: migration.recoveryPath });
+  }
 
   // Remove retired files only while their exact retained content still proves
   // Manager ownership. Drift is released and preserved.
@@ -1001,7 +1157,19 @@ export function reconcileManagedOverlay(
     }
 
     if (!prior && digest !== null) {
-      fail(`refusing to overwrite an unowned file during publication: ${path}`);
+      const recovery = legacyFileRecoveries.get(path);
+      if (!recovery || recovery.digest !== digest) {
+        fail(`refusing to overwrite an unowned file during publication: ${path}`);
+      }
+      archiveLegacyFile(
+        root,
+        target,
+        path,
+        recovery.digest,
+        recovery.recoveryPath,
+        maxFileBytes,
+      );
+      result.archived.push({ path, recoveryPath: recovery.recoveryPath });
     }
     if (prior && digest !== null) {
       const permitted = new Set([
