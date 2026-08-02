@@ -23389,7 +23389,12 @@ Return this JSON shape:
   }
 
   private startIdleParkingSweeper(): void {
-    if (process.env.ID_IDLE_PARK_DISABLED === 'true') return;
+    // Agent shutdown is a user-owned lifecycle decision. Never start the
+    // automatic parking policy merely because its opt-out flag is absent.
+    // Operators who deliberately want that policy must opt in explicitly;
+    // the interactive `/agents park-idle --confirm` command remains available
+    // regardless of this setting.
+    if (process.env.ID_IDLE_PARK_ENABLED !== 'true') return;
     const rawInterval = Number(process.env.ID_IDLE_PARK_INTERVAL_MS || 15 * 60 * 1000);
     const intervalMs = Number.isFinite(rawInterval) && rawInterval > 0
       ? Math.max(60_000, Math.floor(rawInterval))
@@ -26815,9 +26820,10 @@ Return this JSON shape:
         // manager-tracked coordination tasks without relying on the UI.
         this.startGoalAutopilotSync();
 
-        // Keep delegated/on-demand helper agents from accumulating after they finish.
-        // The sweep only parks non-lead agents with no active query, task, schedule,
-        // checkin, or recent query activity.
+        // Agent processes stay running by default. An administrator may
+        // explicitly opt into automatic idle parking with
+        // ID_IDLE_PARK_ENABLED=true; manual parking still requires the
+        // confirmed lifecycle command.
         this.startIdleParkingSweeper();
 
         // Start manager DB retention sweep (events + news; every 5 min by default)

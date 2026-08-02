@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.158]
+
+- Keep idle agents running by default. Automatic idle parking now requires an
+  explicit `ID_IDLE_PARK_ENABLED=true` operator opt-in, while manual parking
+  continues to require `/agents park-idle --confirm`.
+- Add lifecycle regression coverage proving the background sweep cannot stop
+  agents under the default consumer configuration.
+
 ## [0.1.157]
 
 - Update the MCP SDK and its Node adapter override to patched releases so the

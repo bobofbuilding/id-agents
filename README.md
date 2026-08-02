@@ -347,6 +347,10 @@ See [Scheduling Plan](./docs/SCHEDULING_PLAN.md) for the full design.
 /quit                       # Exit
 ```
 
+Agents remain running while idle by default. Automatic idle parking is disabled
+unless an operator explicitly sets `ID_IDLE_PARK_ENABLED=true`; the manual
+parking command always requires `--confirm`.
+
 ## Remote API
 
 The Manager exposes `/remote` for administrative automation. In managed IDACC,

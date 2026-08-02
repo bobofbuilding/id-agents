@@ -244,6 +244,7 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     delete process.env.ID_IDLE_PARK_INTERVAL_MS;
     delete process.env.ID_IDLE_PARK_INITIAL_DELAY_MS;
     delete process.env.ID_IDLE_PARK_DISABLED;
+    delete process.env.ID_IDLE_PARK_ENABLED;
     delete process.env.ID_PLAN_DECISION_QUERY_EXPIRY_MS;
     delete process.env.IDACC_AGENT_LOG_DIR;
     delete process.env.ELECTRON_RUN_AS_NODE;
@@ -2003,8 +2004,27 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     }));
   });
 
-  it('runs an initial idle parking sweep shortly after startup', async () => {
+  it('does not auto-park agents unless an operator explicitly opts in', async () => {
     vi.useFakeTimers();
+    process.env.ID_IDLE_PARK_INTERVAL_MS = '60000';
+    process.env.ID_IDLE_PARK_INITIAL_DELAY_MS = '1000';
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+
+    const parkIdleAgents = vi.spyOn(manager as any, 'parkIdleAgents');
+
+    (manager as any).startIdleParkingSweeper();
+
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
+    expect(parkIdleAgents).not.toHaveBeenCalled();
+
+    await manager.shutdown();
+  });
+
+  it('runs idle parking only after an explicit operator opt-in', async () => {
+    vi.useFakeTimers();
+    process.env.ID_IDLE_PARK_ENABLED = 'true';
     process.env.ID_IDLE_PARK_INTERVAL_MS = String(10 * 60 * 1000);
     process.env.ID_IDLE_PARK_INITIAL_DELAY_MS = '1000';
     const { manager, db, workDir } = await makeManager();
