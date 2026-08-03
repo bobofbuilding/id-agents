@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.159]
+
+- Report the initialized Manager control plane healthy while the bounded
+  previously-running worker restoration pass continues, so large persistent
+  fleets no longer force IDACC back into startup recovery on every restart.
+- Keep schedules, check-ins, and other automated dispatch gated until verified
+  worker restoration finishes.
+
 ## [0.1.158]
 
 - Keep idle agents running by default. Automatic idle parking now requires an

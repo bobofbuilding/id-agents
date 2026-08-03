@@ -26803,6 +26803,14 @@ Return this JSON shape:
         // coder row only. This avoids silent recurrence after one-off repairs
         // while leaving researcher and the rest of the fleet untouched.
         await this.reconcileDefaultCoderRuntimeFromConfig();
+
+        // The management control plane is usable once its routes, database,
+        // runtime lanes, and authoritative config are initialized. Restoring
+        // every previously-running worker can take tens of seconds for a large
+        // fleet and must not make the desktop treat the bundled Manager as
+        // unhealthy during that bounded recovery window. Automated schedule
+        // and check-in dispatch remains gated below until restoration finishes.
+        this.startupReady = true;
         await this.restoreManagerOwnedAgentsAtStartup();
         this.startAgentLogRetention();
 
@@ -26886,7 +26894,6 @@ Return this JSON shape:
         // Automatic schedule dispatch must not overlap process reconciliation,
         // credential hydration, or the sequential verified restore pass.
         this.schedulerService.start();
-        this.startupReady = true;
         settled = true;
         resolve();
         } catch (error) {

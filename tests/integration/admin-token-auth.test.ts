@@ -1906,7 +1906,7 @@ describe('IDACC Manager admin bearer', () => {
     }
   });
 
-  it('does not report healthy until the bounded managed restart-marker pass finishes', async () => {
+  it('reports the initialized control plane healthy while bounded worker restoration finishes', async () => {
     const previousManaged = process.env.IDACC_MANAGED_SERVICE;
     const previousGrace = process.env.IDACC_MANAGER_RESTART_MARKER_GRACE_MS;
     const readinessDb = await createInMemoryDb();
@@ -1927,11 +1927,8 @@ describe('IDACC Manager admin bearer', () => {
           await new Promise((resolve) => setTimeout(resolve, 10));
         }
       }
-      expect(early?.status).toBe(503);
-      expect(await early?.json()).toMatchObject({
-        status: 'starting',
-        ready: false,
-      });
+      expect(early?.status).toBe(200);
+      expect(await early?.json()).toMatchObject({ status: 'ok' });
 
       await starting;
       const ready = await fetch(readinessUrl);
