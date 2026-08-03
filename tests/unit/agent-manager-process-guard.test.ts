@@ -1105,6 +1105,52 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     expect(parked?.status).toBe('stopped');
   });
 
+  it('prioritizes the primary lead, team leads, and default validators before workers', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+    const row = (name: string, metadata: Record<string, unknown> = {}) => agentRow({
+      team_id: 'team-priority',
+      id: `agent-${name}`,
+      name,
+      metadata: { runtime: 'codex', ...metadata },
+    });
+    expect((manager as any).startupRestorePriority('default', row('lead'))).toBe(0);
+    expect((manager as any).startupRestorePriority('engineering-team', row('engineering-lead'))).toBe(1);
+    expect((manager as any).startupRestorePriority('custom-team', row('captain', { role: 'Team coordinator' }))).toBe(1);
+    expect((manager as any).startupRestorePriority('default', row('coder'))).toBe(2);
+    expect((manager as any).startupRestorePriority('engineering-team', row('backend-engineer'))).toBe(10);
+  });
+
+  it('starts a stopped local worker before an explicit dispatch', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+    const teamId = await db.teams.getOrCreateTeamId('engineering-team');
+    await db.agents.create(agentRow({
+      team_id: teamId,
+      id: 'agent-explicit-dispatch',
+      name: 'backend-engineer',
+      port: 4119,
+      status: 'stopped',
+      runtime: 'codex',
+      metadata: { runtime: 'codex' },
+    }));
+    const spawn = verifiedSpawnStub(db, 76546);
+    (manager as any).spawnLocalAgentProcessUnlocked = spawn;
+    const initial = await db.agents.getById('agent-explicit-dispatch');
+
+    const result = await (manager as any).ensureLocalAgentRunningForExplicitDispatch(
+      teamId,
+      'engineering-team',
+      initial,
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.agent.status).toBe('running');
+    expect(spawn).toHaveBeenCalledOnce();
+  });
+
   it('restores a non-provider worker whose parent-watchdog marker lands after the first managed startup scan', async () => {
     const { manager, db, workDir } = await makeManager();
     dbs.push(db);

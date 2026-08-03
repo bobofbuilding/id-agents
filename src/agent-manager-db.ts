@@ -19447,6 +19447,25 @@ Return this JSON shape:
           }
           a = matches[0];
         }
+        if (!/^(?:running|active|busy|working)$/i.test(String(a.status || ''))) {
+          const started = await this.ensureLocalAgentRunningForExplicitDispatch(
+            targetTeamId,
+            targetTeamName,
+            a,
+          );
+          if (!started.success) {
+            return {
+              ok: false,
+              error: started.error,
+              result: {
+                code: 'agent_start_failed',
+                agent: agentName,
+                team: targetTeamName,
+              },
+            };
+          }
+          a = started.agent;
+        }
         await this.sweepStaleQueriesIfDue(0);
         const learnRoutingDedupKey = this.learnRoutingDedupKey(message, a.id);
         if (learnRoutingDedupKey) {
@@ -26810,16 +26829,16 @@ Return this JSON shape:
         // while leaving researcher and the rest of the fleet untouched.
         await this.reconcileDefaultCoderRuntimeFromConfig();
 
-        // The management control plane is usable once its routes, database,
-        // runtime lanes, and authoritative config are initialized. Restoring
-        // every previously-running worker can take tens of seconds for a large
-        // fleet and must not make the desktop treat the bundled Manager as
-        // unhealthy during that bounded recovery window. Automated schedule
-        // and check-in dispatch remains gated below until restoration finishes.
+        // Restore the coordination spine before publishing readiness. The
+        // desktop may render while the larger worker fleet is still recovering,
+        // but primary-lead Chat must never become available while its team-lead
+        // routes are still absent. The remaining workers continue in the same
+        // bounded, sequential verified restore pass after readiness.
         this.fleetRestoring = true;
-        this.startupReady = true;
         try {
-          await this.restoreManagerOwnedAgentsAtStartup();
+          await this.restoreManagerOwnedAgentsAtStartup('leadership');
+          this.startupReady = true;
+          await this.restoreManagerOwnedAgentsAtStartup('workers');
         } finally {
           this.fleetRestoring = false;
         }
@@ -27136,11 +27155,45 @@ Return this JSON shape:
     }
   }
 
-  private async restoreManagerOwnedAgentsAfterRestart(): Promise<void> {
+  private startupRestorePriority(teamName: string, agent: AgentRow): number {
+    const name = String(agent.name || '').trim().toLowerCase();
+    const metadata = (agent.metadata as Record<string, unknown> | null | undefined) ?? {};
+    const roleText = JSON.stringify({
+      description: metadata.description,
+      role: metadata.role,
+      catalog: metadata.catalog,
+    }).toLowerCase();
+    if (teamName === 'default' && name === 'lead') return 0;
+    if (
+      /(?:^|[-_\s])(lead|coordinator|router)$/.test(name)
+      || /^(?:general-counsel|task-master)$/.test(name)
+      || /\b(?:primary lead|team lead|team coordinator|coordinator|routing lead)\b/.test(roleText)
+    ) return 1;
+    if (teamName === 'default' && /^(?:coder|researcher)$/.test(name)) return 2;
+    return 10;
+  }
+
+  private async restoreManagerOwnedAgentsAfterRestart(
+    phase: 'leadership' | 'workers' | 'all' = 'all',
+  ): Promise<void> {
     const teams = await this.db.teams.listTeams().catch(() => []);
+    const candidates: Array<{ team: (typeof teams)[number]; initialAgent: AgentRow; priority: number }> = [];
     for (const team of teams) {
       const agents = await this.dbListAgents(team.id, true).catch(() => []);
       for (const initialAgent of agents) {
+        const priority = this.startupRestorePriority(team.name, initialAgent);
+        if (phase === 'leadership' && priority > 2) continue;
+        if (phase === 'workers' && priority <= 2) continue;
+        candidates.push({ team, initialAgent, priority });
+      }
+    }
+    candidates.sort((a, b) => (
+      a.priority - b.priority
+      || Number(b.team.name === 'default') - Number(a.team.name === 'default')
+      || a.team.name.localeCompare(b.team.name)
+      || a.initialAgent.name.localeCompare(b.initialAgent.name)
+    ));
+    for (const { team, initialAgent } of candidates) {
         const initialMetadata = (
           initialAgent.metadata as Record<string, unknown> | null | undefined
         ) ?? {};
@@ -27231,7 +27284,6 @@ Return this JSON shape:
             }
           },
         );
-      }
     }
   }
 
@@ -27244,17 +27296,19 @@ Return this JSON shape:
     return Math.min(5_000, Math.max(0, Math.floor(configured)));
   }
 
-  private async restoreManagerOwnedAgentsAtStartup(): Promise<void> {
+  private async restoreManagerOwnedAgentsAtStartup(
+    phase: 'leadership' | 'workers' | 'all' = 'all',
+  ): Promise<void> {
     // Graceful Manager shutdown writes markers before exit, so restore those
     // immediately. After an unexpected supervised crash, surviving workers
     // discover parent death on their 1s watchdog and write the same durable
     // marker while shutting down. A single bounded second pass covers that
     // handoff without slowing standalone Manager startup or polling forever.
-    await this.restoreManagerOwnedAgentsAfterRestart();
+    await this.restoreManagerOwnedAgentsAfterRestart(phase);
     const graceMs = this.managedRestartMarkerGraceMs();
     if (graceMs <= 0) return;
     await sleep(graceMs);
-    await this.restoreManagerOwnedAgentsAfterRestart();
+    await this.restoreManagerOwnedAgentsAfterRestart(phase);
   }
 
   private async resumeProviderAgentAfterManagerRestart(
@@ -28270,6 +28324,52 @@ Return this JSON shape:
   ): Promise<{ success: boolean; pid?: number; logFile?: string; error?: string }> {
     const key = this.agentLifecycleKey(teamId, agentData);
     return this.withAgentLifecycleLock(key, () => this.spawnLocalAgentProcessUnlocked(teamId, teamName, agentData));
+  }
+
+  /**
+   * An explicit /ask is also an explicit request to make the selected local
+   * agent available. This closes the delegation gap where a lead could create
+   * and assign child work correctly but the Manager still POSTed to a stopped
+   * worker's old endpoint. The lifecycle lock lets an in-progress startup win
+   * without killing and respawning the same generation.
+   */
+  private async ensureLocalAgentRunningForExplicitDispatch(
+    teamId: string,
+    teamName: string,
+    agent: AgentRow,
+  ): Promise<{ success: true; agent: AgentRow } | { success: false; error: string }> {
+    if (isRemoteEndpointRuntime(agent.runtime) || agent.type === 'virtual' || agent.type === 'interactive') {
+      return { success: true, agent };
+    }
+    if (agent.type !== 'claude') {
+      return { success: false, error: `Agent "${agent.name}" cannot be started by the local Manager` };
+    }
+    return this.withAgentLifecycleLock(
+      this.agentLifecycleKey(teamId, agent),
+      async () => {
+        let current = await this.dbQueryAgentById(teamId, agent.id);
+        if (!current) return { success: false, error: `Agent "${agent.name}" was removed before dispatch` };
+        if (current.status === 'running') return { success: true, agent: current };
+        const result = await this.spawnLocalAgentProcessUnlocked(teamId, teamName, {
+          name: current.name,
+          id: current.id,
+          port: current.port,
+          model: current.model,
+          workingDirectory: current.working_directory ?? undefined,
+          tokenId: current.token_id ?? undefined,
+        });
+        if (!result.success) {
+          return {
+            success: false,
+            error: `Agent "${current.name}" could not be started for explicit dispatch: ${result.error || 'startup failed'}`,
+          };
+        }
+        current = await this.dbQueryAgentById(teamId, current.id);
+        return current
+          ? { success: true, agent: current }
+          : { success: false, error: `Agent "${agent.name}" disappeared after startup` };
+      },
+    );
   }
 
   private agentLifecycleKey(

@@ -1907,7 +1907,7 @@ describe('IDACC Manager admin bearer', () => {
     }
   });
 
-  it('reports the initialized control plane healthy while bounded worker restoration finishes', async () => {
+  it('withholds readiness until leadership restoration, then stays healthy while workers finish', async () => {
     const previousManaged = process.env.IDACC_MANAGED_SERVICE;
     const previousGrace = process.env.IDACC_MANAGER_RESTART_MARKER_GRACE_MS;
     const readinessDb = await createInMemoryDb();
@@ -1915,10 +1915,29 @@ describe('IDACC Manager admin bearer', () => {
     const readinessManager = new AgentManagerDb(readinessWorkDir, readinessDb as never);
     const readinessPort = await findFreePort();
     const readinessUrl = `http://127.0.0.1:${readinessPort}/health`;
+    let releaseLeadership!: () => void;
+    let releaseWorkers!: () => void;
+    let signalLeadership!: () => void;
+    let signalWorkers!: () => void;
+    const leadershipStarted = new Promise<void>((resolve) => { signalLeadership = resolve; });
+    const workersStarted = new Promise<void>((resolve) => { signalWorkers = resolve; });
+    const leadershipGate = new Promise<void>((resolve) => { releaseLeadership = resolve; });
+    const workersGate = new Promise<void>((resolve) => { releaseWorkers = resolve; });
+    vi.spyOn(readinessManager as any, 'restoreManagerOwnedAgentsAtStartup')
+      .mockImplementation(async (phase: 'leadership' | 'workers') => {
+        if (phase === 'leadership') {
+          signalLeadership();
+          await leadershipGate;
+          return;
+        }
+        signalWorkers();
+        await workersGate;
+      });
     process.env.IDACC_MANAGED_SERVICE = '1';
     process.env.IDACC_MANAGER_RESTART_MARKER_GRACE_MS = '120';
     try {
       const starting = readinessManager.start(readinessPort);
+      await leadershipStarted;
       let early: Response | null = null;
       const deadline = Date.now() + 1_000;
       while (!early && Date.now() < deadline) {
@@ -1928,13 +1947,24 @@ describe('IDACC Manager admin bearer', () => {
           await new Promise((resolve) => setTimeout(resolve, 10));
         }
       }
-      expect(early?.status).toBe(200);
+      expect(early?.status).toBe(503);
       expect(await early?.json()).toMatchObject({
+        status: 'starting',
+        ready: false,
+        restoring: true,
+      });
+
+      releaseLeadership();
+      await workersStarted;
+      const coordinating = await fetch(readinessUrl);
+      expect(coordinating.status).toBe(200);
+      expect(await coordinating.json()).toMatchObject({
         status: 'ok',
         ready: true,
         restoring: true,
       });
 
+      releaseWorkers();
       await starting;
       const ready = await fetch(readinessUrl);
       expect(ready.status).toBe(200);
@@ -1944,6 +1974,8 @@ describe('IDACC Manager admin bearer', () => {
         restoring: false,
       });
     } finally {
+      releaseLeadership();
+      releaseWorkers();
       await readinessManager.shutdown().catch(() => {});
       await readinessDb.close();
       fs.rmSync(readinessWorkDir, { recursive: true, force: true });

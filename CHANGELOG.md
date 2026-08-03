@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.161]
+
+- Restore the primary lead, non-default team leads, and default validators
+  before the managed control plane reports ready, while the remaining worker
+  fleet continues its bounded verified recovery afterward.
+- Treat an explicit `/ask` as authorization to start its selected local agent,
+  so team leads can delegate to stopped teammates without dispatching into a
+  dead endpoint.
+- Serialize start-on-dispatch with Manager lifecycle recovery to prevent a
+  simultaneous restore and delegation from respawning the same worker.
+
 ## [0.1.160]
 
 - Make explicit local-agent stops deterministic on macOS, Linux, and Windows:
