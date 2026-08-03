@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.162]
+
+- Refresh the production dependency lock to `fast-uri` 3.1.5 and Hono 4.12.34,
+  clearing the newly published host-confusion and CORS ReDoS advisories before
+  the leadership-first Manager is bundled into an IDACC review build.
+
 ## [0.1.161]
 
 - Restore the primary lead, non-default team leads, and default validators
