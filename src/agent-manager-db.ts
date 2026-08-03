@@ -1398,7 +1398,7 @@ const DEFAULT_VALIDATOR_RECOMMENDATION_LOOP: ValidatorRecommendationLoopConfig =
   updatedAt: null,
 };
 const MANAGER_HTTP_SHUTDOWN_TIMEOUT_MS = 3_000;
-const WINDOWS_AGENT_TERMINATION_GRACE_MS = 2_000;
+const LOCAL_AGENT_TERMINATION_GRACE_MS = 2_000;
 const TALK_TO_DELIVERY_TIMEOUT_MS = 30_000;
 const TALK_TO_MAX_ATTEMPTS = 3;
 const TALK_TO_INITIAL_RETRY_DELAY_MS = 250;
@@ -1472,6 +1472,7 @@ export class AgentManagerDb {
   private agentLogRetentionInterval: NodeJS.Timeout | null = null;
   private shuttingDown = false;
   private startupReady = false;
+  private fleetRestoring = false;
   private validatorRecommendationLoopLocks: Map<string, Promise<void>> = new Map();
   private taskOwnerWakeAttempts: Map<string, number> = new Map();
   private scheduleTargetWakeAttempts: Map<string, number> = new Map();
@@ -11694,6 +11695,7 @@ Return this JSON shape:
       res.status(ready ? 200 : 503).json({
         status: ready ? 'ok' : 'starting',
         ready,
+        restoring: this.fleetRestoring,
         ...managerHealthAttestation(),
         timestamp: Date.now(),
       });
@@ -11735,6 +11737,7 @@ Return this JSON shape:
         return res.status(503).json({
           status: 'starting',
           ready: false,
+          restoring: this.fleetRestoring,
           ...managerHealthAttestation(),
           timestamp: Date.now(),
         });
@@ -11746,6 +11749,8 @@ Return this JSON shape:
       ]);
       res.json({
         status: 'ok',
+        ready: true,
+        restoring: this.fleetRestoring,
         ...managerHealthAttestation(),
         team: teamName,
         agents: parseInt(count || '0'),
@@ -26669,6 +26674,7 @@ Return this JSON shape:
 
   async start(port: number = 4100): Promise<void> {
     this.startupReady = false;
+    this.fleetRestoring = false;
     this.managementPort = port;
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -26810,8 +26816,13 @@ Return this JSON shape:
         // fleet and must not make the desktop treat the bundled Manager as
         // unhealthy during that bounded recovery window. Automated schedule
         // and check-in dispatch remains gated below until restoration finishes.
+        this.fleetRestoring = true;
         this.startupReady = true;
-        await this.restoreManagerOwnedAgentsAtStartup();
+        try {
+          await this.restoreManagerOwnedAgentsAtStartup();
+        } finally {
+          this.fleetRestoring = false;
+        }
         this.startAgentLogRetention();
 
         // Start periodic health monitoring (every 30s)
@@ -26913,6 +26924,7 @@ Return this JSON shape:
     if (this.shuttingDown) return;
     this.shuttingDown = true;
     this.startupReady = false;
+    this.fleetRestoring = false;
     if (this.checkinService) {
       this.checkinService.stop();
       this.checkinService = null;
@@ -28533,7 +28545,7 @@ Return this JSON shape:
           && proc.signalCode == null
         ),
         isAlive: () => this.processIsAlive(pid),
-        graceMs: WINDOWS_AGENT_TERMINATION_GRACE_MS,
+        graceMs: LOCAL_AGENT_TERMINATION_GRACE_MS,
         onError: (message, error) => {
           console.warn(`[Manager] ${message}: ${error instanceof Error ? error.message : String(error)}`);
         },
@@ -29458,31 +29470,24 @@ Return this JSON shape:
 
       const row = rowsByPid.get(pid) ?? expectedRow;
       const verifyOwnership = () => this.verifyLocalAgentProcessOwnership(pid, port, row);
-      let signalled = false;
-      if (process.platform === 'win32') {
-        const result = await terminateOwnedProcessTree(pid, {
-          verifyOwnership,
-          isAlive: () => this.processIsAlive(pid),
-          graceMs: WINDOWS_AGENT_TERMINATION_GRACE_MS,
-          // Shutdown first requests every child to exit, then applies one
-          // coordinated force pass after the shared three-second grace.
-          forceAfterGrace: !this.shuttingDown,
-          onError: (message, error) => {
-            console.warn(`[Manager] ${message}: ${error instanceof Error ? error.message : String(error)}`);
-          },
-        });
-        signalled = result.gracefulSignalled || result.forcedSignalled || result.exited;
-      } else {
-        const target = verifiedOwnedProcess(pid, await verifyOwnership());
-        if (target) {
-          signalled = signalOwnedProcessTree(target, 'SIGTERM', {
-            detachedProcessGroup: true,
-            onError: (message, error) => {
-              console.warn(`[Manager] ${message}: ${error instanceof Error ? error.message : String(error)}`);
-            },
-          });
-        }
-      }
+      // An explicit stop must complete reliably on every platform. Request a
+      // graceful tree shutdown first, then re-verify the exact owned process
+      // before a bounded force fallback. During Manager shutdown the shared
+      // shutdown path remains graceful-only and performs its coordinated force
+      // pass after all workers have received SIGTERM.
+      const result = await terminateOwnedProcessTree(pid, {
+        verifyOwnership,
+        isAlive: () => this.processIsAlive(pid),
+        graceMs: LOCAL_AGENT_TERMINATION_GRACE_MS,
+        forceAfterGrace: !this.shuttingDown,
+        // The helper ignores process-group signalling on Windows and applies it
+        // on Unix, where every local worker is spawned as a detached group.
+        detachedProcessGroup: true,
+        onError: (message, error) => {
+          console.warn(`[Manager] ${message}: ${error instanceof Error ? error.message : String(error)}`);
+        },
+      });
+      const signalled = result.gracefulSignalled || result.forcedSignalled || result.exited;
       if (!signalled) {
         console.warn(`[Manager] Refusing to stop unverified PID ${pid} on port ${port}`);
         continue;

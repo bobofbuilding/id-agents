@@ -288,6 +288,7 @@ describe('IDACC Manager admin bearer', () => {
     expect(Object.keys(body).every((key) => [
       'status',
       'ready',
+      'restoring',
       'service',
       'runtimeVersion',
       'instanceNonce',
@@ -1928,12 +1929,20 @@ describe('IDACC Manager admin bearer', () => {
         }
       }
       expect(early?.status).toBe(200);
-      expect(await early?.json()).toMatchObject({ status: 'ok' });
+      expect(await early?.json()).toMatchObject({
+        status: 'ok',
+        ready: true,
+        restoring: true,
+      });
 
       await starting;
       const ready = await fetch(readinessUrl);
       expect(ready.status).toBe(200);
-      expect(await ready.json()).toMatchObject({ status: 'ok' });
+      expect(await ready.json()).toMatchObject({
+        status: 'ok',
+        ready: true,
+        restoring: false,
+      });
     } finally {
       await readinessManager.shutdown().catch(() => {});
       await readinessDb.close();

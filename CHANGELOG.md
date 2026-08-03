@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.160]
+
+- Make explicit local-agent stops deterministic on macOS, Linux, and Windows:
+  request graceful process-tree shutdown first, then re-verify ownership before
+  a bounded force fallback when the verified worker does not exit.
+- Keep whole-Manager shutdown graceful-only until its existing coordinated
+  force pass, and prove restored workers are the exact processes stopped by the
+  packaged lifecycle smoke.
+- Expose worker-restoration progress separately from control-plane readiness so
+  the desktop stays usable during recovery while lifecycle-sensitive callers
+  can wait for a settled fleet.
+
 ## [0.1.159]
 
 - Report the initialized Manager control plane healthy while the bounded

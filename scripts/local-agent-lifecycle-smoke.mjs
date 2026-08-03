@@ -234,8 +234,10 @@ try {
   manager = startManager(env);
   await waitFor(async () => {
     const response = await fetch(`${managerUrl}/health`, { signal: AbortSignal.timeout(500) });
-    return response.ok;
-  }, 20_000, `restarted Manager did not become healthy\n${manager.output()}`);
+    if (!response.ok) return false;
+    const body = await response.json();
+    return body.ready === true && body.restoring === false;
+  }, 20_000, `restarted Manager did not finish worker restoration\n${manager.output()}`);
   const restored = await waitFor(async () => {
     const response = await jsonRequest(managerUrl, token, '/agents');
     const agents = Array.isArray(response.body) ? response.body : response.body.agents;
@@ -249,6 +251,11 @@ try {
     body: { command: `/agent ${restartName} stop` },
   });
   assert.equal(finalStop.body.ok, true, JSON.stringify(finalStop.body));
+  assert.equal(
+    finalStop.body.result.pids.includes(Number(restored.pid)),
+    true,
+    JSON.stringify(finalStop.body),
+  );
   await waitFor(() => !processAlive(Number(restored.pid)), 5_000, 'restored worker did not stop');
   await stopManager(manager);
   manager = undefined;

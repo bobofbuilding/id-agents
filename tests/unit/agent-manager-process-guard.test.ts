@@ -287,11 +287,17 @@ describe('AgentManagerDb killAgentProcess guards', () => {
       return null;
     });
 
-    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation((_pid, signal) => {
+      if (signal === 0) {
+        const error = Object.assign(new Error('not running'), { code: 'ESRCH' });
+        throw error;
+      }
+      return true;
+    });
 
     const result = await (manager as any).killAgentProcess(4101);
 
-    expect(killSpy.mock.calls).toEqual([
+    expect(killSpy.mock.calls.filter(([, signal]) => signal !== 0)).toEqual([
       [-agentPid, 'SIGTERM'],
       [agentPid, 'SIGTERM'],
     ]);
@@ -473,11 +479,17 @@ describe('AgentManagerDb killAgentProcess guards', () => {
       commandLine: 'node dist/local-agent-server.js cto --port 4106',
     }));
 
-    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation((_pid, signal) => {
+      if (signal === 0) {
+        const error = Object.assign(new Error('not running'), { code: 'ESRCH' });
+        throw error;
+      }
+      return true;
+    });
 
     const result = await (manager as any).killAgentProcess(4106);
 
-    expect(killSpy.mock.calls).toEqual([
+    expect(killSpy.mock.calls.filter(([, signal]) => signal !== 0)).toEqual([
       [-agentPid, 'SIGTERM'],
       [agentPid, 'SIGTERM'],
     ]);
@@ -526,7 +538,9 @@ describe('AgentManagerDb killAgentProcess guards', () => {
 
     (manager as any).listPidsListeningOnPort = vi.fn(() => []);
     (manager as any).inspectProcess = vi.fn(() => null);
-    (manager as any).processIsAlive = vi.fn(() => true);
+    (manager as any).processIsAlive = vi.fn()
+      .mockReturnValueOnce(true)
+      .mockReturnValue(false);
     (manager as any).probeLocalAgentIdentity = vi.fn(async () => ({ ok: true, attested: true }));
     const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
 
