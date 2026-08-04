@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.163]
+
+- Authenticate Manager goal-driver writes to the bundled Brain with the same
+  profile-scoped bearer used by every other managed Brain request, preventing
+  healthy Brain services from being misreported as unavailable.
+
 ## [0.1.162]
 
 - Refresh the production dependency lock to `fast-uri` 3.1.5 and Hono 4.12.34,

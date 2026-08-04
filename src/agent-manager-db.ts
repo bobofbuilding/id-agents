@@ -23148,7 +23148,7 @@ Return this JSON shape:
     try {
       const response = await fetch(`${this.brainApiBaseUrl()}/entities`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        headers: { ...this.brainHeaders(), accept: 'application/json' },
         body: JSON.stringify({
           id: goal.id,
           type: 'goal',
