@@ -12,7 +12,7 @@
  * subsequent passes; this manifest is the single source of truth for the contract today.
  */
 
-export const CC_API_VERSION = 5;
+export const CC_API_VERSION = 6;
 
 export interface CcRoute {
   method: string;
@@ -45,6 +45,7 @@ export const CC_ROUTES: CcRoute[] = [
   { method: 'GET', path: '/agents/:id/instructions', group: 'agent-config' },
   { method: 'POST', path: '/agents/:id/instructions', group: 'agent-config' },
   { method: 'POST', path: '/agents/:id/runtime', group: 'agent-config' },
+  { method: 'POST', path: '/agents/:id/configuration', group: 'agent-config' },
   { method: 'POST', path: '/agents/:id/mcp', group: 'agent-config' },
   { method: 'POST', path: '/agents/:id/delegates', group: 'agent-config' },
   { method: 'POST', path: '/agents/:id/team', group: 'agent-config' },
@@ -62,6 +63,7 @@ export const CC_FEATURES = [
   'observability', // /activity, /usage, /usage/by-task
   'manager-controls', // local-model concurrency
   'runtime-preflight', // manager-authoritative runtime/model resolution and readiness
+  'atomic-agent-config', // CAS + preflight + one rebuild + verified rollback
   'agent-config', // per-agent instructions/runtime/mcp/delegates/team/metadata
   'team-config', // per-team relay config
   'library', // skills/plugins install

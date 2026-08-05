@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.164]
+
+- Add an authenticated, compare-and-set agent configuration endpoint so IDACC can apply runtime, model, effort, speed, and lifecycle changes atomically with rollback.
+- Keep exact MCP connection material process-local while persisting only safe registry references, and park the unstable BrowserMCP adapter.
+- Preserve operator-selected runtime and model settings across Manager restarts and reject standalone control of authenticated managed workers.
+
 ## [0.1.163]
 
 - Authenticate Manager goal-driver writes to the bundled Brain with the same

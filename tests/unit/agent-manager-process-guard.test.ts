@@ -795,6 +795,50 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     expect(proc.unref).toHaveBeenCalledOnce();
   });
 
+  it('does not let a standalone manager replace an authenticated desktop worker', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    await db.agents.create(agentRow({
+      team_id: teamId,
+      id: 'agent-desktop-owned',
+      name: 'desktop-owned',
+      port: 4110,
+      status: 'running',
+      runtime: 'codex',
+      metadata: {
+        runtime: 'codex',
+        managerOwnedLaunchIntent: true,
+        processGeneration: 'desktop-generation',
+        processRuntime: 'codex',
+        processRuntimeLane: 'codex:default',
+      },
+    }));
+    const killSpy = vi.fn(async () => ({ killed: false, pids: [] }));
+    (manager as any).killAgentProcess = killSpy;
+
+    const result = await (manager as any).spawnLocalAgentProcessUnlocked(
+      teamId,
+      'default',
+      {
+        id: 'agent-desktop-owned',
+        name: 'desktop-owned',
+        port: 4110,
+      },
+    );
+
+    expect(result).toEqual({
+      success: false,
+      error: expect.stringContaining('belongs to an authenticated Control Center manager'),
+    });
+    expect(killSpy).not.toHaveBeenCalled();
+    expect((await db.agents.getById('agent-desktop-owned'))?.metadata).toMatchObject({
+      processGeneration: 'desktop-generation',
+      processRuntime: 'codex',
+    });
+  });
+
   it('durably binds a managed worker generation to the exact runtime lane issued at spawn', async () => {
     process.env.IDACC_ADMIN_TOKEN = 'managed-issued-lane-admin-token';
     process.env.IDACC_MANAGER_SERVICE_TOKEN = 'managed-issued-lane-service-token-000000000000';
