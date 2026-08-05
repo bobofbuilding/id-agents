@@ -283,7 +283,7 @@ interface StalledOwnerTriageReport {
   items: StalledOwnerTriageReportItem[];
 }
 
-interface BrainAutopilotGoal {
+export interface BrainAutopilotGoal {
   id: string;
   name: string;
   status: string | null;
@@ -329,6 +329,49 @@ export function normalizeGoalAutopilotControlConfig(
       ? Math.max(1, Math.min(12, Math.floor(maxTasks)))
       : fallback.maxTasksPerRun,
   };
+}
+
+export function canonicalBrainAutopilotGoalId(value: unknown): string {
+  return String(value || '').trim().replace(/#legacy-[a-z0-9]+$/i, '');
+}
+
+/**
+ * Legacy profile convergence could leave `goal:<id>#legacy-*` beside the exact
+ * canonical `goal:<id>` entity. Treat those rows as one logical goal so a due
+ * cycle cannot drive the same operator goal twice. Runtime evidence is merged
+ * conservatively to preserve the newest run guard and every known task ref.
+ */
+export function dedupeBrainAutopilotGoals<T extends BrainAutopilotGoal>(goals: T[]): T[] {
+  const grouped = new Map<string, T[]>();
+  for (const goal of goals) {
+    const canonicalId = canonicalBrainAutopilotGoalId(goal.id);
+    const bucket = grouped.get(canonicalId) ?? [];
+    bucket.push(goal);
+    grouped.set(canonicalId, bucket);
+  }
+  return [...grouped.entries()].map(([canonicalId, rows]) => {
+    const preferred = rows.find((goal) => goal.id === canonicalId)
+      ?? [...rows].sort((a, b) => b.updatedAt - a.updatedAt)[0];
+    const lastRunAt = rows.reduce((latest, goal) => Math.max(latest, goal.lastRunAt ?? 0), 0) || null;
+    const taskRefs = Array.from(new Set(rows.flatMap((goal) => goal.taskRefs).filter(Boolean)));
+    const driver = preferred.data.driver && typeof preferred.data.driver === 'object'
+      ? preferred.data.driver
+      : {};
+    return {
+      ...preferred,
+      id: canonicalId,
+      lastRunAt,
+      taskRefs,
+      data: {
+        ...preferred.data,
+        driver: {
+          ...driver,
+          ...(lastRunAt ? { lastRunAt } : {}),
+          taskRefs,
+        },
+      },
+    };
+  });
 }
 
 export function isGoalAutopilotRunDue(
@@ -22337,10 +22380,13 @@ Return this JSON shape:
             }
             return { ok: false, error: `Unknown option ${token}` };
           }
+          const config = await this.goalAutopilotControlConfig();
+          const requestedLimit = limit ?? config.maxTasksPerRun;
+          const effectiveLimit = Math.min(requestedLimit, config.maxTasksPerRun);
           if (!dryRun) await this.updateGoalAutopilotRuntime({ lastStartedAt: Date.now() });
           const report = await this.runGoalAutopilotSync({
             dryRun,
-            limit,
+            limit: effectiveLimit,
             teamName: targetTeamName,
           });
           if (!dryRun) await this.recordGoalAutopilotRun(report);
@@ -23635,7 +23681,7 @@ Return this JSON shape:
     const nowMs = Date.now();
     const staleMs = this.goalAutopilotSyncStaleMs();
     const limit = Math.max(1, Math.min(options.limit ?? this.goalAutopilotSyncMaxTasks(), this.goalAutopilotSyncMaxTasks()));
-    const goals = read.goals
+    const goals = dedupeBrainAutopilotGoals(read.goals)
       .filter((goal) => !options.teamName || goal.teamName === options.teamName)
       .sort((a, b) => {
         const rank = (goal: BrainAutopilotGoal) => goal.priority === 'primary' ? 0 : goal.priority === 'secondary' ? 1 : 2;
@@ -23644,6 +23690,14 @@ Return this JSON shape:
     result.consideredGoals = goals.length;
 
     const openByTeam = new Map<string, TaskRow[]>();
+    const teamsByName = new Map<string, TeamRow | null>();
+    for (const teamName of new Set(goals.map((goal) => goal.teamName))) {
+      const team = await this.db.teams.getTeamByName(teamName).catch(() => null);
+      teamsByName.set(teamName, team);
+      if (!team) continue;
+      const openTasks = await this.listOpenTasksForTeam(team.id);
+      openByTeam.set(team.id, openTasks);
+    }
     for (const goal of goals) {
       if (result.tasksSpawned >= limit) {
         result.skipped.push({ goal: goal.id, team: goal.teamName, reason: 'run_limit_reached' });
@@ -23653,12 +23707,11 @@ Return this JSON shape:
         result.skipped.push({ goal: goal.id, team: goal.teamName, reason: 'recent_driver_run' });
         continue;
       }
-      const team = await this.db.teams.getTeamByName(goal.teamName).catch(() => null);
+      const team = teamsByName.get(goal.teamName) ?? null;
       if (!team) {
         result.skipped.push({ goal: goal.id, team: goal.teamName, reason: 'team_not_found' });
         continue;
       }
-      if (!openByTeam.has(team.id)) openByTeam.set(team.id, await this.listOpenTasksForTeam(team.id));
       const openTasks = openByTeam.get(team.id)!;
       if (openTasks.some((task) => this.taskMentionsGoal(task, goal.id))) {
         result.skipped.push({ goal: goal.id, team: team.name, reason: 'open_task_exists' });

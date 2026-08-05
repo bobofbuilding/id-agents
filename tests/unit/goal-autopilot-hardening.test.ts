@@ -2,6 +2,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  dedupeBrainAutopilotGoals,
   dedupeBrainGoalInstructions,
   isGoalAutopilotRunDue,
   normalizeGoalAutopilotControlConfig,
@@ -47,5 +48,38 @@ describe('goal autopilot hardening', () => {
       { ...base, source_id: 'memory:3', memory_id: 3, key: 'other:default', content: 'other instruction' },
     ]);
     expect(result.map((item) => item.key)).toEqual(['goals:active:default', 'other:default']);
+  });
+
+  it('coalesces canonical and legacy Brain rows into one logical autopilot goal', () => {
+    const base = {
+      name: 'Improve task throughput',
+      status: 'active',
+      teamName: 'default',
+      priority: 'primary',
+      agentName: 'lead',
+    };
+    const result = dedupeBrainAutopilotGoals([
+      {
+        ...base,
+        id: 'goal:goal-one',
+        data: { autopilot: true, driver: { lastRunAt: 100, taskRefs: ['#aaaa'] } },
+        updatedAt: 110,
+        lastRunAt: 100,
+        taskRefs: ['#aaaa'],
+      },
+      {
+        ...base,
+        id: 'goal:goal-one#legacy-deadbeef',
+        data: { autopilot: true, driver: { lastRunAt: 200, taskRefs: ['#bbbb'] } },
+        updatedAt: 210,
+        lastRunAt: 200,
+        taskRefs: ['#bbbb'],
+      },
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe('goal:goal-one');
+    expect(result[0].lastRunAt).toBe(200);
+    expect(result[0].taskRefs).toEqual(['#aaaa', '#bbbb']);
+    expect(result[0].data.driver).toMatchObject({ lastRunAt: 200, taskRefs: ['#aaaa', '#bbbb'] });
   });
 });

@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.167]
+
+- Coalesce canonical and retired legacy Brain goal rows before autopilot work is
+  created, so one logical goal cannot produce duplicate task batches.
+- Enforce the configured per-cycle task cap for scheduled and manual goal syncs.
+
 ## [0.1.166]
 
 - Create only the configured SQLite database parent directory, preventing a
