@@ -19,9 +19,9 @@ export async function createDb(): Promise<Db> {
   const os = await import('node:os');
   const path = await import('node:path');
   const { mkdirSync } = await import('node:fs');
-  const dataDir = path.join(os.homedir(), '.id-agents');
-  mkdirSync(dataDir, { recursive: true });
-  const dbPath = process.env.SQLITE_PATH || path.join(dataDir, 'id-agents.db');
+  const dbPath = process.env.SQLITE_PATH
+    || path.join(os.homedir(), '.id-agents', 'id-agents.db');
+  mkdirSync(path.dirname(dbPath), { recursive: true });
   const adapter = new SqliteAdapterImpl(dbPath);
   console.log(`Database: SQLite (${dbPath})`);
   return createSqliteDb(adapter);

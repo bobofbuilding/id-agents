@@ -122,12 +122,46 @@ describe('aggregate plugin, skill, and agent overlay ownership', () => {
       path.join(agentWorkDir, '.agents/skills/shared-skill/assets/fixture.txt'),
       'utf8',
     )).toBe('explicit-asset');
-    expect(fs.existsSync(path.join(agentWorkDir, '.claude/skills/shared-skill'))).toBe(false);
-    expect(fs.existsSync(path.join(agentWorkDir, '.cursor/skills/shared-skill'))).toBe(false);
+    for (const root of ['.claude/skills', '.agents/skills', '.cursor/skills']) {
+      expect(fs.readFileSync(
+        path.join(agentWorkDir, root, 'shared-skill', 'SKILL.md'),
+        'utf8',
+      )).toContain('Explicit configured skill');
+      expect(fs.readFileSync(
+        path.join(agentWorkDir, root, 'shared-skill', 'assets', 'fixture.txt'),
+        'utf8',
+      )).toBe('explicit-asset');
+    }
     expect(fs.readFileSync(
       path.join(agentWorkDir, '.agents/skills/user-owned/SKILL.md'),
       'utf8',
     )).toContain('User authored');
+  });
+
+  it('retains an unavailable optional skill while refreshing bundled framework skills', () => {
+    const explicitRoot = path.join(tmpDir, 'explicit-skills');
+    fs.mkdirSync(path.join(explicitRoot, 'brain'), { recursive: true });
+    fs.writeFileSync(path.join(explicitRoot, 'brain', 'SKILL.md'), '# Current Brain skill');
+
+    const agentWorkDir = path.join(tmpDir, 'agent-workdir-unavailable-skill');
+    const unavailable = path.join(agentWorkDir, '.agents', 'skills', 'legacy-optional');
+    fs.mkdirSync(unavailable, { recursive: true });
+    fs.writeFileSync(path.join(unavailable, 'SKILL.md'), '# Preserved optional skill');
+
+    const manager = new AgentManagerDb(tmpDir, {} as any, { libraryRoot: null });
+    reconcile(manager, agentWorkDir, {
+      skills: ['brain', 'legacy-optional'],
+      skillsRoot: explicitRoot,
+    });
+
+    expect(fs.readFileSync(path.join(unavailable, 'SKILL.md'), 'utf8'))
+      .toContain('Preserved optional skill');
+    for (const root of ['.claude/skills', '.agents/skills', '.cursor/skills']) {
+      expect(fs.readFileSync(
+        path.join(agentWorkDir, root, 'brain', 'SKILL.md'),
+        'utf8',
+      )).toContain('Current Brain skill');
+    }
   });
 
   it('transitions plugin fallback to bundled agent skill and back under one receipt', () => {

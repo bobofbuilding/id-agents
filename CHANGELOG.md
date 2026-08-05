@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.1.166]
+
+- Create only the configured SQLite database parent directory, preventing a
+  profile-scoped IDACC Manager from recreating the retired legacy
+  `~/.id-agents` directory on startup.
+
+## [0.1.165]
+
+- Refresh every managed worker workspace before startup and Manager restart
+  recovery so migrated agents cannot keep stale Manager authentication or
+  hard-coded Brain endpoint guidance.
+- Project configured skills across Claude, Codex, and Cursor runtime roots so
+  a later harness change cannot reactivate an obsolete skill copy.
+- Preserve a real existing optional skill when its library source is no longer
+  bundled, allowing security-critical framework skills to refresh without
+  silently adopting or deleting the unavailable capability.
+
 ## [0.1.164]
 
 - Add an authenticated, compare-and-set agent configuration endpoint so IDACC can apply runtime, model, effort, speed, and lifecycle changes atomically with rollback.

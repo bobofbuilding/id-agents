@@ -1766,6 +1766,7 @@ describe('IDACC Manager admin bearer', () => {
     const firstSpawnGate = new Promise<void>((resolve) => { releaseFirstSpawn = resolve; });
     const order: string[] = [];
     let spawnCount = 0;
+    let refreshCount = 0;
     const spawn = vi.spyOn(manager as any, 'spawnLocalAgentProcessUnlocked')
       .mockImplementation(async () => {
         spawnCount += 1;
@@ -1780,7 +1781,10 @@ describe('IDACC Manager admin bearer', () => {
         return { success: true, pid: 45241 };
       });
     const refresh = vi.spyOn(manager as any, 'refreshManagedOverlayForRebuild')
-      .mockImplementation(async () => { order.push('rebuild-refresh'); });
+      .mockImplementation(async () => {
+        refreshCount += 1;
+        order.push(refreshCount === 1 ? 'rebind-refresh' : 'rebuild-refresh');
+      });
     const kill = vi.spyOn(manager as any, 'killAgentProcess')
       .mockResolvedValue({ killed: true, pids: [45240] });
     const cancel = vi.spyOn(manager as any, 'cancelPendingQueriesForAgent')
@@ -1813,13 +1817,14 @@ describe('IDACC Manager admin bearer', () => {
       const rebuild = (manager as any).rebuildLocalClaudeAgent(teamId, TEAM, initial);
       await new Promise((resolve) => setTimeout(resolve, 20));
       expect(spawn).toHaveBeenCalledTimes(1);
-      expect(refresh).not.toHaveBeenCalled();
+      expect(refresh).toHaveBeenCalledTimes(1);
       releaseFirstSpawn();
       const [rebindResponse, rebuildResult] = await Promise.all([rebind, rebuild]);
       expect(rebindResponse.status).toBe(200);
       expect(rebuildResult.success).toBe(true);
       expect(spawn).toHaveBeenCalledTimes(2);
       expect(order).toEqual([
+        'rebind-refresh',
         'rebind-spawn-start',
         'rebind-spawn-end',
         'rebuild-refresh',
@@ -1869,6 +1874,7 @@ describe('IDACC Manager admin bearer', () => {
     const firstSpawnGate = new Promise<void>((resolve) => { releaseFirstSpawn = resolve; });
     const order: string[] = [];
     let spawnCount = 0;
+    let refreshCount = 0;
     const spawn = vi.spyOn(manager as any, 'spawnLocalAgentProcessUnlocked')
       .mockImplementation(async (_teamId: string, _teamName: string, agentData: { id: string }) => {
         spawnCount += 1;
@@ -1885,7 +1891,10 @@ describe('IDACC Manager admin bearer', () => {
         return { success: true, pid: 45251 };
       });
     const refresh = vi.spyOn(manager as any, 'refreshManagedOverlayForRebuild')
-      .mockImplementation(async () => { order.push('move-rebuild-refresh'); });
+      .mockImplementation(async () => {
+        refreshCount += 1;
+        order.push(refreshCount === 1 ? 'rebind-refresh' : 'move-rebuild-refresh');
+      });
     const kill = vi.spyOn(manager as any, 'killAgentProcess')
       .mockResolvedValue({ killed: true, pids: [45250] });
     const cancel = vi.spyOn(manager as any, 'cancelPendingQueriesForAgent')
@@ -1926,7 +1935,7 @@ describe('IDACC Manager admin bearer', () => {
       await new Promise((resolve) => setTimeout(resolve, 20));
       expect(moveSettled).toBe(false);
       expect(spawn).toHaveBeenCalledTimes(1);
-      expect(refresh).not.toHaveBeenCalled();
+      expect(refresh).toHaveBeenCalledTimes(1);
 
       releaseFirstSpawn();
       const [rebindResponse, moveResponse] = await Promise.all([rebind, move]);
@@ -1940,6 +1949,7 @@ describe('IDACC Manager admin bearer', () => {
         rebuilt: true,
       });
       expect(order).toEqual([
+        'rebind-refresh',
         'rebind-spawn-start',
         'rebind-spawn-end',
         'move-rebuild-refresh',
