@@ -15534,7 +15534,8 @@ Return this JSON shape:
               ? this.normalizeProviderRuntimeAssignment(runtimeInput, body.provider)
               : null;
             const executionRuntime = providerAssignment ? 'provider-api' : resolveRuntime(runtimeInput);
-            if (!providerAssignment) {
+            const runtimeOrModelChanged = runtimeInput !== displayRuntime || model !== (current.model || '');
+            if (!providerAssignment && runtimeOrModelChanged) {
               const issues = validateRuntimePreflight(executionRuntime, model);
               if (issues.length) {
                 return {
