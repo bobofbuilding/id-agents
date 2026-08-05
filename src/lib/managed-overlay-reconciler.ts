@@ -60,6 +60,12 @@ export interface ManagedOverlayFile {
    * but drifted or already-unowned bytes are never adopted into ownership.
    */
   claimExisting?: boolean;
+  /**
+   * Archive and replace an unowned existing file even after a receipt exists.
+   * Use only for an explicitly configured compatibility path whose prior bytes
+   * must remain recoverable (for example, a stale skill in another runtime root).
+   */
+  recoverExisting?: boolean;
 }
 
 export interface ManagedOverlayMarkerBlock {
@@ -110,6 +116,7 @@ export interface ManagedOverlayReconcileResult {
 
 interface DesiredFile {
   claimExisting: boolean;
+  recoverExisting: boolean;
   contents: Buffer;
   mode: number;
   path: string;
@@ -545,6 +552,7 @@ function desiredFiles(options: ManagedOverlayReconcileOptions): Map<string, Desi
     contents: Buffer,
     mode: number,
     claimExisting: boolean = true,
+    recoverExisting: boolean = false,
   ): void => {
     const path = portableRelativePath(pathValue);
     const key = portableRelativePathKey(path);
@@ -557,6 +565,7 @@ function desiredFiles(options: ManagedOverlayReconcileOptions): Map<string, Desi
     folded.set(key, path);
     desired.set(path, {
       claimExisting,
+      recoverExisting,
       contents,
       mode: ownerMode(mode),
       path,
@@ -593,6 +602,7 @@ function desiredFiles(options: ManagedOverlayReconcileOptions): Map<string, Desi
         readFileSync(source),
         file.mode ?? stat.mode,
         file.claimExisting !== false,
+        file.recoverExisting === true,
       );
     } else {
       add(
@@ -600,6 +610,7 @@ function desiredFiles(options: ManagedOverlayReconcileOptions): Map<string, Desi
         Buffer.isBuffer(file.content) ? file.content : Buffer.from(file.content!, 'utf8'),
         file.mode ?? 0o600,
         file.claimExisting !== false,
+        file.recoverExisting === true,
       );
     }
   }
@@ -856,7 +867,7 @@ export function reconcileManagedOverlay(
       && digest !== null
       && digest !== wanted.sha256
     ) {
-      if (!recoverPreReceiptWorkspace) {
+      if (!recoverPreReceiptWorkspace && !wanted.recoverExisting) {
         fail(`refusing to overwrite an unowned file: ${path}`);
       }
       legacyFileRecoveries.set(path, {

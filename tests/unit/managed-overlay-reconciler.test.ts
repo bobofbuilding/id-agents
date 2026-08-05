@@ -152,6 +152,44 @@ describe('managed overlay reconciler', () => {
     expect(readFileSync(exactPath, 'utf8')).toBe('user edit after receipt\n');
   });
 
+  it('archives an explicitly recoverable compatibility path after a receipt exists', () => {
+    const workspace = temporaryRoot('managed-overlay-runtime-transition-');
+    reconcileManagedOverlay({
+      workspaceRoot: workspace,
+      files: [{ destination: '.agents/skills/brain/SKILL.md', content: 'current codex\n' }],
+    });
+    const staleClaudePath = join(workspace, '.claude/skills/brain/SKILL.md');
+    write(staleClaudePath, 'legacy hard-coded endpoint\n');
+
+    expect(() => reconcileManagedOverlay({
+      workspaceRoot: workspace,
+      files: [
+        { destination: '.agents/skills/brain/SKILL.md', content: 'current codex\n' },
+        { destination: '.claude/skills/brain/SKILL.md', content: 'current shared skill\n' },
+      ],
+    })).toThrow(/unowned file/i);
+
+    const migrated = reconcileManagedOverlay({
+      workspaceRoot: workspace,
+      files: [
+        { destination: '.agents/skills/brain/SKILL.md', content: 'current codex\n' },
+        {
+          destination: '.claude/skills/brain/SKILL.md',
+          content: 'current shared skill\n',
+          recoverExisting: true,
+        },
+      ],
+    });
+    expect(readFileSync(staleClaudePath, 'utf8')).toBe('current shared skill\n');
+    expect(migrated.archived.map((entry) => entry.path))
+      .toContain('.claude/skills/brain/SKILL.md');
+    const recovery = migrated.archived.find(
+      (entry) => entry.path === '.claude/skills/brain/SKILL.md',
+    );
+    expect(readFileSync(join(workspace, recovery!.recoveryPath), 'utf8'))
+      .toBe('legacy hard-coded endpoint\n');
+  });
+
   it('never reclaims retained self-source drift while keeping unchanged files cleanable', () => {
     const workspace = temporaryRoot('managed-overlay-retain-existing-');
     const editedPath = join(workspace, 'plugins/demo/plugin.json');

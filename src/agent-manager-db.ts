@@ -4736,6 +4736,7 @@ Return this JSON shape:
     options: {
       skip?: (relativePath: string) => boolean;
       claimExisting?: boolean;
+      recoverExisting?: boolean;
     } = {},
   ): void {
     const rootStat = lstatSync(sourceRoot);
@@ -4770,6 +4771,7 @@ Return this JSON shape:
             content: readFileSync(sourcePath),
             mode: stat.mode,
             ...(options.claimExisting === false && { claimExisting: false }),
+            ...(options.recoverExisting === true && { recoverExisting: true }),
           }, sourceLabel);
         } else {
           throw new Error(`Managed overlay source contains an unsupported entry: ${sourcePath}`);
@@ -4785,6 +4787,7 @@ Return this JSON shape:
     destination: string,
     sourceLabel: string,
     transform?: (contents: string) => string,
+    options: { recoverExisting?: boolean } = {},
   ): void {
     const stat = lstatSync(sourcePath);
     if (stat.isSymbolicLink() || !stat.isFile()) {
@@ -4797,6 +4800,7 @@ Return this JSON shape:
       destination,
       content,
       mode: stat.mode,
+      ...(options.recoverExisting === true && { recoverExisting: true }),
     }, sourceLabel);
   }
 
@@ -5017,6 +5021,7 @@ Return this JSON shape:
       || (this.libraryRoot
         ? getLibraryPaths(this.libraryRoot).skills
         : path.resolve(__dirname, '..', 'skills'));
+    const runtimeSkillRoots = ['.claude/skills', '.agents/skills', '.cursor/skills'];
     const substitutions: Record<string, string> = {
       DISPLAY_NAME: input.displayName,
       TEAM: input.teamName,
@@ -5030,27 +5035,69 @@ Return this JSON shape:
       const sourceDirectory = path.join(skillsRoot, skillName);
       const skillFile = path.join(sourceDirectory, 'SKILL.md');
       if (!existsSync(skillFile)) {
-        throw new Error(`Skill "${skillName}" not found at ${skillFile}`);
-      }
-      this.collectManagedOverlayTree(
-        plan,
-        sourceDirectory,
-        path.posix.join(rp.skillsDir, skillName),
-        `explicit-skill:${skillName}`,
-      );
-      this.putManagedOverlaySourceFile(
-        plan,
-        skillFile,
-        path.posix.join(rp.skillsDir, skillName, 'SKILL.md'),
-        `explicit-skill:${skillName}:templated`,
-        (raw) => {
-          let content = raw;
-          for (const [key, value] of Object.entries(substitutions)) {
-            content = content.replace(new RegExp(`\\{\\{${key}\\}\\}`, 'g'), value);
+        // A profile can retain an optional skill that is no longer bundled by
+        // the current application release. Preserve any real existing copy as
+        // a compatibility source so one unavailable optional capability cannot
+        // block refreshes of auth-critical framework skills.
+        let retainedExistingCopy = false;
+        for (const root of runtimeSkillRoots) {
+          const existingDirectory = path.join(workingDirectory, root, skillName);
+          const existingSkillFile = path.join(existingDirectory, 'SKILL.md');
+          if (!existsSync(existingSkillFile)) continue;
+          const directoryStat = lstatSync(existingDirectory);
+          const fileStat = lstatSync(existingSkillFile);
+          if (
+            directoryStat.isSymbolicLink()
+            || !directoryStat.isDirectory()
+            || fileStat.isSymbolicLink()
+            || !fileStat.isFile()
+          ) {
+            throw new Error(`Skill "${skillName}" has an unsafe compatibility copy at ${existingSkillFile}`);
           }
-          return content;
-        },
-      );
+          this.collectManagedOverlayTree(
+            plan,
+            existingDirectory,
+            path.posix.join(root, skillName),
+            `retained-explicit-skill:${skillName}`,
+            { claimExisting: false },
+          );
+          retainedExistingCopy = true;
+        }
+        if (!retainedExistingCopy) {
+          throw new Error(`Skill "${skillName}" not found at ${skillFile}`);
+        }
+        console.warn(
+          `[AgentManager] Retaining unavailable optional skill "${skillName}" from the existing workspace while refreshing managed framework skills`,
+        );
+        continue;
+      }
+      // Project explicit skills to every supported runtime root. Runtime
+      // changes and migrated workspaces otherwise leave a stale inactive root
+      // behind, which can resurrect obsolete Manager/Brain instructions when
+      // the agent later switches harnesses.
+      for (const root of runtimeSkillRoots) {
+        this.collectManagedOverlayTree(
+          plan,
+          sourceDirectory,
+          path.posix.join(root, skillName),
+          `explicit-skill:${skillName}`,
+          { recoverExisting: true },
+        );
+        this.putManagedOverlaySourceFile(
+          plan,
+          skillFile,
+          path.posix.join(root, skillName, 'SKILL.md'),
+          `explicit-skill:${skillName}:templated`,
+          (raw) => {
+            let content = raw;
+            for (const [key, value] of Object.entries(substitutions)) {
+              content = content.replace(new RegExp(`\\{\\{${key}\\}\\}`, 'g'), value);
+            }
+            return content;
+          },
+          { recoverExisting: true },
+        );
+      }
     }
 
     const localTemplateDirectory = path.join(
@@ -7331,6 +7378,22 @@ Return this JSON shape:
         ...metadata,
         plugins: overlay.localPlugins,
       });
+    }
+  }
+
+  private async refreshManagedOverlayBeforeStart(
+    teamId: string,
+    teamName: string,
+    agent: AgentRow,
+  ): Promise<{ success: true } | { success: false; error: string }> {
+    try {
+      await this.refreshManagedOverlayForRebuild(teamId, teamName, agent);
+      return { success: true };
+    } catch (error) {
+      return {
+        success: false,
+        error: `Managed workspace refresh failed for ${agent.name}: ${error instanceof Error ? error.message : String(error)}`,
+      };
     }
   }
 
@@ -18522,6 +18585,11 @@ Return this JSON shape:
   }
 
   private async resolveSingleAgentForCommand(teamId: string, agentName: string): Promise<{ agent?: AgentRow; error?: string }> {
+    // Managed worker envelopes use the immutable database ID for ownership and
+    // lineage. Those IDs intentionally are not valid human aliases, so resolve
+    // the exact same-team row before applying alias/ENS parsing.
+    const byId = await this.db.agents.getById(agentName);
+    if (byId?.team_id === teamId) return { agent: byId };
     const matches = await this.dbResolveAgents(teamId, agentName);
     if (matches.length === 0) {
       return { error: `Agent "${agentName}" not found` };
@@ -27502,6 +27570,16 @@ Return this JSON shape:
               return;
             }
 
+            const overlayRefresh = await this.refreshManagedOverlayBeforeStart(
+              team.id,
+              team.name,
+              agent,
+            );
+            if (!overlayRefresh.success) {
+              console.warn(`[Manager] ${overlayRefresh.error}`);
+              return;
+            }
+
             const pid = Number(metadata.pid);
             if (agent.status === 'running' && Number.isInteger(pid) && pid > 0) {
               const identity = await this.probeLocalAgentIdentity(
@@ -27655,6 +27733,11 @@ Return this JSON shape:
         status: 409,
         error: this.providerRuntimeRebindRequiredError(),
       };
+    }
+
+    const overlayRefresh = await this.refreshManagedOverlayBeforeStart(teamId, teamName, agent);
+    if (!overlayRefresh.success) {
+      return { success: false, status: 503, error: overlayRefresh.error };
     }
 
     const result = await this.spawnLocalAgentProcessUnlocked(teamId, teamName, {
@@ -28640,7 +28723,15 @@ Return this JSON shape:
     agentData: { name: string; id: string; port: number; model?: string; workingDirectory?: string; tokenId?: string; address?: string }
   ): Promise<{ success: boolean; pid?: number; logFile?: string; error?: string }> {
     const key = this.agentLifecycleKey(teamId, agentData);
-    return this.withAgentLifecycleLock(key, () => this.spawnLocalAgentProcessUnlocked(teamId, teamName, agentData));
+    return this.withAgentLifecycleLock(key, async () => {
+      const agent = await this.dbQueryAgentById(teamId, agentData.id);
+      if (!agent) {
+        return { success: false, error: `Agent "${agentData.name}" was removed before startup` };
+      }
+      const overlayRefresh = await this.refreshManagedOverlayBeforeStart(teamId, teamName, agent);
+      if (!overlayRefresh.success) return overlayRefresh;
+      return this.spawnLocalAgentProcessUnlocked(teamId, teamName, agentData);
+    });
   }
 
   /**
@@ -28667,6 +28758,8 @@ Return this JSON shape:
         let current = await this.dbQueryAgentById(teamId, agent.id);
         if (!current) return { success: false, error: `Agent "${agent.name}" was removed before dispatch` };
         if (current.status === 'running') return { success: true, agent: current };
+        const overlayRefresh = await this.refreshManagedOverlayBeforeStart(teamId, teamName, current);
+        if (!overlayRefresh.success) return overlayRefresh;
         const result = await this.spawnLocalAgentProcessUnlocked(teamId, teamName, {
           name: current.name,
           id: current.id,

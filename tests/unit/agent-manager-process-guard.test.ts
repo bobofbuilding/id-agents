@@ -1133,9 +1133,15 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     }));
     const spawn = verifiedSpawnStub(db, 76543);
     (manager as any).spawnLocalAgentProcessUnlocked = spawn;
+    const refresh = vi.spyOn(manager as any, 'refreshManagedOverlayBeforeStart');
 
     await (manager as any).restoreManagerOwnedAgentsAfterRestart();
 
+    expect(refresh).toHaveBeenCalledWith(
+      teamId,
+      'default',
+      expect.objectContaining({ id: 'agent-restore' }),
+    );
     expect(spawn).toHaveBeenCalledOnce();
     expect(spawn).toHaveBeenCalledWith(teamId, 'default', expect.objectContaining({
       id: 'agent-restore',
@@ -1166,6 +1172,23 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     expect((manager as any).startupRestorePriority('engineering-team', row('backend-engineer'))).toBe(10);
   });
 
+  it('resolves immutable managed agent IDs before human alias parsing', async () => {
+    const { manager, db, workDir } = await makeManager();
+    dbs.push(db);
+    workDirs.push(workDir);
+    const teamId = await db.teams.getOrCreateTeamId('operations-team');
+    const stableId = 'agent_1786000000001_authpeer';
+    await db.agents.create(agentRow({
+      team_id: teamId,
+      id: stableId,
+      name: 'monitor',
+      metadata: { runtime: 'codex', alias: 'monitor' },
+    }));
+
+    await expect((manager as any).resolveSingleAgentForCommand(teamId, stableId))
+      .resolves.toMatchObject({ agent: { id: stableId, name: 'monitor' } });
+  });
+
   it('starts a stopped local worker before an explicit dispatch', async () => {
     const { manager, db, workDir } = await makeManager();
     dbs.push(db);
@@ -1182,6 +1205,7 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     }));
     const spawn = verifiedSpawnStub(db, 76546);
     (manager as any).spawnLocalAgentProcessUnlocked = spawn;
+    const refresh = vi.spyOn(manager as any, 'refreshManagedOverlayBeforeStart');
     const initial = await db.agents.getById('agent-explicit-dispatch');
 
     const result = await (manager as any).ensureLocalAgentRunningForExplicitDispatch(
@@ -1192,6 +1216,11 @@ describe('AgentManagerDb killAgentProcess guards', () => {
 
     expect(result.success).toBe(true);
     expect(result.agent.status).toBe('running');
+    expect(refresh).toHaveBeenCalledWith(
+      teamId,
+      'engineering-team',
+      expect.objectContaining({ id: 'agent-explicit-dispatch' }),
+    );
     expect(spawn).toHaveBeenCalledOnce();
   });
 
