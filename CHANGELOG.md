@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.168]
+
+- Recover missing-material task blocks through a durable, bounded ladder:
+  creator or parent owner, owning lead, task-master, and only explicitly
+  declared source/domain teams, before parking unchanged work.
+- Requeue parked work when its contract, sources, evidence, or parent material
+  changes, adopt legacy missing-material blocks, and surface genuine external
+  decisions in the owning team's Inbox.
+- Record explicit material and domain ownership in workflow contracts so
+  cross-team recovery remains authorized and deterministic.
+
 ## [0.1.167]
 
 - Coalesce canonical and retired legacy Brain goal rows before autopilot work is

@@ -91,6 +91,12 @@ export function buildTaskWorkflowContract(input: Record<string, unknown>, contex
   const sourceIds = list(input.source_ids ?? input.sourceIds ?? input.provenance_refs ?? input.provenanceRefs);
   const parentTaskId = first(input, ['parent_task_id', 'parentTaskId', 'parent_task', 'parentTask']) || label(description, 'Parent task');
   const inputs = list(input.inputs ?? input.input_refs ?? input.inputRefs);
+  const recoveryInput = input.recovery && typeof input.recovery === 'object' && !Array.isArray(input.recovery)
+    ? input.recovery as Record<string, unknown>
+    : {};
+  const materialOwnerIds = list(input.material_owner_ids ?? input.materialOwnerIds ?? recoveryInput.material_owner_ids ?? recoveryInput.materialOwnerIds);
+  const materialOwnerTeams = list(input.material_owner_teams ?? input.materialOwnerTeams ?? recoveryInput.material_owner_teams ?? recoveryInput.materialOwnerTeams);
+  const domainOwnerTeams = list(input.domain_owner_teams ?? input.domainOwnerTeams ?? recoveryInput.domain_owner_teams ?? recoveryInput.domainOwnerTeams);
   if (!inputs.length) inputs.push(`request:${context.actorId || 'operator'}`);
   if (!sourceIds.length) sourceIds.push(`request:${context.actorId || 'operator'}`);
 
@@ -137,6 +143,11 @@ export function buildTaskWorkflowContract(input: Record<string, unknown>, contex
       backlog_policy: backlogPolicy || null,
       relevance: relevance || null,
       parent_task_id: parentTaskId || null,
+      recovery: {
+        material_owner_ids: materialOwnerIds,
+        material_owner_teams: materialOwnerTeams,
+        domain_owner_teams: domainOwnerTeams,
+      },
       validation: {
         route: validationPath,
         validators,

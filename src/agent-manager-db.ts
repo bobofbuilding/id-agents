@@ -258,6 +258,42 @@ const DEFAULT_TASK_BOARD_DONE_LIMIT = 25;
 const INSTRUCTIONS_SIDECAR_BLOCK_BEGIN = '<!-- BEGIN idacc instructions sidecar -->';
 const INSTRUCTIONS_SIDECAR_BLOCK_END = '<!-- END idacc instructions sidecar -->';
 
+type MaterialRecoveryStage =
+  | 'detected'
+  | 'creator_or_parent_owner'
+  | 'owning_lead'
+  | 'task_manager'
+  | 'domain_lead'
+  | 'ask_user'
+  | 'parked';
+
+interface MaterialRecoveryState {
+  version: 'material-recovery.v1';
+  kind: 'missing_material';
+  stage: MaterialRecoveryStage;
+  material_fingerprint: string;
+  blocker_fingerprint: string;
+  repeat_count: number;
+  original_owner_id: string | null;
+  blocked_by_agent_id: string | null;
+  last_recipient_id?: string | null;
+  last_recipient_name?: string | null;
+  last_recipient_team?: string | null;
+  last_routed_at?: number | null;
+  parked_at?: number | null;
+  ask_user_at?: number | null;
+  history: Array<Record<string, unknown>>;
+}
+
+interface MaterialRecoveryResult {
+  status: string;
+  actor?: string;
+  actorTeam?: string;
+  routed: boolean;
+}
+
+type MaterialRecoveryTeam = Pick<TeamRow, 'id' | 'name'>;
+
 interface StalledProbeState {
   lastAt: number;
   attempts: number;
@@ -1695,6 +1731,312 @@ export class AgentManagerDb {
       }
     }
     return {};
+  }
+
+  private materialRecoveryState(task: TaskRow): MaterialRecoveryState | null {
+    const raw = this.taskBlockedDetail(task).recovery_ladder;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const state = raw as Record<string, unknown>;
+    if (state.version !== 'material-recovery.v1' || state.kind !== 'missing_material') return null;
+    const stage = String(state.stage || '') as MaterialRecoveryStage;
+    if (!['detected', 'creator_or_parent_owner', 'owning_lead', 'task_manager', 'domain_lead', 'ask_user', 'parked'].includes(stage)) {
+      return null;
+    }
+    return {
+      ...(state as unknown as MaterialRecoveryState),
+      stage,
+      material_fingerprint: String(state.material_fingerprint || ''),
+      blocker_fingerprint: String(state.blocker_fingerprint || ''),
+      repeat_count: Math.max(1, Number(state.repeat_count || 1)),
+      original_owner_id: typeof state.original_owner_id === 'string' ? state.original_owner_id : null,
+      blocked_by_agent_id: typeof state.blocked_by_agent_id === 'string' ? state.blocked_by_agent_id : null,
+      history: Array.isArray(state.history) ? state.history.slice(-12) as Array<Record<string, unknown>> : [],
+    };
+  }
+
+  private missingMaterialBlocker(message: string): boolean {
+    const text = String(message || '').trim();
+    if (!text) return false;
+    const material = '(?:policy\\s+(?:wording|text|content|draft)|source\\s+(?:artifact|material|document|text|file)|document\\s+path|file\\s+path|source\\s+ids?|artifact|input\\s+material|review\\s+material|content\\s+under\\s+review|completion\\s+evidence|deliverable)';
+    return new RegExp(`\\b(?:no|missing|absent|without|unavailable)\\b[\\s\\S]{0,120}\\b${material}\\b`, 'i').test(text)
+      || new RegExp(`\\b${material}\\b[\\s\\S]{0,120}\\b(?:not|never)\\s+(?:provided|supplied|attached|included|available|found|recorded)\\b`, 'i').test(text)
+      || /cannot be (?:performed|completed|reproduced)[\s\S]{0,120}\bwithout (?:inventing|the|a)\b/i.test(text);
+  }
+
+  private materialBlockerFingerprint(message: string): string {
+    const lower = String(message || '').toLowerCase();
+    const categories = [
+      /policy\s+(?:wording|text|content|draft)/.test(lower) && 'policy',
+      /\b(?:source|source ids?)\b/.test(lower) && 'source',
+      /\bartifact\b/.test(lower) && 'artifact',
+      /\b(?:document|file)\s+path\b/.test(lower) && 'path',
+      /\b(?:input|review)\s+material\b/.test(lower) && 'material',
+      /\b(?:evidence|deliverable)\b/.test(lower) && 'evidence',
+    ].filter((value): value is string => Boolean(value));
+    return crypto.createHash('sha256').update(`missing_material:${[...new Set(categories)].sort().join(',') || 'unspecified'}`).digest('hex');
+  }
+
+  private materialRecoveryRetryMs(): number {
+    const raw = Number(process.env.ID_MATERIAL_RECOVERY_STAGE_MS);
+    return Number.isFinite(raw) && raw > 0
+      ? Math.max(60_000, Math.floor(raw))
+      : 15 * 60 * 1000;
+  }
+
+  private materialRecoveryBaseDescription(description: string | null | undefined): string {
+    return String(description || '').split(/(?:^|\n\n)Manager triage \(/i)[0].trim();
+  }
+
+  private stableMaterialValue(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map((item) => this.stableMaterialValue(item));
+    if (!value || typeof value !== 'object') return value ?? null;
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, item]) => [key, this.stableMaterialValue(item)]),
+    );
+  }
+
+  private async materialRecoveryParentTask(task: TaskRow): Promise<TaskRow | null> {
+    const contract = task.workflow_contract && typeof task.workflow_contract === 'object'
+      ? task.workflow_contract as Record<string, unknown>
+      : {};
+    const parentRef = String(contract.parent_task_id || '').trim();
+    if (!parentRef) return null;
+    const local = await this.resolveTaskRef(parentRef, task.team_id || undefined).catch(() => ({ task: undefined }));
+    if (local.task) return local.task;
+    const global = await this.resolveTaskRef(parentRef).catch(() => ({ task: undefined }));
+    return global.task || null;
+  }
+
+  private async materialRecoveryFingerprint(task: TaskRow): Promise<string> {
+    const parent = await this.materialRecoveryParentTask(task);
+    const payload = this.stableMaterialValue({
+      description: this.materialRecoveryBaseDescription(task.description),
+      workflow_contract: task.workflow_contract || null,
+      completion_evidence: task.completion_evidence || null,
+      parent: parent ? {
+        description: this.materialRecoveryBaseDescription(parent.description),
+        status: parent.status,
+        workflow_contract: parent.workflow_contract || null,
+        completion_evidence: parent.completion_evidence || null,
+      } : null,
+    });
+    return crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+  }
+
+  private materialRecoveryOwnership(task: TaskRow): {
+    materialOwnerIds: string[];
+    materialOwnerTeams: string[];
+    domainOwnerTeams: string[];
+  } {
+    const contract = task.workflow_contract && typeof task.workflow_contract === 'object'
+      ? task.workflow_contract as Record<string, unknown>
+      : {};
+    const recovery = contract.recovery && typeof contract.recovery === 'object' && !Array.isArray(contract.recovery)
+      ? contract.recovery as Record<string, unknown>
+      : {};
+    const strings = (value: unknown): string[] => Array.isArray(value)
+      ? [...new Set(value.map(String).map((item) => item.trim()).filter(Boolean))]
+      : typeof value === 'string' && value.trim() ? [value.trim()] : [];
+    return {
+      materialOwnerIds: strings(recovery.material_owner_ids),
+      materialOwnerTeams: strings(recovery.material_owner_teams),
+      domainOwnerTeams: strings(recovery.domain_owner_teams),
+    };
+  }
+
+  private nextMaterialRecoveryStage(stage: MaterialRecoveryStage): MaterialRecoveryStage {
+    if (stage === 'detected') return 'creator_or_parent_owner';
+    if (stage === 'creator_or_parent_owner') return 'owning_lead';
+    if (stage === 'owning_lead') return 'task_manager';
+    if (stage === 'task_manager') return 'domain_lead';
+    return 'parked';
+  }
+
+  private async materialRecoveryCandidates(
+    task: TaskRow,
+    team: MaterialRecoveryTeam,
+    stage: MaterialRecoveryStage,
+    state: MaterialRecoveryState,
+  ): Promise<Array<{ team: MaterialRecoveryTeam; agent: AgentRow }>> {
+    const candidates: Array<{ team: MaterialRecoveryTeam; agent: AgentRow }> = [];
+    const seen = new Set<string>();
+    const add = (candidateTeam: MaterialRecoveryTeam | null | undefined, candidateAgent: AgentRow | null | undefined) => {
+      if (!candidateTeam || !this.isLiveForSupervision(candidateAgent)) return;
+      if (candidateAgent.id === state.blocked_by_agent_id) return;
+      const key = `${candidateTeam.id}:${candidateAgent.id}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      candidates.push({ team: candidateTeam, agent: candidateAgent });
+    };
+
+    if (stage === 'creator_or_parent_owner') {
+      const ids: string[] = [];
+      if (task.created_by) ids.push(task.created_by);
+      const parent = await this.materialRecoveryParentTask(task);
+      if (parent?.owner) ids.push(parent.owner);
+      for (const id of [...new Set(ids)]) {
+        const candidateAgent = await this.db.agents.getById(id).catch(() => null);
+        const candidateTeam = candidateAgent
+          ? await this.db.teams.getTeam(candidateAgent.team_id).catch(() => null)
+          : null;
+        add(candidateTeam, candidateAgent);
+      }
+    } else if (stage === 'owning_lead') {
+      add(team, await this.findSupervisionLead(team.id).catch(() => null));
+    } else if (stage === 'task_manager') {
+      for (const candidate of await this.findTaskManagerFallbacks().catch(() => [])) add(candidate.team, candidate.agent);
+    } else if (stage === 'domain_lead') {
+      const ownership = this.materialRecoveryOwnership(task);
+      const explicitTeams = new Map<string, TeamRow>();
+      for (const agentId of ownership.materialOwnerIds) {
+        const owner = await this.db.agents.getById(agentId).catch(() => null);
+        const ownerTeam = owner ? await this.db.teams.getTeam(owner.team_id).catch(() => null) : null;
+        if (ownerTeam && ownerTeam.id !== team.id) explicitTeams.set(ownerTeam.id, ownerTeam);
+      }
+      for (const teamName of [...ownership.materialOwnerTeams, ...ownership.domainOwnerTeams]) {
+        const ownerTeam = await this.db.teams.getTeamByName(teamName).catch(() => null);
+        if (ownerTeam && ownerTeam.id !== team.id) explicitTeams.set(ownerTeam.id, ownerTeam);
+      }
+      for (const ownerTeam of explicitTeams.values()) {
+        const configuredLead = await this.findConfiguredTaskCreationLead(ownerTeam.id, ownerTeam.name).catch(() => null);
+        add(ownerTeam, configuredLead);
+      }
+    }
+    return candidates;
+  }
+
+  private materialRecoveryPrompt(params: {
+    task: TaskRow;
+    taskTeam: MaterialRecoveryTeam;
+    stage: MaterialRecoveryStage;
+    blocker: string;
+  }): string {
+    const ref = this.taskShortRef(params.task);
+    const role = params.stage === 'creator_or_parent_owner'
+      ? 'task creator or parent owner'
+      : params.stage === 'owning_lead'
+        ? 'owning team lead'
+        : params.stage === 'task_manager'
+          ? 'task-master'
+          : 'explicitly declared source/domain team lead';
+    return [
+      `MATERIAL RECOVERY from manager for task ${ref} [task-team:${params.taskTeam.name}] [material-recovery:${params.stage}].`,
+      `You are the ${role} rung in the durable recovery ladder.`,
+      `The existing task is blocked because required source material is absent: ${params.blocker.replace(/\s+/g, ' ').slice(0, 600)}`,
+      'Repair the existing task contract by attaching the actual text, artifact, document path, source ID, or reproducible completion evidence. Do not invent the missing material and do not create a duplicate review task.',
+      'If repaired, reply RECOVERED: <what changed and where>. If it is still an internal ownership problem, reply BLOCKED: <specific missing material and owner>. Use ASK-USER: <exact decision or input> only when a genuine external decision is required.',
+      'The manager fingerprints the contract and sources; unchanged material advances once to the next rung and ultimately parks without retrying.',
+    ].join(' ');
+  }
+
+  private async persistMaterialRecoveryState(
+    task: TaskRow,
+    state: MaterialRecoveryState,
+    nowMs: number,
+    retryAt: number | null,
+  ): Promise<void> {
+    await this.db.tasks.updateFields(task.id, {
+      status: 'todo',
+      owner: null,
+      completed_at: null,
+      assignment_id: null,
+      workflow_state: 'blocked',
+      blocked_detail: {
+        ...this.taskBlockedDetail(task),
+        reason: String(this.taskBlockedDetail(task).reason || 'missing_material'),
+        retry_at: retryAt,
+        recovery_ladder: state,
+      },
+      lifecycle_updated_at: Math.floor(nowMs / 1000),
+      updated_at: Math.floor(nowMs / 1000),
+    });
+  }
+
+  private async advanceMaterialRecovery(
+    task: TaskRow,
+    team: MaterialRecoveryTeam,
+    nowMs: number,
+    options: { respectRetry?: boolean } = {},
+  ): Promise<MaterialRecoveryResult> {
+    let state = this.materialRecoveryState(task);
+    if (!state) return { status: 'not_material_recovery', routed: false };
+    const currentFingerprint = await this.materialRecoveryFingerprint(task);
+    if (currentFingerprint !== state.material_fingerprint) {
+      await this.db.tasks.updateFields(task.id, {
+        status: 'todo',
+        owner: null,
+        workflow_state: 'queued',
+        blocked_detail: null,
+        lifecycle_updated_at: Math.floor(nowMs / 1000),
+        updated_at: Math.floor(nowMs / 1000),
+      });
+      return { status: 'material_changed_queued', routed: true };
+    }
+    if (state.stage === 'ask_user') return { status: 'awaiting_user', routed: false };
+    if (state.stage === 'parked') return { status: 'parked_unchanged', routed: false };
+    const retryAt = Number(this.taskBlockedDetail(task).retry_at || 0);
+    if (options.respectRetry !== false && retryAt > nowMs) return { status: 'retry_not_due', routed: false };
+
+    let stage = this.nextMaterialRecoveryStage(state.stage);
+    while (stage !== 'parked') {
+      const candidates = await this.materialRecoveryCandidates(task, team, stage, state);
+      for (const candidate of candidates) {
+        const sent = await this.sendRecentThrottledSupervisionAsk({
+          teamId: candidate.team.id,
+          teamName: candidate.team.name,
+          recipient: candidate.agent,
+          message: this.materialRecoveryPrompt({
+            task,
+            taskTeam: team,
+            stage,
+            blocker: String(this.taskBlockedDetail(task).reason || 'required material is missing'),
+          }),
+          nowMs,
+          force: false,
+        });
+        if (sent === 'failed') continue;
+        state = {
+          ...state,
+          stage,
+          last_recipient_id: candidate.agent.id,
+          last_recipient_name: candidate.agent.name,
+          last_recipient_team: candidate.team.name,
+          last_routed_at: nowMs,
+          history: [...state.history, {
+            stage,
+            status: sent,
+            recipient_id: candidate.agent.id,
+            recipient_name: candidate.agent.name,
+            recipient_team: candidate.team.name,
+            occurred_at: nowMs,
+          }].slice(-12),
+        };
+        await this.persistMaterialRecoveryState(task, state, nowMs, nowMs + this.materialRecoveryRetryMs());
+        return {
+          status: sent === 'sent' ? `sent_${stage}` : `recent_${stage}`,
+          actor: candidate.agent.name,
+          actorTeam: candidate.team.name,
+          routed: sent === 'sent',
+        };
+      }
+      state = {
+        ...state,
+        stage,
+        history: [...state.history, { stage, status: 'unavailable', occurred_at: nowMs }].slice(-12),
+      };
+      stage = this.nextMaterialRecoveryStage(stage);
+    }
+
+    state = {
+      ...state,
+      stage: 'parked',
+      parked_at: nowMs,
+      history: [...state.history, { stage: 'parked', status: 'unchanged_source', occurred_at: nowMs }].slice(-12),
+    };
+    await this.persistMaterialRecoveryState(task, state, nowMs, null);
+    return { status: 'parked_unchanged', routed: false };
   }
 
   private activeQueryMatchesTask(row: QueryRow, task: TaskRow): boolean {
@@ -5724,6 +6066,36 @@ Return this JSON shape:
     return `manager_blocked_${safe}`;
   }
 
+  private async markMaterialRecoveryAwaitingUser(
+    queryRow: QueryRow,
+    occurredAt: number,
+  ): Promise<{ task: TaskRow; team: TeamRow } | null> {
+    const prompt = String(queryRow.prompt || '').trim();
+    if (!prompt.toLowerCase().startsWith('material recovery from manager for task')) return null;
+    const marker = this.activeTaskAskMarker(prompt);
+    const taskTeamName = prompt.match(/\[task-team:([^\]]+)\]/i)?.[1]?.trim();
+    if (!marker || !taskTeamName) return null;
+    const team = await this.db.teams.getTeamByName(taskTeamName).catch(() => null);
+    if (!team) return null;
+    const { task } = await this.resolveTaskRef(marker, team.id).catch(() => ({ task: undefined }));
+    if (!task) return null;
+    const state = this.materialRecoveryState(task);
+    if (!state) return null;
+    const next: MaterialRecoveryState = {
+      ...state,
+      stage: 'ask_user',
+      ask_user_at: occurredAt,
+      history: [...state.history, {
+        stage: 'ask_user',
+        status: 'external_decision_requested',
+        source_query_id: queryRow.query_id,
+        occurred_at: occurredAt,
+      }].slice(-12),
+    };
+    await this.persistMaterialRecoveryState(task, next, occurredAt, null);
+    return { task, team };
+  }
+
   private async promoteHumanDecisionBlockerToManagerInbox(
     queryRow: QueryRow,
     payload: Record<string, unknown>,
@@ -5734,12 +6106,14 @@ Return this JSON shape:
     const message = this.replyMessageFromPayload(payload);
     if (!this.humanDecisionBlockerMessage(message)) return;
 
-    const team = await this.db.teams.getTeam(queryRow.team_id).catch(() => null);
+    const recoveryContext = await this.markMaterialRecoveryAwaitingUser(queryRow, occurredAt);
+    const team = recoveryContext?.team
+      ?? await this.db.teams.getTeam(queryRow.team_id).catch(() => null);
     if (!team) return;
 
-    const managerInbox = this.getManagerInboxRef(queryRow.team_id, team.name);
+    const managerInbox = this.getManagerInboxRef(team.id, team.name);
     const promotedQueryId = this.managerBlockedDecisionQueryId(queryRow.query_id);
-    const existing = await this.db.queries.getByQueryIdForTeam(queryRow.team_id, promotedQueryId).catch(() => null);
+    const existing = await this.db.queries.getByQueryIdForTeam(team.id, promotedQueryId).catch(() => null);
     if (existing) return;
 
     const agent = queryRow.agent_id
@@ -5760,7 +6134,7 @@ Return this JSON shape:
     ].join('\n');
 
     await this.db.queries.create(
-      queryRow.team_id,
+      team.id,
       promotedQueryId,
       null,
       prompt,
@@ -5775,7 +6149,7 @@ Return this JSON shape:
       },
     );
 
-    await this.db.news.add(queryRow.team_id, null, {
+    await this.db.news.add(team.id, null, {
       timestamp: occurredAt,
       type: 'query.received',
       message: `Decision needed from ${from}: ${blockerExcerpt.slice(0, 140)}${blockerExcerpt.length > 140 ? '...' : ''}`,
@@ -5794,7 +6168,7 @@ Return this JSON shape:
       owner_id: managerInbox.ownerId,
     });
 
-    this.broadcastNews(queryRow.team_id, {
+    this.broadcastNews(team.id, {
       type: 'query.received',
       from,
       message: `Decision needed: ${blockerExcerpt}`,
@@ -6697,6 +7071,95 @@ Return this JSON shape:
       await this.markTaskControlReplyApplied({ teamId: queryRow.team_id, queryId: queryRow.query_id, agentId: actorAgentId, occurredAt, task, action: effectiveParsed.action });
       this.managerLog(`Applied CLAIM control reply for task ${task.name} from query ${queryRow.query_id}`);
       return { applied: true, action: effectiveParsed.action, task: task.name };
+    }
+
+    if (effectiveParsed.action === 'blocked' && this.missingMaterialBlocker(`${effectiveParsed.note}\n${message}`)) {
+      const taskTeamId = task.team_id || controlTeamId;
+      const taskTeam = await this.db.teams.getTeam(taskTeamId).catch(() => null);
+      const blocker = (message || effectiveParsed.note || 'Required source material is missing').trim();
+      const currentFingerprint = await this.materialRecoveryFingerprint(task);
+      const existing = this.materialRecoveryState(task);
+      const sameMaterial = existing?.material_fingerprint === currentFingerprint;
+      const state: MaterialRecoveryState = sameMaterial && existing
+        ? {
+          ...existing,
+          repeat_count: existing.repeat_count + 1,
+          history: [...existing.history, {
+            stage: existing.stage,
+            status: 'same_blocker_repeated',
+            query_id: queryRow.query_id,
+            occurred_at: occurredAt,
+          }].slice(-12),
+        }
+        : {
+          version: 'material-recovery.v1',
+          kind: 'missing_material',
+          stage: 'detected',
+          material_fingerprint: currentFingerprint,
+          blocker_fingerprint: this.materialBlockerFingerprint(blocker),
+          repeat_count: 1,
+          original_owner_id: task.owner || null,
+          blocked_by_agent_id: actorAgentId,
+          history: [{
+            stage: 'detected',
+            status: 'missing_material_detected',
+            query_id: queryRow.query_id,
+            occurred_at: occurredAt,
+          }],
+        };
+      const description = sameMaterial
+        ? task.description
+        : this.appendTaskTriageNote(task.description, 'missing_material_recovery', blocker, occurredAt);
+      const blockedDetail = {
+        ...this.taskBlockedDetail(task),
+        version: 'blocked-work.v1',
+        reason: blocker,
+        retry_at: sameMaterial ? this.waitingTaskRetryAt(task) || occurredAt : occurredAt,
+        attempts: Number(this.taskBlockedDetail(task).attempts || 0) + 1,
+        recovery_ladder: state,
+      };
+      const parkedTask: TaskRow = {
+        ...task,
+        status: 'todo',
+        owner: null,
+        completed_at: null,
+        workflow_state: 'blocked',
+        blocked_detail: blockedDetail,
+        description,
+        updated_at: nowSec,
+      };
+      await this.db.tasks.updateFields(task.id, {
+        status: parkedTask.status,
+        owner: parkedTask.owner,
+        completed_at: parkedTask.completed_at,
+        assignment_id: null,
+        workflow_state: parkedTask.workflow_state,
+        blocked_detail: blockedDetail,
+        description,
+        lifecycle_updated_at: nowSec,
+        updated_at: nowSec,
+      });
+      await this.recordTaskSupervision(
+        parkedTask,
+        taskTeamId,
+        actorAgentId,
+        'control_reply_blocked',
+        stalledMinutes,
+        occurredAt,
+      );
+      const recovery = taskTeam
+        ? await this.advanceMaterialRecovery(parkedTask, taskTeam, occurredAt, { respectRetry: sameMaterial })
+        : { status: 'no_task_team', routed: false };
+      await this.markTaskControlReplyApplied({
+        teamId: queryRow.team_id,
+        queryId: queryRow.query_id,
+        agentId: actorAgentId,
+        occurredAt,
+        task,
+        action: 'missing_material_recovery',
+      });
+      this.managerLog(`Started durable material recovery for task ${task.name}: ${recovery.status}`);
+      return { applied: true, action: 'missing_material_recovery', task: task.name, reason: recovery.status };
     }
 
     const taskTeamId = task.team_id || controlTeamId;
@@ -24051,6 +24514,55 @@ Return this JSON shape:
       const teamName = team?.name || task.team_id;
       const ref = this.taskShortRef(task);
       const state = task.workflow_state || 'waiting';
+      let recoveryTask = task;
+      let materialRecovery = this.materialRecoveryState(task);
+      const legacyBlocker = String(this.taskBlockedDetail(task).reason || '').trim();
+      if (!materialRecovery && state === 'blocked' && this.missingMaterialBlocker(legacyBlocker)) {
+        materialRecovery = {
+          version: 'material-recovery.v1',
+          kind: 'missing_material',
+          stage: 'detected',
+          material_fingerprint: await this.materialRecoveryFingerprint(task),
+          blocker_fingerprint: this.materialBlockerFingerprint(legacyBlocker),
+          repeat_count: Math.max(1, Number(this.taskBlockedDetail(task).attempts || 1)),
+          original_owner_id: typeof this.taskBlockedDetail(task).original_owner_id === 'string'
+            ? String(this.taskBlockedDetail(task).original_owner_id)
+            : task.owner,
+          blocked_by_agent_id: null,
+          history: [{
+            stage: 'detected',
+            status: 'legacy_missing_material_adopted',
+            occurred_at: params.nowMs,
+          }],
+        };
+        const blockedDetail = {
+          ...this.taskBlockedDetail(task),
+          retry_at: params.nowMs,
+          recovery_ladder: materialRecovery,
+        };
+        recoveryTask = { ...task, blocked_detail: blockedDetail };
+        await this.db.tasks.updateFields(task.id, {
+          blocked_detail: blockedDetail,
+          lifecycle_updated_at: Math.floor(params.nowMs / 1000),
+          updated_at: Math.floor(params.nowMs / 1000),
+        });
+      }
+      if (materialRecovery && team) {
+        const recovery = await this.advanceMaterialRecovery(recoveryTask, team, params.nowMs, {
+          respectRetry: materialRecovery.stage !== 'detected',
+        });
+        if (recovery.routed) routed++;
+        else skipped++;
+        items.push({
+          task: ref,
+          team: teamName,
+          state,
+          status: recovery.status,
+          actor: recovery.actor,
+          actorTeam: recovery.actorTeam,
+        });
+        continue;
+      }
       const retryAt = this.waitingTaskRetryAt(task);
       if (!params.force && retryAt > params.nowMs) {
         skipped++;
@@ -24537,6 +25049,7 @@ Return this JSON shape:
       || lower.startsWith('you’ve been assigned task')
       || (lower.startsWith('team objective:') && /\byour assigned task\s*\(#?[a-z0-9][a-z0-9_-]{3,}\)/i.test(lower))
       || lower.startsWith('task-manager triage assigned existing')
+      || lower.startsWith('material recovery from manager for task')
       || lower.startsWith('supervision:')
       || lower.startsWith('supervision routing:')
       || lower.startsWith('supervision probe from manager:')
@@ -24599,7 +25112,10 @@ Return this JSON shape:
       // as marker:<task> caused every post-completion validation request to be
       // expired as a duplicate of the original assignment/control query.
       const revisionCycle = text.match(/\[revision-cycle:(\d+)\]/)?.[1];
-      const phase = revisionCycle
+      const materialRecoveryStage = text.match(/\[material-recovery:([a-z_]+)\]/)?.[1];
+      const phase = materialRecoveryStage
+        ? `material-recovery-${materialRecoveryStage}`
+        : revisionCycle
         ? `revision-${revisionCycle}`
         : (
           text.startsWith('validation request for ')

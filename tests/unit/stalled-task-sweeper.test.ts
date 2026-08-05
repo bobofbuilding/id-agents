@@ -174,6 +174,7 @@ describe('stalled task sweeper', () => {
     delete process.env.ID_HOLDING_TASK_MAX_AGE_MS;
     delete process.env.ID_HOLDING_RECOVERY_MAX_PER_SWEEP;
     delete process.env.ID_WAITING_TRIAGE_MAX_PER_SWEEP;
+    delete process.env.ID_MATERIAL_RECOVERY_STAGE_MS;
     delete process.env.ID_VALIDATION_FALLBACK_MAX_PER_SWEEP;
     delete process.env.STALL_MAX_PROBES;
     delete process.env.STALL_PROBE_RESET_MS;
@@ -332,6 +333,355 @@ describe('stalled task sweeper', () => {
     expect(automatic).toMatchObject({ routed: 0, skipped: 1, items: [{ status: 'retry_not_due' }] });
     expect(manual).toMatchObject({ routed: 1, skipped: 0, items: [{ status: 'sent_lead' }] });
     expect(manager.sendSupervisionAsk).toHaveBeenCalledTimes(1);
+  });
+
+  it('starts missing-material recovery with the task creator instead of blind task-manager retry', async () => {
+    const creator = agent({ id: 'creator-1', name: 'policy-author' });
+    const moderator = agent({ id: 'moderator-1', name: 'content-moderator' });
+    const blocked = task({
+      owner: moderator.id,
+      created_by: creator.id,
+      workflow_state: 'executing',
+      workflow_contract: {
+        version: 'task-workflow.v1',
+        source_ids: ['request:content-ops'],
+        parent_task_id: null,
+      },
+    });
+    let current = blocked;
+    const db = fakeDb({
+      agents: {
+        getById: vi.fn(async (id: string) => id === creator.id ? creator : id === moderator.id ? moderator : null),
+      },
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [current]),
+        updateFields: vi.fn(async (_id: string, fields: Partial<TaskRow>) => {
+          current = { ...current, ...fields };
+        }),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-material-recovery-creator-test', db, { libraryRoot: null }) as any;
+    manager.sendRecentThrottledSupervisionAsk = vi.fn(async () => 'sent');
+    manager.findTaskManagerFallbacks = vi.fn(async () => []);
+
+    const result = await manager.applyTaskControlReplyFromCompletedQuery(
+      activeQuery(moderator.id, {
+        query_id: 'missing-policy-source',
+        prompt: 'Supervision: task #12345678 ("Review policy") has been in progress 60m.',
+        status: 'completed',
+      }),
+      { result: 'BLOCKED: No policy wording or source artifact was provided, so the safety review cannot be completed without inventing the text.' },
+      NOW_MS,
+    );
+
+    expect(result).toMatchObject({ applied: true, action: 'missing_material_recovery', reason: 'sent_creator_or_parent_owner' });
+    expect(current).toMatchObject({ status: 'todo', owner: null, workflow_state: 'blocked' });
+    expect((current.blocked_detail as any).recovery_ladder).toMatchObject({
+      version: 'material-recovery.v1',
+      stage: 'creator_or_parent_owner',
+      original_owner_id: moderator.id,
+      blocked_by_agent_id: moderator.id,
+      last_recipient_id: creator.id,
+    });
+    expect(manager.sendRecentThrottledSupervisionAsk).toHaveBeenCalledWith(expect.objectContaining({
+      teamId: TEAM_ID,
+      recipient: creator,
+      message: expect.stringContaining('[material-recovery:creator_or_parent_owner]'),
+    }));
+    expect(manager.findTaskManagerFallbacks).not.toHaveBeenCalled();
+  });
+
+  it('adopts a legacy missing-material block into the ladder during reconciliation', async () => {
+    const creator = agent({ id: 'creator-legacy', name: 'policy-author' });
+    let current = task({
+      status: 'todo',
+      owner: null,
+      created_by: creator.id,
+      workflow_state: 'blocked',
+      workflow_contract: { version: 'task-workflow.v1', source_ids: ['request:content-ops'] },
+      blocked_detail: {
+        version: 'blocked-work.v1',
+        reason: 'No policy wording, document path, or source artifact was provided, so the review cannot be completed.',
+        attempts: 4,
+      },
+    });
+    const db = fakeDb({
+      agents: {
+        getById: vi.fn(async (id: string) => id === creator.id ? creator : null),
+      },
+      tasks: {
+        list: vi.fn(async ({ status, workflowState }: { status?: string; workflowState?: string | null } = {}) =>
+          status === 'todo' && workflowState === 'blocked' ? [current] : []),
+        updateFields: vi.fn(async (_id: string, fields: Partial<TaskRow>) => {
+          current = { ...current, ...fields };
+        }),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-material-recovery-legacy-adoption-test', db, { libraryRoot: null }) as any;
+    manager.sendRecentThrottledSupervisionAsk = vi.fn(async () => 'sent');
+
+    const report = await manager.triageWaitingTasks({
+      teams: [{ id: TEAM_ID, name: 'default' }],
+      limit: 5,
+      nowMs: NOW_MS,
+      force: false,
+    });
+
+    expect(report).toMatchObject({
+      routed: 1,
+      skipped: 0,
+      items: [{ status: 'sent_creator_or_parent_owner', actor: creator.name }],
+    });
+    expect((current.blocked_detail as any).recovery_ladder).toMatchObject({
+      stage: 'creator_or_parent_owner',
+      repeat_count: 4,
+      last_recipient_id: creator.id,
+    });
+    expect((current.blocked_detail as any).recovery_ladder.history).toEqual(expect.arrayContaining([
+      expect.objectContaining({ status: 'legacy_missing_material_adopted' }),
+    ]));
+  });
+
+  it('skips an unavailable owning lead and advances durably to task-master', async () => {
+    const ops = team({ id: 'ops-team', name: 'operations-team' });
+    const taskMaster = agent({ id: 'task-master-1', team_id: ops.id, name: 'task-master' });
+    let current = task({
+      status: 'todo',
+      owner: null,
+      workflow_state: 'blocked',
+      workflow_contract: { version: 'task-workflow.v1', source_ids: ['request:content-ops'] },
+    });
+    const db = fakeDb({
+      teams: {
+        getTeam: vi.fn(async (id: string) => id === ops.id ? ops : team()),
+      },
+      tasks: {
+        updateFields: vi.fn(async (_id: string, fields: Partial<TaskRow>) => {
+          current = { ...current, ...fields };
+        }),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-material-recovery-task-master-test', db, { libraryRoot: null }) as any;
+    const fingerprint = await manager.materialRecoveryFingerprint(current);
+    current = {
+      ...current,
+      blocked_detail: {
+        reason: 'No policy text was supplied.',
+        retry_at: NOW_MS - 1,
+        recovery_ladder: {
+          version: 'material-recovery.v1',
+          kind: 'missing_material',
+          stage: 'creator_or_parent_owner',
+          material_fingerprint: fingerprint,
+          blocker_fingerprint: 'blocker',
+          repeat_count: 1,
+          original_owner_id: 'moderator-1',
+          blocked_by_agent_id: 'moderator-1',
+          history: [],
+        },
+      },
+    };
+    manager.findSupervisionLead = vi.fn(async () => null);
+    manager.findTaskManagerFallbacks = vi.fn(async () => [{ team: ops, agent: taskMaster }]);
+    manager.sendRecentThrottledSupervisionAsk = vi.fn(async () => 'sent');
+
+    const result = await manager.advanceMaterialRecovery(current, team(), NOW_MS);
+
+    expect(result).toMatchObject({ status: 'sent_task_manager', actor: 'task-master', actorTeam: 'operations-team' });
+    expect((current.blocked_detail as any).recovery_ladder).toMatchObject({ stage: 'task_manager', last_recipient_id: taskMaster.id });
+    expect((current.blocked_detail as any).recovery_ladder.history).toEqual(expect.arrayContaining([
+      expect.objectContaining({ stage: 'owning_lead', status: 'unavailable' }),
+    ]));
+  });
+
+  it('routes to another team lead only when the contract explicitly owns the missing source', async () => {
+    const legalTeam = team({ id: 'legal-team', name: 'legal' });
+    const legalLead = agent({ id: 'legal-lead-1', team_id: legalTeam.id, name: 'general-counsel' });
+    const makeBlocked = (withOwnership: boolean) => task({
+      status: 'todo',
+      owner: null,
+      workflow_state: 'blocked',
+      workflow_contract: {
+        version: 'task-workflow.v1',
+        source_ids: ['request:content-ops'],
+        recovery: withOwnership ? { domain_owner_teams: ['legal'] } : {},
+      },
+    });
+    const run = async (withOwnership: boolean) => {
+      let current = makeBlocked(withOwnership);
+      const db = fakeDb({
+        teams: {
+          getTeamByName: vi.fn(async (name: string) => name === legalTeam.name ? legalTeam : name === 'default' ? team() : null),
+        },
+        tasks: {
+          updateFields: vi.fn(async (_id: string, fields: Partial<TaskRow>) => {
+            current = { ...current, ...fields };
+          }),
+        },
+      });
+      const manager = new AgentManagerDb(`/tmp/id-agents-material-recovery-domain-${withOwnership}`, db, { libraryRoot: null }) as any;
+      const fingerprint = await manager.materialRecoveryFingerprint(current);
+      current = {
+        ...current,
+        blocked_detail: {
+          reason: 'The source artifact is missing.',
+          retry_at: NOW_MS - 1,
+          recovery_ladder: {
+            version: 'material-recovery.v1',
+            kind: 'missing_material',
+            stage: 'task_manager',
+            material_fingerprint: fingerprint,
+            blocker_fingerprint: 'blocker',
+            repeat_count: 1,
+            original_owner_id: 'moderator-1',
+            blocked_by_agent_id: 'moderator-1',
+            history: [],
+          },
+        },
+      };
+      manager.findConfiguredTaskCreationLead = vi.fn(async () => legalLead);
+      manager.sendRecentThrottledSupervisionAsk = vi.fn(async () => 'sent');
+      const result = await manager.advanceMaterialRecovery(current, team(), NOW_MS);
+      return { current, manager, result };
+    };
+
+    const unowned = await run(false);
+    expect(unowned.result.status).toBe('parked_unchanged');
+    expect(unowned.manager.sendRecentThrottledSupervisionAsk).not.toHaveBeenCalled();
+
+    const owned = await run(true);
+    expect(owned.result).toMatchObject({ status: 'sent_domain_lead', actor: legalLead.name, actorTeam: legalTeam.name });
+    expect((owned.current.blocked_detail as any).recovery_ladder.stage).toBe('domain_lead');
+  });
+
+  it('parks an unchanged terminal blocker, then requeues only after material changes', async () => {
+    let current = task({
+      status: 'todo',
+      owner: null,
+      workflow_state: 'blocked',
+      workflow_contract: { version: 'task-workflow.v1', source_ids: ['request:content-ops'] },
+    });
+    const db = fakeDb({
+      tasks: {
+        updateFields: vi.fn(async (_id: string, fields: Partial<TaskRow>) => {
+          current = { ...current, ...fields };
+        }),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-material-recovery-park-test', db, { libraryRoot: null }) as any;
+    const fingerprint = await manager.materialRecoveryFingerprint(current);
+    current = {
+      ...current,
+      blocked_detail: {
+        reason: 'No document path is attached.',
+        retry_at: NOW_MS - 1,
+        recovery_ladder: {
+          version: 'material-recovery.v1',
+          kind: 'missing_material',
+          stage: 'domain_lead',
+          material_fingerprint: fingerprint,
+          blocker_fingerprint: 'blocker',
+          repeat_count: 2,
+          original_owner_id: 'moderator-1',
+          blocked_by_agent_id: 'moderator-1',
+          history: [],
+        },
+      },
+    };
+    manager.sendRecentThrottledSupervisionAsk = vi.fn(async () => 'sent');
+
+    const parked = await manager.advanceMaterialRecovery(current, team(), NOW_MS);
+    const stillParked = await manager.advanceMaterialRecovery(current, team(), NOW_MS + 60_000);
+
+    expect(parked.status).toBe('parked_unchanged');
+    expect(stillParked.status).toBe('parked_unchanged');
+    expect((current.blocked_detail as any).retry_at).toBeNull();
+    expect((current.blocked_detail as any).recovery_ladder.stage).toBe('parked');
+    expect(manager.sendRecentThrottledSupervisionAsk).not.toHaveBeenCalled();
+
+    current = {
+      ...current,
+      workflow_contract: { version: 'task-workflow.v1', source_ids: ['artifact:policy-draft-v2'] },
+    };
+    const changed = await manager.advanceMaterialRecovery(current, team(), NOW_MS + 120_000);
+
+    expect(changed.status).toBe('material_changed_queued');
+    expect(current.workflow_state).toBe('queued');
+    expect(current.blocked_detail).toBeNull();
+  });
+
+  it('marks material recovery ASK-USER as waiting and surfaces it in the owning team Inbox', async () => {
+    const domainTeam = team({ id: 'legal-team', name: 'legal' });
+    let current = task({
+      status: 'todo',
+      owner: null,
+      workflow_state: 'blocked',
+      workflow_contract: { version: 'task-workflow.v1', source_ids: ['request:content-ops'] },
+    });
+    const db = fakeDb({
+      teams: {
+        getTeam: vi.fn(async (id: string) => id === domainTeam.id ? domainTeam : team()),
+        getTeamByName: vi.fn(async (name: string) => name === 'default' ? team() : name === domainTeam.name ? domainTeam : null),
+      },
+      tasks: {
+        getByUuidPrefix: vi.fn(async () => [current]),
+        updateFields: vi.fn(async (_id: string, fields: Partial<TaskRow>) => {
+          current = { ...current, ...fields };
+        }),
+      },
+      queries: {
+        getByQueryIdForTeam: vi.fn(async () => null),
+        create: vi.fn(async () => {}),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-material-recovery-ask-user-test', db, { libraryRoot: null }) as any;
+    const fingerprint = await manager.materialRecoveryFingerprint(current);
+    current = {
+      ...current,
+      blocked_detail: {
+        reason: 'No policy draft is available.',
+        retry_at: NOW_MS + 60_000,
+        recovery_ladder: {
+          version: 'material-recovery.v1',
+          kind: 'missing_material',
+          stage: 'domain_lead',
+          material_fingerprint: fingerprint,
+          blocker_fingerprint: 'blocker',
+          repeat_count: 1,
+          original_owner_id: 'moderator-1',
+          blocked_by_agent_id: 'moderator-1',
+          history: [],
+        },
+      },
+    };
+
+    await manager.promoteHumanDecisionBlockerToManagerInbox(
+      activeQuery('legal-lead-1', {
+        team_id: domainTeam.id,
+        query_id: 'query-material-external-decision',
+        prompt: 'MATERIAL RECOVERY from manager for task #12345678 [task-team:default] [material-recovery:domain_lead].',
+        status: 'completed',
+      }),
+      { result: 'ASK-USER: Please choose whether the unpublished policy draft may be released to the review team.' },
+      NOW_MS,
+    );
+
+    expect((current.blocked_detail as any).recovery_ladder.stage).toBe('ask_user');
+    expect((current.blocked_detail as any).retry_at).toBeNull();
+    expect(db.queries.create).toHaveBeenCalledWith(
+      TEAM_ID,
+      'manager_blocked_query-material-external-decision',
+      null,
+      expect.stringContaining('ASK-USER: Please choose whether'),
+      NOW_MS,
+      undefined,
+      { owner_kind: 'manager', owner_id: TEAM_ID },
+      expect.objectContaining({ source: 'human_decision_blocker' }),
+    );
+    expect(db.news.add).toHaveBeenCalledWith(TEAM_ID, null, expect.objectContaining({
+      query_id: 'manager_blocked_query-material-external-decision',
+      reply_expected: true,
+    }));
   });
 
   it('allows stalled-task sweep cadence overrides with a one-minute floor', () => {

@@ -79,6 +79,35 @@ describe('task workflow contract', () => {
     expect(result.contract).not.toHaveProperty('tenant_relevance');
   });
 
+  it('records explicit material and domain ownership for bounded recovery routing', () => {
+    const result = buildTaskWorkflowContract({
+      goal_id: 'goal-recovery',
+      expected_output: 'A reviewed policy',
+      acceptance_criteria: ['Review cites the supplied policy'],
+      validation_path: ['operations-team/content-moderator'],
+      out_of_scope: ['Drafting a replacement policy'],
+      backlog_policy: 'park when the source does not change',
+      work_relevance: 'Prevents blind retries',
+      source_ids: ['artifact:policy-draft'],
+      material_owner_ids: ['policy-author-1'],
+      material_owner_teams: ['content-team'],
+      recovery: { domain_owner_teams: ['legal'] },
+    }, {
+      taskId: 'task-recovery',
+      taskUuid: 'uuid-recovery',
+      teamId: 'team-1',
+      teamName: 'operations-team',
+      ownerId: 'moderator-1',
+      nowMs: 1_000,
+    });
+
+    expect(result.contract.recovery).toEqual({
+      material_owner_ids: ['policy-author-1'],
+      material_owner_teams: ['content-team'],
+      domain_owner_teams: ['legal'],
+    });
+  });
+
   it('rejects invalid lifecycle jumps', () => {
     expect(canTransitionTaskWorkflow('executing', 'validation_pending')).toBe(true);
     expect(canTransitionTaskWorkflow('validated', 'executing')).toBe(false);
