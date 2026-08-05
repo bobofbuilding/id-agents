@@ -922,6 +922,16 @@ describe('AgentManagerDb killAgentProcess guards', () => {
     const { manager, db, workDir } = await makeManager();
     dbs.push(db);
     workDirs.push(workDir);
+    const teamId = await db.teams.getOrCreateTeamId('default');
+    await db.agents.create(agentRow({
+      team_id: teamId,
+      id: 'agent-1',
+      name: 'coder-first',
+      port: 4243,
+      status: 'pending',
+      metadata: { runtime: 'codex' },
+    }));
+    (manager as any).refreshManagedOverlayBeforeStart = vi.fn(async () => ({ success: true }));
 
     const starts: string[] = [];
     let firstStarted!: () => void;
@@ -940,14 +950,14 @@ describe('AgentManagerDb killAgentProcess guards', () => {
       return { success: true, pid: 5000 + calls, logFile: `/tmp/${agentData.name}.log` };
     });
 
-    const first = (manager as any).spawnLocalAgentProcess('team-1', 'default', {
+    const first = (manager as any).spawnLocalAgentProcess(teamId, 'default', {
       name: 'coder-first',
       id: 'agent-1',
       port: 4243,
     });
     await firstStartedPromise;
 
-    const second = (manager as any).spawnLocalAgentProcess('team-1', 'default', {
+    const second = (manager as any).spawnLocalAgentProcess(teamId, 'default', {
       name: 'coder-second',
       id: 'agent-1',
       port: 4243,

@@ -2087,6 +2087,7 @@ describe('stalled task sweeper', () => {
     const worker = agent({ id: 'counsel-1', name: 'general-counsel' });
     const db = fakeDb({
       agents: {
+        getById: vi.fn(async () => null),
         resolve: vi.fn(async (_teamId: string, ref: string) => ref === 'general-counsel' ? [worker] : []),
       },
       tasks: {
@@ -4126,7 +4127,7 @@ describe('stalled task sweeper', () => {
         getTeamByName: vi.fn(async (name: string) => name === 'engineering-team' ? team({ name }) : null),
       },
       agents: {
-        getById: vi.fn(async (id: string) => id === lead.id ? lead : worker),
+        getById: vi.fn(async (id: string) => id === lead.id ? lead : id === worker.id ? worker : null),
         getByName: vi.fn(async (name: string) => name === lead.name ? lead : name === worker.name ? worker : null),
         resolve: vi.fn(async (_teamId: string, ref: string) => {
           if (ref === lead.name) return [lead];
@@ -4324,6 +4325,7 @@ describe('stalled task sweeper', () => {
       },
     });
     const manager = new AgentManagerDb('/tmp/id-agents-rebuild-cancel-test', db, { libraryRoot: null }) as any;
+    manager.refreshManagedOverlayForRebuild = vi.fn(async () => {});
     manager.killAgentProcess = vi.fn(async () => ({ killed: true }));
     manager.spawnLocalAgentProcessUnlocked = vi.fn(async () => ({ success: true, pid: 123, logFile: '/tmp/agent.log' }));
 
