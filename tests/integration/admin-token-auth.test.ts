@@ -1259,6 +1259,60 @@ describe('IDACC Manager admin bearer', () => {
     expect(modelAnonymous.status).toBe(401);
   });
 
+  it('applies a stopped agent configuration atomically and rejects a stale reviewed snapshot', async () => {
+    const teamId = await db.teams.getOrCreateTeamId(TEAM);
+    const agentId = 'atomic-agent-configuration';
+    await db.agents.create({
+      team_id: teamId,
+      id: agentId,
+      name: 'atomic-agent-configuration',
+      type: 'claude',
+      runtime: 'codex',
+      model: 'gpt-5',
+      status: 'stopped',
+      created_at: Date.now(),
+      metadata: { runtime: 'codex', effort: 'medium', speed: '' },
+    } as any);
+    const url = `${managerUrl}/agents/${encodeURIComponent(agentId)}/configuration`;
+    const headers = {
+      'content-type': 'application/json',
+      'X-Id-Team': TEAM,
+      'X-Id-Admin': '1',
+      Authorization: `Bearer ${ADMIN_TOKEN}`,
+    };
+
+    const stale = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        expected: { runtime: 'codex', model: 'gpt-5', effort: 'high', speed: '', status: 'stopped' },
+        configuration: { runtime: 'codex', model: 'gpt-5', effort: 'low', speed: '' },
+      }),
+    });
+    expect(stale.status).toBe(409);
+    expect(await stale.json()).toMatchObject({ error: 'agent_configuration_changed' });
+
+    const applied = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        expected: { runtime: 'codex', model: 'gpt-5', effort: 'medium', speed: '', status: 'stopped' },
+        configuration: { runtime: 'codex', model: 'gpt-5', effort: 'low', speed: '' },
+      }),
+    });
+    expect(applied.status).toBe(200);
+    expect(await applied.json()).toMatchObject({
+      ok: true,
+      verified: true,
+      rebuilt: false,
+      rolledBack: false,
+      after: { runtime: 'codex', model: 'gpt-5', effort: 'low', status: 'stopped' },
+    });
+    const row = await db.agents.getById(agentId);
+    expect(row?.status).toBe('stopped');
+    expect(row?.metadata).toMatchObject({ runtime: 'codex', effort: 'low' });
+  });
+
   it('blocks managed metadata and registration forgery while allowing only an attested owned pid publish', async () => {
     const teamId = await db.teams.getOrCreateTeamId(TEAM);
     const agentId = 'managed-metadata-guard-agent';

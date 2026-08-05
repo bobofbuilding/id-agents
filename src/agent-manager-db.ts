@@ -183,6 +183,39 @@ import {
   parseBrainMcpArgs,
   sameMcpServerSnapshot,
 } from './harness/mcp.js';
+
+type StoredMcpServerReference = Pick<McpServerSpec, 'name' | 'transport' | 'command'> & {
+  connectionEnv: string;
+};
+
+function mcpConnectionEnvironmentName(name: string): string {
+  const digest = crypto.createHash('sha256').update(String(name).trim().toLowerCase()).digest('hex').slice(0, 20);
+  return `IDACC_MCP_CONNECTION_${digest.toUpperCase()}`;
+}
+
+function isBrokenBrowserMcp(server: Partial<McpServerSpec> | null | undefined): boolean {
+  if (!server) return false;
+  if (String(server.name || '').trim().toLowerCase() === 'browsermcp') return true;
+  return Array.isArray(server.args) && server.args.some((arg) => String(arg).startsWith('@browsermcp/mcp'));
+}
+
+function storedMcpReference(server: McpServerSpec): StoredMcpServerReference {
+  return {
+    name: server.name.trim(),
+    transport: server.transport || 'stdio',
+    ...(server.command ? { command: server.command } : {}),
+    connectionEnv: mcpConnectionEnvironmentName(server.name),
+  };
+}
+
+function isStoredMcpReference(server: unknown): server is StoredMcpServerReference {
+  return Boolean(
+    server
+    && typeof server === 'object'
+    && typeof (server as StoredMcpServerReference).name === 'string'
+    && typeof (server as StoredMcpServerReference).connectionEnv === 'string',
+  );
+}
 import {
   normalizeProviderRuntimePolicy,
   type ProviderRuntimePolicyInput,
@@ -1460,6 +1493,8 @@ export class AgentManagerDb {
   private runtimeCredentialPoolByTeam: Map<string, RuntimeCredentialPoolConfig> = new Map();
   private defaultRuntimeCredentialPool: RuntimeCredentialPoolConfig | null = null;
   private providerRuntimeAssignments: Map<string, ProviderRuntimeAssignment> = new Map();
+  /** Exact MCP connections are process-local; durable agent metadata stores only registry references. */
+  private mcpRuntimeAssignments: Map<string, McpServerSpec[]> = new Map();
   private runtimeFailoverRetryOf: Map<string, string> = new Map();
   private installedOllamaModelsCache: { at: number; models: string[] } | null = null;
   private subscriptionRuntimeAvailabilityCache: Map<string, { checkedAt: number; active: boolean }> = new Map();
@@ -8884,8 +8919,6 @@ Return this JSON shape:
     teamName: string,
     headers: Record<string, string> = {},
   ): Promise<Record<string, string>> {
-    if (!this.idaccAdminToken) return { ...headers };
-
     const current = await this.dbQueryAgentById(agent.team_id, agent.id)
       .catch(() => null);
     const target = current || agent;
@@ -8898,6 +8931,20 @@ Return this JSON shape:
       metadata.local === true
       || metadata[MANAGER_OWNED_LAUNCH_INTENT_KEY] === true
     );
+    const authenticatedManagedAssignment = (
+      typeof metadata[MANAGER_PROCESS_RUNTIME_KEY] === 'string'
+      && typeof metadata[MANAGER_PROCESS_GENERATION_KEY] === 'string'
+    );
+    if (!this.idaccAdminToken) {
+      if (managedLocal && authenticatedManagedAssignment) {
+        throw new Error(
+          `managed worker ${target.id} belongs to an authenticated Control Center manager; `
+          + 'route through that manager instead of the standalone daemon',
+        );
+      }
+      return { ...headers };
+    }
+
     if (!managedLocal) return { ...headers };
 
     const processGeneration = typeof metadata[MANAGER_PROCESS_GENERATION_KEY] === 'string'
@@ -9020,10 +9067,26 @@ Return this JSON shape:
     };
   }
 
-  private effectiveMcpServersForAgent(metadata: AgentMetadata | null | undefined): McpServerSpec[] {
-    const explicit = Array.isArray(metadata?.mcpServers)
-      ? (metadata!.mcpServers as McpServerSpec[]).filter((server) => server && typeof server.name === 'string' && server.name.trim())
+  private effectiveMcpServersForAgent(
+    metadata: AgentMetadata | null | undefined,
+    agentId?: string,
+  ): McpServerSpec[] {
+    const remembered = agentId ? this.mcpRuntimeAssignments.get(agentId) : undefined;
+    const stored = Array.isArray(metadata?.mcpServers)
+      ? (metadata!.mcpServers as Array<McpServerSpec | StoredMcpServerReference>)
       : [];
+    const explicit = (remembered ?? stored.flatMap((server) => {
+      if (!server || typeof server.name !== 'string' || !server.name.trim() || isBrokenBrowserMcp(server)) return [];
+      if (!isStoredMcpReference(server)) return [server as McpServerSpec];
+      const raw = process.env[server.connectionEnv];
+      if (!raw) return [];
+      try {
+        const connection = JSON.parse(raw) as Partial<McpServerSpec>;
+        return [{ ...server, ...connection, name: server.name } as McpServerSpec];
+      } catch {
+        return [];
+      }
+    })).filter((server) => !isBrokenBrowserMcp(server));
     const byName = new Map<string, McpServerSpec>();
     for (const server of explicit) byName.set(server.name, server);
     if (hasBrainSkill(metadata) && !byName.has('brain')) {
@@ -9036,7 +9099,7 @@ Return this JSON shape:
   private brainToolStatusForAgent(a: AgentRow): Record<string, unknown> {
     const metadata = (a.metadata as AgentMetadata | null | undefined) || {};
     const explicit = Array.isArray(metadata.mcpServers) ? metadata.mcpServers as McpServerSpec[] : [];
-    const effective = this.effectiveMcpServersForAgent(metadata);
+    const effective = this.effectiveMcpServersForAgent(metadata, a.id);
     const explicitBrain = explicit.some((server) => server?.name === 'brain');
     const effectiveBrain = effective.some((server) => server?.name === 'brain');
     const runtime = resolveRuntime(a.runtime);
@@ -9521,6 +9584,13 @@ Return this JSON shape:
 
     const coderRow = await this.db.agents.getByName(defaultTeam.id, 'coder');
     if (!coderRow || coderRow.deleted_at !== null) return;
+
+    // The deployment config is authoritative when the default coder is first
+    // created, not on every Manager boot. Runtime/model choices made through
+    // HR are durable operator state and must not be silently replaced by a
+    // packaged fallback after a restart. Retain this narrow repair only for a
+    // malformed legacy row that has no usable runtime or model at all.
+    if (String(coderRow.runtime || '').trim() && String(coderRow.model || '').trim()) return;
 
     const drift = detectDefaultCoderRuntimeDrift(coderSpec, coderRow, this.defaultConfig?.model);
     if (!drift) return;
@@ -12766,6 +12836,12 @@ Return this JSON shape:
             return res.status(400).json({ error: 'Each server needs a non-empty name' });
           }
           const normalizedName = s.name.trim();
+          if (isBrokenBrowserMcp(s)) {
+            // BrowserMCP's recursive close failure can crash every attached
+            // query. It is intentionally parked during migration; Playwright
+            // or the app-owned Computer Use broker remain supported choices.
+            continue;
+          }
           if (serverNames.has(normalizedName)) {
             return res.status(400).json({ error: `Duplicate MCP server name "${normalizedName}"` });
           }
@@ -12827,10 +12903,12 @@ Return this JSON shape:
                 },
               };
             }
-            await this.db.agents.updateMetadata(currentAgent.id, { ...cur, mcpServers: servers });
+            const storedServers = (servers as McpServerSpec[]).map(storedMcpReference);
+            this.mcpRuntimeAssignments.set(currentAgent.id, servers as McpServerSpec[]);
+            await this.db.agents.updateMetadata(currentAgent.id, { ...cur, mcpServers: storedServers });
             return {
               status: 200,
-              body: { agent: currentAgent.name, mcpServers: servers, needsRebuild: true },
+              body: { agent: currentAgent.name, mcpServers: storedServers, needsRebuild: true },
             };
           },
         );
@@ -15376,6 +15454,209 @@ Return this JSON shape:
         res.json({ ok: true, ...result, agent: { id: agent.id, name: agent.name, domain: fresh?.domain, tokenId: fresh?.token_id } });
       } catch (e: any) {
         res.status(500).json({ error: e?.message || String(e) });
+      }
+    });
+
+    // Apply the complete HR runtime configuration as one reviewed operation.
+    // The expected snapshot is a compare-and-set guard; a running worker is
+    // rebuilt once and verified, and any failed launch restores the prior
+    // durable configuration (and prior live worker when possible).
+    this.managementApp.post('/agents/:id/configuration', async (req, res) => {
+      if (!this.isAdminRequest(req)) {
+        return res.status(403).json({ error: 'admin_required' });
+      }
+      const { id: teamId, name: teamName } = await this.getTeam(req);
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const requested = body.configuration && typeof body.configuration === 'object'
+        ? body.configuration as Record<string, unknown>
+        : {};
+      const expected = body.expected && typeof body.expected === 'object'
+        ? body.expected as Record<string, unknown>
+        : null;
+      if (!expected) {
+        return res.status(400).json({ error: 'expected configuration snapshot is required' });
+      }
+
+      const initial = await this.dbQueryAgentById(teamId, req.params.id);
+      if (!initial) return res.status(404).json({ error: 'Agent not found' });
+      if (initial.type !== 'claude' || isRemoteEndpointRuntime(initial.runtime)) {
+        return res.status(400).json({ error: 'Only local runtime-backed agents have switchable configuration' });
+      }
+
+      try {
+        const mutation = await this.withAgentLifecycleLock(
+          this.agentLifecycleKey(teamId, initial),
+          async (): Promise<{ status: number; body: Record<string, unknown> }> => {
+            const current = await this.dbQueryAgentById(teamId, initial.id);
+            if (!current) return { status: 404, body: { error: 'Agent not found' } };
+            const priorMetadata = { ...((current.metadata || {}) as AgentMetadata) };
+            const displayRuntime = typeof priorMetadata.runtime === 'string'
+              && priorMetadata.runtime.startsWith('provider:')
+              ? priorMetadata.runtime
+              : current.runtime;
+            const currentSnapshot = {
+              runtime: displayRuntime || '',
+              model: current.model || '',
+              effort: typeof priorMetadata.effort === 'string' ? priorMetadata.effort : '',
+              speed: typeof priorMetadata.speed === 'string' ? priorMetadata.speed : '',
+              status: current.status || '',
+            };
+            const staleFields = Object.entries(currentSnapshot)
+              .filter(([key, value]) => Object.hasOwn(expected, key) && String(expected[key] ?? '') !== String(value ?? ''))
+              .map(([key]) => key);
+            if (staleFields.length) {
+              return {
+                status: 409,
+                body: {
+                  error: 'agent_configuration_changed',
+                  message: `Agent configuration changed after review (${staleFields.join(', ')}).`,
+                  current: currentSnapshot,
+                },
+              };
+            }
+
+            const runtimeInput = String(requested.runtime ?? displayRuntime ?? '').trim();
+            const model = String(requested.model ?? current.model ?? '').trim();
+            const effort = String(requested.effort ?? currentSnapshot.effort).trim();
+            const speed = String(requested.speed ?? currentSnapshot.speed).trim();
+            if (!runtimeInput || !isSupportedRuntimeSpecifier(runtimeInput)) {
+              return { status: 400, body: { error: `Unknown runtime "${runtimeInput}"` } };
+            }
+            if (!model) return { status: 400, body: { error: 'A model is required' } };
+            if (effort && !['minimal', 'low', 'medium', 'high', 'xhigh'].includes(effort)) {
+              return { status: 400, body: { error: `Unknown effort "${effort}"` } };
+            }
+            if (speed && !['default', 'fast'].includes(speed)) {
+              return { status: 400, body: { error: `Unknown speed "${speed}"` } };
+            }
+
+            const providerAssignment = isProviderRuntimeSpecifier(runtimeInput)
+              ? this.normalizeProviderRuntimeAssignment(runtimeInput, body.provider)
+              : null;
+            const executionRuntime = providerAssignment ? 'provider-api' : resolveRuntime(runtimeInput);
+            if (!providerAssignment) {
+              const issues = validateRuntimePreflight(executionRuntime, model);
+              if (issues.length) {
+                return {
+                  status: 400,
+                  body: {
+                    error: 'runtime_preflight_failed',
+                    issues,
+                    detail: issues.map((issue) => runtimeIssueHint(issue.code) || issue.message).join('; '),
+                  },
+                };
+              }
+            }
+
+            const nextMetadata: AgentMetadata = providerAssignment
+              ? {
+                  ...priorMetadata,
+                  runtime: providerAssignment.lane,
+                  providerRuntime: this.providerRuntimeMetadata(providerAssignment),
+                  effort,
+                  speed,
+                }
+              : {
+                  ...priorMetadata,
+                  runtime: executionRuntime,
+                  providerRuntime: undefined,
+                  effort,
+                  speed,
+                };
+            const priorAssignment = this.providerRuntimeAssignments.get(current.id);
+            const wasRunning = current.status === 'running' || current.status === 'starting';
+            const targetStatus = wasRunning ? 'pending' : current.status;
+
+            const restorePriorAssignment = () => {
+              if (priorAssignment) this.providerRuntimeAssignments.set(current.id, priorAssignment);
+              else this.providerRuntimeAssignments.delete(current.id);
+            };
+            try {
+              await this.db.agents.updateStatus(current.id, targetStatus, {
+                runtime: executionRuntime,
+                model,
+                metadata: nextMetadata,
+              });
+              if (providerAssignment) this.providerRuntimeAssignments.set(current.id, providerAssignment);
+              else this.providerRuntimeAssignments.delete(current.id);
+
+              if (wasRunning) {
+                const refreshed = await this.dbQueryAgentById(teamId, current.id);
+                if (!refreshed) throw new Error('Agent disappeared before rebuild');
+                const rebuilt = await this.rebuildLocalClaudeAgentUnlocked(teamId, teamName, refreshed);
+                if (!rebuilt.success) throw new Error(rebuilt.error || 'verified worker startup failed');
+              }
+
+              const verified = await this.dbQueryAgentById(teamId, current.id);
+              if (!verified) throw new Error('Agent disappeared during post-rebuild verification');
+              const verifiedMetadata = (verified.metadata || {}) as AgentMetadata;
+              const verifiedRuntime = typeof verifiedMetadata.runtime === 'string'
+                && verifiedMetadata.runtime.startsWith('provider:')
+                ? verifiedMetadata.runtime
+                : verified?.runtime;
+              const verifiedOk = Boolean(
+                verifiedRuntime === runtimeInput
+                && verified.model === model
+                && String(verifiedMetadata.effort ?? '') === effort
+                && String(verifiedMetadata.speed ?? '') === speed
+                && (!wasRunning || verified.status === 'running')
+              );
+              if (!verifiedOk) throw new Error('post-rebuild configuration verification failed');
+
+              return {
+                status: 200,
+                body: {
+                  ok: true,
+                  id: current.id,
+                  name: current.name,
+                  before: currentSnapshot,
+                  after: {
+                    runtime: verifiedRuntime,
+                    model: verified.model,
+                    effort,
+                    speed,
+                    status: verified.status,
+                  },
+                  rebuilt: wasRunning,
+                  verified: true,
+                  rolledBack: false,
+                },
+              };
+            } catch (error: any) {
+              restorePriorAssignment();
+              await this.db.agents.updateStatus(current.id, current.status, {
+                runtime: current.runtime,
+                model: current.model,
+                metadata: priorMetadata,
+              }).catch(() => {});
+              let rollbackRestored = !wasRunning;
+              if (wasRunning) {
+                const restored = await this.dbQueryAgentById(teamId, current.id);
+                if (restored) {
+                  const rollbackBuild = await this.rebuildLocalClaudeAgentUnlocked(teamId, teamName, restored).catch((rollbackError: any) => ({
+                    success: false,
+                    error: rollbackError?.message || String(rollbackError),
+                  }));
+                  rollbackRestored = rollbackBuild.success;
+                }
+              }
+              return {
+                status: 503,
+                body: {
+                  error: 'agent_configuration_apply_failed',
+                  message: error?.message || String(error),
+                  verified: false,
+                  rolledBack: true,
+                  rollbackRestored,
+                },
+              };
+            }
+          },
+        );
+        return res.status(mutation.status).json(mutation.body);
+      } catch (error: any) {
+        const message = error?.message || String(error);
+        return res.status(providerRuntimeErrorStatus(message)).json({ error: message });
       }
     });
 
@@ -26824,16 +27105,12 @@ Return this JSON shape:
         // before any spawned agents select a lane.
         await this.hydrateRuntimeStateFromTeams();
 
-        // Keep the durable default config authoritative for the default-team
-        // coder row only. This avoids silent recurrence after one-off repairs
-        // while leaving researcher and the rest of the fleet untouched.
+        // Seed only malformed legacy default/coder rows. Established HR
+        // runtime/model choices remain authoritative across Manager restarts.
         await this.reconcileDefaultCoderRuntimeFromConfig();
 
-        // Restore the coordination spine before publishing readiness. The
-        // desktop may render while the larger worker fleet is still recovering,
-        // but primary-lead Chat must never become available while its team-lead
-        // routes are still absent. The remaining workers continue in the same
-        // bounded, sequential verified restore pass after readiness.
+        // Restore the primary lead before publishing readiness. The remaining
+        // independently locked workers recover in a bounded parallel pass.
         this.fleetRestoring = true;
         try {
           await this.restoreManagerOwnedAgentsAtStartup('leadership');
@@ -26922,7 +27199,7 @@ Return this JSON shape:
         console.log('[Manager] CheckinService started (wake on every eligible fire)');
 
         // Automatic schedule dispatch must not overlap process reconciliation,
-        // credential hydration, or the sequential verified restore pass.
+        // credential hydration, or the bounded verified restore pass.
         this.schedulerService.start();
         settled = true;
         resolve();
@@ -27182,8 +27459,11 @@ Return this JSON shape:
       const agents = await this.dbListAgents(team.id, true).catch(() => []);
       for (const initialAgent of agents) {
         const priority = this.startupRestorePriority(team.name, initialAgent);
-        if (phase === 'leadership' && priority > 2) continue;
-        if (phase === 'workers' && priority <= 2) continue;
+        // Only the primary lead is part of the readiness gate. Team leads and
+        // default validators are independent worker processes; serializing all
+        // of them recreated the old 50-second startup tail on larger fleets.
+        if (phase === 'leadership' && priority > 0) continue;
+        if (phase === 'workers' && priority <= 0) continue;
         candidates.push({ team, initialAgent, priority });
       }
     }
@@ -27193,14 +27473,14 @@ Return this JSON shape:
       || a.team.name.localeCompare(b.team.name)
       || a.initialAgent.name.localeCompare(b.initialAgent.name)
     ));
-    for (const { team, initialAgent } of candidates) {
+    const restoreCandidate = async ({ team, initialAgent }: (typeof candidates)[number]) => {
         const initialMetadata = (
           initialAgent.metadata as Record<string, unknown> | null | undefined
         ) ?? {};
         if (
           initialMetadata[MANAGER_OWNED_LAUNCH_INTENT_KEY] !== true
           && initialMetadata[MANAGER_RESTART_REQUESTED_KEY] !== true
-        ) continue;
+        ) return;
         await this.withAgentLifecycleLock(
           this.agentLifecycleKey(team.id, initialAgent),
           async () => {
@@ -27284,7 +27564,24 @@ Return this JSON shape:
             }
           },
         );
-    }
+    };
+
+    // Leadership remains strictly ordered so the coordination spine is
+    // deterministic. Ordinary workers are independent by agent lifecycle key;
+    // restore them with a small bounded pool to avoid the previous one-minute
+    // serial recovery tail without creating a process/port stampede.
+    const configured = Number(process.env.IDACC_STARTUP_RESTORE_CONCURRENCY ?? 4);
+    const concurrency = phase === 'leadership'
+      ? 1
+      : Math.min(8, Math.max(1, Number.isFinite(configured) ? Math.floor(configured) : 4));
+    let next = 0;
+    const workers = Array.from({ length: Math.min(concurrency, candidates.length) }, async () => {
+      while (next < candidates.length) {
+        const candidate = candidates[next++];
+        await restoreCandidate(candidate);
+      }
+    });
+    await Promise.all(workers);
   }
 
   private managedRestartMarkerGraceMs(): number {
@@ -27491,6 +27788,25 @@ Return this JSON shape:
           const metadata = {
             ...((agent.metadata as Record<string, unknown> | null | undefined) ?? {}),
           };
+          if (Array.isArray(metadata.mcpServers)) {
+            const currentServers = metadata.mcpServers as Array<McpServerSpec | StoredMcpServerReference>;
+            const migratedServers = currentServers.flatMap((server) => {
+              if (!server || typeof server.name !== 'string' || isBrokenBrowserMcp(server)) return [];
+              if (isStoredMcpReference(server)) return [server];
+              const connectionEnv = mcpConnectionEnvironmentName(server.name);
+              return process.env[connectionEnv]
+                ? [storedMcpReference(server as McpServerSpec)]
+                : [server];
+            });
+            if (!sameMcpServerSnapshot(
+              migratedServers as McpServerSpec[],
+              currentServers as McpServerSpec[],
+            )) {
+              metadata.mcpServers = migratedServers;
+              await this.db.agents.updateMetadata(agent.id, metadata);
+              updated += 1;
+            }
+          }
           const rawPid = metadata.pid;
           const pid = typeof rawPid === 'number' ? rawPid : Number(rawPid);
           const validPid = Number.isSafeInteger(pid) && pid > 0;
@@ -28117,7 +28433,7 @@ Return this JSON shape:
 
     // External MCP servers attached to this agent (Modules view → metadata).
     // Serialized as JSON for claude-agent-server to parse into HarnessOptions.
-    const mcpServers = this.effectiveMcpServersForAgent(metadata);
+    const mcpServers = this.effectiveMcpServersForAgent(metadata, agentRow?.id);
     const mcpEnv = mcpServers.length > 0
       ? JSON.stringify(mcpServers)
       : undefined;
@@ -28690,6 +29006,17 @@ Return this JSON shape:
       const { name, id, port, model, workingDirectory, tokenId } = agentData;
       const agentRow = await this.dbQueryAgentById(teamId, id);
       const agentMetadata = (agentRow?.metadata as AgentMetadata | null | undefined) ?? {};
+      if (
+        !this.idaccAdminToken
+        && typeof agentMetadata[MANAGER_PROCESS_RUNTIME_KEY] === 'string'
+        && typeof agentMetadata[MANAGER_PROCESS_GENERATION_KEY] === 'string'
+      ) {
+        return {
+          success: false,
+          error: `Agent ${id} belongs to an authenticated Control Center manager; `
+            + 'the standalone daemon cannot replace its worker generation',
+        };
+      }
       if (
         agentRow
         && resolveRuntime(agentRow.runtime || agentMetadata.runtime) === 'provider-api'

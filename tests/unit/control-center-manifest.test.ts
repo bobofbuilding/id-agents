@@ -13,6 +13,12 @@ describe('Control Center manifest', () => {
       path: '/runtime/preflight',
       group: 'manager-controls',
     });
+    expect(CC_FEATURES).toContain('atomic-agent-config');
+    expect(CC_ROUTES).toContainEqual({
+      method: 'POST',
+      path: '/agents/:id/configuration',
+      group: 'agent-config',
+    });
     expect(ccCapabilities().cc_api_version).toBe(CC_API_VERSION);
   });
 });
