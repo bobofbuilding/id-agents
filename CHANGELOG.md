@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.166]
+
+- Create only the configured SQLite database parent directory, preventing a
+  profile-scoped IDACC Manager from recreating the retired legacy
+  `~/.id-agents` directory on startup.
+
 ## [0.1.165]
 
 - Refresh every managed worker workspace before startup and Manager restart
