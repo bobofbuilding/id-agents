@@ -10,8 +10,10 @@ import {
   getRuntimeInterfaceProfile,
   getRuntimeProfile,
   getRuntimeProviderName,
+  parseClaudeAuthStatus,
   resolveRuntime,
   resolveSpawnRuntimeModel,
+  runtimeIssueHint,
   supportsMcpTools,
   supportsPluginSkillFallback,
   supportsSessionResume,
@@ -95,6 +97,14 @@ describe('runtime registry', () => {
     expect(supportsSessionResume('copilot')).toBe(false);
     expect(supportsSessionResume('kiro-cli')).toBe(true);
     expect(supportsSessionResume('kimi-cli')).toBe(false);
+  });
+
+  it('strictly parses Claude Code auth status and gives an IDACC recovery path', () => {
+    expect(parseClaudeAuthStatus('{"loggedIn":true,"authMethod":"oauth"}')).toBe(true);
+    expect(parseClaudeAuthStatus('{"loggedIn":false,"authMethod":"none"}')).toBe(false);
+    expect(parseClaudeAuthStatus('Claude Code 2.1.220')).toBe(false);
+    expect(parseClaudeAuthStatus('{not-json')).toBe(false);
+    expect(runtimeIssueHint('claude_auth_missing')).toMatch(/IDACC Settings.*Manage account/i);
   });
 
   it('exposes one runtime-neutral interface contract for every runtime', () => {

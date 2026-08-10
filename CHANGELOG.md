@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.170]
+
+- Verify Claude's structured authentication state during runtime preflight,
+  rather than accepting a version-only CLI check that can pass with an expired
+  OAuth session.
+- Return a stable `claude_auth_missing` recovery hint that directs operators to
+  IDACC's managed Claude account flow before an agent is assigned or rebuilt.
+
 ## [0.1.169]
 
 - Keep duplicate detection project-scoped and use indexed open/recent-complete

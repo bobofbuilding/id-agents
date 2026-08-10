@@ -603,6 +603,8 @@ export function runtimeIssueHint(code: string): string | null {
       return 'Missing ANTHROPIC_API_KEY. Add `export ANTHROPIC_API_KEY=sk-...` to ~/.zshrc (or ~/.bashrc) or to a project .env. Get a key: https://console.anthropic.com/settings/keys';
     case 'codex_auth_missing':
       return 'Missing OPENAI_API_KEY. Add `export OPENAI_API_KEY=sk-...` to ~/.zshrc (or ~/.bashrc) or to a project .env, or run `codex login`. Docs: https://github.com/openai/codex';
+    case 'claude_auth_missing':
+      return 'Claude Code is signed out or its OAuth session expired. Open IDACC Settings, choose Claude, and use Manage account to sign in again.';
     case 'cursor_auth_missing':
       return 'Cursor Agent CLI is not authenticated. Set `CURSOR_API_KEY` or run `cursor-agent login` on this host. Install: curl https://cursor.com/install -fsS | bash';
     case 'grok_auth_missing':
@@ -615,6 +617,21 @@ export function runtimeIssueHint(code: string): string | null {
       return 'Kimi Code is not authenticated. Run `kimi login` on this host, finish the browser device-code flow, then retry.';
     default:
       return null;
+  }
+}
+
+/**
+ * Claude Code's supported auth probe returns JSON on stdout. Keep parsing
+ * deliberately strict: a version-only response, warning text, or malformed
+ * payload must never be mistaken for an authenticated subscription.
+ */
+export function parseClaudeAuthStatus(value: unknown): boolean {
+  if (typeof value !== 'string' || !value.trim()) return false;
+  try {
+    const parsed = JSON.parse(value) as { loggedIn?: unknown };
+    return parsed?.loggedIn === true;
+  } catch {
+    return false;
   }
 }
 
@@ -638,7 +655,25 @@ export function validateRuntimePreflight(
   }
 
   if (resolvedRuntime === 'claude-code-cli' || resolvedRuntime === 'claude-code-local') {
-    return [...issues, ...checkCommandAvailable('claude')];
+    const binaryIssues = checkCommandAvailable('claude');
+    issues.push(...binaryIssues);
+    if (binaryIssues.length === 0) {
+      try {
+        const result = runRuntimeCommand('claude', ['auth', 'status'], 10000);
+        if (!result || result.error || result.status !== 0 || !parseClaudeAuthStatus(result.stdout)) {
+          issues.push({
+            code: 'claude_auth_missing',
+            message: `runtime "${resolvedRuntime}" requires an active \`claude auth login\` session`,
+          });
+        }
+      } catch {
+        issues.push({
+          code: 'claude_auth_missing',
+          message: `runtime "${resolvedRuntime}" requires an active \`claude auth login\` session`,
+        });
+      }
+    }
+    return issues;
   }
 
   if (resolvedRuntime === 'cursor-cli') {
