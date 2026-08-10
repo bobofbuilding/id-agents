@@ -294,6 +294,25 @@ describe('TasksRepository claim doing limit', () => {
     expect(rows.map((row) => row.name)).toEqual(['oldest', 'middle']);
   });
 
+  it('filters task scans by project and recent activity', async () => {
+    const teamId = await teams.getOrCreateTeamId('project-scan-team');
+    await tasks.create(task({ team_id: teamId, name: 'tcp-recent', project_id: 'tcp', status: 'done', updated_at: 30 }));
+    await tasks.create(task({ team_id: teamId, name: 'tcp-old', project_id: 'tcp', status: 'done', updated_at: 10 }));
+    await tasks.create(task({ team_id: teamId, name: 'other-recent', project_id: 'other', status: 'done', updated_at: 40 }));
+    await tasks.create(task({ team_id: teamId, name: 'unscoped-recent', project_id: null, status: 'done', updated_at: 50 }));
+
+    const scoped = await tasks.list({
+      teamId,
+      projectId: 'tcp',
+      status: 'done',
+      updatedAfter: 20,
+    });
+    const unscoped = await tasks.list({ teamId, projectId: null, status: 'done' });
+
+    expect(scoped.map((row) => row.name)).toEqual(['tcp-recent']);
+    expect(unscoped.map((row) => row.name)).toEqual(['unscoped-recent']);
+  });
+
   it('filters workflow state before applying the scan limit', async () => {
     const teamId = await teams.getOrCreateTeamId('workflow-scan-team');
     for (let index = 0; index < 4; index += 1) {

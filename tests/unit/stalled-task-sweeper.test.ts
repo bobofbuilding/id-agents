@@ -755,6 +755,7 @@ describe('stalled task sweeper', () => {
       'operations-team',
       'task-master',
       expect.stringContaining('Validation request for task #12345678'),
+      { sourceTeamName: 'default', task: pending },
     );
     expect(db.tasks.updateFields).toHaveBeenCalledWith(pending.id, expect.objectContaining({
       validation_detail: expect.objectContaining({
@@ -852,6 +853,7 @@ describe('stalled task sweeper', () => {
       'default',
       'researcher',
       expect.stringContaining('DONE: artifact output/report.md; tests 12/12 passed.'),
+      { sourceTeamName: 'default', task: pending },
     );
     expect(db.tasks.updateFields).toHaveBeenCalledWith(pending.id, expect.objectContaining({
       validation_detail: expect.objectContaining({
@@ -900,12 +902,14 @@ describe('stalled task sweeper', () => {
       'default',
       'coder',
       expect.stringContaining('Validation request for task #12345678'),
+      { sourceTeamName: 'default', task: pending },
     );
     expect(manager.sendSupervisionAsk).toHaveBeenNthCalledWith(
       2,
       'default',
       'researcher',
       expect.stringContaining('Validation request for task #12345678'),
+      { sourceTeamName: 'default', task: pending },
     );
     expect(db.tasks.updateFields).toHaveBeenCalledWith(pending.id, expect.objectContaining({
       validation_detail: expect.objectContaining({
@@ -960,6 +964,7 @@ describe('stalled task sweeper', () => {
       'default',
       'researcher',
       expect.stringContaining('Validation request for task #12345678'),
+      { sourceTeamName: 'default', task: pending },
     );
     expect(db.tasks.updateFields).toHaveBeenCalledWith(pending.id, expect.objectContaining({
       validation_detail: expect.objectContaining({
@@ -1046,6 +1051,10 @@ describe('stalled task sweeper', () => {
       'operations-team',
       'task-master',
       expect.stringContaining('Completion evidence query: completion-query-1'),
+      {
+        sourceTeamName: 'default',
+        task: expect.objectContaining({ id: failed.id, workflow_state: 'validation_pending' }),
+      },
     );
     expect(db.tasks.updateFields).toHaveBeenNthCalledWith(1, failed.id, expect.objectContaining({
       workflow_state: 'validation_pending',
@@ -1223,6 +1232,18 @@ describe('stalled task sweeper', () => {
       workflow_state: 'executing',
       validation_detail: expect.objectContaining({ revision_cycles: 1 }),
     }));
+    expect(db.events.insert).toHaveBeenCalledWith(expect.objectContaining({
+      topic: 'task:validation-verdict',
+      subject_id: pending.uuid,
+      data: expect.objectContaining({
+        verdict: 'revise',
+        from_status: 'done',
+        from_workflow_state: 'validation_pending',
+        to_status: 'doing',
+        to_workflow_state: 'executing',
+        revision_cycle: 1,
+      }),
+    }));
     expect(manager.sendSupervisionAsk).toHaveBeenCalledWith(
       'default',
       'worker',
@@ -1391,6 +1412,47 @@ describe('stalled task sweeper', () => {
       duplicate_scope: 'title',
       suggested_action: 'status-check',
     });
+    expect(db.tasks.list).toHaveBeenCalledWith({ teamId: TEAM_ID, projectId: null, status: 'doing' });
+    expect(db.tasks.list).toHaveBeenCalledWith({ teamId: TEAM_ID, projectId: null, status: 'todo' });
+    expect(db.tasks.list).toHaveBeenCalledWith(expect.objectContaining({
+      teamId: TEAM_ID,
+      projectId: null,
+      status: 'done',
+      updatedAfter: expect.any(Number),
+      limit: 500,
+    }));
+  });
+
+  it('never treats the same goal and title in another project as a duplicate', async () => {
+    const existing = task({
+      id: 'task-alpha',
+      name: 'define-product-scope',
+      title: 'Define product scope',
+      project_id: 'alpha',
+      description: 'Goal ID: goal_manual_dispatch',
+    });
+    const db = fakeDb({
+      tasks: {
+        // Return the row regardless of filters to verify the guard also enforces
+        // project scope in memory as a defense against older repositories.
+        list: vi.fn(async () => [existing]),
+      },
+    });
+    const manager = new AgentManagerDb('/tmp/id-agents-project-task-duplicate-test', db, { libraryRoot: null }) as any;
+
+    const otherProject = await manager.findDuplicateTaskByGoalSignature(TEAM_ID, {
+      title: 'Define product scope',
+      goal_id: 'goal_manual_dispatch',
+      project_id: 'tcp',
+    });
+    const sameProject = await manager.findDuplicateTaskByGoalSignature(TEAM_ID, {
+      title: 'Define product scope',
+      goal_id: 'goal_manual_dispatch',
+      project_id: 'alpha',
+    });
+
+    expect(otherProject).toBeNull();
+    expect(sameProject).toBe(existing);
   });
 
   it('builds stable duplicate keys for repeated Learn routing prompts', () => {

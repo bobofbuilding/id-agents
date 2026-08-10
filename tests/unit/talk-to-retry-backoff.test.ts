@@ -97,4 +97,29 @@ describe('AgentManagerDb /talk-to delivery retry backoff', () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+
+  it('retries a busy worker response before dropping the handoff', async () => {
+    vi.useFakeTimers();
+
+    const manager = new AgentManagerDb('/tmp/id-agents-talk-busy-retry-test', makeDb() as any, { libraryRoot: null }) as any;
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockResolvedValueOnce(makeResponse(429, { error: 'agent_busy' }) as any)
+      .mockResolvedValueOnce(makeResponse(202, { query_id: 'query-after-busy' }) as any);
+
+    const delivery = manager.forwardToAgent(
+      'http://worker.example',
+      'bounded work',
+      'team-lead',
+      undefined,
+      { attempts: 3, initialDelayMs: 250, label: 'worker' },
+    );
+
+    await vi.advanceTimersByTimeAsync(250);
+    await expect(delivery).resolves.toEqual({
+      ok: true,
+      data: { query_id: 'query-after-busy' },
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
 });

@@ -652,6 +652,8 @@ export interface TasksRepository {
     workflowState?: TaskRow['workflow_state'] | null;
     owner?: string;
     teamId?: string | null;
+    projectId?: string | null;
+    updatedAfter?: number;
     limit?: number;
     order?: 'updated_desc' | 'updated_asc';
   }): Promise<TaskRow[]>;

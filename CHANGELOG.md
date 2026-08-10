@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.1.169]
+
+- Keep duplicate detection project-scoped and use indexed open/recent-complete
+  task reads so unrelated projects and large task histories do not interfere
+  with new delegation.
+- Carry task and project context into cross-team validation, and record every
+  validation verdict as an explicit lifecycle event so requested revisions are
+  visible instead of appearing as unexplained reopened work.
+- Retry short-lived busy/rate-limit delivery failures for synchronous and
+  asynchronous handoffs, and tighten inter-agent task contracts around exact
+  project roots, acceptance evidence, and one live task per assignee.
+- Refresh vulnerable transitive dependency locks for js-yaml and nanoid.
+
 ## [0.1.168]
 
 - Recover missing-material task blocks through a durable, bounded ladder:

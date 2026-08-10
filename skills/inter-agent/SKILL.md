@@ -64,6 +64,7 @@ curl -fsS -X POST "http://127.0.0.1:$ID_AGENT_PORT/news-to" \
     "task":{
       "title":"Validate the bounded assignment",
       "name":"validate-bounded-assignment",
+      "project_id":"<active project id when one was supplied>",
       "goal_id":"goal_current_objective",
       "expected_output":"A bounded validation packet with evidence.",
       "acceptance_criteria":"Every stated condition is checked and unresolved risk is named.",
@@ -81,6 +82,10 @@ all seven dispatch fields are required. Reuse that exact task name; do not
 create a duplicate. The Manager supplies the effective task reference and
 lifecycle addresses at runtime, so do not construct task URLs from a remembered
 host or port.
+
+Preserve the active project ID whenever the objective names one. If the Manager
+returns an exact project root in the dispatch context, run project commands and
+write project artifacts there; never substitute the persistent agent workspace.
 
 For a passive status notice that must not start an LLM turn, omit `trigger`:
 

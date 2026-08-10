@@ -79,6 +79,8 @@ export class PgTasksRepo implements TasksRepository {
     workflowState?: TaskRow['workflow_state'] | null;
     owner?: string;
     teamId?: string | null;
+    projectId?: string | null;
+    updatedAfter?: number;
     limit?: number;
     order?: 'updated_desc' | 'updated_asc';
   }): Promise<TaskRow[]> {
@@ -109,6 +111,18 @@ export class PgTasksRepo implements TasksRepository {
         clauses.push(`team_id = $${idx++}`);
         params.push(filters.teamId);
       }
+    }
+    if (filters?.projectId !== undefined) {
+      if (filters.projectId === null) {
+        clauses.push('project_id IS NULL');
+      } else {
+        clauses.push(`project_id = $${idx++}`);
+        params.push(filters.projectId);
+      }
+    }
+    if (filters?.updatedAfter !== undefined && Number.isFinite(filters.updatedAfter)) {
+      clauses.push(`updated_at >= $${idx++}`);
+      params.push(filters.updatedAfter);
     }
 
     const limit = filters?.limit && Number.isFinite(filters.limit)

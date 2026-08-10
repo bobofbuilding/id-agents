@@ -2369,6 +2369,7 @@ export class AgentManagerDb {
     return {
       title: task.title,
       description: task.description,
+      project_id: task.project_id,
     };
   }
 
@@ -2551,12 +2552,29 @@ export class AgentManagerDb {
     const goalId = this.taskGoalIdFromInput(input);
     const title = this.firstBriefString(input, ['title']);
     const targetSignature = this.taskTargetSignatureFromInput(input);
+    const projectId = this.firstBriefString(input, ['project_id', 'projectId']);
+    const projectScope = projectId || null;
     if (!goalId && !title) return null;
     const recentDoneWindowMs = this.taskDuplicateRecentDoneWindowMs();
     const nowMs = Date.now();
-    const allTasks = await this.db.tasks.list({ teamId }).catch(() => [] as TaskRow[]);
+    const recentDoneAfter = Math.floor((nowMs - recentDoneWindowMs) / 1000);
+    const [doing, todo, recentDone] = await Promise.all([
+      this.db.tasks.list({ teamId, projectId: projectScope, status: 'doing' }).catch(() => [] as TaskRow[]),
+      this.db.tasks.list({ teamId, projectId: projectScope, status: 'todo' }).catch(() => [] as TaskRow[]),
+      recentDoneWindowMs > 0
+        ? this.db.tasks.list({
+            teamId,
+            projectId: projectScope,
+            status: 'done',
+            updatedAfter: recentDoneAfter,
+            limit: 500,
+          }).catch(() => [] as TaskRow[])
+        : Promise.resolve([] as TaskRow[]),
+    ]);
+    const allTasks = [...new Map([...doing, ...todo, ...recentDone].map((task) => [task.id, task])).values()];
     const matches: Array<{ task: TaskRow; matchRank: number; statusRank: number; updatedAt: number }> = [];
     for (const candidate of allTasks) {
+      if ((candidate.project_id || null) !== projectScope) continue;
       const candidateGoal = this.taskGoalIdFromInput(this.taskBriefInputFromTask(candidate));
       if (goalId && candidateGoal !== goalId) continue;
 
@@ -2604,6 +2622,7 @@ export class AgentManagerDb {
 
   private async existingTaskFoundResponse(existing: TaskRow, input: TaskBriefValidationInput | Record<string, unknown>): Promise<Record<string, unknown>> {
     const goalId = this.taskGoalIdFromInput(input);
+    const requestedProjectId = this.firstBriefString(input, ['project_id', 'projectId']);
     const requestedTarget = this.taskTargetSignatureFromInput(input);
     const existingTarget = this.taskTargetSignatureFromTask(existing);
     const owner = existing.owner ? await this.db.agents.getById(existing.owner).catch(() => null) : null;
@@ -2627,6 +2646,8 @@ export class AgentManagerDb {
       existing_owner_id: owner?.id || existing.owner || null,
       existing_goal_id: goalId,
       existing_target: existingTarget,
+      requested_project_id: requestedProjectId,
+      existing_project_id: existing.project_id || null,
       duplicate_scope: duplicateScope,
       duplicate_state: duplicateState,
       suggested_action: 'status-check',
@@ -6008,6 +6029,27 @@ Return this JSON shape:
       completed_at: verdict === 'approved' ? nowSec : null,
       lifecycle_updated_at: nowSec,
       updated_at: nowSec,
+    });
+    await emitControlEvent(this.db.events, {
+      teamId: taskTeamId,
+      topic: 'task:validation-verdict',
+      actorAgentId: validatorId,
+      subjectKind: 'task',
+      subjectId: task.uuid,
+      occurredAt,
+      data: {
+        task_name: task.name,
+        task_uuid: task.uuid,
+        verdict,
+        validation_query_id: queryRow.query_id,
+        completion_query_id: priorValidation.completion_query_id || null,
+        from_status: task.status,
+        from_workflow_state: task.workflow_state,
+        to_status: verdict === 'approved' ? 'done' : verdict === 'revise' ? 'doing' : 'todo',
+        to_workflow_state: nextState,
+        revision_cycle: revisionCycle,
+        reason: validatorMessage.split(/\r?\n/).find(Boolean)?.trim().slice(0, 500) || null,
+      },
     });
     if (verdict === 'revise' && task.owner) {
       const [taskTeam, owner] = await Promise.all([
@@ -9583,7 +9625,8 @@ Return this JSON shape:
         const errorText = await talkRes.text().catch(() => talkRes.statusText);
         failureStatus = talkRes.status;
         failure = `${talkRes.status} ${errorText.slice(0, 200)}`.trim();
-        if (attempt >= attempts || talkRes.status < 500) break;
+        const retryableStatus = talkRes.status === 429 || talkRes.status >= 500;
+        if (attempt >= attempts || !retryableStatus) break;
       } catch (err: any) {
         failureStatus = 502;
         failure = err?.message || String(err);
@@ -11281,13 +11324,14 @@ Return this JSON shape:
       const lmgToken = await this.acquireLocalGate(targetAgent);
 
       // Forward the message to the agent's /talk endpoint
-      const deliveryRetry = shouldWait
-        ? {
-            attempts: TALK_TO_MAX_ATTEMPTS,
-            initialDelayMs: TALK_TO_INITIAL_RETRY_DELAY_MS,
-            label: targetDisplayId,
-          }
-        : undefined;
+      // Busy workers reject peer /talk with 429. Apply the same short bounded
+      // retry to asynchronous delegation so a momentary overlap does not drop
+      // the handoff and force operators to repair it manually.
+      const deliveryRetry = {
+        attempts: TALK_TO_MAX_ATTEMPTS,
+        initialDelayMs: TALK_TO_INITIAL_RETRY_DELAY_MS,
+        label: targetDisplayId,
+      };
       const result = await this.forwardToAgent(
         targetUrl,
         outgoingMessage,
@@ -17926,6 +17970,26 @@ Return this JSON shape:
           lifecycle_updated_at: Math.floor(nowMs / 1000),
           updated_at: Math.floor(nowMs / 1000),
         });
+        await emitControlEvent(this.db.events, {
+          teamId,
+          topic: 'task:validation-verdict',
+          actorAgentId: validatorId,
+          subjectKind: 'task',
+          subjectId: task.uuid,
+          occurredAt: nowMs,
+          data: {
+            task_name: task.name,
+            task_uuid: task.uuid,
+            verdict,
+            evidence_ids: evidenceIds,
+            from_status: task.status,
+            from_workflow_state: from,
+            to_status: verdict === 'approved' ? 'done' : verdict === 'revise' ? 'doing' : 'todo',
+            to_workflow_state: nextState,
+            revision_cycle: Number((task.validation_detail as any)?.revision_cycles || 0) + (verdict === 'revise' ? 1 : 0),
+            source: 'tasks.validate',
+          },
+        });
         const updated = await this.db.tasks.getByNameForTeam(task.name, teamId);
         res.json({ ok: true, task: await this.buildTaskResult(updated!, teamId), promotion });
       } catch (err: any) {
@@ -22664,6 +22728,7 @@ Return this JSON shape:
             description: taskDescription,
             goal_id: goalId,
             target,
+            project_id: projectId,
           });
           if (duplicateTask) {
             return {
@@ -22674,6 +22739,7 @@ Return this JSON shape:
                 description: taskDescription,
                 goal_id: goalId,
                 target,
+                project_id: projectId,
               }),
             };
           }
@@ -24811,7 +24877,12 @@ Return this JSON shape:
         continue;
       }
 
-      const sent = await this.sendSupervisionAsk(validator.team.name, validator.agent.name, message);
+      const sent = await this.sendSupervisionAsk(
+        validator.team.name,
+        validator.agent.name,
+        message,
+        { sourceTeamName: taskTeamName, task },
+      );
       if (!sent) {
         failedRoutes.push(`${validator.team.name}/${validator.agent.name}`);
         routingAttemptedIds.push(validator.agent.id);
@@ -24960,20 +25031,31 @@ Return this JSON shape:
     return directTaskRef ? { task_ref: directTaskRef } : undefined;
   }
 
-  private async sendSupervisionAsk(teamName: string, agentName: string, message: string): Promise<boolean> {
+  private async sendSupervisionAsk(
+    teamName: string,
+    agentName: string,
+    message: string,
+    options: { sourceTeamName?: string; task?: TaskRow } = {},
+  ): Promise<boolean> {
     const quoted = `"${message.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
-    const context = this.supervisionDispatchContext(message);
+    const sourceTeamName = options.sourceTeamName || teamName;
+    const targetRef = sourceTeamName === teamName ? agentName : `${teamName}/${agentName}`;
+    const taskContext = options.task ? {
+      task_ref: this.taskShortRef(options.task),
+      ...(options.task.project_id ? { project_id: options.task.project_id } : {}),
+    } : undefined;
+    const context = taskContext || this.supervisionDispatchContext(message);
     try {
       const res = await fetch(`http://127.0.0.1:${this.managementPort}/remote`, {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
           'X-Id-Admin': '1',
-          'X-Id-Team': teamName,
+          'X-Id-Team': sourceTeamName,
           ...adminAuthorizationHeaders(this.idaccAdminToken),
         },
         body: JSON.stringify({
-          command: `/ask ${agentName} ${quoted}`,
+          command: `/ask ${targetRef} ${quoted}`,
           ...(context ? { context } : {}),
         }),
         signal: AbortSignal.timeout(20_000),
@@ -24981,7 +25063,8 @@ Return this JSON shape:
       if (!res.ok) return false;
       const body = await res.json().catch(() => null) as { ok?: unknown } | null;
       return body?.ok === true;
-    } catch {
+    } catch (err: any) {
+      this.managerLog(`Supervision dispatch to ${targetRef} failed: ${err?.message || err}`);
       return false;
     }
   }
