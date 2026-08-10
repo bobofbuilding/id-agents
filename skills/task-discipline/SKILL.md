@@ -56,7 +56,9 @@ lifecycle below: create → claim → do → done.
 
 1. Create: `POST $MANAGER_URL/tasks` with `{title, name, from: <your-name> }`
 2. Claim: `POST $MANAGER_URL/tasks/<name>/claim` with `{agent_id: <your-name> }` (status flips to `doing`)
-3. Do the work. Write artifacts to `./output/` in your working directory.
+3. Do the work. When the dispatch context supplies a project root, run commands
+   from that exact root and write artifacts to its requested paths. Otherwise,
+   write standalone artifacts to `./output/` in your working directory.
 4. Complete: `POST $MANAGER_URL/tasks/<name>/done` with `{agent_id: <your-name> }` (status flips to `done`)
 
 Include `X-Id-Team: $ID_TEAM`, `X-Id-Agent: $ID_AGENT_ID`, and
@@ -105,8 +107,10 @@ event logs.
 ## Duplicate-task guard
 
 The Manager rejects task creation when the request matches an existing
-logical unit of work for the same team. It compares goal, target, and
-title signals; matching open tasks and recently completed tasks produce
+logical unit of work for the same team and project scope. Project-scoped tasks
+are compared only with the same project, while unscoped tasks are compared only
+with other unscoped tasks. It compares goal, target, and title signals; matching
+open tasks and recently completed tasks produce
 `existing_task_found` with the existing task, status, match scope, and a
 `status-check` recommendation.
 
