@@ -52,6 +52,19 @@ Every non-trivial unit of work MUST go through the task lifecycle.
 - Single-line answers, greetings, simple look-ups
 - Work that is already part of an existing task you claimed
 
+### Planning-only and advisory artifacts
+- A request to draft a plan, checklist, design, or other reference-only artifact
+  is **not** permission to execute that plan, create implementation children,
+  deploy, broadcast, or perform live operational work.
+- If that advisory work needs a self-initiated task for auditability, do not
+  invent a member-owned child task just to satisfy a team-lead closure rule.
+  Close the planner task with \`--advisory-query\` (or a precise
+  \`--no-delegation-reason "planning_only: ..."\`) and include the delivered
+  artifact in the summary.
+- This exemption is only for genuinely non-executable, reference-only scope.
+  Implementation, verification, deployment, and operational objectives still
+  require the normal delegated-child lifecycle.
+
 ### Assigned vs self-initiated work
 - **Assigned**: the dispatch brief contains \`task: <name>\` and explicit
   claim/done URLs. The manager has already created the task. Use the

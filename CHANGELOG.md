@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.172]
+
+- Let reference-only planning and advisory tasks close with the existing
+  advisory completion exemption, without fabricating a completed delegated
+  child task; execution and deployment work remains subject to normal
+  team-lead delegation.
+
 ## [0.1.171]
 
 - Add admin-gated, stable-ID team renaming and preserve explicit cross-team

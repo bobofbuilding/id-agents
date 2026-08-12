@@ -26,6 +26,14 @@ describe('PROTOCOL_DEFAULTS', () => {
     expect(PROTOCOL_DEFAULTS).toContain('task lifecycle');
   });
 
+  it('keeps planning-only artifacts out of the delegated-child lifecycle', () => {
+    expect(PROTOCOL_DEFAULTS).toContain('Planning-only and advisory artifacts');
+    expect(PROTOCOL_DEFAULTS).toContain('invent a member-owned child task');
+    expect(PROTOCOL_DEFAULTS).toContain('`--advisory-query`');
+    expect(PROTOCOL_DEFAULTS).toContain('`--no-delegation-reason "planning_only: ..."`');
+    expect(PROTOCOL_DEFAULTS).toContain('Implementation, verification, deployment, and operational objectives still');
+  });
+
   it('contains output convention section', () => {
     expect(PROTOCOL_DEFAULTS).toContain('## Output Convention');
     expect(PROTOCOL_DEFAULTS).toContain('./output/');
