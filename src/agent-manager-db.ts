@@ -10188,7 +10188,7 @@ Return this JSON shape:
     const config = this.defaultDeploymentConfig;
     if (!config?.agents || config.agents.length === 0) return;
 
-    const defaultTeam = await this.db.teams.getTeamByName('default');
+    const defaultTeam = (await this.idaccOrgIdentityPolicy())?.team ?? null;
     if (!defaultTeam) return;
 
     const coderSpec = config.agents.find((agent) => agent.name === 'coder');
@@ -10215,7 +10215,7 @@ Return this JSON shape:
     const nextStatus = coderRow.status === 'running' ? 'starting' : 'pending';
 
     console.warn(
-      `[Manager] default/coder drift detected: runtime ${coderRow.runtime} -> ${drift.runtime}, model ${coderRow.model} -> ${drift.model}`,
+      `[Manager] ${defaultTeam.name}/coder drift detected: runtime ${coderRow.runtime} -> ${drift.runtime}, model ${coderRow.model} -> ${drift.model}`,
     );
 
     await this.db.agents.updateStatus(coderRow.id, nextStatus, {
@@ -11844,13 +11844,14 @@ Return this JSON shape:
    *   'anon'   — all other callers
    *
    * teamId resolution:
-   *   - admin principals: getOrCreate (same as legacy behaviour)
+   *   - admin principals: getOrCreate, except a stale `default` scope follows a
+   *     persisted renamed primary rather than resurrecting an empty team
    *   - non-admin: getTeamByName only; 404 if team does not exist
    */
   private teamContextMiddleware(): express.RequestHandler {
     return async (req: express.Request, res: express.Response, next: express.NextFunction) => {
       try {
-        const teamName = this.getTeamName(req);
+        let teamName = this.getTeamName(req);
         const isAdmin = this.isAdminRequest(req);
         const managed = Boolean(this.idaccAdminToken);
         const agentHeader = req.headers['x-id-agent'];
@@ -11931,16 +11932,25 @@ Return this JSON shape:
           return;
         }
 
+        let teamRow = await this.db.teams.getTeamByName(teamName);
+        if (!teamRow && teamName === 'default') {
+          const primary = await this.idaccOrgIdentityPolicy();
+          if (primary) {
+            teamName = primary.team.name;
+            teamRow = primary.team;
+          }
+        }
+
         let teamId: string;
         if (isAdmin) {
-          // Admin principals may create teams on the fly (legacy behaviour)
-          teamId = await this.db.teams.getOrCreateTeamId(teamName);
+          // Admin principals may create teams on the fly (legacy behaviour),
+          // while a stale starter scope follows the renamed primary above.
+          teamId = teamRow?.id ?? await this.db.teams.getOrCreateTeamId(teamName);
           // Ensure per-team directory exists
           const teamDir = `${this.baseWorkDir}/teams/${teamName}`;
           if (!existsSync(teamDir)) mkdirSync(teamDir, { recursive: true });
         } else {
           // Non-admin: team must already exist
-          const teamRow = await this.db.teams.getTeamByName(teamName);
           if (!teamRow) {
             res.status(404).json({ error: 'team_not_found' });
             return;
@@ -14996,17 +15006,102 @@ Return this JSON shape:
       }
     });
 
-    // Update team settings (port ranges removed — ports are now globally sequential)
+    // Rename a team and/or record its Control Center identity policy. Team ids
+    // remain stable, so tasks, schedules, agents, and inbox records keep their
+    // existing ownership. Runtime-backed agents are rebuilt by the Control
+    // Center after this atomic database rename so their process environment can
+    // adopt the new human-facing team name.
     this.managementApp.patch('/teams/:name', async (req, res) => {
       const { name } = req.params;
 
       try {
+        if (!this.isAdminRequest(req)) return res.status(403).json({ error: 'admin_required' });
         const team = await this.db.teams.getTeamByName(name);
         if (!team) {
           return res.status(404).json({ error: `Team "${name}" not found` });
         }
+        const body = req.body || {};
+        const requestedName = String(body.name ?? body.newName ?? '').trim();
+        const identityInput = body.orgIdentity ?? body.org_identity;
+        let normalizedIdentity: Record<string, unknown> | undefined;
 
-        res.json({ name: team.name, message: 'Port ranges are no longer used. Ports are allocated globally.' });
+        if (!requestedName && identityInput === undefined) {
+          return res.json({ name: team.name, message: 'No team identity changes requested.' });
+        }
+
+        // Validate the entire requested identity before mutating the team name.
+        // A malformed identity must never leave a half-applied rename behind.
+        if (identityInput !== undefined) {
+          if (!identityInput || typeof identityInput !== 'object' || Array.isArray(identityInput)) {
+            return res.status(400).json({ error: 'orgIdentity must be an object' });
+          }
+          const raw = identityInput as Record<string, unknown>;
+          const primaryAgent = String(raw.primaryAgent ?? raw.primary_agent ?? '').trim();
+          const validators = Array.isArray(raw.validators)
+            ? Array.from(new Set(raw.validators.map((value) => String(value).trim()).filter(Boolean)))
+            : [];
+          if (!primaryAgent) return res.status(400).json({ error: 'orgIdentity.primaryAgent is required' });
+          const identityNames = [primaryAgent, ...validators];
+          for (const agentName of identityNames) {
+            const check = validateName(agentName, 'agent');
+            if (!check.valid) return res.status(400).json({ error: check.error });
+          }
+          const agents = await this.db.agents.list(team.id).catch(() => [] as AgentRow[]);
+          const missing = identityNames.filter((agentName) => !agents.some((agent) => agent.name === agentName));
+          if (missing.length) {
+            return res.status(409).json({ error: `Organization identity agent(s) are not in ${requestedName || team.name}: ${missing.join(', ')}` });
+          }
+          normalizedIdentity = {
+            primary: raw.primary !== false,
+            primaryAgent,
+            validators,
+          };
+        }
+
+        let nextName = team.name;
+        if (requestedName && requestedName !== team.name) {
+          const nameCheck = validateName(requestedName, 'team');
+          if (!nameCheck.valid) return res.status(400).json({ error: nameCheck.error });
+          const collision = await this.db.teams.getTeamByName(requestedName).catch((error: unknown) => {
+            throw error;
+          });
+          if (collision && collision.id !== team.id) {
+            return res.status(409).json({ error: `Team "${requestedName}" already exists` });
+          }
+          await this.db.teams.renameTeam(team.id, requestedName);
+          nextName = requestedName;
+
+          // Keep explicit relay allow-lists valid across the rename. A failure
+          // here is reported as a warning because the stable team-id rename has
+          // already succeeded and must not be obscured by a secondary policy.
+          const relayWarnings: string[] = [];
+          for (const row of await this.db.teams.listTeams()) {
+            try {
+              const config = await this.db.teams.getConfig(row.id);
+              const delegates = config.delegates_to;
+              if (!Array.isArray(delegates) || !delegates.includes(team.name)) continue;
+              await this.db.teams.setDelegatesTo(row.id, Array.from(new Set(
+                delegates.map((value) => value === team.name ? nextName : String(value)),
+              )));
+            } catch (error: any) {
+              relayWarnings.push(`${row.name}: ${error?.message || String(error)}`);
+            }
+          }
+          if (relayWarnings.length) {
+            console.warn(`[Manager] Team ${team.name} renamed to ${nextName} with relay warnings: ${relayWarnings.join('; ')}`);
+          }
+        }
+
+        if (normalizedIdentity) await this.db.teams.setOrgIdentity(team.id, normalizedIdentity);
+
+        const agentCount = parseInt(await this.db.agents.count(team.id) || '0');
+        res.json({
+          ok: true,
+          previousName: team.name,
+          name: nextName,
+          agentCount,
+          identityUpdated: identityInput !== undefined,
+        });
       } catch (error: any) {
         res.status(500).json({ error: error.message || 'Failed to update team' });
       }
@@ -16664,7 +16759,8 @@ Return this JSON shape:
         const agent = await this.dbQueryAgentById(teamId, req.params.id);
         if (!agent) return res.status(404).json({ error: 'Agent not found' });
 
-        const { wallet, name: newName } = req.body;
+        const { wallet, name: requestedName } = req.body || {};
+        const newName = typeof requestedName === 'string' ? requestedName.trim() : '';
         const hasUpdates = wallet || newName;
 
         if (!hasUpdates) return res.status(400).json({ error: 'No updates provided' });
@@ -16686,10 +16782,32 @@ Return this JSON shape:
               error: `Agent name "${newName}" conflicts with existing "${collision.name}"`,
             });
           }
-          await this.db.agents.updateIdentity(agent.id, { name: newName });
+          const metadata = { ...((agent.metadata as Record<string, unknown> | null) || {}) };
+          const priorAliases = Array.isArray(metadata.previousAliases)
+            ? metadata.previousAliases.map((value) => String(value).trim()).filter(Boolean)
+            : [];
+          if (newName !== agent.name) {
+            metadata.previousAliases = Array.from(new Set([
+              ...priorAliases,
+              agent.name,
+              typeof metadata.alias === 'string' ? metadata.alias.trim() : '',
+            ].filter((value) => value && value !== newName)));
+          }
+          // agentToResponse intentionally uses metadata.alias as the local
+          // display/routing name. Move it with the rename; keeping the old
+          // value here would make the database row change while every Control
+          // Center roster continued to display and address the former name.
+          metadata.alias = newName;
+          await this.db.agents.updateIdentity(agent.id, { name: newName, metadata });
         }
 
-        res.json({ ok: true, updated: Object.keys(req.body) });
+        res.json({
+          ok: true,
+          id: agent.id,
+          previousName: agent.name,
+          name: newName || agent.name,
+          updated: Object.keys(req.body || {}),
+        });
       } catch (err: any) {
         res.status(500).json({ error: err.message });
       }
@@ -19503,11 +19621,12 @@ Return this JSON shape:
   private async deleteEmptyTeamByName(
     name: string,
   ): Promise<{ ok: true; result: { success: true; name: string; message: string } } | { ok: false; status: number; error: string }> {
-    if (name === 'default') {
+    const orgIdentity = await this.idaccOrgIdentityPolicy();
+    if (orgIdentity?.team.name === name) {
       return {
         ok: false,
         status: 400,
-        error: 'Cannot delete the "default" team — it is the fallback for all unscoped requests',
+        error: `Cannot delete the primary team "${name}"`,
       };
     }
 
@@ -19535,9 +19654,9 @@ Return this JSON shape:
     // Keep the destructive audit record in the non-deletable default team.
     // Recording it against the team being deleted would be erased by the
     // teams -> event_log cascade and make the incident impossible to trace.
-    const auditTeam = await this.db.teams.getTeamByName('default');
+    const auditTeam = orgIdentity?.team ?? await this.db.teams.getTeamByName('default').catch(() => null);
     if (!auditTeam) {
-      return { ok: false, status: 503, error: 'Cannot delete a team while the durable default-team audit scope is unavailable' };
+      return { ok: false, status: 503, error: 'Cannot delete a team while the durable primary-team audit scope is unavailable' };
     }
     try {
       await emitControlEvent(this.db.events, {
@@ -23893,9 +24012,36 @@ Return this JSON shape:
     return Number.isFinite(raw) && raw >= 0 ? Math.min(20, Math.floor(raw)) : 2;
   }
 
+  private async idaccOrgIdentityPolicy(): Promise<{
+    team: TeamRow;
+    primaryAgent: string;
+    validators: string[];
+  } | null> {
+    const listWithConfig = this.db.teams.listTeamsWithConfig;
+    const teams = typeof listWithConfig === 'function'
+      ? await listWithConfig.call(this.db.teams).catch(() => [] as TeamRow[])
+      : [] as TeamRow[];
+    for (const team of teams) {
+      const config = (team.config && typeof team.config === 'object')
+        ? team.config as Record<string, unknown>
+        : await this.db.teams.getConfig(team.id).catch(() => ({} as Record<string, unknown>));
+      const raw = config.idacc_org_identity;
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+      const identity = raw as Record<string, unknown>;
+      if (identity.primary === false) continue;
+      const primaryAgent = String(identity.primaryAgent ?? identity.primary_agent ?? '').trim();
+      if (!primaryAgent) continue;
+      const validators = Array.isArray(identity.validators)
+        ? Array.from(new Set(identity.validators.map((value) => String(value).trim()).filter(Boolean)))
+        : ['coder', 'researcher'];
+      return { team, primaryAgent, validators };
+    }
+    const fallback = await this.db.teams.getTeamByName('default').catch(() => null);
+    return fallback ? { team: fallback, primaryAgent: 'lead', validators: ['coder', 'researcher'] } : null;
+  }
+
   private async goalAutopilotControlTeamId(): Promise<string | null> {
-    const team = await this.db.teams.getTeamByName('default').catch(() => null);
-    return team?.id || null;
+    return (await this.idaccOrgIdentityPolicy())?.team.id || null;
   }
 
   private async goalAutopilotControlConfig(): Promise<GoalAutopilotControlConfig> {
@@ -24716,10 +24862,11 @@ Return this JSON shape:
     if (!task.team_id) return [];
     const team = await this.db.teams.getTeam(task.team_id).catch(() => null);
     if (!team) return [];
-    const defaultTeam = await this.db.teams.getTeamByName('default').catch(() => null);
+    const orgIdentity = await this.idaccOrgIdentityPolicy();
+    const defaultTeam = orgIdentity?.team ?? null;
     const validators: Array<{ team: TeamRow; agent: AgentRow }> = [];
     if (defaultTeam) {
-      for (const name of ['coder', 'researcher']) {
+      for (const name of orgIdentity?.validators ?? ['coder', 'researcher']) {
         const agent = await this.db.agents.getByName(defaultTeam.id, name).catch(() => null);
         if (agent) validators.push({ team: defaultTeam, agent });
       }
@@ -28418,16 +28565,14 @@ Return this JSON shape:
     // because reseeding interval schedules would reset their anchor and expiry.
   }
 
-  /**
-   * Ensure well-known teams exist: `default` (fallback for unscoped requests)
-   * and `public` (public-agent registrations). Created idempotently on every
-   * manager start. User-specific project teams are NOT seeded here — deploy
-   * them with `/deploy <config>` instead.
-   */
+  /** Ensure public always exists and create the starter default team only until IDACC has
+   * persisted a primary identity. A renamed primary must not make `default` reappear on boot. */
   private async seedWellKnownTeams(): Promise<void> {
     try {
       const seeded: string[] = [];
-      for (const name of ['default', 'public']) {
+      const primary = await this.idaccOrgIdentityPolicy();
+      const names = primary ? ['public'] : ['default', 'public'];
+      for (const name of names) {
         await this.db.teams.getOrCreateTeamId(name);
         const teamDir = `${this.baseWorkDir}/teams/${name}`;
         if (!existsSync(teamDir)) mkdirSync(teamDir, { recursive: true });
@@ -28721,8 +28866,15 @@ Return this JSON shape:
 
     // Resolve team — look up only; do NOT auto-create. A stale client
     // reconnecting with a team name that was deleted must not resurrect it.
-    const teamName = teamHeader ? String(teamHeader) : (process.env.ID_TEAM || 'default');
-    const teamRow = await this.db.teams.getTeamByName(teamName);
+    let teamName = teamHeader ? String(teamHeader) : (process.env.ID_TEAM || 'default');
+    let teamRow = await this.db.teams.getTeamByName(teamName);
+    if (!teamRow && !teamHeader && teamName === 'default') {
+      const primary = await this.idaccOrgIdentityPolicy();
+      if (primary) {
+        teamName = primary.team.name;
+        teamRow = primary.team;
+      }
+    }
     if (!teamRow) {
       console.log(`[WS] Rejecting connection for unknown team "${teamName}"`);
       try {

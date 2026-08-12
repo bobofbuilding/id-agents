@@ -12,7 +12,7 @@
  * subsequent passes; this manifest is the single source of truth for the contract today.
  */
 
-export const CC_API_VERSION = 6;
+export const CC_API_VERSION = 7;
 
 export interface CcRoute {
   method: string;
@@ -50,7 +50,9 @@ export const CC_ROUTES: CcRoute[] = [
   { method: 'POST', path: '/agents/:id/delegates', group: 'agent-config' },
   { method: 'POST', path: '/agents/:id/team', group: 'agent-config' },
   { method: 'POST', path: '/agents/:id/metadata', group: 'agent-config' },
+  { method: 'PATCH', path: '/agents/:id/metadata', group: 'identity-rename' },
   // team configuration
+  { method: 'PATCH', path: '/teams/:name', group: 'identity-rename' },
   { method: 'GET', path: '/teams/:name/config', group: 'team-config' },
   { method: 'POST', path: '/teams/:name/delegates', group: 'team-config' },
   // library (skills / plugins install)
@@ -66,6 +68,7 @@ export const CC_FEATURES = [
   'atomic-agent-config', // CAS + preflight + one rebuild + verified rollback
   'agent-config', // per-agent instructions/runtime/mcp/delegates/team/metadata
   'team-config', // per-team relay config
+  'identity-rename', // stable-id team rename + guarded agent identity rename
   'library', // skills/plugins install
   'brain-context', // brain volunteer hook on dispatch
   'brain-control', // manager-mediated, acknowledged Brain reads and writes

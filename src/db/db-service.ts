@@ -48,6 +48,9 @@ export interface TeamsRepository {
   /** Fetch a single team by name, or null if not found. */
   getTeamByName(name: string): Promise<TeamRow | null>;
 
+  /** Rename a team without changing its stable id or team-scoped records. */
+  renameTeam(teamId: string, name: string): Promise<void>;
+
   /** Return the parsed config JSON for a team (empty object if none). */
   getConfig(teamId: string): Promise<Record<string, unknown>>;
 
@@ -65,6 +68,9 @@ export interface TeamsRepository {
 
   /** Merge organization chart data into the team config. */
   setOrg(teamId: string, org: Record<string, unknown> | null): Promise<void>;
+
+  /** Store or remove the Control Center's primary-team identity policy. */
+  setOrgIdentity(teamId: string, identity: Record<string, unknown> | null): Promise<void>;
 
   /** Store or remove the team's runtime credential pool declaration. */
   setRuntimeCredentialPool(teamId: string, pool: Record<string, unknown> | null): Promise<void>;

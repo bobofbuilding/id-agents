@@ -257,6 +257,11 @@ describe('Agent rename — reserved-name guard', () => {
       body: JSON.stringify({ name: newValidName }),
     });
     expect(res.ok).toBe(true);
+    expect(await res.json()).toMatchObject({
+      id: idchainAgentId,
+      previousName: idchainAgentName,
+      name: newValidName,
+    });
 
     const lookup = await fetch(`${baseUrl}/agents/by-name/${newValidName}`, {
       headers: makeHeaders('idchain'),
@@ -264,6 +269,9 @@ describe('Agent rename — reserved-name guard', () => {
     expect(lookup.ok).toBe(true);
     const lookupBody = await lookup.json() as any;
     expect(lookupBody.id ?? lookupBody.agent?.id).toEqual(idchainAgentId);
+    expect(lookupBody.name).toBe(newValidName);
+    expect(lookupBody.alias).toBe(newValidName);
+    expect(lookupBody.metadata?.previousAliases).toContain(idchainAgentName);
 
     // Restore original name so downstream tests using idchainAgentName still resolve
     const restore = await fetch(`${baseUrl}/agents/${idchainAgentId}/metadata`, {

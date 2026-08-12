@@ -51,6 +51,10 @@ export class PgTeamsRepo implements TeamsRepository {
     return r.rows[0];
   }
 
+  async renameTeam(teamId: string, name: string): Promise<void> {
+    await this.db.query('UPDATE teams SET name = $2 WHERE id = $1', [teamId, name]);
+  }
+
   async getConfig(teamId: string): Promise<Record<string, unknown>> {
     const r = await this.db.query<{ config: Record<string, unknown> | null }>(
       'SELECT config FROM teams WHERE id = $1',
@@ -106,6 +110,22 @@ export class PgTeamsRepo implements TeamsRepository {
        SET config = jsonb_set(config, '{org}', $2::jsonb, true)
        WHERE id = $1`,
       [teamId, JSON.stringify(org)],
+    );
+  }
+
+  async setOrgIdentity(teamId: string, identity: Record<string, unknown> | null): Promise<void> {
+    if (identity === null) {
+      await this.db.query(
+        `UPDATE teams SET config = config - 'idacc_org_identity' WHERE id = $1`,
+        [teamId],
+      );
+      return;
+    }
+    await this.db.query(
+      `UPDATE teams
+       SET config = jsonb_set(config, '{idacc_org_identity}', $2::jsonb, true)
+       WHERE id = $1`,
+      [teamId, JSON.stringify(identity)],
     );
   }
 

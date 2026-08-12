@@ -1,6 +1,6 @@
 {
   "name": "id-agents",
-  "version": "0.1.170",
+  "version": "0.1.171",
   "description": "Local multi-agent orchestration runtime with REST APIs",
   "type": "module",
   "main": "dist/index.js",

@@ -2,9 +2,8 @@
 /**
  * Control Center agent team reassignment contract.
  *
- * HR Manager rename/merge uses POST /agents/:id/team to move existing local
- * agents between teams. Normal moves require an existing target; guarded
- * rename calls may opt into creating an empty target team.
+ * HR Manager merge uses POST /agents/:id/team to move existing local agents.
+ * Stable team rename uses PATCH /teams/:name and preserves the team id.
  */
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -193,5 +192,95 @@ describe('POST /agents/:id/team', () => {
     });
 
     expect(res.status).toBe(403);
+  });
+});
+
+describe('stable identity rename routes', () => {
+  it('renames the primary team without changing its id or roster ownership', async () => {
+    const source = await db.teams.getTeamByName('default');
+    expect(source).not.toBeNull();
+    await insertAgent(db.adapter, source!.id, 'agent_primary_rename', 'lead');
+    await insertAgent(db.adapter, source!.id, 'agent_coder_rename', 'coder');
+    await insertAgent(db.adapter, source!.id, 'agent_researcher_rename', 'researcher');
+
+    const renamed = await fetch(`${baseUrl}/teams/default`, {
+      method: 'PATCH',
+      headers: headers('default'),
+      body: JSON.stringify({
+        name: 'executive-team',
+        orgIdentity: { primary: true, primaryAgent: 'lead', validators: ['coder', 'researcher'] },
+      }),
+    });
+    expect(renamed.status).toBe(200);
+    expect(await renamed.json()).toMatchObject({
+      ok: true,
+      previousName: 'default',
+      name: 'executive-team',
+      identityUpdated: true,
+    });
+
+    expect(await db.teams.getTeamByName('default')).toBeNull();
+    const target = await db.teams.getTeamByName('executive-team');
+    expect(target?.id).toBe(source!.id);
+    expect((await db.agents.getByName(target!.id, 'lead'))?.id).toBe('agent_primary_rename');
+    expect((await db.teams.getConfig(target!.id)).idacc_org_identity).toEqual({
+      primary: true,
+      primaryAgent: 'lead',
+      validators: ['coder', 'researcher'],
+    });
+
+    const staleStarterScope = await fetch(`${baseUrl}/agents`, {
+      headers: headers('default'),
+    });
+    expect(staleStarterScope.status).toBe(200);
+    expect((await staleStarterScope.json() as { agents: unknown[] }).agents).toHaveLength(3);
+    expect(await db.teams.getTeamByName('default')).toBeNull();
+
+    const restored = await fetch(`${baseUrl}/teams/executive-team`, {
+      method: 'PATCH',
+      headers: headers('executive-team'),
+      body: JSON.stringify({
+        name: 'default',
+        orgIdentity: { primary: true, primaryAgent: 'lead', validators: ['coder', 'researcher'] },
+      }),
+    });
+    expect(restored.status).toBe(200);
+  });
+
+  it('rejects team rename collisions and non-admin callers', async () => {
+    await db.teams.getOrCreateTeamId('rename-source');
+    await db.teams.getOrCreateTeamId('rename-target');
+
+    const collision = await fetch(`${baseUrl}/teams/rename-source`, {
+      method: 'PATCH',
+      headers: headers('rename-source'),
+      body: JSON.stringify({ name: 'rename-target' }),
+    });
+    expect(collision.status).toBe(409);
+
+    const unauthorized = await fetch(`${baseUrl}/teams/rename-source`, {
+      method: 'PATCH',
+      headers: headers('rename-source', false),
+      body: JSON.stringify({ name: 'renamed-without-admin' }),
+    });
+    expect(unauthorized.status).toBe(403);
+  });
+
+  it('validates organization identity before changing the team name', async () => {
+    const sourceId = await db.teams.getOrCreateTeamId('identity-validation-source');
+    await insertAgent(db.adapter, sourceId, 'agent_identity_validation_lead', 'lead');
+
+    const response = await fetch(`${baseUrl}/teams/identity-validation-source`, {
+      method: 'PATCH',
+      headers: headers('identity-validation-source'),
+      body: JSON.stringify({
+        name: 'identity-validation-target',
+        orgIdentity: { primary: true, primaryAgent: 'missing-lead', validators: [] },
+      }),
+    });
+
+    expect(response.status).toBe(409);
+    expect((await db.teams.getTeamByName('identity-validation-source'))?.id).toBe(sourceId);
+    expect(await db.teams.getTeamByName('identity-validation-target')).toBeNull();
   });
 });

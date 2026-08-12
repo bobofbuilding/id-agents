@@ -56,6 +56,10 @@ export class SqliteTeamsRepo implements TeamsRepository {
     return { ...rows[0], config: parseJsonObject(rows[0].config) };
   }
 
+  async renameTeam(teamId: string, name: string): Promise<void> {
+    await this.db.query(`UPDATE teams SET name = ? WHERE id = ?`, [name, teamId]);
+  }
+
   async getConfig(teamId: string): Promise<Record<string, unknown>> {
     const { rows } = await this.db.query<{ config: unknown }>(
       `SELECT config FROM teams WHERE id = ?`,
@@ -103,6 +107,16 @@ export class SqliteTeamsRepo implements TeamsRepository {
     const config = await this.getConfig(teamId);
     if (org === null) delete config.org;
     else config.org = org;
+    await this.db.query(
+      `UPDATE teams SET config = ? WHERE id = ?`,
+      [stringifyJson(config), teamId],
+    );
+  }
+
+  async setOrgIdentity(teamId: string, identity: Record<string, unknown> | null): Promise<void> {
+    const config = await this.getConfig(teamId);
+    if (identity === null) delete config.idacc_org_identity;
+    else config.idacc_org_identity = identity;
     await this.db.query(
       `UPDATE teams SET config = ? WHERE id = ?`,
       [stringifyJson(config), teamId],

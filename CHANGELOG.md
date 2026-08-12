@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.171]
+
+- Add admin-gated, stable-ID team renaming and preserve explicit cross-team
+  relay references when a team name changes.
+- Persist a Control Center primary-team identity policy so renamed primary
+  teams remain the durable control and validation scope.
+- Preserve an agent's previous names as audit metadata while moving its active
+  display/routing alias, and expose rename routes in Control Center API v7.
+
 ## [0.1.170]
 
 - Verify Claude's structured authentication state during runtime preflight,
