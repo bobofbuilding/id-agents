@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.173]
+
+- Allow a new explicitly identified plan/run to create fresh work after an
+  earlier matching task is terminal, while retaining duplicate protection for
+  open work and same-plan retries.
+
 ## [0.1.172]
 
 - Let reference-only planning and advisory tasks close with the existing
