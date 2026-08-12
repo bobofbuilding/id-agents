@@ -2370,6 +2370,7 @@ export class AgentManagerDb {
       title: task.title,
       description: task.description,
       project_id: task.project_id,
+      plan_id: task.plan_id,
     };
   }
 
@@ -2553,6 +2554,11 @@ export class AgentManagerDb {
     const title = this.firstBriefString(input, ['title']);
     const targetSignature = this.taskTargetSignatureFromInput(input);
     const projectId = this.firstBriefString(input, ['project_id', 'projectId']);
+    // A new, explicit plan/run is a fresh unit of work.  It must not be
+    // blocked by a terminal task from an earlier plan merely because the
+    // title and goal overlap during the recent-completion dedupe window.
+    // Open work remains protected by the normal goal/target guard.
+    const requestedPlanId = this.firstBriefString(input, ['plan_id', 'planId', 'plan']);
     const projectScope = projectId || null;
     if (!goalId && !title) return null;
     const recentDoneWindowMs = this.taskDuplicateRecentDoneWindowMs();
@@ -2601,6 +2607,7 @@ export class AgentManagerDb {
       if (candidate.status === 'done') {
         if (recentDoneWindowMs <= 0) continue;
         if (nowMs - this.taskLastActivityMs(candidate) > recentDoneWindowMs) continue;
+        if (requestedPlanId && candidate.plan_id && candidate.plan_id !== requestedPlanId) continue;
       }
       matches.push({
         task: candidate,

@@ -1839,6 +1839,52 @@ describe('/talk-to auto-attach', () => {
     expect(await db.tasks.list({ teamId })).toHaveLength(1);
   });
 
+  it('allows a new explicit plan to supersede a recently completed duplicate task', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    await db.tasks.create({
+      id: 'task_recent_done_prior_plan',
+      name: 'audit-reconcile-authorized-projects',
+      uuid: '12345678-1234-4234-9234-123456789abd',
+      team_id: teamId,
+      title: 'Audit reconcile authorized projects',
+      description: [
+        'Goal ID: goal_manual_dispatch',
+        'Expected output: completed repository audit',
+        'Acceptance criteria: audit complete',
+        'Validation path: coder and researcher',
+        'Out of scope: duplicate work',
+        'Backlog policy: status-check the recent owner before reopening',
+        'Work relevance: medium: validates an authorized project release.',
+      ].join('\n'),
+      status: 'done',
+      created_by: dispatcherId,
+      owner: targetId,
+      plan_id: 'audit-reconcile-authorized-projects-prior-run',
+      created_at: now - 180,
+      updated_at: now - 60,
+      completed_at: now - 60,
+    });
+
+    const fresh = await fetch(`${baseUrl}/tasks`, {
+      method: 'POST',
+      headers: adminHeaders(TEAM),
+      body: JSON.stringify({
+        title: 'Audit reconcile authorized projects 20260812t083200z',
+        name: 'audit-reconcile-authorized-projects-20260812t083200z',
+        from: 'manager',
+        ...validBriefFields(),
+        goal_id: 'goal_manual_dispatch',
+        plan_id: 'audit-reconcile-authorized-projects-20260812t083200z',
+        expected_output: 'fresh repository audit run',
+        acceptance_criteria: ['current repository state is recorded'],
+        backlog_policy: 'run the explicitly authorized current audit',
+        work_relevance: 'medium: completes a newly authorized repository audit run.',
+      }),
+    });
+    expect(fresh.status).toBe(201);
+    expect(await db.tasks.list({ teamId })).toHaveLength(2);
+  });
+
   it('rejects validator children created after the parent task is terminal', async () => {
     const now = Math.floor(Date.now() / 1000);
     await db.tasks.create({
