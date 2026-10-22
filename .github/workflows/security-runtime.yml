@@ -20,7 +20,8 @@ jobs:
         with:
           node-version: '22.23.4'
       - run: node --version
-      - run: npm audit fix --package-lock-only --ignore-scripts --audit-level=high
+      - run: npm ci
+      - run: npm update @modelcontextprotocol/sdk vitest @vitest/mocker fast-uri hono ip-address proxy-addr source-map-js vite --package-lock-only --ignore-scripts
       - name: Record generated dependency lockfile for review
         if: always()
         run: |
